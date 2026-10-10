@@ -14,8 +14,8 @@ use std::path::Path;
 
 use lamb_core::geometry::tangent_circle::{self, ApparentCurve};
 use lamb_core::geometry::{
-    Point2, Point3, Polyline2, ResolvedSegment, Transform2D, VirtualCornerEntry, circle_fit, cursor_snaps, distance, fillet, intersect, offset,
-    point, polyline, tolerance, transform2d,
+    Point2, Point3, Polyline2, ResolvedSegment, Transform2D, VirtualCornerEntry, circle_fit, cursor_snaps, dimension, distance, fillet, halfspace,
+    hatch_pattern, intersect, loop_chain, offset, point, polyline, tolerance, transform_ops, transform2d, triangulate,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -208,6 +208,41 @@ fn dispatch() -> HashMap<&'static str, Handler> {
             out(offset::polyline_from_points(&arg::<Vec<Point2>>(a, 0)?, arg::<Option<bool>>(a, 1)?.unwrap_or(false)))
         }),
         ("geometry-primitives/offset#chordDistance", |a| Ok(num_out(offset::chord_distance(arg::<Point2>(a, 0)?, arg(a, 1)?)))),
+        // geometry-primitives/dimension (transformDimension takes a function argument: no dispatch line)
+        ("geometry-primitives/dimension#resolveDimension", |a| out(dimension::resolve_dimension(&arg::<dimension::Dimension2>(a, 0)?, num(a, 1)?))),
+        // geometry-primitives/hatchPattern
+        ("geometry-primitives/hatchPattern#parsePatFile", |a| out(hatch_pattern::parse_pat_file(&arg::<String>(a, 0)?))),
+        ("geometry-primitives/hatchPattern#stringifyPatFile", |a| {
+            out(hatch_pattern::stringify_pat_file(&arg::<Vec<hatch_pattern::PatternDefinition>>(a, 0)?))
+        }),
+        ("geometry-primitives/hatchPattern#findBuiltinPattern", |a| out(hatch_pattern::find_builtin_pattern(&arg::<String>(a, 0)?))),
+        ("geometry-primitives/hatchPattern#dashIntervalsInRange", |a| {
+            out(hatch_pattern::dash_intervals_in_range(&arg::<Vec<f64>>(a, 0)?, num(a, 1)?, num(a, 2)?, num(a, 3)?))
+        }),
+        // geometry-primitives/loopChain
+        ("geometry-primitives/loopChain#chainBoundaryLoops", |a| {
+            out(loop_chain::chain_boundary_loops(&arg::<Vec<loop_chain::LoopChainEntity>>(a, 0)?, num(a, 1)?))
+        }),
+        // geometry-primitives/triangulate
+        ("geometry-primitives/triangulate#polygonAreaSigned", |a| Ok(num_out(triangulate::polygon_area_signed(&arg::<Vec<Point2>>(a, 0)?)))),
+        ("geometry-primitives/triangulate#isConvexLoop", |a| Ok(Value::Bool(triangulate::is_convex_loop(&arg::<Vec<Point2>>(a, 0)?)))),
+        ("geometry-primitives/triangulate#triangulateLoop", |a| out(triangulate::triangulate_loop(&arg::<Vec<Point2>>(a, 0)?))),
+        // geometry-primitives/halfspace
+        ("geometry-primitives/halfspace#sectionConvexPolyhedron", |a| {
+            out(halfspace::section_convex_polyhedron(&arg::<Vec<Vec<Point3>>>(a, 0)?, arg(a, 1)?))
+        }),
+        ("geometry-primitives/halfspace#clipConvexPolyhedron", |a| {
+            out(halfspace::clip_convex_polyhedron(&arg::<Vec<Vec<Point3>>>(a, 0)?, arg(a, 1)?))
+        }),
+        // geometry-primitives/transformOps
+        ("geometry-primitives/transformOps#translatePoint", |a| out(transform_ops::translate_point(arg::<Point2>(a, 0)?, num(a, 1)?, num(a, 2)?))),
+        ("geometry-primitives/transformOps#rotatePointAbout", |a| {
+            out(transform_ops::rotate_point_about(arg::<Point2>(a, 0)?, arg(a, 1)?, num(a, 2)?))
+        }),
+        ("geometry-primitives/transformOps#scalePointAbout", |a| out(transform_ops::scale_point_about(arg::<Point2>(a, 0)?, arg(a, 1)?, num(a, 2)?))),
+        ("geometry-primitives/transformOps#mirrorPointAcrossLine", |a| {
+            out(transform_ops::mirror_point_across_line(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?))
+        }),
     ];
     table.iter().copied().collect()
 }
@@ -487,6 +522,12 @@ fn golden_fixtures() {
     let _ = std::io::stderr().write_all(format!("\ngolden fixtures:\n{report}").as_bytes());
 
     assert!(failures.is_empty(), "{} golden case(s) failed for ported exports (see report above)", failures.len());
+
+    // Every geometry-primitives export with fixture cases must be ported; other packages are
+    // counted, not failed.
+    let unported: Vec<&str> = stats.keys().map(String::as_str).filter(|k| k.starts_with("geometry-primitives/") && !table.contains_key(k)).collect();
+    let (ported, exports, ..) = packages.get("geometry-primitives").copied().unwrap_or_default();
+    assert_eq!(ported, exports, "geometry-primitives exports with fixture cases but no dispatch line: {}", unported.join(", "));
 }
 
 // ---------------------------------------------------------------------------------------------
