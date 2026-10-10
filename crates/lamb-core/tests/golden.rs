@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
+use lamb_core::derivation::{alignment, projection, read};
 use lamb_core::geometry::tangent_circle::{self, ApparentCurve};
 use lamb_core::geometry::{
     Point2, Point3, Polyline2, ResolvedSegment, Transform2D, VirtualCornerEntry, circle_fit, cursor_snaps, dimension, distance, fillet, halfspace,
@@ -271,6 +272,45 @@ fn dispatch() -> HashMap<&'static str, Handler> {
         ("document-model/project#findView", |a| out(model::find_view(&arg::<Project>(a, 0)?, arg(a, 1)?))),
         ("document-model/project#findLayer", |a| out(model::find_layer(&arg::<Project>(a, 0)?, &arg::<String>(a, 1)?))),
         ("document-model/project#findLevel", |a| out(model::find_level(&arg::<Project>(a, 0)?, arg(a, 1)?))),
+        // derivation-engine/projection
+        ("derivation-engine/projection#planLocalToGlobalXY", |a| {
+            out(projection::plan_local_to_global_xy(&read::view_ref(&arg::<AnyView>(a, 0)?), arg(a, 1)?)?)
+        }),
+        ("derivation-engine/projection#verticalGazeDir", |a| {
+            #[derive(serde::Deserialize)]
+            struct GazeArg {
+                #[serde(rename = "cHat")]
+                c_hat: Point2,
+                #[serde(default)]
+                flipped: Option<bool>,
+            }
+            let g = arg::<GazeArg>(a, 0)?;
+            out(projection::vertical_gaze_dir(g.c_hat, g.flipped.unwrap_or(false)))
+        }),
+        ("derivation-engine/projection#planPlacementThrough", |a| {
+            out(projection::plan_placement_through(&read::view_ref(&arg::<AnyView>(a, 0)?), &read::view_ref(&arg::<AnyView>(a, 1)?), arg(a, 2)?)?)
+        }),
+        ("derivation-engine/projection#perpendicularCutLineThrough", |a| {
+            out(projection::perpendicular_cut_line_through(
+                &read::view_ref(&arg::<AnyView>(a, 0)?),
+                &read::view_ref(&arg::<AnyView>(a, 1)?),
+                arg(a, 2)?,
+                num(a, 3)?,
+            )?)
+        }),
+        // derivation-engine/alignment
+        ("derivation-engine/alignment#computeAlignmentBasis", |a| {
+            out(alignment::compute_alignment_basis(&read::view_ref(&arg::<AnyView>(a, 0)?), &read::view_ref(&arg::<AnyView>(a, 1)?))?)
+        }),
+        ("derivation-engine/alignment#localDirectionAlongCHat", |a| {
+            Ok(num_out(alignment::local_direction_along_c_hat(&read::view_ref(&arg::<AnyView>(a, 0)?), arg(a, 1)?)))
+        }),
+        ("derivation-engine/alignment#planPointToUV", |a| {
+            out(alignment::plan_point_to_uv(&read::view_ref(&arg::<AnyView>(a, 0)?), &arg(a, 1)?, arg(a, 2)?)?)
+        }),
+        ("derivation-engine/alignment#uvToPlanPoint", |a| {
+            out(alignment::uv_to_plan_point(&read::view_ref(&arg::<AnyView>(a, 0)?), &arg(a, 1)?, arg(a, 2)?)?)
+        }),
     ];
     table.iter().copied().collect()
 }
