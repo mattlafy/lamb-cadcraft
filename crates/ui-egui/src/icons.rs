@@ -118,6 +118,7 @@ pub enum Icon {
     Annotation,
     Workspace,
     ChevronDown,
+    ChevronUp,
     ChevronLeft,
     ChevronRight,
     Plus,
@@ -139,6 +140,9 @@ pub enum Icon {
     Distance,
     Area,
     List,
+    PickAdd,
+    SelectObjects,
+    QuickSelect,
 }
 
 struct Pen<'a> {
@@ -790,6 +794,7 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, dim: bool) {
             pen.l(9.0, 9.0, 21.0, 9.0);
         }
         ChevronDown => pen.poly(&[(6.0, 9.0), (12.0, 15.0), (18.0, 9.0)], false, b),
+        ChevronUp => pen.poly(&[(6.0, 15.0), (12.0, 9.0), (18.0, 15.0)], false, b),
         ChevronLeft => pen.poly(&[(15.0, 6.0), (9.0, 12.0), (15.0, 18.0)], false, b),
         ChevronRight => pen.poly(&[(9.0, 6.0), (15.0, 12.0), (9.0, 18.0)], false, b),
         Plus => {
@@ -883,6 +888,22 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, dim: bool) {
                 pen.l(8.0, y, 20.0, y);
             }
         }
+        PickAdd => {
+            // An object box with a plus: picks add to the selection.
+            pen.rect(3.0, 3.0, 11.0, 11.0, b);
+            pen.la(17.0, 11.0, 17.0, 21.0);
+            pen.la(12.0, 16.0, 22.0, 16.0);
+        }
+        SelectObjects => {
+            // A pointer picking an object box.
+            pen.rect(12.0, 3.0, 9.0, 9.0, a);
+            pen.poly(&[(4.0, 6.0), (4.0, 20.0), (7.5, 16.5), (10.5, 21.5), (12.5, 20.5), (9.5, 15.5), (14.0, 15.0)], true, b);
+        }
+        QuickSelect => {
+            // A filter funnel with a spark.
+            pen.poly(&[(3.0, 4.0), (19.0, 4.0), (13.0, 11.0), (13.0, 19.0), (9.0, 17.0), (9.0, 11.0)], true, b);
+            pen.poly(&[(20.0, 10.0), (16.5, 15.5), (20.0, 15.5), (17.0, 21.0)], false, a);
+        }
     }
 }
 
@@ -896,5 +917,5 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, size: f32, tooltip: &str, selected:
         ui.painter().rect_filled(rect, 3.0, t.control_hover.gamma_multiply(0.6));
     }
     paint(ui.painter(), rect.shrink(size * 0.08), icon, !ui.is_enabled());
-    resp.on_hover_text(tooltip)
+    resp.on_hover_text(crate::i18n::t(tooltip))
 }

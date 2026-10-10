@@ -8,7 +8,7 @@ use cadcraft_geom::{
 use serde_json::{Value, json};
 
 use super::helpers::*;
-use super::machines::{SelOutcome, SelectPhase, number};
+use super::machines::{SelOutcome, SelectPhase, SelectRun, number};
 use super::*;
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
 
@@ -87,8 +87,14 @@ pub fn specs() -> Vec<CommandSpec> {
             .menu(&["Modify", "Array", "Polar Array"])
             .params("{handles?, center, count, angle? (degrees, default 360), rotate?: bool}")
             .interactive(|_| Ok(Box::new(SelectThen::new(Op::ArrayPolar)))),
-        CommandSpec::new("draworder.front", "Bring to Front", run_front).menu(&["Tools", "Draw Order", "Bring to Front"]).params("{handles?}"),
-        CommandSpec::new("draworder.back", "Send to Back", run_back).menu(&["Tools", "Draw Order", "Send to Back"]).params("{handles?}"),
+        CommandSpec::new("draworder.front", "Bring to Front", run_front)
+            .menu(&["Tools", "Draw Order", "Bring to Front"])
+            .params("{handles?}")
+            .interactive(|_| Ok(Box::new(SelectRun::new("draworder.front", "DRAWORDER")))),
+        CommandSpec::new("draworder.back", "Send to Back", run_back)
+            .menu(&["Tools", "Draw Order", "Send to Back"])
+            .params("{handles?}")
+            .interactive(|_| Ok(Box::new(SelectRun::new("draworder.back", "DRAWORDER")))),
         CommandSpec::new("break", "Break", run_break)
             .menu(&["Modify", "Break"])
             .alias(&["br"])
@@ -258,7 +264,8 @@ fn run_stretch(s: &mut Session, p: &Value) -> Result<Value> {
     let bx = cadcraft_geom::Bounds2::new(*a, *b);
     let d = delta_of("stretch", p)?;
     let space = s.space();
-    let hs = crate::select::select_window(s.doc()?, &space, bx, true);
+    let mut hs = crate::select::select_window(s.doc()?, &space, bx, true);
+    hs.retain(|h| !super::curves::is_locked(s, *h));
     let doc = s.doc_mut()?;
     for h in &hs {
         doc.modify_entity(*h, |e| stretch_entity(e, &bx, d))?;
@@ -477,6 +484,9 @@ fn prim_to_segments(p: &Prim) -> Vec<Segment> {
 
 /// Trim `h` at the piece containing `pick`. Returns the handles that replace it.
 pub(crate) fn trim(s: &mut Session, h: Handle, pick: Vec2, edges: Option<&[Handle]>) -> Result<Vec<Handle>> {
+    if super::curves::is_locked(s, h) {
+        return Err(EngineError::Other("The object is on a locked layer.".into()));
+    }
     let e = s.doc()?.entity(h).map(|e| (**e).clone()).ok_or_else(|| EngineError::Other("no such object".into()))?;
     let cut = edge_segments(s, edges, h)?;
     let pieces: Vec<EntityKind> = match &e.kind {
@@ -660,6 +670,9 @@ fn param_on(s: &Segment, p: Vec2) -> f64 {
 
 /// Extend the end of `h` nearest `pick` to the nearest boundary edge.
 pub(crate) fn extend(s: &mut Session, h: Handle, pick: Vec2, edges: Option<&[Handle]>) -> Result<()> {
+    if super::curves::is_locked(s, h) {
+        return Err(EngineError::Other("The object is on a locked layer.".into()));
+    }
     let e = s.doc()?.entity(h).map(|e| (**e).clone()).ok_or_else(|| EngineError::Other("no such object".into()))?;
     let cut = edge_segments(s, edges, h)?;
     let new_kind = match &e.kind {
@@ -756,6 +769,9 @@ pub(crate) fn fillet_lines(
     radius: f64,
     chamfer: Option<(f64, f64)>,
 ) -> Result<Option<Handle>> {
+    if super::curves::is_locked(s, h1) || super::curves::is_locked(s, h2) {
+        return Err(EngineError::Other("The object is on a locked layer.".into()));
+    }
     let d = s.doc()?;
     let e1 = d.entity(h1).map(|e| (**e).clone()).ok_or_else(|| EngineError::Other("no such object".into()))?;
     let e2 = d.entity(h2).map(|e| (**e).clone()).ok_or_else(|| EngineError::Other("no such object".into()))?;
@@ -891,7 +907,10 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
         EntityKind::Polyline3d(p) => Some(
             p.points
                 .windows(2)
-                .filter_map(|w| Some(Entity { handle: Handle(0), common: e.common.clone(), kind: line(w.first()?.xy(), w.get(1)?.xy()) }))
+                .filter_map(|w| {
+                    let kind = EntityKind::Line(cadcraft_doc::Line { a: *w.first()?, b: *w.get(1)? });
+                    Some(Entity { handle: Handle(0), common: e.common.clone(), kind })
+                })
                 .collect(),
         ),
         EntityKind::MText(m) => Some(
@@ -971,6 +990,9 @@ fn explode(s: &mut Session, hs: &[Handle]) -> Result<Vec<Handle>> {
     let space = s.space();
     let mut out = Vec::new();
     for h in hs {
+        if super::curves::is_locked(s, *h) {
+            continue;
+        }
         let Some(e) = s.doc()?.entity(*h).map(|e| (**e).clone()) else { continue };
         let Some(parts) = explode_kind(s.doc()?, &e) else { continue };
         let d = s.doc_mut()?;
@@ -1168,6 +1190,8 @@ fn run_breakat(s: &mut Session, p: &Value) -> Result<Value> {
 pub(crate) fn join(s: &mut Session, hs: &[Handle]) -> Result<Option<Handle>> {
     let d = s.doc()?;
     let mut segs: Vec<Segment> = Vec::new();
+    // Source entity of each segment in `segs`, so only entities that end up in the chain are removed.
+    let mut owners: Vec<Handle> = Vec::new();
     let mut common = None;
     for h in hs {
         let Some(e) = d.entity(*h) else { continue };
@@ -1178,12 +1202,14 @@ pub(crate) fn join(s: &mut Session, hs: &[Handle]) -> Result<Option<Handle>> {
             EntityKind::LwPolyline(p) if !p.closed => segs.extend(Polyline { vertices: p.vertices.clone(), closed: false }.segments()),
             _ => {}
         }
+        owners.resize(segs.len(), *h);
     }
     if segs.len() < 2 {
         return Err(EngineError::Other("Select at least two objects to join.".into()));
     }
     // Chain greedily from the first segment.
     let mut chain = vec![segs.remove(0)];
+    let mut used = vec![owners.remove(0)];
     let tol = 1e-6;
     loop {
         let start = chain.first().map(Segment::start).unwrap_or_default();
@@ -1194,6 +1220,7 @@ pub(crate) fn join(s: &mut Session, hs: &[Handle]) -> Result<Option<Handle>> {
             break;
         };
         let s0 = segs.remove(i);
+        used.push(owners.remove(i));
         if s0.start().near(end, tol) {
             chain.push(s0);
         } else if s0.end().near(end, tol) {
@@ -1224,7 +1251,7 @@ pub(crate) fn join(s: &mut Session, hs: &[Handle]) -> Result<Option<Handle>> {
     }
     let space = s.space();
     let doc = s.doc_mut()?;
-    for h in hs {
+    for h in hs.iter().filter(|h| used.contains(*h)) {
         doc.remove_entity(*h);
     }
     let nh = doc.new_handle();
@@ -1283,6 +1310,15 @@ struct SelectThen {
     objs: Vec<Handle>,
     pts: Vec<Vec2>,
     reference: bool,
+    /// ROTATE Reference: the reference angle (radians), once known. Its first point, and the
+    /// first of the two new-angle points, are kept in `ref_from`.
+    ref_angle: Option<f64>,
+    /// ROTATE Reference: the new angle is given by two points (the `Points` option).
+    ref_points: bool,
+    /// SCALE Reference: first point of a reference length given by two points.
+    ref_from: Option<Vec2>,
+    /// SCALE Reference: the reference length, once known.
+    ref_len: Option<f64>,
     copy_mode: bool,
     window: Option<cadcraft_geom::Bounds2>,
     ask_erase: bool,
@@ -1296,6 +1332,10 @@ impl SelectThen {
             objs: Vec::new(),
             pts: Vec::new(),
             reference: false,
+            ref_angle: None,
+            ref_points: false,
+            ref_from: None,
+            ref_len: None,
             copy_mode: false,
             window: None,
             ask_erase: false,
@@ -1315,7 +1355,11 @@ impl SelectThen {
             }
             Op::Join => {
                 match join(s, &self.objs) {
-                    Ok(_) => s.echo(format!("{} objects joined into 1 polyline", self.objs.len())),
+                    Ok(_) => {
+                        // Objects outside the joined chain are kept, so count only the ones JOIN consumed.
+                        let n = s.doc().map(|d| self.objs.iter().filter(|h| d.entity(**h).is_none()).count()).unwrap_or(0);
+                        s.echo(format!("{n} objects joined into 1 polyline"))
+                    }
                     Err(e) => s.echo(e.to_string()),
                 }
                 Ok(Step::Done)
@@ -1339,6 +1383,135 @@ impl SelectThen {
             _ => Ok(Step::Continue),
         }
     }
+
+    /// SCALE Reference: reference length (typed, or two points), then new length (typed, or a
+    /// point measured from the base point). The scale factor is new length / reference length.
+    fn scale_reference(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        let Some(base) = self.pts.first().copied() else { return Ok(Step::Done) };
+        match (self.ref_len, self.ref_from, i) {
+            (None, None, Input::Point(p)) => {
+                self.ref_from = Some(p);
+                Ok(Step::Continue)
+            }
+            (None, None, Input::Text(t)) => {
+                self.ref_len = Some(require_length(number(&t))?);
+                Ok(Step::Continue)
+            }
+            (None, None, Input::Enter) => {
+                self.ref_len = Some(1.0);
+                Ok(Step::Continue)
+            }
+            (None, Some(a), Input::Point(p)) => {
+                self.ref_len = Some(require_length(Some(a.dist(p)))?);
+                Ok(Step::Continue)
+            }
+            (Some(r), _, Input::Point(p)) => self.scale_by(s, base, base.dist(p) / r),
+            (Some(r), _, Input::Text(t)) => {
+                let n = require_length(number(&t))?;
+                self.scale_by(s, base, n / r)
+            }
+            (_, _, Input::Enter) => Ok(Step::Done),
+            _ => Ok(Step::Continue),
+        }
+    }
+
+    /// ROTATE Reference: reference angle (typed, or two points), then the new angle (typed, a
+    /// point measured from the base point, or two points after `Points`). The objects turn by the
+    /// new angle minus the reference angle.
+    fn rotate_reference(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        let Some(base) = self.pts.first().copied() else { return Ok(Step::Done) };
+        let angle =
+            |t: &str| crate::units::parse_angle(t).filter(|a| a.is_finite()).ok_or_else(|| EngineError::Other("Requires an angle or point.".into()));
+        let two_points = |a: Vec2, p: Vec2| {
+            if a.near(p, 1e-12) { Err(EngineError::Other("The two points must differ.".into())) } else { Ok(a.angle_to(p)) }
+        };
+        let Some(r) = self.ref_angle else {
+            match (self.ref_from, i) {
+                (None, Input::Point(p)) => self.ref_from = Some(p),
+                (None, Input::Text(t)) => self.ref_angle = Some(angle(&t)?),
+                (None, Input::Enter) => self.ref_angle = Some(0.0),
+                (Some(a), Input::Point(p)) => {
+                    self.ref_angle = Some(two_points(a, p)?);
+                    self.ref_from = None;
+                }
+                _ => {}
+            }
+            return Ok(Step::Continue);
+        };
+        let new = match (self.ref_points, self.ref_from, i) {
+            (false, _, Input::Keyword(k)) if k == "Points" => {
+                self.ref_points = true;
+                return Ok(Step::Continue);
+            }
+            (false, _, Input::Point(p)) => base.angle_to(p),
+            (false, _, Input::Text(t)) => angle(&t)?,
+            (false, _, Input::Enter) => 0.0,
+            (true, None, Input::Point(p)) => {
+                self.ref_from = Some(p);
+                return Ok(Step::Continue);
+            }
+            (true, Some(a), Input::Point(p)) => two_points(a, p)?,
+            _ => return Ok(Step::Continue),
+        };
+        transform_entities(s, &self.objs, &Mat3::rotate_about(base, new - r), self.copy_mode)?;
+        s.set_selection(Vec::new());
+        Ok(Step::Done)
+    }
+
+    /// The prompt while ROTATE Reference collects its angles.
+    fn rotate_reference_prompt(&self) -> Prompt {
+        match (self.ref_angle, self.ref_points, self.ref_from) {
+            (None, _, None) => Prompt::new("Specify the reference angle", Accept::POINT_OR_NUMBER).default("0"),
+            (None, _, Some(p)) | (Some(_), true, Some(p)) => Prompt::new("Specify second point", Accept::POINT).base(p),
+            (Some(_), false, _) => {
+                Prompt::new("Specify the new angle", Accept::POINT_OR_NUMBER).kw(&["Points"]).default("0").base_opt(self.pts.first().copied())
+            }
+            (Some(_), true, None) => Prompt::new("Specify first point", Accept::POINT),
+        }
+    }
+
+    /// Rubber band while ROTATE Reference collects its angles: the objects turned to the cursor
+    /// once the reference angle is known, else the line from the first point.
+    fn rotate_reference_preview(&self, s: &Session, c: Vec2) -> Vec<EntityKind> {
+        let (Some(base), Ok(d)) = (self.pts.first().copied(), s.doc()) else { return Vec::new() };
+        match (self.ref_angle, self.ref_points, self.ref_from) {
+            (Some(r), false, _) => {
+                let m = Mat3::rotate_about(base, base.angle_to(c) - r);
+                let mut out: Vec<EntityKind> = self
+                    .objs
+                    .iter()
+                    .take(500)
+                    .filter_map(|h| d.entity(*h))
+                    .map(|e| {
+                        let mut k = e.kind.clone();
+                        k.transform(&m);
+                        k
+                    })
+                    .collect();
+                out.push(line(base, c));
+                out
+            }
+            (_, _, Some(a)) => vec![line(a, c)],
+            _ => Vec::new(),
+        }
+    }
+
+    fn scale_by(&mut self, s: &mut Session, base: Vec2, f: f64) -> Result<Step> {
+        let f = require_length(Some(f))?;
+        transform_entities(s, &self.objs, &Mat3::scale_about(base, f), self.copy_mode)?;
+        s.set_selection(Vec::new());
+        Ok(Step::Done)
+    }
+}
+
+/// A finite length greater than zero (rejects 0, negatives, NaN and infinity).
+fn positive_length(v: Option<f64>) -> Option<f64> {
+    v.filter(|f| f.is_finite() && *f > 1e-12)
+}
+
+/// [`positive_length`], or the error that makes the prompt ask again.
+fn require_length(v: Option<f64>) -> Result<f64> {
+    positive_length(v).ok_or_else(|| EngineError::Other("Requires a positive number.".into()))
 }
 
 impl Interactive for SelectThen {
@@ -1388,6 +1561,16 @@ impl Interactive for SelectThen {
         let pts_from = if self.op == Op::Stretch { 2 } else { 0 };
         let k = n.saturating_sub(pts_from);
         let bp = if self.op == Op::Stretch { self.pts.get(2).copied() } else { base };
+        if self.op == Op::Scale && self.reference {
+            return match (self.ref_len, self.ref_from) {
+                (Some(_), _) => Prompt::new("Specify new length", Accept::POINT_OR_NUMBER).base_opt(base),
+                (None, Some(p)) => Prompt::new("Specify second point", Accept::POINT).base(p),
+                (None, None) => Prompt::new("Specify reference length", Accept::POINT_OR_NUMBER).default("1"),
+            };
+        }
+        if self.op == Op::Rotate && self.reference {
+            return self.rotate_reference_prompt();
+        }
         match (self.op, k) {
             (Op::Move | Op::Copy | Op::Stretch, 0) => Prompt::new("Specify base point", Accept::POINT).kw(&["Displacement"]),
             (Op::Move | Op::Stretch, _) => Prompt::new("Specify second point or <use first point as displacement>", Accept::POINT).base_opt(bp),
@@ -1411,6 +1594,7 @@ impl Interactive for SelectThen {
                     self.window = Some(bx);
                     let space = s.space();
                     self.objs = crate::select::select_window(s.doc()?, &space, bx, true);
+                    self.objs.retain(|h| !super::curves::is_locked(s, *h));
                     s.echo(format!("{} found", self.objs.len()));
                     s.set_selection(self.objs.clone());
                     self.sel.done = true;
@@ -1440,15 +1624,20 @@ impl Interactive for SelectThen {
         }
         let off = if self.op == Op::Stretch { 2 } else { 0 };
         let k = self.pts.len() - off;
+        if self.op == Op::Scale && self.reference {
+            return self.scale_reference(s, i);
+        }
+        if self.op == Op::Rotate && self.reference {
+            return self.rotate_reference(s, i);
+        }
         match (self.op, k, i) {
             (_, _, Input::Keyword(kw)) if kw == "Copy" => {
                 self.copy_mode = true;
                 s.echo("Rotating/scaling a copy of the selected objects.");
                 Ok(Step::Continue)
             }
-            (_, _, Input::Keyword(kw)) if kw == "Reference" => {
+            (Op::Scale | Op::Rotate, 1, Input::Keyword(kw)) if kw == "Reference" => {
                 self.reference = true;
-                s.echo("Reference: not available yet; enter a value.");
                 Ok(Step::Continue)
             }
             (Op::Copy, _, Input::Keyword(kw)) if kw == "Exit" => {
@@ -1543,6 +1732,9 @@ impl Interactive for SelectThen {
         }
     }
     fn preview(&self, s: &Session, c: Vec2) -> Vec<EntityKind> {
+        if self.op == Op::Rotate && self.reference {
+            return self.rotate_reference_preview(s, c);
+        }
         if !self.sel.done {
             return Vec::new();
         }
@@ -1550,7 +1742,12 @@ impl Interactive for SelectThen {
         let m = match self.op {
             Op::Move | Op::Copy | Op::Stretch => Mat3::translate(c - base),
             Op::Rotate => Mat3::rotate_about(base, base.angle_to(c)),
-            Op::Scale => Mat3::scale_about(base, base.dist(c).max(1e-9)),
+            Op::Scale if !self.reference => Mat3::scale_about(base, base.dist(c).max(1e-9)),
+            Op::Scale => match self.ref_len.and_then(|r| positive_length(Some(base.dist(c) / r))) {
+                Some(f) => Mat3::scale_about(base, f),
+                None if self.ref_len.is_some() => return Vec::new(),
+                None => return self.ref_from.map(|a| vec![line(a, c)]).unwrap_or_default(),
+            },
             Op::Mirror if !self.ask_erase => Mat3::mirror(base, c),
             _ => return Vec::new(),
         };
@@ -1870,6 +2067,8 @@ impl Interactive for FilletM {
 #[derive(Default)]
 struct BreakM {
     obj: Option<(Handle, Vec2)>,
+    /// The `First point` option: the next point replaces the selection pick as the first break point.
+    first_point: bool,
 }
 
 impl Interactive for BreakM {
@@ -1879,6 +2078,7 @@ impl Interactive for BreakM {
     fn prompt(&self, _s: &Session) -> Prompt {
         match self.obj {
             None => Prompt::new("Select object", Accept::POINT),
+            Some(_) if self.first_point => Prompt::new("Specify first break point", Accept::POINT),
             Some(_) => Prompt::new("Specify second break point", Accept::POINT).kw(&["First point"]),
         }
     }
@@ -1894,6 +2094,15 @@ impl Interactive for BreakM {
                     }
                     None => s.echo("*Invalid selection*"),
                 }
+                Ok(Step::Continue)
+            }
+            (Some(_), Input::Keyword(k)) if k == "First point" => {
+                self.first_point = true;
+                Ok(Step::Continue)
+            }
+            (Some((h, _)), Input::Point(p1)) if self.first_point => {
+                self.obj = Some((h, p1));
+                self.first_point = false;
                 Ok(Step::Continue)
             }
             (Some((h, p1)), Input::Point(p2)) => {

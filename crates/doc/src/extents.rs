@@ -1,28 +1,41 @@
 //! Approximate entity bounds (used for extents, zoom and selection pre-filtering).
 
-use cadcraft_geom::{Bounds2, Polyline, Vec2};
+use cadcraft_geom::{Arc, Bounds2, EPS, Polyline, Vec2, bulge_to_arc};
 
-use crate::{Drawing, Entity, EntityKind, Prim};
+use crate::{Drawing, Entity, EntityKind, LwPolyline, Prim};
 
 /// Nested block references deeper than this are ignored (cyclic or hostile files).
 pub const MAX_BLOCK_DEPTH: usize = 16;
 
-fn text_box(insert: Vec2, height: f64, len: usize, width_factor: f64, rotation: f64) -> Bounds2 {
-    let w = height * 0.8 * width_factor.abs().max(0.01) * len.max(1) as f64;
-    let pts = [Vec2::ZERO, Vec2::new(w, 0.0), Vec2::new(w, height), Vec2::new(0.0, height)].map(|p| insert + p.rotate(rotation));
-    Bounds2::from_points(pts)
+/// Bounds of a single-line TEXT / ATTDEF / ATTRIB of `len` characters, following its justification
+/// the same way the renderer places it (the stroke font is about 0.88 of the height per character).
+fn text_box(t: &crate::Text, len: usize) -> Bounds2 {
+    use crate::{HAlign, VAlign};
+    let w = t.height * 0.9 * t.width_factor.abs().max(0.01) * len.max(1) as f64;
+    let origin = match t.halign {
+        HAlign::Left | HAlign::Aligned | HAlign::Fit => t.insert,
+        _ => t.align_pt.unwrap_or(t.insert),
+    };
+    let dx = match t.halign {
+        HAlign::Left | HAlign::Aligned | HAlign::Fit => 0.0,
+        HAlign::Center | HAlign::Middle => -w / 2.0,
+        HAlign::Right => -w,
+    };
+    let dy = match (t.halign, t.valign) {
+        (HAlign::Middle, _) => -t.height / 2.0,
+        (_, VAlign::Baseline) => 0.0,
+        (_, VAlign::Bottom) => t.height / 3.0,
+        (_, VAlign::Middle) => -t.height / 2.0,
+        (_, VAlign::Top) => -t.height,
+    };
+    let local = [Vec2::new(dx, dy), Vec2::new(dx + w, dy), Vec2::new(dx + w, dy + t.height), Vec2::new(dx, dy + t.height)];
+    Bounds2::from_points(local.map(|p| origin.xy() + p.rotate(t.rotation)))
 }
 
 pub fn entity_bounds(d: &Drawing, e: &Entity, depth: usize) -> Bounds2 {
     match &e.kind {
-        EntityKind::Text(t) => text_box(
-            t.align_pt.filter(|_| t.halign != crate::HAlign::Left).unwrap_or(t.insert).xy(),
-            t.height,
-            t.value.chars().count(),
-            t.width_factor,
-            t.rotation,
-        ),
-        EntityKind::AttDef(a) => text_box(a.text.insert.xy(), a.text.height, a.tag.chars().count(), a.text.width_factor, a.text.rotation),
+        EntityKind::Text(t) => text_box(t, t.value.chars().count()),
+        EntityKind::AttDef(a) => text_box(&a.text, a.tag.chars().count()),
         EntityKind::MText(t) => {
             let lines = t.contents.split("\\P").count().max(1);
             let longest = t.contents.split("\\P").map(|l| l.chars().count()).max().unwrap_or(1);
@@ -62,7 +75,7 @@ pub fn entity_bounds(d: &Drawing, e: &Entity, depth: usize) -> Bounds2 {
             }
             for a in &ins.attribs {
                 if !a.invisible {
-                    b = b.union(&text_box(a.text.insert.xy(), a.text.height, a.text.value.chars().count(), a.text.width_factor, a.text.rotation));
+                    b = b.union(&text_box(&a.text, a.text.value.chars().count()));
                 }
             }
             b
@@ -80,7 +93,14 @@ pub fn entity_bounds(d: &Drawing, e: &Entity, depth: usize) -> Bounds2 {
                 b.add(dm.text_mid.xy());
             }
             // Room for text and arrows.
-            let th = d.dim_style(&dm.style).map(|s| s.text_height * s.scale.max(1e-9)).unwrap_or(0.18) * d.header.f64("DIMSCALE", 1.0).max(1e-9);
+            // The same scale the dimension's geometry uses.
+            let th = d
+                .dim_style(&dm.style)
+                .map(|s| {
+                    let s = s.with_overrides(&dm.overrides);
+                    s.text_height * s.effective_scale(d.header.f64("DIMSCALE", 1.0))
+                })
+                .unwrap_or(0.18 * d.header.f64("DIMSCALE", 1.0).max(1e-9));
             b = b.expand(th * 2.5);
             if let Some(blk) = dm.block.as_ref().and_then(|n| d.block(n))
                 && depth < MAX_BLOCK_DEPTH
@@ -109,7 +129,7 @@ pub fn entity_bounds(d: &Drawing, e: &Entity, depth: usize) -> Bounds2 {
             let v = i.v.xy() * i.size.y;
             Bounds2::from_points([o, o + u, o + v, o + u + v])
         }
-        EntityKind::LwPolyline(p) => Polyline { vertices: p.vertices.clone(), closed: p.closed }.bounds().expand(p.const_width / 2.0),
+        EntityKind::LwPolyline(p) => lwpolyline_bounds(p),
         kind => {
             let mut b = Bounds2::EMPTY;
             for p in kind.prims() {
@@ -133,5 +153,108 @@ pub fn entity_bounds(d: &Drawing, e: &Entity, depth: usize) -> Bounds2 {
             }
             b
         }
+    }
+}
+
+/// The polyline's drawn extent: its centre line, widened by the filled band of every segment,
+/// with the constant width or each segment's own start/end widths tapering along it, as drawn.
+fn lwpolyline_bounds(p: &LwPolyline) -> Bounds2 {
+    let mut b = Polyline { vertices: p.vertices.clone(), closed: p.closed }.bounds();
+    let n = p.vertices.len();
+    let count = if p.closed { n } else { n.saturating_sub(1) };
+    // The constant width wins, as when drawing; non-finite or negative widths count as zero.
+    let half = |w: f64| if w.is_finite() && w > 0.0 { w / 2.0 } else { 0.0 };
+    for i in 0..count {
+        let (Some(v), Some(w)) = (p.vertices.get(i), p.vertices.get((i + 1) % n)) else { continue };
+        let (h0, h1) = if p.const_width > 0.0 { (half(p.const_width), half(p.const_width)) } else { (half(v.start_width), half(v.end_width)) };
+        if h0 == 0.0 && h1 == 0.0 {
+            // A thin segment: the centre line already counts.
+            continue;
+        }
+        match bulge_to_arc(v.p, w.p, v.bulge) {
+            // A straight segment's band is a trapezoid: its four corners are exact.
+            None if !v.p.near(w.p, EPS) => {
+                let nrm = (w.p - v.p).normalized().perp();
+                for q in [v.p + nrm * h0, v.p - nrm * h0, w.p + nrm * h1, w.p - nrm * h1] {
+                    b.add(q);
+                }
+            }
+            None => {}
+            // An arc segment: both band edges, sampled finely along the arc with the width
+            // interpolated along it, then widened by the sampling tolerance so the curve between
+            // samples is inside.
+            Some((arc, ccw)) => {
+                let outer = arc.radius + h0.max(h1);
+                let tol = outer * 1e-4;
+                let mut pts = Vec::new();
+                Arc { radius: outer, ..arc }.tessellate(tol, &mut pts);
+                let last = pts.len().saturating_sub(1).max(1) as f64;
+                let mut edges = Bounds2::EMPTY;
+                for (k, q) in pts.iter().enumerate() {
+                    // The fraction along the segment, which runs against the arc when not ccw.
+                    let t = k as f64 / last;
+                    let t = if ccw { t } else { 1.0 - t };
+                    let h = h0 + (h1 - h0) * t;
+                    let dir = (*q - arc.center).normalized();
+                    edges.add(arc.center + dir * (arc.radius + h));
+                    edges.add(arc.center + dir * (arc.radius - h));
+                }
+                if !edges.is_empty() {
+                    b = b.union(&edges.expand(tol));
+                }
+            }
+        }
+    }
+    b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{HAlign, Text, VAlign};
+    use cadcraft_geom::Vec3;
+
+    fn text(halign: HAlign, valign: VAlign) -> Text {
+        Text {
+            insert: Vec3::new(0.0, 0.0, 0.0),
+            align_pt: Some(Vec3::new(0.0, 0.0, 0.0)),
+            height: 1.0,
+            value: "HELLO".into(),
+            rotation: 0.0,
+            width_factor: 1.0,
+            oblique: 0.0,
+            style: "Standard".into(),
+            halign,
+            valign,
+        }
+    }
+
+    fn bounds(kind: EntityKind) -> Bounds2 {
+        entity_bounds(&Drawing::default(), &Entity::new(crate::Handle(1), kind), 0)
+    }
+
+    #[test]
+    fn right_justified_text_is_left_of_alignment_point() {
+        let b = bounds(EntityKind::Text(text(HAlign::Right, VAlign::Baseline)));
+        // Rendered strokes span x -4.4..0, y 0..1.
+        assert!(b.min.x <= -4.4 && b.max.x >= 0.0 && b.max.x < 1.0);
+        assert!(b.min.y <= 0.0 && b.max.y >= 1.0);
+    }
+
+    #[test]
+    fn centered_and_top_left_text_follow_placement() {
+        let c = bounds(EntityKind::Text(text(HAlign::Center, VAlign::Baseline)));
+        assert!(c.min.x <= -2.2 && c.max.x >= 2.2);
+        let tl = bounds(EntityKind::Text(text(HAlign::Left, VAlign::Top)));
+        assert!(tl.min.x <= 0.0 && tl.max.x >= 4.4);
+        assert!(tl.min.y <= -1.0 && tl.max.y >= 0.0 && tl.max.y < 1.0);
+    }
+
+    #[test]
+    fn right_justified_attdef_is_left_of_alignment_point() {
+        let text = text(HAlign::Right, VAlign::Baseline);
+        let a = crate::Attrib { tag: "HELLO".into(), text, invisible: false, constant: false, prompt: String::new() };
+        let b = bounds(EntityKind::AttDef(a));
+        assert!(b.min.x <= -4.4 && b.max.x < 1.0);
     }
 }

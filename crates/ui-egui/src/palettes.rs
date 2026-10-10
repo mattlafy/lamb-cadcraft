@@ -133,7 +133,13 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
             let active = app.ui.toolset_tab == name;
             let resp = ui.interact(tr, ui.id().with(("ts", name)), Sense::click());
             p.rect_filled(tr, 0.0, if active { t.tab_active } else { t.chrome });
-            p.text(tr.center(), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(13.5), if active { t.text } else { t.text_dim });
+            p.text(
+                tr.center(),
+                egui::Align2::CENTER_CENTER,
+                crate::i18n::t(name),
+                egui::FontId::proportional(13.5),
+                if active { t.text } else { t.text_dim },
+            );
             if resp.clicked() {
                 app.ui.toolset_tab = name.into();
             }
@@ -143,7 +149,7 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
         let cr = Rect::from_center_size(pos2(r.right() - 14.0, r.top() + tab_h / 2.0), vec2(14.0, 14.0));
         let cresp = ui.interact(cr, ui.id().with("ts_collapse"), Sense::click());
         icons::paint(&p, cr, Icon::ChevronLeft, false);
-        if cresp.on_hover_text("Collapse Tool Sets").clicked() {
+        if cresp.on_hover_text(crate::tl!("Collapse Tool Sets")).clicked() {
             app.ui.show_toolsets = false;
         }
         let body = Rect::from_min_max(pos2(r.left(), r.top() + tab_h), r.max);
@@ -164,7 +170,13 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
                         if collapsed { Icon::ChevronRight } else { Icon::ChevronDown },
                         false,
                     );
-                    pp.text(pos2(hr.left() + 22.0, hr.center().y), egui::Align2::LEFT_CENTER, *name, egui::FontId::proportional(12.5), t.text);
+                    pp.text(
+                        pos2(hr.left() + 22.0, hr.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        crate::i18n::t(name),
+                        egui::FontId::proportional(12.5),
+                        t.text,
+                    );
                     icons::paint(pp, Rect::from_center_size(pos2(hr.right() - 12.0, hr.center().y), vec2(11.0, 11.0)), Icon::Gear, false);
                     if hresp.clicked() {
                         toggle_group = Some(name.to_string());
@@ -239,7 +251,13 @@ pub const MODELING: &[(&str, &[Tool], &[Tool])] = &[
 fn section_header(ui: &mut egui::Ui, title: &str) -> Rect {
     let t = Tokens::get();
     let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
-    ui.painter().text(pos2(hr.left() + 10.0, hr.center().y), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(14.0), t.text);
+    ui.painter().text(
+        pos2(hr.left() + 10.0, hr.center().y),
+        egui::Align2::LEFT_CENTER,
+        crate::i18n::t(title),
+        egui::FontId::proportional(14.0),
+        t.text,
+    );
     hr
 }
 
@@ -359,7 +377,13 @@ fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
         let w = ui.available_width() - 10.0;
         let (rect, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
         ui.painter().rect_filled(rect, 3.0, t.control);
-        ui.painter().text(pos2(rect.left() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER, "Unsaved Layer State", crate::theme::body(), t.text);
+        ui.painter().text(
+            pos2(rect.left() + 8.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            crate::tl!("Unsaved Layer State"),
+            crate::theme::body(),
+            t.text,
+        );
         icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.right() - 12.0, rect.center().y), vec2(12.0, 12.0)), Icon::ChevronDown, false);
     });
     ui.add_space(4.0);
@@ -373,7 +397,7 @@ fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
             if app.ui.show_layer_list { Icon::ChevronDown } else { Icon::ChevronRight },
             false,
         );
-        ui.painter().text(pos2(rect.left() + 20.0, rect.center().y), egui::Align2::LEFT_CENTER, label, crate::theme::body(), t.text);
+        ui.painter().text(pos2(rect.left() + 20.0, rect.center().y), egui::Align2::LEFT_CENTER, crate::i18n::t(label), crate::theme::body(), t.text);
         if resp.clicked() {
             app.ui.show_layer_list = !app.ui.show_layer_list;
         }
@@ -411,8 +435,11 @@ fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
 fn prop_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     let t = Tokens::get();
     ui.horizontal(|ui| {
-        let (lr, _) = ui.allocate_exact_size(vec2(118.0, 22.0), Sense::hover());
-        ui.painter().text(pos2(lr.right() - 6.0, lr.center().y), egui::Align2::RIGHT_CENTER, label, crate::theme::body(), t.text_dim);
+        let mut job = egui::text::LayoutJob::simple(crate::i18n::t(label).to_string(), crate::theme::body(), t.text_dim, 106.0);
+        job.halign = egui::Align::RIGHT;
+        let galley = ui.painter().layout_job(job);
+        let (lr, _) = ui.allocate_exact_size(vec2(118.0, galley.size().y.max(22.0)), Sense::hover());
+        ui.painter().galley(pos2(lr.right() - 6.0, lr.center().y - galley.size().y / 2.0), galley, t.text_dim);
         add(ui);
     });
 }
@@ -442,9 +469,12 @@ fn value_box(ui: &mut egui::Ui, text: &str, combo: bool, enabled: bool) -> egui:
 fn edit_field(ui: &mut egui::Ui, id: egui::Id, value: String) -> Option<String> {
     let mut buf = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| value.clone());
     let w = ui.available_width() - 10.0;
-    let resp = ui.add_sized([w, 20.0], egui::TextEdit::singleline(&mut buf).id(id.with("te")).font(crate::theme::body()));
+    let te = id.with("te");
+    let resp = ui.add_sized([w, 20.0], egui::TextEdit::singleline(&mut buf).id(te).font(crate::theme::body()));
     let mut out = None;
-    if resp.has_focus() {
+    // Keyboard focus from memory: `Response::has_focus` is false while the window itself is
+    // unfocused, which dropped the typed text every frame.
+    if ui.memory(|m| m.has_focus(te)) {
         ui.data_mut(|d| d.insert_temp(id, buf.clone()));
     } else {
         ui.data_mut(|d| d.remove::<String>(id));
@@ -455,107 +485,221 @@ fn edit_field(ui: &mut egui::Ui, id: egui::Id, value: String) -> Option<String> 
     out
 }
 
-fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
+/// A drop-down of `items` showing `current`; returns the item clicked.
+fn pick_menu(ui: &mut egui::Ui, current: &str, items: impl IntoIterator<Item = String>) -> Option<String> {
+    // Names are the drawing's own; only the ByLayer/ByBlock keywords are translated.
+    let shown = |s: &str| if ["ByLayer", "ByBlock"].contains(&s) { crate::i18n::t(s).to_string() } else { s.to_string() };
+    let mut out = None;
+    ui.menu_button(shown(current), |ui| {
+        for it in items {
+            if ui.button(shown(&it)).clicked() {
+                out = Some(it);
+                ui.close();
+            }
+        }
+    });
+    out
+}
+
+/// A greyed value with no command behind it yet: visibly inert, never a silent dead button.
+fn unavailable(ui: &mut egui::Ui, text: &str) {
+    value_box(ui, crate::i18n::t(text), false, false).on_hover_text(crate::tl!("Not available yet"));
+}
+
+/// A greyed value computed from the geometry.
+fn read_only(ui: &mut egui::Ui, text: &str) {
+    value_box(ui, crate::i18n::t(text), false, false).on_hover_text(crate::tl!("Read-only"));
+}
+
+/// The Properties header: All/My, the selection-type filter and the PICKADD / Select Objects /
+/// Quick Select buttons.
+fn properties_header(app: &mut CadApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
     let hr = section_header(ui, "Properties");
-    // All | My segmented control.
+    // All | My segmented control ("My" property sets don't exist yet).
     let seg = Rect::from_min_size(pos2(hr.right() - 120.0, hr.top() + 4.0), vec2(70.0, 18.0));
     ui.painter().rect_filled(seg, 3.0, t.chrome_dark);
     let half = Rect::from_min_size(seg.min, vec2(35.0, 18.0));
-    ui.painter().rect_filled(if app.ui.properties_all { half } else { half.translate(vec2(35.0, 0.0)) }, 3.0, t.control);
-    ui.painter().text(half.center(), egui::Align2::CENTER_CENTER, "All", crate::theme::small(), t.text);
-    ui.painter().text(half.center() + vec2(35.0, 0.0), egui::Align2::CENTER_CENTER, "My", crate::theme::small(), t.text);
+    let my = half.translate(vec2(35.0, 0.0));
+    ui.painter().rect_filled(if app.ui.properties_all { half } else { my }, 3.0, t.control);
+    ui.painter().text(half.center(), egui::Align2::CENTER_CENTER, crate::tl!("All"), crate::theme::small(), t.text);
+    ui.painter().text(my.center(), egui::Align2::CENTER_CENTER, crate::tl!("My"), crate::theme::small(), t.text_faint);
+    ui.interact(my, ui.id().with("prop_my"), Sense::hover()).on_hover_text(crate::tl!("My properties: not available yet"));
     let sel = app.session.selection();
+    let pickadd = app.session.settings.pickadd;
     let Ok(d) = app.session.doc() else { return };
-    // Selection type combo.
-    let types: Vec<&'static str> = sel.iter().filter_map(|h| d.entity(*h).map(|e| e.kind.type_name())).collect();
-    let header = match types.len() {
-        0 => "No selection".to_string(),
-        1 => types.first().map(|s| s.to_string()).unwrap_or_default(),
-        n => {
-            let first = types.first().copied().unwrap_or("");
-            if types.iter().all(|t| *t == first) { format!("{first} ({n})") } else { format!("All ({n})") }
+    // Selected handles by type, in first-seen order.
+    let mut types: Vec<(&'static str, Vec<String>)> = Vec::new();
+    for h in &sel {
+        if let Some(e) = d.entity(*h) {
+            let n = e.kind.type_name();
+            match types.iter_mut().find(|(t, _)| *t == n) {
+                Some((_, hs)) => hs.push(h.hex()),
+                None => types.push((n, vec![h.hex()])),
+            }
         }
+    }
+    let count: usize = types.iter().map(|(_, hs)| hs.len()).sum();
+    let header = match (count, types.as_slice()) {
+        (0, _) => crate::tl!("No selection").to_string(),
+        (1, [(n, _)]) => crate::i18n::t(n).to_string(),
+        (n, [(ty, _)]) => format!("{} ({n})", crate::i18n::t(ty)),
+        (n, _) => format!("{} ({n})", crate::tl!("All")),
     };
+    let mut run: Option<(&str, Value)> = None;
+    let mut start: Option<&str> = None;
     ui.horizontal(|ui| {
         ui.add_space(8.0);
-        value_box(ui, &header, true, !sel.is_empty());
-    });
-    ui.add_space(4.0);
-    let h = &d.header;
-    if sel.is_empty() {
-        let rows: Vec<(&str, String, bool)> = vec![
-            ("Color", Color::from_aci(h.i64("CECOLOR", 256) as i16).name(), true),
-            ("Layer", h.str("CLAYER", "0"), true),
-            ("Linetype", h.str("CELTYPE", "ByLayer"), true),
-            ("Linetype scale", format!("{:.4}", h.f64("CELTSCALE", 1.0)), true),
-            ("Lineweight", cadcraft_doc::Lineweight::from_dxf(h.i64("CELWEIGHT", -1) as i16).name(), true),
-            ("Transparency", "ByLayer".into(), true),
-            ("Thickness", format!("{:.4}", h.f64("THICKNESS", 0.0)), true),
-            ("Text style", h.str("TEXTSTYLE", "Standard"), true),
-            ("Dimension style", h.str("DIMSTYLE", "Standard"), true),
-            ("Multileader style", h.str("CMLEADERSTYLE", "Standard"), true),
-            ("Table style", h.str("CTABLESTYLE", "Standard"), true),
-            ("Annotation scale", "1:1".into(), true),
-            ("Text height", format!("{:.4}", h.f64("TEXTSIZE", 0.2)), true),
-            ("Plot style", "ByColor".into(), true),
-            ("Plot style table", "None".into(), true),
-            ("Plot style attached to", "Model".into(), false),
-            ("Plot table type", "Not available".into(), false),
-        ];
-        let layers: Vec<String> = d.layers.iter().map(|l| l.name.clone()).collect();
-        let mut action: Option<(&str, Value)> = None;
-        for (label, val, en) in rows {
-            prop_row(ui, label, |ui| match label {
-                "Color" => {
-                    ui.menu_button(format!("■ {val}"), |ui| {
-                        for (n, c) in [
-                            ("ByLayer", 256),
-                            ("ByBlock", 0),
-                            ("Red", 1),
-                            ("Yellow", 2),
-                            ("Green", 3),
-                            ("Cyan", 4),
-                            ("Blue", 5),
-                            ("Magenta", 6),
-                            ("White", 7),
-                        ] {
-                            if ui.button(n).clicked() {
-                                action = Some(("color", json!({ "color": c })));
-                                ui.close();
-                            }
-                        }
-                    });
-                }
-                "Layer" => {
-                    ui.menu_button(val.clone(), |ui| {
-                        for l in &layers {
-                            if ui.button(l).clicked() {
-                                action = Some(("layer.current", json!({ "name": l })));
-                                ui.close();
-                            }
-                        }
-                    });
-                }
-                "Text height" => {
-                    if let Some(v) = edit_field(ui, ui.id().with("cur_textsize"), val.clone())
-                        && let Ok(f) = v.trim().parse::<f64>()
-                    {
-                        action = Some(("setvar", json!({ "name": "TEXTSIZE", "value": f })));
+        ui.spacing_mut().item_spacing = vec2(3.0, 0.0);
+        let w = (ui.available_width() - 80.0).max(60.0);
+        let resp = ui.allocate_ui(vec2(w, 20.0), |ui| value_box(ui, &header, true, count > 0)).inner;
+        if count > 0 {
+            // Narrow the selection to one object type.
+            egui::Popup::from_toggle_button_response(&resp).width(w - 10.0).close_behavior(egui::PopupCloseBehavior::CloseOnClick).show(|ui| {
+                for (ty, hs) in &types {
+                    if ui.button(format!("{} ({})", crate::i18n::t(ty), hs.len())).clicked() {
+                        run = Some(("select", json!({ "handles": hs })));
                     }
-                }
-                "Linetype scale" => {
-                    if let Some(v) = edit_field(ui, ui.id().with("cur_celtscale"), val.clone())
-                        && let Ok(f) = v.trim().parse::<f64>()
-                    {
-                        action = Some(("setvar", json!({ "name": "CELTSCALE", "value": f })));
-                    }
-                }
-                _ => {
-                    value_box(ui, &val, en, en);
                 }
             });
         }
+        let tip = if pickadd {
+            crate::tl!("Toggle PICKADD (on: picks add to the selection)")
+        } else {
+            crate::tl!("Toggle PICKADD (off: each pick replaces the selection)")
+        };
+        if icons::button(ui, Icon::PickAdd, 22.0, tip, pickadd).clicked() {
+            run = Some(("setvar", json!({ "name": "PICKADD", "value": i32::from(!pickadd) })));
+        }
+        if icons::button(ui, Icon::SelectObjects, 22.0, crate::tl!("Select Objects"), false).clicked() {
+            start = Some("select");
+        }
+        if icons::button(ui, Icon::QuickSelect, 22.0, crate::tl!("Quick Select"), false).clicked() {
+            start = Some("ui.dialog.qselect");
+        }
+    });
+    if let Some((c, p)) = run {
+        let _ = app.run(c, p);
+    }
+    if let Some(c) = start {
+        app.start(c);
+    }
+}
+
+fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    properties_header(app, ui);
+    let sel = app.session.selection();
+    let Ok(d) = app.session.doc() else { return };
+    ui.add_space(4.0);
+    let h = &d.header;
+    if sel.is_empty() {
+        // Current properties for new objects; each row runs the command that sets it.
+        let layers: Vec<String> = d.layers.iter().map(|l| l.name.clone()).collect();
+        let linetypes: Vec<String> = d.linetypes.iter().map(|l| l.name.clone()).collect();
+        let text_styles: Vec<String> = d.text_styles.iter().map(|l| l.name.clone()).collect();
+        let dim_styles: Vec<String> = d.dim_styles.iter().map(|l| l.name.clone()).collect();
+        let ml_styles: Vec<String> = d.mleader_styles.iter().map(|l| l.name.clone()).collect();
+        let tb_styles: Vec<String> = d.table_styles.iter().map(|l| l.name.clone()).collect();
+        let mut action: Option<(&str, Value)> = None;
+        let mut act = |c: &'static str, p: Value| action = Some((c, p));
+        prop_row(ui, "Color", |ui| {
+            ui.menu_button(format!("■ {}", crate::i18n::t(&Color::from_aci(h.i64("CECOLOR", 256) as i16).name())), |ui| {
+                for (n, c) in [
+                    ("ByLayer", 256),
+                    ("ByBlock", 0),
+                    ("Red", 1),
+                    ("Yellow", 2),
+                    ("Green", 3),
+                    ("Cyan", 4),
+                    ("Blue", 5),
+                    ("Magenta", 6),
+                    ("White", 7),
+                ] {
+                    if ui.button(crate::i18n::t(n)).clicked() {
+                        act("color", json!({ "color": c }));
+                        ui.close();
+                    }
+                }
+            });
+        });
+        prop_row(ui, "Layer", |ui| {
+            if let Some(l) = pick_menu(ui, &h.str("CLAYER", "0"), layers) {
+                act("layer.current", json!({ "name": l }));
+            }
+        });
+        prop_row(ui, "Linetype", |ui| {
+            let items = ["ByLayer", "ByBlock"]
+                .map(String::from)
+                .into_iter()
+                .chain(linetypes.into_iter().filter(|l| !["ByLayer", "ByBlock"].contains(&l.as_str())));
+            if let Some(l) = pick_menu(ui, &h.str("CELTYPE", "ByLayer"), items) {
+                act("linetype", json!({ "current": l }));
+            }
+        });
+        prop_row(ui, "Linetype scale", |ui| {
+            if let Some(v) = edit_field(ui, ui.id().with("cur_celtscale"), format!("{:.4}", h.f64("CELTSCALE", 1.0)))
+                && let Ok(f) = v.trim().parse::<f64>()
+            {
+                act("setvar", json!({ "name": "CELTSCALE", "value": f }));
+            }
+        });
+        prop_row(ui, "Lineweight", |ui| {
+            ui.menu_button(crate::i18n::t(&cadcraft_doc::Lineweight::from_dxf(h.i64("CELWEIGHT", -1) as i16).name()), |ui| {
+                for n in ["ByLayer", "ByBlock", "Default"] {
+                    if ui.button(crate::i18n::t(n)).clicked() {
+                        act("lweight", json!({ "lineweight": n }));
+                        ui.close();
+                    }
+                }
+                for v in cadcraft_doc::Lineweight::STANDARD {
+                    if ui.button(format!("{:.2} mm", f64::from(v) / 100.0)).clicked() {
+                        act("lweight", json!({ "lineweight": f64::from(v) / 100.0 }));
+                        ui.close();
+                    }
+                }
+            });
+        });
+        prop_row(ui, "Transparency", |ui| unavailable(ui, "ByLayer"));
+        prop_row(ui, "Thickness", |ui| {
+            if let Some(v) = edit_field(ui, ui.id().with("cur_thickness"), format!("{:.4}", h.f64("THICKNESS", 0.0)))
+                && let Ok(f) = v.trim().parse::<f64>()
+            {
+                act("setvar", json!({ "name": "THICKNESS", "value": f }));
+            }
+        });
+        prop_row(ui, "Text style", |ui| {
+            if let Some(n) = pick_menu(ui, &h.str("TEXTSTYLE", "Standard"), text_styles) {
+                act("style.current", json!({ "name": n }));
+            }
+        });
+        prop_row(ui, "Dimension style", |ui| {
+            if let Some(n) = pick_menu(ui, &h.str("DIMSTYLE", "Standard"), dim_styles) {
+                act("dimstyle.current", json!({ "name": n }));
+            }
+        });
+        prop_row(ui, "Multileader style", |ui| {
+            if let Some(n) = pick_menu(ui, &h.str("CMLEADERSTYLE", "Standard"), ml_styles) {
+                act("mleaderstyle", json!({ "name": n, "current": true }));
+            }
+        });
+        prop_row(ui, "Table style", |ui| {
+            if let Some(n) = pick_menu(ui, &h.str("CTABLESTYLE", "Standard"), tb_styles) {
+                act("tablestyle", json!({ "name": n, "current": true }));
+            }
+        });
+        prop_row(ui, "Annotation scale", |ui| unavailable(ui, "1:1"));
+        prop_row(ui, "Text height", |ui| {
+            if let Some(v) = edit_field(ui, ui.id().with("cur_textsize"), format!("{:.4}", h.f64("TEXTSIZE", 0.2)))
+                && let Ok(f) = v.trim().parse::<f64>()
+            {
+                act("setvar", json!({ "name": "TEXTSIZE", "value": f }));
+            }
+        });
+        prop_row(ui, "Plot style", |ui| unavailable(ui, "ByColor"));
+        prop_row(ui, "Plot style table", |ui| unavailable(ui, "None"));
+        prop_row(ui, "Plot style attached to", |ui| read_only(ui, "Model"));
+        prop_row(ui, "Plot table type", |ui| read_only(ui, "Not available"));
         if let Some((c, p)) = action {
             let _ = app.run(c, p);
         }
@@ -576,6 +720,7 @@ fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
     let linetype = same(&|e| e.common.linetype.clone());
     let lts = same(&|e| format!("{:.4}", e.common.ltscale));
     let lw = same(&|e| e.common.lineweight.name());
+    let tr = same(&|e| e.common.transparency.name());
     let layers: Vec<String> = d.layers.iter().map(|l| l.name.clone()).collect();
     let linetypes: Vec<String> = d.linetypes.iter().map(|l| l.name.clone()).collect();
     let ids: Vec<String> = sel.iter().map(|h| h.hex()).collect();
@@ -583,11 +728,11 @@ fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
     let group = |ui: &mut egui::Ui, title: &str| {
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
         ui.painter().rect_filled(r.shrink2(vec2(6.0, 1.0)), 2.0, t.chrome_dark);
-        ui.painter().text(pos2(r.left() + 12.0, r.center().y), egui::Align2::LEFT_CENTER, title, crate::theme::small(), t.text_dim);
+        ui.painter().text(pos2(r.left() + 12.0, r.center().y), egui::Align2::LEFT_CENTER, crate::i18n::t(title), crate::theme::small(), t.text_dim);
     };
     group(ui, "General");
     prop_row(ui, "Color", |ui| {
-        ui.menu_button(format!("■ {color}"), |ui| {
+        ui.menu_button(format!("■ {}", crate::i18n::t(&color)), |ui| {
             for (n, c) in [
                 ("ByLayer", 256),
                 ("ByBlock", 0),
@@ -601,7 +746,7 @@ fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
                 ("Color 8", 8),
                 ("Color 9", 9),
             ] {
-                if ui.button(n).clicked() {
+                if ui.button(crate::i18n::t(n)).clicked() {
                     set = Some(json!({ "handles": ids, "color": c }));
                     ui.close();
                 }
@@ -619,12 +764,12 @@ fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
         });
     });
     prop_row(ui, "Linetype", |ui| {
-        ui.menu_button(linetype.clone(), |ui| {
+        ui.menu_button(if ["ByLayer", "ByBlock", "*VARIES*"].contains(&linetype.as_str()) { crate::i18n::t(&linetype) } else { &linetype }, |ui| {
             for l in std::iter::once("ByLayer".to_string())
                 .chain(std::iter::once("ByBlock".to_string()))
                 .chain(linetypes.iter().filter(|l| !["ByLayer", "ByBlock"].contains(&l.as_str())).cloned())
             {
-                if ui.button(&l).clicked() {
+                if ui.button(if ["ByLayer", "ByBlock"].contains(&l.as_str()) { crate::i18n::t(&l) } else { &l }).clicked() {
                     set = Some(json!({ "handles": ids, "linetype": l }));
                     ui.close();
                 }
@@ -639,10 +784,12 @@ fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     });
     prop_row(ui, "Lineweight", |ui| {
-        ui.menu_button(lw.clone(), |ui| {
-            if ui.button("ByLayer").clicked() {
-                set = Some(json!({ "handles": ids, "lineweight": "ByLayer" }));
-                ui.close();
+        ui.menu_button(crate::i18n::t(&lw), |ui| {
+            for n in ["ByLayer", "ByBlock", "Default"] {
+                if ui.button(crate::i18n::t(n)).clicked() {
+                    set = Some(json!({ "handles": ids, "lineweight": n }));
+                    ui.close();
+                }
             }
             for v in cadcraft_doc::Lineweight::STANDARD {
                 if ui.button(format!("{:.2} mm", f64::from(v) / 100.0)).clicked() {
@@ -653,7 +800,32 @@ fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
         });
     });
     prop_row(ui, "Transparency", |ui| {
-        value_box(ui, "ByLayer", true, true);
+        ui.menu_button(crate::i18n::t(&tr), |ui| {
+            for v in ["ByLayer", "ByBlock"] {
+                if ui.button(crate::i18n::t(v)).clicked() {
+                    set = Some(json!({ "handles": ids, "transparency": v }));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            // A fixed percentage, committed when the drag or edit ends.
+            let tid = egui::Id::new(("prop_tr", &ids));
+            let cur = tr.parse::<u8>().ok();
+            let mut pct = ui.data_mut(|d| d.get_temp::<u8>(tid)).or(cur).unwrap_or(0);
+            ui.horizontal(|ui| {
+                ui.label(crate::tl!("Percent"));
+                let r = ui.add(egui::DragValue::new(&mut pct).range(0..=90).speed(0.5));
+                if r.dragged() || r.has_focus() {
+                    ui.data_mut(|d| d.insert_temp(tid, pct));
+                }
+                if r.drag_stopped() || r.lost_focus() {
+                    if cur != Some(pct) {
+                        set = Some(json!({ "handles": ids, "transparency": pct }));
+                    }
+                    ui.data_mut(|d| d.remove::<u8>(tid));
+                }
+            });
+        });
     });
     if sel.len() == 1 {
         group(ui, "Geometry");
@@ -668,11 +840,6 @@ fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
         };
         match &e.kind {
             EntityKind::Line(l) => {
-                let fixed = |ui: &mut egui::Ui, label: &str, v: f64| {
-                    prop_row(ui, label, |ui| {
-                        value_box(ui, &format!("{v:.4}"), false, true);
-                    })
-                };
                 prop_row(ui, "Start X", |ui| {
                     if let Some(s) = edit_field(ui, ui.id().with(("sx", &ids)), format!("{:.4}", l.a.x))
                         && let Ok(f) = s.trim().parse::<f64>()
@@ -702,22 +869,19 @@ fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
                     }
                 });
                 let dlt = l.b.xy() - l.a.xy();
-                fixed(ui, "Delta X", dlt.x);
-                fixed(ui, "Delta Y", dlt.y);
-                fixed(ui, "Length", dlt.len());
-                fixed(ui, "Angle", dlt.angle().to_degrees());
+                prop_row(ui, "Delta X", |ui| read_only(ui, &format!("{:.4}", dlt.x)));
+                prop_row(ui, "Delta Y", |ui| read_only(ui, &format!("{:.4}", dlt.y)));
+                // Length and angle keep the start point and move the end point.
+                num(ui, "Length", "length", dlt.len(), &mut set, &ids);
+                num(ui, "Angle", "angle", dlt.angle().to_degrees(), &mut set, &ids);
             }
             EntityKind::Circle(c) => {
                 num(ui, "Center X", "cx", c.center.x, &mut set, &ids);
                 num(ui, "Center Y", "cy", c.center.y, &mut set, &ids);
                 num(ui, "Radius", "radius", c.radius, &mut set, &ids);
                 num(ui, "Diameter", "diameter", c.radius * 2.0, &mut set, &ids);
-                prop_row(ui, "Circumference", |ui| {
-                    value_box(ui, &format!("{:.4}", c.radius * std::f64::consts::TAU), false, true);
-                });
-                prop_row(ui, "Area", |ui| {
-                    value_box(ui, &format!("{:.4}", c.radius * c.radius * std::f64::consts::PI), false, true);
-                });
+                num(ui, "Circumference", "circumference", c.radius * std::f64::consts::TAU, &mut set, &ids);
+                num(ui, "Area", "area", c.radius * c.radius * std::f64::consts::PI, &mut set, &ids);
                 if let Some(v) = &mut set
                     && let Some(o) = v.as_object_mut()
                 {
@@ -756,18 +920,14 @@ fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
             EntityKind::LwPolyline(pl) => {
                 num(ui, "Global width", "width", pl.const_width, &mut set, &ids);
                 let g = cadcraft_geom::Polyline { vertices: pl.vertices.clone(), closed: pl.closed };
-                prop_row(ui, "Length", |ui| {
-                    value_box(ui, &format!("{:.4}", g.len()), false, true);
-                });
+                prop_row(ui, "Length", |ui| read_only(ui, &format!("{:.4}", g.len())));
                 if pl.closed {
-                    prop_row(ui, "Area", |ui| {
-                        value_box(ui, &format!("{:.4}", g.area().abs()), false, true);
-                    });
+                    prop_row(ui, "Area", |ui| read_only(ui, &format!("{:.4}", g.area().abs())));
                 }
                 prop_row(ui, "Closed", |ui| {
                     let mut c = pl.closed;
                     let label = if c { "Yes" } else { "No" };
-                    if ui.checkbox(&mut c, label).changed() {
+                    if ui.checkbox(&mut c, crate::i18n::t(label)).changed() {
                         set = Some(json!({ "handles": ids, "closed": c }));
                     }
                 });
@@ -793,13 +953,13 @@ fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
                     }
                 });
                 prop_row(ui, "Dim style", |ui| {
-                    value_box(ui, &dm.style, true, true);
+                    if let Some(n) = pick_menu(ui, &dm.style, d.dim_styles.iter().map(|st| st.name.clone())) {
+                        set = Some(json!({ "handles": ids, "dimStyle": n }));
+                    }
                 });
             }
             EntityKind::Insert(i) => {
-                prop_row(ui, "Name", |ui| {
-                    value_box(ui, &i.block, false, true);
-                });
+                prop_row(ui, "Name", |ui| read_only(ui, &i.block));
                 num(ui, "Rotation", "rotation", i.rotation.to_degrees(), &mut set, &ids);
                 num(ui, "Scale", "scale", i.scale.x, &mut set, &ids);
             }

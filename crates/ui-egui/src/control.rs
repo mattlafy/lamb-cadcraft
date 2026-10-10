@@ -14,8 +14,8 @@
 //! - `ui.click {x, y}`, `ui.move {x, y}`: real egui pointer input in screen points
 //! - `ui.key {key, cmd?, shift?, alt?}`, `ui.text {text}`: synthetic keyboard input
 //! - `ui.set {...UiState fields}`, `ui.resize {width, height}`
-//! - `ui.screenshot {path?}`: PNG of the window; `ui.render {path, width?, height?}`: headless
-//!   render of the drawing (no window needed)
+//! - `ui.screenshot {path?}`: PNG of the window; `ui.render {path?, width?, height?, fit?}`: headless
+//!   render of the drawing (no window needed; fits the drawing unless `fit` is false; replies `pngBase64`)
 //! - `app.open {path}`, `app.save {path?}`, `app.quit`
 
 use std::sync::mpsc::Sender;
@@ -85,6 +85,7 @@ pub fn cmdline_state(app: &CadApp) -> Value {
         "accept": p.as_ref().map(|p| p.accept),
         "buffer": app.cmd.buffer,
         "history": app.session.log.iter().rev().take(20).rev().cloned().collect::<Vec<_>>(),
+        "historyExpanded": app.cmd.expanded,
     })
 }
 
@@ -93,12 +94,14 @@ pub fn inspect(app: &CadApp, ctx: &egui::Context) -> Value {
     let view = app.session.state().map(|s| s.view()).ok();
     json!({
         "ui": serde_json::to_value(&app.ui).unwrap_or_default(),
+        "theme": if app.shown_theme() == egui::Theme::Light { "light" } else { "dark" },
         "canvasRect": app.canvas.rect.map(|c| json!([c.left(), c.top(), c.width(), c.height()])),
         "window": [r.width(), r.height()],
         "view": view.map(|v| json!({"center": [v.center.x, v.center.y], "height": v.height})),
         "cursor": app.canvas.cursor.map(|c| [c.x, c.y]),
         "snap": app.canvas.snap.map(|s| json!({"point": [s.point.x, s.point.y], "mode": s.name})),
         "session": app.session.summary(),
+        "closePrompt": app.close_prompt(),
         "perf": {"frameMs": app.frame_ms, "buildMs": app.canvas.build_ms, "drawMs": app.canvas.draw_ms, "meshMs": app.canvas.mesh_ms, "renderer": if app.canvas.gpu.is_some() { "gpu" } else { "cpu" }, "prims": app.canvas.list.as_ref().map(|l| l.prims.len())},
     })
 }
@@ -174,6 +177,7 @@ pub fn handle(app: &mut CadApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
             let wp =
                 if world { Vec2::new(x, y) } else { app.canvas.xf.map(|xf| xf.to_world(egui::pos2(x as f32, y as f32))).unwrap_or(Vec2::new(x, y)) };
             app.session.cursor = wp;
+            app.session.cursor_deferred = None;
             app.canvas.cursor = Some(wp);
             if action == "move" {
                 if let Some(sp) = app.canvas.xf.map(|xf| xf.to_screen(wp)) {
@@ -205,6 +209,29 @@ pub fn handle(app: &mut CadApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
                 app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers });
                 app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers });
             }
+            ok(Value::Null)
+        }
+        // Press at (x, y), move in steps to `to`, release there: a real drag through egui.
+        "ui.drag" => {
+            let (Some(x), Some(y)) = (f("x"), f("y")) else { return err("missing x/y") };
+            let to = p.get("to").and_then(Value::as_array);
+            let (Some(tx), Some(ty)) = (to.and_then(|a| a.first()).and_then(Value::as_f64), to.and_then(|a| a.get(1)).and_then(Value::as_f64)) else {
+                return err("missing to: [x, y]");
+            };
+            let button = match s("button") {
+                Some("right") => egui::PointerButton::Secondary,
+                Some("middle") => egui::PointerButton::Middle,
+                _ => egui::PointerButton::Primary,
+            };
+            let modifiers = egui::Modifiers::default();
+            let from = egui::pos2(x as f32, y as f32);
+            let to = egui::pos2(tx as f32, ty as f32);
+            app.synthetic.push(egui::Event::PointerMoved(from));
+            app.synthetic.push(egui::Event::PointerButton { pos: from, button, pressed: true, modifiers });
+            for i in 1..=8 {
+                app.synthetic.push(egui::Event::PointerMoved(from + (to - from) * (i as f32 / 8.0)));
+            }
+            app.synthetic.push(egui::Event::PointerButton { pos: to, button, pressed: false, modifiers });
             ok(Value::Null)
         }
         "ui.key" => {
@@ -252,18 +279,19 @@ pub fn handle(app: &mut CadApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
             let Ok(st) = app.session.state() else { return err("no drawing") };
             let list = cadcraft_render::build(&st.doc, &st.space, &cadcraft_render::Options::default());
             let v = st.view();
-            let view = cadcraft_render::raster::View { center: v.center, scale: f64::from(h) / v.height.max(1e-12), width: w, height: h };
+            let fit = p.get("fit").and_then(Value::as_bool).unwrap_or(true);
+            let view = render_view(&list.bounds, v.center, v.height, fit, w, h);
             let Some(png) = cadcraft_render::raster::render_png(&list, &view, &cadcraft_render::raster::RasterOptions::default()) else {
                 return err("render failed");
             };
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(path) = s("path") {
-                return match std::fs::write(path, &png) {
-                    Ok(()) => ok(json!({"path": path, "bytes": png.len()})),
-                    Err(e) => err(e),
-                };
+                if let Err(e) = std::fs::write(path, &png) {
+                    return err(e);
+                }
+                return ok(render_reply(&png, w, h, Some(path)));
             }
-            ok(json!({"bytes": png.len()}))
+            ok(render_reply(&png, w, h, None))
         }
         "app.open" => {
             let Some(path) = s("path") else { return err("missing path") };
@@ -271,12 +299,32 @@ pub fn handle(app: &mut CadApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
         }
         "app.save" => wrap(app.run(if s("path").is_some() { "saveas" } else { "qsave" }, p.clone())),
         "app.quit" => {
+            // Programmatic calls never open dialogs: quit without the unsaved-changes prompt.
+            app.quit_confirmed = true;
             app.quit_requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             ok(Value::Null)
         }
         other => err(format!("unknown method `{other}`")),
     }
+}
+
+/// The raster view for `ui.render`: fitted to the drawing's bounds, or the current screen view.
+fn render_view(bounds: &cadcraft_geom::Bounds2, center: Vec2, height: f64, fit: bool, w: u32, h: u32) -> cadcraft_render::raster::View {
+    if fit {
+        cadcraft_render::raster::View::fit(bounds, w, h, 0.05)
+    } else {
+        cadcraft_render::raster::View { center, scale: f64::from(h) / height.max(1e-12), width: w, height: h }
+    }
+}
+
+/// The `ui.render` reply, matching the headless backend (`pngBase64`, `width`, `height`), plus `bytes` and `path`.
+fn render_reply(png: &[u8], w: u32, h: u32, path: Option<&str>) -> Value {
+    let mut v = json!({"pngBase64": cadcraft_engine::cmd::file::base64_encode(png), "width": w, "height": h, "bytes": png.len()});
+    if let (Some(path), Some(o)) = (path, v.as_object_mut()) {
+        o.insert("path".to_string(), json!(path));
+    }
+    v
 }
 
 /// Save a screenshot PNG.
@@ -291,5 +339,31 @@ pub fn save_screenshot(image: &egui::ColorImage, path: Option<&str>) -> Value {
     match img.save(&path) {
         Ok(()) => json!({"ok": true, "result": {"path": path, "width": w, "height": h}}),
         Err(e) => json!({"ok": false, "error": e.to_string()}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_view_fit_finds_offscreen_drawing() {
+        let far = cadcraft_geom::Bounds2::new(Vec2::new(9000.0, 9000.0), Vec2::new(9100.0, 9050.0));
+        let fitted = render_view(&far, Vec2::ZERO, 100.0, true, 800, 500);
+        assert_eq!(fitted.center, far.center());
+        let kept = render_view(&far, Vec2::ZERO, 100.0, false, 800, 500);
+        assert_eq!(kept.center, Vec2::ZERO);
+        assert!((kept.scale - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn render_reply_has_base64_width_height_and_keeps_old_keys() {
+        let r = render_reply(b"abc", 7, 5, Some("x.png"));
+        assert_eq!(r["pngBase64"], "YWJj");
+        assert_eq!(r["width"], 7);
+        assert_eq!(r["height"], 5);
+        assert_eq!(r["bytes"], 3);
+        assert_eq!(r["path"], "x.png");
+        assert!(render_reply(b"abc", 7, 5, None).get("path").is_none());
     }
 }

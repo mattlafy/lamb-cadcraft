@@ -7,6 +7,7 @@ use cadcraft_geom::{Segment, Vec2, Vec3};
 use serde_json::{Value, json};
 
 use super::helpers::v3;
+use super::machines::SelectRun;
 use super::*;
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
 
@@ -70,7 +71,10 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{points: [[arrow], ..., [landing]], text}")
             .interactive(|_| Ok(Box::new(MLeaderM::default()))),
         CommandSpec::new("leader", "Leader", run_leader).alias(&["lead"]).params("{points: [[x,y]...], text?}"),
-        CommandSpec::new("dimstyle.update", "Update", run_update).menu(&["Dimension", "Update"]).params("{handles?}"),
+        CommandSpec::new("dimstyle.update", "Update", run_update)
+            .menu(&["Dimension", "Update"])
+            .params("{handles?}")
+            .interactive(|_| Ok(Box::new(SelectRun::new("dimstyle.update", "DIMSTYLE")))),
         CommandSpec::new("dimoverride", "Override", run_override)
             .menu(&["Dimension", "Override"])
             .alias(&["dov", "dimover"])
@@ -80,11 +84,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .menu(&["Dimension", "Reassociate Dimensions"])
             .alias(&["dre"])
             .params("{handles?} (dimensions; attaches their definition points to the objects under them)")
-            .interactive(|s| Ok(Box::new(SelectThen::new(s, "dimreassociate")))),
+            .interactive(|_| Ok(Box::new(SelectRun::new("dimreassociate", "DIMREASSOCIATE")))),
         CommandSpec::new("dimdisassociate", "Disassociate Dimensions", run_disassociate)
             .alias(&["dda"])
             .params("{handles?}")
-            .interactive(|s| Ok(Box::new(SelectThen::new(s, "dimdisassociate")))),
+            .interactive(|_| Ok(Box::new(SelectRun::new("dimdisassociate", "DIMDISASSOCIATE")))),
         CommandSpec::new("dimtedit.home", "Home", |s, p| run_tedit(s, p, "home")).menu(&["Dimension", "Align Text", "Home"]).params("{handles?}"),
         CommandSpec::new("dimtedit.angle", "Angle", |s, p| run_tedit(s, p, "angle"))
             .menu(&["Dimension", "Align Text", "Angle"])
@@ -121,7 +125,7 @@ fn dim(s: &Session, kind: DimKind, defpt: Vec2, p13: Vec2, p14: Vec2, p15: Vec2,
         text_rotation: 0.0,
         user_text_pos: false,
         block: None,
-        overrides: Default::default(),
+        overrides: s.doc().map(|d| d.dim_overrides()).unwrap_or_default(),
         assoc: Vec::new(),
     })
 }
@@ -481,21 +485,35 @@ fn run_update(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// DIMOVERRIDE: per-dimension style overrides (`clear` removes them); `text` sets the text.
 fn run_override(s: &mut Session, p: &Value) -> Result<Value> {
-    if p.get("text").is_some() && p.as_object().is_some_and(|o| o.keys().all(|k| matches!(k.as_str(), "text" | "handles" | "handle"))) {
-        let hs = targets(s, p)?;
-        let t = str_param(p, "text").unwrap_or("").to_string();
-        let d = s.doc_mut()?;
-        for h in &hs {
-            let _ = d.modify_entity(*h, |e| {
-                if let EntityKind::Dimension(dm) = &mut e.kind {
-                    dm.text = t.clone();
-                    dm.block = None;
-                }
-            });
-        }
-        return Ok(json!({ "changed": hs.len() }));
+    if p.get("text").is_none() {
+        return super::props::dim_override(s, p);
     }
-    super::props::dim_override(s, p)
+    let hs = targets(s, p)?;
+    let t = str_param(p, "text").unwrap_or("").to_string();
+    // Dimension variables given next to `text` are applied first, so an unknown name still errors before anything changes.
+    let vars: serde_json::Map<String, Value> = p
+        .as_object()
+        .map(|o| o.iter().filter(|(k, _)| !matches!(k.as_str(), "text" | "handles" | "handle")).map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    let mut ignored = Value::Null;
+    if !vars.is_empty() {
+        let mut rest = vars;
+        rest.insert("handles".into(), json!(hs.iter().map(|h| h.hex()).collect::<Vec<_>>()));
+        ignored = super::props::dim_override(s, &Value::Object(rest))?.get("ignored").cloned().unwrap_or(Value::Null);
+    }
+    let d = s.doc_mut()?;
+    for h in &hs {
+        let _ = d.modify_entity(*h, |e| {
+            if let EntityKind::Dimension(dm) = &mut e.kind {
+                dm.text = t.clone();
+                dm.block = None;
+            }
+        });
+    }
+    match ignored {
+        Value::Null => Ok(json!({ "changed": hs.len() })),
+        ig => Ok(json!({ "changed": hs.len(), "ignored": ig })),
+    }
 }
 
 /// The two points a picked object is dimensioned between (DIMLINEAR "select object").
@@ -654,53 +672,6 @@ fn run_dimspace(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "spaced": others.len() }))
 }
 
-/// Select objects, then run a JSON command on them.
-struct SelectThen {
-    sel: super::machines::SelectPhase,
-    id: &'static str,
-}
-
-impl SelectThen {
-    fn new(_s: &Session, id: &'static str) -> Self {
-        SelectThen { sel: super::machines::SelectPhase::default(), id }
-    }
-    fn run(&self, s: &mut Session, hs: Vec<Handle>) -> Result<Step> {
-        let hex: Vec<String> = hs.iter().map(|h| h.hex()).collect();
-        let r = s.execute(self.id, &json!({ "handles": hex }))?;
-        if let Some(m) = r.get("message").and_then(Value::as_str) {
-            s.echo(m.to_string());
-        }
-        Ok(Step::Done)
-    }
-}
-
-impl Interactive for SelectThen {
-    fn name(&self) -> &'static str {
-        if self.id == "dimreassociate" { "DIMREASSOCIATE" } else { "DIMDISASSOCIATE" }
-    }
-    fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        self.sel = super::machines::SelectPhase::begin(s);
-        if self.sel.done {
-            let hs = self.sel.picked.clone();
-            return self.run(s, hs);
-        }
-        Ok(Step::Continue)
-    }
-    fn prompt(&self, _s: &Session) -> Prompt {
-        self.sel.prompt()
-    }
-    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
-        match self.sel.feed(s, &i)? {
-            super::machines::SelOutcome::More => Ok(Step::Continue),
-            super::machines::SelOutcome::Empty => Ok(Step::Done),
-            super::machines::SelOutcome::Done(hs) => self.run(s, hs),
-        }
-    }
-    fn preview(&self, _s: &Session, _c: Vec2) -> Vec<EntityKind> {
-        Vec::new()
-    }
-}
-
 /// DIMOVERRIDE at the command line: variable, value (repeat), Enter, then select dimensions.
 struct OverrideM {
     vars: serde_json::Map<String, Value>,
@@ -787,6 +758,19 @@ impl Interactive for OverrideM {
 fn pick_at(s: &Session, p: Vec2) -> Option<Handle> {
     let ap = s.pixel_size() * s.settings.pickbox.max(1.0) * 1.5;
     crate::select::pick(s.doc().ok()?, &s.space(), p, ap)
+}
+
+/// The straight or curved piece of `h` picked at `p`: a line, an arc, or the polyline segment nearest `p`.
+fn segment_at(s: &Session, h: Handle, p: Vec2) -> Option<Segment> {
+    match &s.doc().ok()?.entity(h)?.kind {
+        EntityKind::Line(l) => Some(Segment::Line(cadcraft_geom::Line::new(l.a.xy(), l.b.xy()))),
+        EntityKind::Arc(a) => Some(Segment::Arc { arc: cadcraft_geom::Arc::new(a.center.xy(), a.radius, a.start, a.end), ccw: true }),
+        EntityKind::LwPolyline(pl) => cadcraft_geom::Polyline { vertices: pl.vertices.clone(), closed: pl.closed }
+            .segments()
+            .into_iter()
+            .min_by(|x, y| x.closest(p).dist(p).total_cmp(&y.closest(p).dist(p))),
+        _ => None,
+    }
 }
 
 struct LinearM {
@@ -1032,22 +1016,30 @@ impl Interactive for AngularM {
                     s.echo("*Invalid selection*");
                     return Ok(Step::Continue);
                 };
-                let kind = s.doc()?.entity(h).map(|e| e.kind.clone());
-                match kind {
-                    Some(EntityKind::Arc(a)) if self.first.is_none() => {
-                        let g = cadcraft_geom::Arc::new(a.center.xy(), a.radius, a.start, a.end);
+                let circle = s
+                    .doc()?
+                    .entity(h)
+                    .and_then(|e| if let EntityKind::Circle(c) = &e.kind { Some(cadcraft_geom::Circle::new(c.center.xy(), c.radius)) } else { None });
+                if let Some(g) = circle.filter(|_| self.first.is_none()) {
+                    // The center is the vertex and the pick the first endpoint; ask for the second.
+                    self.vertex = true;
+                    self.vertex_mode = vec![g.center, g.closest(p)];
+                    return Ok(Step::Continue);
+                }
+                match segment_at(s, h, p) {
+                    Some(Segment::Arc { arc: g, .. }) if self.first.is_none() => {
                         self.arc = Some((g.center, g.start_point(), g.end_point()));
                     }
-                    Some(EntityKind::Line(l)) => {
+                    Some(Segment::Line(l)) => {
                         self.handles.push(h);
-                        let seg = (l.a.xy(), l.b.xy());
+                        let seg = (l.a, l.b);
                         if self.first.is_none() {
                             self.first = Some(seg);
                         } else {
                             self.second = Some(seg);
                         }
                     }
-                    _ => s.echo("Select a line or an arc."),
+                    _ => s.echo("Select an arc, circle or line."),
                 }
                 Ok(Step::Continue)
             }

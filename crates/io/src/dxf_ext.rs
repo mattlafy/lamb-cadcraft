@@ -1,16 +1,17 @@
 //! DXF data shared by the reader and the writer beyond plain entity geometry:
 //! dimension-variable group codes (DIMSTYLE records and the `ACAD` "DSTYLE" override xdata,
 //! both per the DXF Reference), arrowhead block names, extended-data helpers and the
-//! CADCraft-owned payloads (exact associativity, table flags, parametric constraints).
+//! CADCraft-owned payloads (exact associativity, table flags, hatch gradients, parametric
+//! constraints).
 //!
 //! CADCraft's own data lives under the registered application `CADCRAFT` (xdata) and the
-//! named-object-dictionary entry `CADCRAFT_CONSTRAINTS` (an XRECORD). Other readers keep or
-//! ignore both.
+//! named-object-dictionary entries `CADCRAFT_CONSTRAINTS` and `CADCRAFT_LAYERSTATES`
+//! (XRECORDs). Other readers keep or ignore them.
 
 use std::collections::HashMap;
 
 use cadcraft_color::Color;
-use cadcraft_doc::{AssocSnap, Constraint, DimAssoc, DimStyle, Handle, Parametric};
+use cadcraft_doc::{AssocSnap, Constraint, DimAssoc, DimStyle, Handle, LayerState, Parametric};
 use cadcraft_dxf::Tag;
 use cadcraft_render::Arrowhead;
 use serde::{Deserialize, Serialize};
@@ -20,11 +21,14 @@ use serde_json::Value;
 pub(crate) const APP: &str = "CADCRAFT";
 /// Named-object-dictionary key of the constraint XRECORD.
 pub(crate) const CONSTRAINTS_KEY: &str = "CADCRAFT_CONSTRAINTS";
+/// Named-object-dictionary key of the saved layer states XRECORD.
+pub(crate) const LAYER_STATES_KEY: &str = "CADCRAFT_LAYERSTATES";
 
 /// Caps for hostile input.
 pub(crate) const MAX_XDATA_ITEMS: usize = 4096;
 pub(crate) const MAX_PAYLOAD: usize = 64 << 20;
 pub(crate) const MAX_CONSTRAINTS: usize = 1_000_000;
+pub(crate) const MAX_LAYER_STATES: usize = 100_000;
 
 /// How a dimension variable is stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,6 +215,36 @@ pub(crate) fn arrow_block_name(name: &str) -> Option<(String, Arrowhead)> {
     Some((if keep { n.to_string() } else { std_name }, kind))
 }
 
+/// Applications whose xdata carries layer properties: transparency and description.
+pub(crate) const LAYER_TRANSPARENCY_APP: &str = "AcCmTransparency";
+pub(crate) const LAYER_DESCRIPTION_APP: &str = "AcAecLayerStandard";
+
+/// A transparency percentage (0..=90) as an `AcCmTransparency` value: the alpha with the
+/// "by alpha" flag (0x02 in the top byte).
+pub(crate) fn transparency_to_dxf(percent: u8) -> i64 {
+    let t = u32::from(percent.min(90));
+    i64::from(0x0200_0000 | ((100 - t) * 255 / 100))
+}
+
+/// The percentage of an `AcCmTransparency` value; `None` unless it is "by alpha".
+pub(crate) fn transparency_from_dxf(v: i64) -> Option<u8> {
+    if (v >> 24) & 0xff != 2 {
+        return None;
+    }
+    let alpha = u32::try_from(v & 0xff).ok()?;
+    let opaque = (alpha * 100 + 127) / 255;
+    u8::try_from(100u32.saturating_sub(opaque).min(90)).ok()
+}
+
+/// An xdata string cut to the 255 bytes a `1000` group may hold, at a character boundary.
+pub(crate) fn xdata_str(s: &str) -> &str {
+    let mut end = s.len().min(255);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or_default()
+}
+
 /// The extended data of one application: the groups after its `1001` up to the next `1001`.
 pub(crate) fn xdata<'a>(tags: &'a [Tag], app: &str) -> &'a [Tag] {
     let Some(start) = tags.iter().position(|t| t.code == 1001 && t.str().trim().eq_ignore_ascii_case(app)) else { return &[] };
@@ -272,6 +306,15 @@ pub(crate) fn read_dstyle(tags: &[Tag], styles: &HashMap<String, String>, blocks
     out
 }
 
+/// Xdata marker of the paper-space viewport (id 1) the writer adds to layouts that have none;
+/// CADCraft keeps that viewport implicit, so the reader drops it.
+pub(crate) const PAPER_VIEW: &str = "PAPERVIEW";
+
+/// True for a VIEWPORT record carrying the [`PAPER_VIEW`] marker.
+pub(crate) fn is_paper_view(tags: &[Tag]) -> bool {
+    xdata(tags, APP).iter().any(|t| t.code == 1000 && t.str().trim().eq_ignore_ascii_case(PAPER_VIEW))
+}
+
 /// Snap kinds in CADCraft's ASSOC xdata.
 fn snap_code(s: &AssocSnap) -> i64 {
     match s {
@@ -304,6 +347,53 @@ pub(crate) fn assoc_xdata(assoc: &[DimAssoc]) -> Vec<Tag> {
     }
     v.push(Tag::s(1002, "}"));
     v
+}
+
+/// An arc-length dimension as CADCraft xdata: `1000 ARCLEN`, `1002 {`, the arc centre as an xdata
+/// point (`1010`/`1020`/`1030`), `1002 }`. The record itself stays a standard aligned dimension
+/// (DXF has no arc-length DIMENSION type), so other programs still read it.
+pub(crate) fn arclen_xdata(center: cadcraft_geom::Vec3) -> Vec<Tag> {
+    vec![Tag::s(1000, "ARCLEN"), Tag::s(1002, "{"), Tag::f(1010, center.x), Tag::f(1020, center.y), Tag::f(1030, center.z), Tag::s(1002, "}")]
+}
+
+/// The arc centre written by [`arclen_xdata`]; None for other dimensions and other writers.
+pub(crate) fn read_arclen(tags: &[Tag]) -> Option<cadcraft_geom::Vec3> {
+    let list = xdata_list(xdata(tags, APP), "ARCLEN");
+    let g = |c: i32| list.iter().find(|t| t.code == c).map(Tag::f64).filter(|v| v.is_finite());
+    Some(cadcraft_geom::Vec3::new(g(1010)?, g(1020)?, g(1030).unwrap_or(0.0)))
+}
+
+/// A viewport's frozen layer names as CADCraft xdata: `1000 VPFROZEN`, `1002 {`, one `1000` per layer, `1002 }`.
+pub(crate) fn frozen_xdata(layers: &[String]) -> Vec<Tag> {
+    let mut v = vec![Tag::s(1000, "VPFROZEN"), Tag::s(1002, "{")];
+    v.extend(layers.iter().map(|l| Tag::s(1000, l.clone())));
+    v.push(Tag::s(1002, "}"));
+    v
+}
+
+/// The frozen layer names written by [`frozen_xdata`]; empty for files from other writers.
+pub(crate) fn read_frozen(tags: &[Tag]) -> Vec<String> {
+    let list = xdata_list(xdata(tags, APP), "VPFROZEN");
+    list.iter().take(MAX_XDATA_ITEMS).filter(|t| t.code == 1000).map(Tag::str).collect()
+}
+
+/// A viewport's layer colour overrides as CADCraft xdata: `1000 VPCOLORS`, `1002 {`, then per override
+/// `1000 layer` and `1000 colour` (the [`Color::name`] text, which keeps true colours), `1002 }`.
+pub(crate) fn layer_colors_xdata(colors: &[(String, Color)]) -> Vec<Tag> {
+    let mut v = vec![Tag::s(1000, "VPCOLORS"), Tag::s(1002, "{")];
+    for (layer, color) in colors {
+        v.push(Tag::s(1000, layer.clone()));
+        v.push(Tag::s(1000, color.name()));
+    }
+    v.push(Tag::s(1002, "}"));
+    v
+}
+
+/// The overrides written by [`layer_colors_xdata`]; empty for files from other writers, bad pairs are skipped.
+pub(crate) fn read_layer_colors(tags: &[Tag]) -> Vec<(String, Color)> {
+    let list = xdata_list(xdata(tags, APP), "VPCOLORS");
+    let names: Vec<String> = list.iter().take(MAX_XDATA_ITEMS * 2).filter(|t| t.code == 1000).map(Tag::str).collect();
+    names.as_chunks::<2>().0.iter().filter_map(|[name, color]| Some((name.clone(), Color::parse(color)?))).collect()
 }
 
 const POINT_NAMES: [&str; 5] = ["defpt", "p13", "p14", "p15", "p16"];
@@ -364,13 +454,18 @@ struct Payload {
 }
 
 /// JSON chunks (≤ 250 characters) for the constraint XRECORD, or `None` when the drawing has
-/// no parametric data. Backslashes are written as `\` so no chunk contains a DXF
-/// `\U+` escape.
+/// no parametric data.
 pub(crate) fn constraint_chunks(constraints: &[Constraint], parametric: &Parametric) -> Option<Vec<String>> {
     if constraints.is_empty() && *parametric == Parametric::default() {
         return None;
     }
     let json = serde_json::to_string(&Payload { version: 1, constraints: constraints.to_vec(), parametric: parametric.clone() }).ok()?;
+    Some(json_chunks(&json))
+}
+
+/// JSON text split into XRECORD strings of at most 250 characters. Backslashes are written as
+/// `\u005c` so no chunk contains a DXF `\U+` escape.
+fn json_chunks(json: &str) -> Vec<String> {
     let mut safe = String::with_capacity(json.len());
     let mut it = json.chars().peekable();
     while let Some(c) = it.next() {
@@ -388,7 +483,37 @@ pub(crate) fn constraint_chunks(constraints: &[Constraint], parametric: &Paramet
         }
     }
     let chars: Vec<char> = safe.chars().collect();
-    Some(chars.chunks(250).map(|c| c.iter().collect()).collect())
+    chars.chunks(250).map(|c| c.iter().collect()).collect()
+}
+
+/// The saved layer states stored in the `CADCRAFT_LAYERSTATES` XRECORD.
+#[derive(Serialize, Deserialize)]
+struct LayerStatesPayload {
+    version: u32,
+    #[serde(default)]
+    states: Vec<LayerState>,
+}
+
+/// JSON chunks for the layer states XRECORD, or `None` when the drawing has no saved layer
+/// states.
+pub(crate) fn layer_state_chunks(states: &[LayerState]) -> Option<Vec<String>> {
+    if states.is_empty() {
+        return None;
+    }
+    let json = serde_json::to_string(&LayerStatesPayload { version: 1, states: states.to_vec() }).ok()?;
+    Some(json_chunks(&json))
+}
+
+/// Parse the layer states XRECORD text; `None` when it is not a payload we understand.
+pub(crate) fn parse_layer_states(text: &str) -> Option<Vec<LayerState>> {
+    if text.len() > MAX_PAYLOAD {
+        return None;
+    }
+    let p: LayerStatesPayload = serde_json::from_str(text).ok()?;
+    if p.version != 1 || p.states.len() > MAX_LAYER_STATES {
+        return None;
+    }
+    Some(p.states)
 }
 
 /// Parse the constraint XRECORD text; `None` when it is not a payload we understand.

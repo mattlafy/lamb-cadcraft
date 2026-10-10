@@ -156,6 +156,19 @@ fn symmetric_fix() {
 }
 
 #[test]
+fn two_line_angle_over_180_is_rejected() {
+    let mut d = Drawing::default();
+    let a = line(&mut d, (0.0, 0.0), (10.0, 0.0));
+    let b = line(&mut d, (0.0, 0.0), (0.0, 5.0));
+    let before = (ln(&d, a), ln(&d, b));
+    assert!(add(&mut d, dim(ConstraintKind::Angular, &[w(a), w(b)], "", "200"), &SolveOptions::default()).is_err());
+    assert!(d.constraints.is_empty());
+    assert_eq!((ln(&d, a), ln(&d, b)), before);
+    ok(&mut d, dim(ConstraintKind::Angular, &[w(a), w(b)], "", "180"));
+    assert!(all_satisfied(&d));
+}
+
+#[test]
 fn dimensional_constraints() {
     let mut d = Drawing::default();
     let a = line(&mut d, (0.0, 0.0), (10.0, 1.0));
@@ -432,4 +445,21 @@ fn autoconstrain_rectangle_of_lines() {
     let l = line(&mut d, (50.0, 0.0), (60.0, 0.001));
     let only_v = InferOptions { types: vec!["Vertical".into()], ..Default::default() };
     assert!(autoconstrain(&mut d, &[l], &only_v).is_empty());
+}
+
+#[test]
+fn set_parameter_rejects_out_of_domain_dimension() {
+    let opts = SolveOptions::default();
+    let mut d = Drawing::default();
+    let l = line(&mut d, (0.0, 0.0), (10.0, 0.0));
+    ok(&mut d, dim(ConstraintKind::Distance(DistAxis::Aligned), &[w(l)], "d1", "8"));
+    let c = circle(&mut d, (0.0, 20.0), 5.0);
+    ok(&mut d, dim(ConstraintKind::Radius, &[w(c)], "rad1", "3"));
+    let before = d.clone();
+    assert!(set_parameter(&mut d, "d1", "-5", &opts).is_err());
+    assert!(set_parameter(&mut d, "rad1", "0", &opts).is_err());
+    assert_eq!(d, before);
+    set_parameter(&mut d, "d1", "6", &opts).unwrap();
+    set_parameter(&mut d, "rad1", "2", &opts).unwrap();
+    assert!(all_satisfied(&d));
 }

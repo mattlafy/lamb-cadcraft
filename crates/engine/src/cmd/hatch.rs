@@ -19,12 +19,14 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-/// Tessellated outlines of every visible curve in the space (hatch boundary candidates).
-fn outlines(d: &Drawing, space: &Space, near: Option<Bounds2>) -> Vec<Vec<Vec2>> {
-    let Some(store) = d.space(space) else { return Vec::new() };
+/// Tessellated outlines of every visible curve in the space (hatch boundary candidates), each
+/// with the handle of the object it came from.
+fn outlines(d: &Drawing, space: &Space, near: Option<Bounds2>) -> (Vec<Vec<Vec2>>, Vec<Handle>) {
+    let Some(store) = d.space(space) else { return (Vec::new(), Vec::new()) };
     let ext = d.extents(space);
     let tol = (ext.width() + ext.height()).max(1e-9) / 20000.0;
     let mut out = Vec::new();
+    let mut owners = Vec::new();
     for e in store.iter() {
         if !d.is_visible(e) || matches!(e.kind, EntityKind::Hatch(_) | EntityKind::Text(_) | EntityKind::MText(_) | EntityKind::Dimension(_)) {
             continue;
@@ -47,9 +49,10 @@ fn outlines(d: &Drawing, space: &Space, near: Option<Bounds2>) -> Vec<Vec<Vec2>>
                 }
             }
         }
+        owners.extend(std::iter::repeat_n(e.handle, polys.len()));
         out.extend(polys);
     }
-    out
+    (out, owners)
 }
 
 /// Closed loops of entities that are closed curves (for islands and "select objects").
@@ -80,14 +83,29 @@ fn closed_loop(d: &Drawing, e: &Entity) -> Option<Vec<PolyVertex>> {
     }
 }
 
+/// Open curves that can make up an island together (a square drawn as four LINEs, two ARCs
+/// forming a circle). Closed objects are islands on their own (see `closed_loop`).
+fn island_curve(d: &Drawing, e: &Entity) -> bool {
+    matches!(
+        e.kind,
+        EntityKind::Line(_)
+            | EntityKind::Arc(_)
+            | EntityKind::Ellipse(_)
+            | EntityKind::LwPolyline(_)
+            | EntityKind::Polyline3d(_)
+            | EntityKind::Spline(_)
+    ) && closed_loop(d, e).is_none()
+}
+
 /// Boundary loops (outer + islands) around an internal point.
 pub(crate) fn loops_at(s: &Session, p: Vec2) -> Result<Vec<HatchLoop>> {
     let d = s.doc()?;
     let space = s.space();
     let ext = d.extents(&space);
     let tol = ((ext.width() + ext.height()) * 1e-9).max(1e-9);
-    let polys = outlines(d, &space, None);
-    let outer = cadcraft_geom::region::enclosing_loop(&polys, p, tol).ok_or_else(|| EngineError::Other("Valid hatch boundary not found.".into()))?;
+    let (polys, owners) = outlines(d, &space, None);
+    let found = cadcraft_geom::region::boundary_at(&polys, p, tol).ok_or_else(|| EngineError::Other("Valid hatch boundary not found.".into()))?;
+    let outer = found.outer;
     let ob = Bounds2::from_points(outer.iter().copied());
     let mut loops = vec![HatchLoop { vertices: outer.iter().map(|q| PolyVertex::new(*q)).collect(), outer: true }];
     // Islands: closed objects entirely inside the outer loop that don't contain the pick point.
@@ -108,6 +126,15 @@ pub(crate) fn loops_at(s: &Session, p: Vec2) -> Result<Vec<HatchLoop>> {
                     loops.push(HatchLoop { vertices: vs, outer: false });
                 }
             }
+        }
+    }
+    // Islands made of separate open curves (four LINEs around a square). Groups that include a
+    // closed object were handled above, object by object.
+    for island in found.islands {
+        let open_curves = !island.sources.is_empty()
+            && island.sources.iter().all(|&i| owners.get(i).and_then(|h| d.entity(*h)).is_some_and(|e| island_curve(d, e)));
+        if open_curves {
+            loops.push(HatchLoop { vertices: island.outline.into_iter().map(PolyVertex::new).collect(), outer: false });
         }
     }
     Ok(loops)
@@ -402,5 +429,35 @@ impl Interactive for BoundaryM {
             Input::Enter => Ok(Step::Done),
             _ => Ok(Step::Continue),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// The drawing's only hatch and its handle (hatches go to the back of the draw order, so not the last entity).
+    fn only_hatch(s: &Session) -> (String, Hatch) {
+        let d = s.doc().unwrap();
+        d.model.iter().find_map(|e| if let EntityKind::Hatch(h) = &e.kind { Some((e.handle.hex(), h.clone())) } else { None }).unwrap()
+    }
+
+    #[test]
+    fn hatchedit_pattern_replaces_gradient() {
+        let mut s = Session::new();
+        s.execute("rectang", &json!({ "p1": [0, 0], "p2": [10, 10] })).unwrap();
+        s.execute("gradient", &json!({ "points": [[5, 5]], "color1": "1", "color2": "3" })).unwrap();
+        let (h, hatch) = only_hatch(&s);
+        assert!(hatch.gradient.is_some());
+        // Scale-only and angle-only edits keep the gradient.
+        s.execute("hatchedit", &json!({ "handles": [h.clone()], "scale": 2, "angle": 30 })).unwrap();
+        assert!(only_hatch(&s).1.gradient.is_some());
+        s.execute("hatchedit", &json!({ "handles": [h], "pattern": "ANSI31" })).unwrap();
+        let hatch = only_hatch(&s).1;
+        assert_eq!(hatch.pattern, "ANSI31");
+        assert!(!hatch.solid);
+        assert!(hatch.gradient.is_none());
     }
 }

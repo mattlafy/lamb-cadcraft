@@ -19,16 +19,30 @@ Errors come back as `{"id": …, "ok": false, "error": "message"}`.
 | `engine.execute` | `{command, params}` | Run any command with JSON parameters. Never opens a dialog. |
 | `engine.commands` | | Every command: id, label, menu path, shortcut, aliases, params doc, enabled. |
 | `drawing.inspect` | `{entities?, limit?}` | Drawing summary (counts, extents, layers, styles, blocks, layouts, selection, undo) and entities with handles and geometry. |
-| `ui.inspect` | | UI state, canvas rect, view, cursor and snap, performance counters. |
+| `ui.inspect` | | UI state, canvas rect, view, cursor and snap, performance counters; `closePrompt`: the drawing a "Save changes?" prompt is asking about (null when none). |
 | `ui.menu.list` / `ui.menu.invoke` | `{command}` | The menu tree; invoke an item like a click (interactive). |
 | `ui.pointer` | `{x, y, space?: "world"\|"screen", button?, action?: "click"\|"move"}` | Click in the drawing area (world coordinates by default). Right button = Enter. |
 | `ui.click` / `ui.move` | `{x, y, button?, shift?}` | Real egui pointer events in screen points (reach every widget). |
+| `ui.drag` | `{x, y, to: [x, y], button?}` | Real press, move and release (drag the command line's top edge, the ViewCube ring…). |
 | `ui.key` / `ui.text` | `{key, cmd?, shift?, alt?}` / `{text}` | Synthetic keyboard input. |
-| `ui.set` | UiState fields | Show/hide palettes, toolbars, command line, ViewCube… |
+| `ui.set` | UiState fields | Show/hide palettes, toolbars, command line, ViewCube…; `theme: "system"\|"light"\|"dark"` (also `engine.execute` with `ui.theme {theme}`); `ui.inspect` reports the theme shown (`theme`: light/dark). |
 | `ui.resize` | `{width, height}` | Resize the window. |
 | `ui.screenshot` | `{path?}` | PNG of the window (needs a presented frame). |
-| `ui.render` | `{path?, width?, height?}` | Headless render of the current view of the drawing. |
+| `ui.render` | `{path?, width?, height?, fit?}` | Headless render. `fit` (default true) frames the whole drawing; `false` uses the current view. Replies `{pngBase64, width, height, bytes, path?}`. |
 | `app.open` / `app.save` / `app.quit` | `{path}` | File operations. |
 
 The MCP server (`cadcraft-cli mcp --connect 127.0.0.1:PORT`) wraps this protocol; headless
 (`cadcraft-cli mcp`) it serves the same methods from an in-process session.
+
+## Interface language
+
+Select a language with `engine.execute` and the UI command `ui.language`:
+
+```json
+{"id":1,"method":"engine.execute","params":{"command":"ui.language","params":{"lang":"uk"}}}
+```
+
+Supported values are `auto`, `en` and `uk`. `ui.set` also accepts
+`{"interfaceLanguage":"uk"}`; `ui.inspect` reports the saved choice in its UI state.
+Invalid choices leave the current language unchanged. Menus, command labels and prompt text
+returned by the control channel retain their English source text. See [localization.md](localization.md).

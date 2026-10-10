@@ -95,6 +95,23 @@ fn pedit_json_options() {
 }
 
 #[test]
+fn join_keeps_selected_objects_outside_the_chain() {
+    let mut s = Session::new();
+    let a = h(&s.execute("line", &json!({"points": [[0, 0], [5, 0]]})).unwrap());
+    let b = h(&s.execute("line", &json!({"points": [[5, 0], [5, 5]]})).unwrap());
+    let far = h(&s.execute("line", &json!({"points": [[50, 50], [60, 60]]})).unwrap());
+    let c = h(&s.execute("circle", &json!({"center": [50, 50], "radius": 2})).unwrap());
+    let r = s.execute("join", &json!({"handles": [a, b, far, c]})).unwrap();
+    let joined = r["handle"].as_str().unwrap().to_string();
+    assert_eq!(poly(&kind(&s, &joined)).vertices.len(), 3);
+    let d = s.doc().unwrap();
+    assert!(d.entity(Handle::parse_hex(&a).unwrap()).is_none());
+    assert!(d.entity(Handle::parse_hex(&b).unwrap()).is_none());
+    assert!(d.entity(Handle::parse_hex(&far).unwrap()).is_some(), "unconnected line stays");
+    assert!(d.entity(Handle::parse_hex(&c).unwrap()).is_some(), "unrelated circle stays");
+}
+
+#[test]
 fn pedit_command_line() {
     let mut s = Session::new();
     pline(&mut s, json!([[0, 0], [10, 0], [10, 10]]), false);
@@ -605,4 +622,62 @@ fn textedit_json_and_command_line() {
     s.cmdline("").unwrap();
     assert!(s.running.is_none());
     assert!(matches!(kind(&s, &t), EntityKind::Text(x) if x.value == "hello world"));
+}
+
+#[test]
+fn explode_polyline3d_keeps_elevations() {
+    let mut s = Session::new();
+    let p = h(&s.execute("3dpoly", &json!({"points": [[0, 0, 5], [1, 0, 6], [1, 1, 7]]})).unwrap());
+    s.execute("explode", &json!({"handles": [p]})).unwrap();
+    let lines: Vec<(f64, f64)> = s
+        .doc()
+        .unwrap()
+        .model
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntityKind::Line(l) => Some((l.a.z, l.b.z)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lines, vec![(5.0, 6.0), (6.0, 7.0)]);
+}
+
+/// Snapshot of every model entity, to prove a command left the drawing untouched.
+fn model_dump(s: &Session) -> String {
+    format!("{:?}", s.doc().unwrap().model.iter().map(|e| e.kind.clone()).collect::<Vec<_>>())
+}
+
+#[test]
+fn editing_commands_leave_locked_layer_objects_alone() {
+    let mut s = Session::new();
+    let a = h(&s.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap());
+    let b = h(&s.execute("line", &json!({"points": [[5, -5], [5, 5]]})).unwrap());
+    let c = h(&s.execute("line", &json!({"points": [[0, 0], [0, 10]]})).unwrap());
+    let e = h(&s.execute("line", &json!({"points": [[0, 10], [3, 10]]})).unwrap());
+    let r = h(&s.execute("rectang", &json!({"p1": [20, 0], "p2": [25, 5]})).unwrap());
+    let sp = h(&s.execute("spline", &json!({"control": [[0, 20], [2, 23], [4, 23], [6, 20]], "degree": 3})).unwrap());
+    s.execute("layer.set", &json!({"name": "0", "locked": true})).unwrap();
+    let before = model_dump(&s);
+    // Commands that reject the request.
+    assert!(s.execute("trim", &json!({"handle": a, "pick": [2, 0], "edges": [b]})).is_err());
+    assert!(s.execute("extend", &json!({"handle": e, "pick": [3, 10], "edges": [b]})).is_err());
+    assert!(s.execute("fillet", &json!({"h1": a, "p1": [8, 0], "h2": c, "p2": [0, 8], "radius": 2})).is_err());
+    assert!(s.execute("splinedit", &json!({"handle": sp, "option": "move", "index": 1, "to": [2, 29]})).is_err());
+    // Commands that skip the locked objects.
+    s.execute("select", &json!({"handles": [a, r]})).unwrap();
+    assert_eq!(s.execute("erase.selection", &json!({})).unwrap()["erased"], 0);
+    assert_eq!(s.execute("cutclip", &json!({"handles": [a]})).unwrap()["cut"], 0);
+    assert_eq!(s.execute("stretch", &json!({"window": [[-1, -1], [11, 1]], "delta": [10, 0]})).unwrap()["stretched"], 0);
+    s.execute("explode", &json!({"handles": [r]})).unwrap();
+    // The interactive STRETCH (crossing window, base point, second point) too.
+    s.start("stretch").unwrap();
+    for (x, y) in [(-1.0, -1.0), (11.0, 1.0), (0.0, 0.0), (10.0, 0.0)] {
+        s.input(crate::Input::Point(Vec2::new(x, y))).unwrap();
+    }
+    assert_eq!(model_dump(&s), before);
+    // Unlocked, the same edits work.
+    s.execute("layer.set", &json!({"name": "0", "locked": false})).unwrap();
+    s.execute("trim", &json!({"handle": a, "pick": [2, 0], "edges": [b]})).unwrap();
+    s.execute("explode", &json!({"handles": [r]})).unwrap();
+    assert_ne!(model_dump(&s), before);
 }

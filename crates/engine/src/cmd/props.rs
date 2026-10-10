@@ -1,7 +1,7 @@
 //! Properties: per-object property edits, current properties, MATCHPROP, linetypes, units.
 
 use cadcraft_color::Color;
-use cadcraft_doc::{EntityKind, Lineweight};
+use cadcraft_doc::{EntityKind, Lineweight, Transparency};
 use cadcraft_geom::Vec3;
 use serde_json::{Value, json};
 
@@ -11,7 +11,7 @@ use crate::{Result, Session};
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec::new("properties", "Properties", run_get).menu(&["Modify", "Properties"]).alias(&["pr", "props", "ch"]).params("{handles?} → properties of the selection").noundo(),
-        CommandSpec::new("properties.set", "Set Properties", run_set).params("{handles?, layer?, color?, linetype?, lineweight?, ltscale?, transparency?, visible?, <geometry fields: radius, center, start, end, text, height, rotation…>}"),
+        CommandSpec::new("properties.set", "Set Properties", run_set).params("{handles?, layer?, color?, linetype?, lineweight?, ltscale?, transparency?: \"ByLayer\" | \"ByBlock\" | 0..90, visible?, <geometry fields: radius, center, start, end, text, height, rotation…>}"),
         CommandSpec::new("matchprop", "Match Properties", run_matchprop).menu(&["Modify", "Match Properties"]).alias(&["ma", "painter"]).params("{source, targets: [hex]}"),
         CommandSpec::new("color", "Color...", run_color).menu(&["Format", "Color..."]).alias(&["col", "colour"]).params("{color: \"ByLayer\" | \"red\" | 1..255 | \"r,g,b\"}"),
         CommandSpec::new("linetype", "Linetype...", run_linetype).menu(&["Format", "Linetype..."]).alias(&["lt", "ltype"]).params("{current?: name, load?: name | \"*\"}"),
@@ -60,6 +60,7 @@ pub(super) fn entity_props(d: &cadcraft_doc::Drawing, e: &cadcraft_doc::Entity) 
         "linetype": e.common.linetype,
         "lineweight": e.common.lineweight.name(),
         "ltscale": e.common.ltscale,
+        "transparency": transparency_value(e.common.transparency),
         "visible": e.common.visible,
     });
     let geo = serde_json::to_value(&e.kind).unwrap_or(Value::Null);
@@ -121,6 +122,25 @@ fn parse_color(v: &Value) -> Option<Color> {
     v.as_str().and_then(Color::parse).or_else(|| v.as_i64().and_then(|i| i16::try_from(i).ok()).map(Color::from_aci))
 }
 
+/// A transparency as JSON, in the form `properties.set` takes: "ByLayer", "ByBlock" or a percentage.
+pub(super) fn transparency_value(t: Transparency) -> Value {
+    match t {
+        Transparency::Percent(p) => json!(p),
+        other => json!(other.name()),
+    }
+}
+
+/// "ByLayer", "ByBlock" or a percentage 0..=90 (a number, or a string such as "50" or "50%").
+fn parse_transparency(v: &Value) -> Option<Transparency> {
+    let pct = match v.as_str() {
+        Some(s) if s.trim().eq_ignore_ascii_case("bylayer") => return Some(Transparency::ByLayer),
+        Some(s) if s.trim().eq_ignore_ascii_case("byblock") => return Some(Transparency::ByBlock),
+        Some(s) => s.trim().trim_end_matches('%').trim_end().parse::<f64>().ok()?,
+        None => v.as_f64()?,
+    };
+    (pct.is_finite() && (0.0..=90.0).contains(&pct)).then(|| Transparency::Percent(pct.round() as u8))
+}
+
 fn set_xy(p: &mut Vec3, v: &Value) {
     if let Some(q) = point_value(v) {
         p.x = q.x;
@@ -134,6 +154,10 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("properties.set", "nothing selected"));
     }
     let color = p.get("color").map(|c| parse_color(c).ok_or_else(|| bad("properties.set", "bad colour"))).transpose()?;
+    let transparency = p
+        .get("transparency")
+        .map(|v| parse_transparency(v).ok_or_else(|| bad("properties.set", "transparency must be ByLayer, ByBlock or a percentage from 0 to 90")))
+        .transpose()?;
     let lw = p.get("lineweight").map(|v| match v.as_str().map(str::to_ascii_lowercase).as_deref() {
         Some("bylayer") => Lineweight::ByLayer,
         Some("byblock") => Lineweight::ByBlock,
@@ -148,6 +172,9 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(l) = str_param(p, "layer") {
         d.ensure_layer(l);
     }
+    let dim_style = str_param(p, "dimStyle")
+        .map(|n| d.dim_style(n).map(|st| st.name.clone()).ok_or_else(|| bad("properties.set", format!("dimension style `{n}` not found"))))
+        .transpose()?;
     for h in &hs {
         d.modify_entity(*h, |e| {
             if let Some(l) = str_param(p, "layer") {
@@ -164,6 +191,9 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
             }
             if let Some(x) = p.get("ltscale").and_then(Value::as_f64).filter(|x| *x > 0.0) {
                 e.common.ltscale = x;
+            }
+            if let Some(t) = transparency {
+                e.common.transparency = t;
             }
             if let Some(v) = p.get("visible").and_then(Value::as_bool) {
                 e.common.visible = v;
@@ -198,6 +228,12 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
                     }
                     if let Some(dm) = num("diameter").filter(|r| *r > 0.0) {
                         c.radius = dm / 2.0;
+                    }
+                    if let Some(cf) = num("circumference").filter(|x| *x > 0.0) {
+                        c.radius = cf / cadcraft_geom::TAU;
+                    }
+                    if let Some(a) = num("area").filter(|x| *x > 0.0) {
+                        c.radius = (a / cadcraft_geom::PI).sqrt();
                     }
                 }
                 EntityKind::Arc(a) => {
@@ -266,11 +302,19 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
                         dm.text = v.to_string();
                         dm.block = None;
                     }
+                    if let Some(st) = &dim_style {
+                        dm.style.clone_from(st);
+                        dm.block = None;
+                    }
                 }
                 EntityKind::Hatch(h) => {
                     if let Some(v) = str_param(p, "pattern") {
                         h.pattern = v.to_ascii_uppercase();
                         h.solid = h.pattern == "SOLID";
+                        if !h.solid {
+                            // A named pattern replaces the gradient fill; the renderer draws the gradient first when it is set.
+                            h.gradient = None;
+                        }
                     }
                     if let Some(x) = num("scale").filter(|x| *x > 0.0) {
                         h.scale = x;
@@ -591,6 +635,10 @@ fn run_dimstyle(s: &mut Session, p: &Value) -> Result<Value> {
     if bool_or(p, "current", true) {
         d.header.set_str("DIMSTYLE", &name);
     }
+    // Editing or making the current style current clears the SETVAR overrides.
+    if d.header.str("DIMSTYLE", "Standard").eq_ignore_ascii_case(&name) {
+        d.sync_dim_vars();
+    }
     let mut out = dimstyles_json(d);
     if !rejected.is_empty()
         && let Some(o) = out.as_object_mut()
@@ -622,6 +670,7 @@ fn run_dimstyle_current(s: &mut Session, p: &Value) -> Result<Value> {
     let d = s.doc_mut()?;
     let n = d.dim_style(name).map(|t| t.name.clone()).ok_or_else(|| bad("dimstyle.current", format!("no dimension style `{name}`")))?;
     d.header.set_str("DIMSTYLE", &n);
+    d.sync_dim_vars();
     Ok(dimstyles_json(d))
 }
 
@@ -820,8 +869,41 @@ fn run_rename(s: &mut Session, p: &Value) -> Result<Value> {
         }
         "linetype" => {
             let d = s.doc_mut()?;
+            if ["ByBlock", "ByLayer", "Continuous"].iter().any(|n| from.eq_ignore_ascii_case(n)) {
+                return Err(bad("rename", format!("the {from} linetype cannot be renamed")));
+            }
+            if d.linetype(&to).is_some() && !to.eq_ignore_ascii_case(&from) {
+                return Err(bad("rename", format!("a linetype `{to}` already exists")));
+            }
             let st = d.linetypes.iter_mut().find(|t| t.name.eq_ignore_ascii_case(&from)).ok_or_else(|| bad("rename", "no such linetype"))?;
-            st.name = to;
+            st.name = to.clone();
+            // References follow the new name.
+            let fix = |n: &mut String| {
+                if n.eq_ignore_ascii_case(&from) {
+                    *n = to.clone();
+                }
+            };
+            d.layers.iter_mut().for_each(|l| fix(&mut l.linetype));
+            if d.header.str("CELTYPE", "ByLayer").eq_ignore_ascii_case(&from) {
+                d.header.set_str("CELTYPE", &to);
+            }
+            let users = |st: &cadcraft_doc::EntityStore| -> Vec<cadcraft_doc::Handle> {
+                st.iter().filter(|e| e.common.linetype.eq_ignore_ascii_case(&from)).map(|e| e.handle).collect()
+            };
+            let mut hs = users(&d.model);
+            hs.extend(d.layouts.iter().flat_map(|l| users(&l.entities)));
+            for h in hs {
+                d.modify_entity(h, |e| fix(&mut e.common.linetype))?;
+            }
+            for block in d.blocks.values_mut() {
+                let hs = users(&block.entities);
+                if !hs.is_empty() {
+                    let b = std::sync::Arc::make_mut(block);
+                    for h in hs {
+                        b.entities.modify(h, |e| fix(&mut e.common.linetype));
+                    }
+                }
+            }
         }
         _ => return Err(bad("rename", "unsupported table")),
     }

@@ -173,12 +173,113 @@ fn dxf_roundtrip_preserves_entities() {
 }
 
 #[test]
+fn lwpolyline_elevation_roundtrips() {
+    for elevation in [5.0, -2.5, 0.0] {
+        let mut d = Drawing::new_metric();
+        d.add(
+            &Space::Model,
+            Common::default(),
+            EntityKind::LwPolyline(LwPolyline {
+                vertices: vec![PolyVertex::new(Vec2::ZERO), PolyVertex::new(Vec2::new(10.0, 0.0)), PolyVertex::new(Vec2::new(10.0, 10.0))],
+                closed: true,
+                const_width: 0.0,
+                elevation,
+                plinegen: false,
+            }),
+        )
+        .unwrap();
+        let back = roundtrip(&d);
+        let again = roundtrip(&back);
+        for doc in [&back, &again] {
+            let p = first(doc, |k| if let EntityKind::LwPolyline(p) = k { Some(p.clone()) } else { None });
+            assert_eq!(p.elevation, elevation);
+            assert_eq!(p.vertices.len(), 3);
+        }
+    }
+}
+
+#[test]
 fn second_roundtrip_is_stable() {
     let d = sample();
     let t1 = write_dxf(&d);
     let d2 = read_dxf(t1.as_bytes()).unwrap();
     let d3 = read_dxf(write_dxf(&d2).as_bytes()).unwrap();
     assert_eq!(d2.model.len(), d3.model.len());
+}
+
+#[test]
+fn layer_transparency_and_description_roundtrip() {
+    // Issues #96 and #97: both are LAYER xdata (AcCmTransparency, AcAecLayerStandard).
+    let layers = [("T0", 0, ""), ("T1", 1, "One"), ("T40", 40, "Existing brick walls to remain"), ("T90", 90, "Ångström – ünïcode")];
+    let mut d = Drawing::new_imperial();
+    for (name, transparency, description) in layers {
+        d.layers.push(Layer {
+            name: name.into(),
+            transparency,
+            description: description.into(),
+            color: Color::Index(1),
+            plot: false,
+            ..Layer::default()
+        });
+    }
+    let long = "é".repeat(200);
+    d.layers.push(Layer { name: "Long".into(), description: long.clone(), ..Layer::default() });
+    let text = write_dxf(&d);
+    let back = read_dxf(text.as_bytes()).unwrap();
+    for (name, transparency, description) in layers {
+        let l = back.layer(name).unwrap();
+        assert_eq!((l.transparency, l.description.as_str(), l.color, l.plot), (transparency, description, Color::Index(1), false), "{name}");
+    }
+    // An xdata string holds at most 255 bytes; the cut falls on a character boundary.
+    assert_eq!(back.layer("Long").unwrap().description, long[..254]);
+    // AutoCAD's encoding: the alpha with the "by alpha" flag, under registered applications.
+    assert!(text.contains("AcCmTransparency\r\n1071\r\n33554585\r\n"), "40% is alpha 153");
+    assert_eq!(text.matches("AcDbRegAppTableRecord\r\n  2\r\nAcCmTransparency").count(), 1);
+    assert!(text.contains("AcDbRegAppTableRecord\r\n  2\r\nAcAecLayerStandard"));
+    // Values that aren't "by alpha" (ByLayer, ByBlock, junk) leave the layer opaque.
+    for v in [0, 0x0100_0000, -1, i64::MAX] {
+        assert_eq!(crate::dxf_ext::transparency_from_dxf(v), None, "{v:#x}");
+    }
+    assert_eq!(crate::dxf_ext::transparency_from_dxf(0x0200_00ff), Some(0));
+    assert_eq!(crate::dxf_ext::transparency_from_dxf(0x0200_0000), Some(90));
+}
+
+#[test]
+fn block_definition_properties_and_constant_attdefs_roundtrip() {
+    let mut d = Drawing::new_metric();
+    let mut b = Block::new("Title");
+    (b.description, b.units, b.explodable) = ("Drawing title block".into(), 4, false);
+    let text = Text {
+        insert: Vec3::ZERO,
+        align_pt: None,
+        height: 2.5,
+        value: "ACME".into(),
+        rotation: 0.0,
+        width_factor: 1.0,
+        oblique: 0.0,
+        style: "Standard".into(),
+        halign: HAlign::Left,
+        valign: VAlign::Baseline,
+    };
+    let attdef =
+        |tag: &str, invisible: bool, constant: bool| Attrib { tag: tag.into(), text: text.clone(), invisible, constant, prompt: String::new() };
+    for (i, a) in [attdef("COMPANY", false, true), attdef("SECRET", true, true), attdef("SHEET", false, false)].into_iter().enumerate() {
+        b.entities.push(Entity::new(Handle(0x500 + i as u64), EntityKind::AttDef(a)));
+    }
+    d.blocks.insert("Title".into(), std::sync::Arc::new(b));
+    d.blocks.insert("Plain".into(), std::sync::Arc::new(Block::new("Plain")));
+    d.bump_handseed(Handle(0x510));
+    let back = roundtrip(&d);
+    let t = back.block("Title").unwrap();
+    assert_eq!((t.description.as_str(), t.units, t.explodable), ("Drawing title block", 4, false));
+    let flags: Vec<(String, bool, bool)> = t
+        .entities
+        .iter()
+        .filter_map(|e| if let EntityKind::AttDef(a) = &e.kind { Some((a.tag.clone(), a.invisible, a.constant)) } else { None })
+        .collect();
+    assert_eq!(flags, [("COMPANY".into(), false, true), ("SECRET".into(), true, true), ("SHEET".into(), false, false)]);
+    let p = back.block("Plain").unwrap();
+    assert_eq!((p.description.as_str(), p.units, p.explodable), ("", 0, true));
 }
 
 #[test]
@@ -195,6 +296,28 @@ fn reads_r12_style_polyline_and_paper_flag() {
         _ => panic!(),
     }
     assert_eq!(d.layouts[0].entities.len(), 1);
+}
+
+#[test]
+fn entity_transparency_roundtrips_as_group_440() {
+    // Issue #132: ByLayer writes nothing, ByBlock 0x01000000, a percentage its alpha | 0x02000000.
+    let ts = [Transparency::ByLayer, Transparency::ByBlock, Transparency::Percent(0), Transparency::Percent(40), Transparency::Percent(90)];
+    let mut d = Drawing::new_imperial();
+    for (i, t) in ts.iter().enumerate() {
+        let y = i as f64;
+        let line = EntityKind::Line(Line { a: Vec3::new(0.0, y, 0.0), b: Vec3::new(1.0, y, 0.0) });
+        d.add(&Space::Model, Common { transparency: *t, ..Common::default() }, line).unwrap();
+    }
+    let text = write_dxf(&d);
+    assert_eq!(text.matches("\r\n440\r\n").count(), 4, "ByLayer writes no 440");
+    assert!(text.contains("\r\n440\r\n16777216\r\n"), "ByBlock");
+    assert!(text.contains("\r\n440\r\n33554585\r\n"), "40% is alpha 153");
+    let back = read_dxf(text.as_bytes()).unwrap();
+    assert_eq!(back.model.iter().map(|e| e.common.transparency).collect::<Vec<_>>(), ts);
+    // Values that are neither ByBlock nor "by alpha" read as ByLayer.
+    let text = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n440\n-1\n10\n0\n20\n0\n11\n1\n21\n1\n0\nLINE\n8\n0\n440\n33554432\n10\n0\n20\n0\n11\n1\n21\n1\n0\nENDSEC\n0\nEOF\n";
+    let d = read(text.as_bytes(), "a.dxf").unwrap();
+    assert_eq!(d.model.iter().map(|e| e.common.transparency).collect::<Vec<_>>(), [Transparency::ByLayer, Transparency::Percent(90)]);
 }
 
 #[test]
@@ -220,6 +343,66 @@ fn svg_and_png_export() {
     assert!(svg.starts_with("<svg") && svg.contains("polyline"));
     let png = write(&d, "a.png").unwrap();
     assert_eq!(&png[1..4], b"PNG");
+}
+
+fn view_box(svg: &str) -> String {
+    let i = svg.find("viewBox=\"").map(|i| i + 9).unwrap_or(0);
+    svg[i..].split('"').next().unwrap_or("").to_string()
+}
+
+#[test]
+fn image_export_frames_window() {
+    use cadcraft_geom::Bounds2;
+    let d = sample();
+    let win = Bounds2::new(Vec2::new(1.0, 2.0), Vec2::new(31.0, 22.0));
+    // SVG: the viewBox is exactly the window (no margin); the default still fits the extents.
+    let framed = String::from_utf8(write_framed(&d, "a.svg", Some(win)).unwrap()).unwrap();
+    let plain = String::from_utf8(write(&d, "a.svg").unwrap()).unwrap();
+    assert_eq!(view_box(&framed), "0 0 30.000000 20.000000");
+    assert_ne!(view_box(&framed), view_box(&plain));
+    assert_eq!(plain, String::from_utf8(write_framed(&d, "a.svg", None).unwrap()).unwrap());
+    let ext = cadcraft_render::build(&d, &Space::Model, &cadcraft_render::Options::default()).bounds;
+    let m = ext.width().max(ext.height()) * 0.02;
+    assert_eq!(view_box(&plain), format!("0 0 {:.6} {:.6}", ext.width() + 2.0 * m, ext.height() + 2.0 * m));
+    // PNG: the window fills the 3:2 image exactly, centred.
+    let v = png_view(&ext, 2400, 1600, Some(win));
+    assert_eq!(v.center, Vec2::new(16.0, 12.0));
+    assert!((v.scale - 80.0).abs() < 1e-9);
+    assert_eq!(png_view(&ext, 2400, 1600, None), cadcraft_render::raster::View::fit(&ext, 2400, 1600, 0.05));
+    let png_framed = write_framed(&d, "a.png", Some(win)).unwrap();
+    assert_eq!(&png_framed[1..4], b"PNG");
+    assert_ne!(png_framed, write(&d, "a.png").unwrap());
+    // PDF: the window is fitted to the sheet instead of the extents.
+    let pdf_framed = write_framed(&d, "a.pdf", Some(win)).unwrap();
+    check_pdf(&pdf_framed);
+    assert_ne!(pdf_framed, write(&d, "a.pdf").unwrap());
+    // Non-image formats ignore the window.
+    assert_eq!(write_framed(&d, "a.dxf", Some(win)).unwrap(), write(&d, "a.dxf").unwrap());
+}
+
+#[test]
+fn hostile_export_window_is_an_error() {
+    use cadcraft_geom::Bounds2;
+    let d = sample();
+    let raw = |x0: f64, y0: f64, x1: f64, y1: f64| Bounds2 { min: Vec2::new(x0, y0), max: Vec2::new(x1, y1) };
+    let bad = [
+        raw(f64::NAN, 0.0, 1.0, 1.0),
+        raw(0.0, 0.0, f64::INFINITY, 1.0),
+        raw(0.0, 0.0, 0.0, 1.0),                   // zero width
+        raw(0.0, 0.0, 1.0, 0.0),                   // zero height
+        raw(5.0, 0.0, 1.0, 1.0),                   // inverted
+        raw(-1e300, -1e300, 1e300, 1e300),         // huge
+        raw(1e11, 1e11, 1e11 + 1e-6, 1e11 + 1e-6), // vanishingly small next to its coordinates
+        Bounds2::EMPTY,
+    ];
+    for w in bad {
+        assert!(check_window(&w).is_err(), "{w:?}");
+        for name in ["a.png", "a.svg", "a.pdf"] {
+            assert!(write_framed(&d, name, Some(w)).is_err(), "{name} {w:?}");
+        }
+    }
+    assert!(check_window(&raw(-1e6, -1e6, 1e6, 1e6)).is_ok());
+    assert!(check_window(&raw(0.0, 0.0, 1e-3, 1e-3)).is_ok());
 }
 
 /// Structural sanity check of a PDF: header, object count, xref offsets pointing at `n 0 obj`.
@@ -393,6 +576,76 @@ fn roundtrip(d: &Drawing) -> Drawing {
     read_dxf(write_dxf(d).as_bytes()).unwrap()
 }
 
+#[test]
+fn viewport_frozen_layers_roundtrip() {
+    let mut d = sample();
+    let paper = Space::Paper("Layout1".into());
+    let vp = |id: u32, frozen: Vec<String>| {
+        EntityKind::Viewport(Viewport {
+            center: Vec3::new(5.0, 4.0, 0.0),
+            width: 8.0,
+            height: 6.0,
+            view_center: Vec2::new(5.0, 2.5),
+            view_height: 12.0,
+            id,
+            locked: true,
+            frozen_layers: frozen,
+            layer_colors: Vec::new(),
+        })
+    };
+    d.add(&paper, Common::default(), vp(2, vec!["Walls".into(), "A B".into()])).unwrap();
+    d.add(&paper, Common::default(), vp(3, Vec::new())).unwrap();
+    let back = roundtrip(&d);
+    let frozen: Vec<(u32, Vec<String>)> = back
+        .layouts
+        .iter()
+        .flat_map(|l| l.entities.iter())
+        .filter_map(|e| match &e.kind {
+            EntityKind::Viewport(v) => Some((v.id, v.frozen_layers.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(frozen.contains(&(2, vec!["Walls".to_string(), "A B".to_string()])), "{frozen:?}");
+    assert!(frozen.contains(&(3, Vec::new())), "{frozen:?}");
+}
+
+#[test]
+fn viewport_layer_colors_roundtrip() {
+    let mut d = sample();
+    let paper = Space::Paper("Layout1".into());
+    let vp = |id: u32, frozen: Vec<String>, colors: Vec<(String, Color)>| {
+        EntityKind::Viewport(Viewport {
+            center: Vec3::new(5.0, 4.0, 0.0),
+            width: 8.0,
+            height: 6.0,
+            view_center: Vec2::new(5.0, 2.5),
+            view_height: 12.0,
+            id,
+            locked: false,
+            frozen_layers: frozen,
+            layer_colors: colors,
+        })
+    };
+    let colors = vec![("Walls".to_string(), Color::Index(5)), ("A B".to_string(), Color::True(cadcraft_color::Rgb(255, 128, 0)))];
+    d.add(&paper, Common::default(), vp(2, Vec::new(), colors.clone())).unwrap();
+    d.add(&paper, Common::default(), vp(3, Vec::new(), Vec::new())).unwrap();
+    // Frozen layers and colour overrides share one CADCraft xdata group.
+    d.add(&paper, Common::default(), vp(4, vec!["Walls".into()], colors.clone())).unwrap();
+    let back = roundtrip(&d);
+    let found: Vec<(u32, Vec<String>, Vec<(String, Color)>)> = back
+        .layouts
+        .iter()
+        .flat_map(|l| l.entities.iter())
+        .filter_map(|e| match &e.kind {
+            EntityKind::Viewport(v) => Some((v.id, v.frozen_layers.clone(), v.layer_colors.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(found.contains(&(2, Vec::new(), colors.clone())), "{found:?}");
+    assert!(found.contains(&(3, Vec::new(), Vec::new())), "{found:?}");
+    assert!(found.contains(&(4, vec!["Walls".to_string()], colors)), "{found:?}");
+}
+
 fn full_dim_style() -> DimStyle {
     DimStyle {
         name: "Mech".into(),
@@ -506,6 +759,78 @@ fn dimension_overrides_roundtrip_as_dstyle_xdata() {
     // Canonical values round-trip exactly.
     let again = first(&roundtrip(&back), |k| if let EntityKind::Dimension(x) = k { Some(x.clone()) } else { None });
     assert_eq!(again.overrides, got.overrides);
+}
+
+/// A drawing with `n` lines, circles and polylines on a grid (issue #57's tests).
+fn many_entities(n: usize) -> Drawing {
+    let mut d = Drawing::new_imperial();
+    for i in 0..n {
+        let (x, y) = ((i % 300) as f64 * 10.0, (i / 300) as f64 * 10.0);
+        let kind = match i % 3 {
+            0 => EntityKind::Line(Line { a: Vec3::new(x, y, 0.0), b: Vec3::new(x + 4.0, y + (i % 7) as f64, 0.0) }),
+            1 => EntityKind::Circle(Circle { center: Vec3::new(x, y, 0.0), radius: 1.0 + (i % 5) as f64 }),
+            _ => EntityKind::LwPolyline(LwPolyline {
+                vertices: (0..8).map(|k| PolyVertex::new(Vec2::new(x + f64::from(k), y + (k % 3) as f64))).collect(),
+                closed: false,
+                const_width: 0.0,
+                elevation: 0.0,
+                plinegen: false,
+            }),
+        };
+        d.add(&Space::Model, Common::default(), kind).unwrap();
+    }
+    d
+}
+
+/// An AutoCAD 2010 (AC1024) DWG of `n` entities, made through the DWG bridge.
+#[cfg(not(target_arch = "wasm32"))]
+fn ac1024_dwg(n: usize) -> Vec<u8> {
+    let dxf = write_dxf(&many_entities(n)).replacen("AC1015", "AC1024", 1);
+    let dwg = cadcraft_dwg::dxf_to_dwg(dxf.as_bytes()).unwrap();
+    assert_eq!(cadcraft_dwg::version(&dwg).as_deref(), Some("AC1024"));
+    dwg
+}
+
+/// Issue #57: an AutoCAD 2010 DWG with tens of thousands of entities opens completely, and its
+/// DXF rendition stays far inside the limits (about 6 bytes of DXF and 0.4 group codes per DWG
+/// byte), so a 10 MB file is nowhere near them.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn ac1024_dwg_with_many_entities_opens() {
+    let n = 30_000;
+    let dwg = ac1024_dwg(n);
+    let dxf = cadcraft_dwg::dwg_to_dxf(&dwg).unwrap();
+    let tags = cadcraft_dxf::parse(&dxf).unwrap().len();
+    assert!(dxf.len() < dwg.len() * 20, "DXF {} bytes from {} DWG bytes", dxf.len(), dwg.len());
+    assert!(tags < dwg.len(), "{tags} group codes from {} DWG bytes", dwg.len());
+    let d = read(&dwg, "big.dwg").unwrap();
+    assert_eq!(d.entity_count(), n);
+}
+
+/// Issue #57: oversized input is rejected early, with a message naming the limit, never a panic.
+/// A conversion that runs away (a damaged or misread DWG can make the reader produce a drawing
+/// thousands of times larger than the file) stops at the DXF size limit instead of filling memory
+/// and failing later with "file too large"; the DWG size is checked before reading; the DXF
+/// group-code count before parsing.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn oversized_dwg_and_dxf_are_rejected_early() {
+    let dwg = ac1024_dwg(3000);
+    let full = cadcraft_dwg::dwg_to_dxf(&dwg).unwrap().len();
+    assert!(full > 400_000, "{full}");
+    let limits = cadcraft_dwg::Limits { max_dxf_bytes: 300_000, ..cadcraft_dwg::Limits::DEFAULT };
+    let e = cadcraft_dwg::dwg_to_dxf_with(&dwg, limits).unwrap_err();
+    assert!(e.starts_with("DWG: converting this 0."), "{e}");
+    assert!(e.contains("MB file produced more than 0.3 MB of drawing data (the limit)"), "{e}");
+
+    let limits = cadcraft_dwg::Limits { max_dwg_bytes: 100_000, ..cadcraft_dwg::Limits::DEFAULT };
+    let e = cadcraft_dwg::dwg_to_dxf_with(&dwg, limits).unwrap_err();
+    assert!(e.starts_with("DWG: the file is 0.") && e.ends_with("MB, larger than the 0.1 MB CADCraft opens"), "{e}");
+
+    // Lines that aren't even group codes: the size is reported before anything is parsed.
+    let text = "not a group code\nx\n".repeat(60);
+    let e = cadcraft_dxf::parse_with_limit(text.as_bytes(), 50).unwrap_err();
+    assert_eq!(e.to_string(), "drawing too large: 60 DXF group codes, more than the 50 CADCraft reads");
 }
 
 #[test]
@@ -658,6 +983,35 @@ fn constraints_and_parameters_roundtrip_exactly() {
     assert!(!write_dxf(&Drawing::new_imperial()).contains("CADCRAFT_CONSTRAINTS"));
 }
 
+#[test]
+fn layer_states_roundtrip_next_to_constraints() {
+    let mut d = Drawing::new_imperial();
+    let (constraints, _) = parametric_sample(&mut d);
+    d.layers.push(Layer {
+        name: "Wände".into(),
+        color: Color::True(cadcraft_color::Rgb(200, 10, 40)),
+        transparency: 30,
+        description: "walls \\ hidden".into(),
+        ..Layer::default()
+    });
+    d.layer_states.push(LayerState { name: "Plot".into(), layers: d.layers.clone() });
+    let mut off = d.layers.clone();
+    for l in &mut off {
+        (l.on, l.frozen, l.locked, l.plot) = (false, true, true, false);
+    }
+    d.layer_states.push(LayerState { name: "All off".into(), layers: off });
+    let text = write_dxf(&d);
+    assert!(text.contains("CADCRAFT_LAYERSTATES"));
+    let back = read_dxf(text.as_bytes()).unwrap();
+    assert_eq!(back.layer_states, d.layer_states);
+    assert_eq!(back.constraints, constraints);
+    assert_eq!(roundtrip(&back).layer_states, d.layer_states);
+    #[cfg(not(target_arch = "wasm32"))]
+    assert_eq!(read(&write(&d, "x.dwg").unwrap(), "x.dwg").unwrap().layer_states, d.layer_states);
+    // Drawings without saved layer states carry no record.
+    assert!(!write_dxf(&Drawing::new_imperial()).contains("CADCRAFT_LAYERSTATES"));
+}
+
 fn table_sample() -> Table {
     let cell = |t: &str| TableCell { text: t.into(), merged: None };
     let mut rows = vec![
@@ -722,6 +1076,134 @@ fn text_style_flags_roundtrip() {
     assert!((got.oblique - st.oblique).abs() < 1e-12);
     let plain = back.text_style("Plain").unwrap();
     assert_eq!((plain.backwards, plain.upside_down, plain.vertical, plain.annotative), (true, false, false, false));
+}
+
+/// Non-ASCII text in every kind of string the writer emits: CJK, Latin-1 and an astral
+/// character (issue #164).
+const INTL: &str = "图号 Ä°ø Ø 😀";
+
+fn intl_text(value: &str) -> Text {
+    Text {
+        insert: Vec3::new(1.0, 1.0, 0.0),
+        align_pt: None,
+        height: 2.5,
+        value: value.into(),
+        rotation: 0.0,
+        width_factor: 1.0,
+        oblique: 0.0,
+        style: "Standard".into(),
+        halign: HAlign::Left,
+        valign: VAlign::Baseline,
+    }
+}
+
+fn intl_sample() -> Drawing {
+    let mut d = Drawing::new_metric();
+    let layer = format!("层 {INTL}");
+    let block = format!("块 {INTL}");
+    d.layers.push(Layer { name: layer.clone(), color: Color::Index(3), ..Layer::default() });
+    let on = Common { layer: layer.clone(), ..Common::default() };
+    d.add(&Space::Model, on.clone(), EntityKind::Text(intl_text(INTL))).unwrap();
+    d.add(
+        &Space::Model,
+        on.clone(),
+        EntityKind::MText(MText {
+            insert: Vec3::new(5.0, 5.0, 0.0),
+            height: 2.5,
+            width: 30.0,
+            attach: 1,
+            rotation: 0.0,
+            style: "Standard".into(),
+            contents: format!("{INTL}\\P第二行 Ünïcødé"),
+            line_spacing: 1.0,
+        }),
+    )
+    .unwrap();
+    let def = Attrib { tag: "图号".into(), text: intl_text("默认"), invisible: false, constant: false, prompt: String::new() };
+    let mut b = Block::new(&block);
+    b.entities.push(Entity::new(Handle(0x50), EntityKind::AttDef(def)));
+    d.blocks.insert(block.clone(), std::sync::Arc::new(b));
+    let att = Attrib { tag: "图号".into(), text: intl_text(INTL), invisible: false, constant: false, prompt: String::new() };
+    d.add(
+        &Space::Model,
+        on,
+        EntityKind::Insert(Insert {
+            block,
+            insert: Vec3::new(2.0, 2.0, 0.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            attribs: vec![att],
+            cols: 1,
+            rows: 1,
+            col_spacing: 0.0,
+            row_spacing: 0.0,
+        }),
+    )
+    .unwrap();
+    d
+}
+
+fn assert_intl(back: &Drawing) {
+    let layer = format!("层 {INTL}");
+    let block = format!("块 {INTL}");
+    assert_eq!(back.layer(&layer).map(|l| l.color), Some(Color::Index(3)));
+    let text = first(back, |k| if let EntityKind::Text(t) = k { Some(t.value.clone()) } else { None });
+    assert_eq!(text, INTL);
+    let mtext = first(back, |k| if let EntityKind::MText(t) = k { Some(t.contents.clone()) } else { None });
+    assert_eq!(mtext, format!("{INTL}\\P第二行 Ünïcødé"));
+    let ins = first(back, |k| if let EntityKind::Insert(i) = k { Some(i.clone()) } else { None });
+    assert_eq!(ins.block, block);
+    assert_eq!(ins.attribs.len(), 1);
+    assert_eq!(ins.attribs[0].tag, "图号");
+    assert_eq!(ins.attribs[0].text.value, INTL);
+    let b = back.block(&block).unwrap();
+    let def = b.entities.iter().find_map(|e| if let EntityKind::AttDef(a) = &e.kind { Some(a.clone()) } else { None }).unwrap();
+    assert_eq!(def.tag, "图号");
+    assert_eq!(def.text.value, "默认");
+    assert!(back.model.iter().all(|e| e.common.layer == layer));
+}
+
+/// The writer declares R2000 (`AC1015`, `ANSI_1252`), where text is in the code page and not
+/// UTF-8, so every non-ASCII character must be a `\U+XXXX` escape and the file pure ASCII.
+#[test]
+fn non_ascii_text_is_escaped_for_r2000_and_roundtrips() {
+    let d = intl_sample();
+    let text = write_dxf(&d);
+    assert!(text.is_ascii(), "an AC1015 DXF must not contain UTF-8 bytes");
+    let tags = cadcraft_dxf::parse(text.as_bytes()).unwrap();
+    let header = |name: &str| tags.windows(2).find(|w| w[0].code == 9 && w[0].str() == name).map(|w| w[1].str());
+    assert_eq!(header("$ACADVER").as_deref(), Some("AC1015"));
+    assert_eq!(header("$DWGCODEPAGE").as_deref(), Some("ANSI_1252"));
+    // CJK, Latin-1 and a surrogate pair for the astral character.
+    assert!(text.contains("\\U+56FE\\U+53F7 \\U+00C4\\U+00B0\\U+00F8 \\U+00D8 \\U+D83D\\U+DE00"));
+    let back = read_dxf(text.as_bytes()).unwrap();
+    assert_intl(&back);
+    // A second save writes the same text.
+    assert_eq!(write_dxf(&back).matches("\\U+").count(), text.matches("\\U+").count());
+}
+
+/// Real R2007+ files are UTF-8 and older ones are in their code page; both still read.
+#[test]
+fn reads_utf8_and_code_page_text() {
+    let file = |ver: &str, value: &[u8]| {
+        let mut b =
+            format!("0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\n{ver}\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nTEXT\n8\n0\n10\n0\n20\n0\n40\n1\n1\n")
+                .into_bytes();
+        b.extend_from_slice(value);
+        b.extend_from_slice(b"\n0\nENDSEC\n0\nEOF\n");
+        b
+    };
+    let value = |bytes: &[u8]| first(&read_dxf(bytes).unwrap(), |k| if let EntityKind::Text(t) = k { Some(t.value.clone()) } else { None });
+    assert_eq!(value(&file("AC1032", INTL.as_bytes())), INTL);
+    assert_eq!(value(&file("AC1015", b"Caf\xe9 \xd8 \\U+56FE\\U+53F7")), "Café Ø 图号");
+}
+
+/// Saving as DWG goes through this DXF and acadrust, which decodes the escapes.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn dwg_roundtrip_keeps_non_ascii_text() {
+    let back = read(&write(&intl_sample(), "x.dwg").unwrap(), "x.dwg").unwrap();
+    assert_intl(&back);
 }
 
 #[test]
@@ -864,4 +1346,313 @@ fn mleader_is_written_as_leader_and_mtext() {
     let back = roundtrip(&d);
     assert!(back.model.iter().any(|e| matches!(e.kind, EntityKind::Leader(_))));
     assert!(back.model.iter().any(|e| matches!(&e.kind, EntityKind::MText(t) if t.contents == "Note")));
+}
+
+#[test]
+fn attdef_prompt_survives_dxf_roundtrip() {
+    let mut d = Drawing::new_metric();
+    let text = Text {
+        insert: Vec3::ZERO,
+        align_pt: None,
+        height: 2.0,
+        value: "X".into(),
+        rotation: 0.0,
+        width_factor: 1.0,
+        oblique: 0.0,
+        style: "Standard".into(),
+        halign: HAlign::Left,
+        valign: VAlign::Baseline,
+    };
+    let attdef = |prompt: &str| {
+        EntityKind::AttDef(Attrib { tag: "TAG1".into(), text: text.clone(), invisible: false, constant: false, prompt: prompt.into() })
+    };
+    d.add(&Space::Model, Default::default(), attdef("Enter value")).unwrap();
+    d.add(&Space::Model, Default::default(), attdef("")).unwrap();
+    let back = roundtrip(&d);
+    let prompts: Vec<&str> =
+        back.model.iter().filter_map(|e| if let EntityKind::AttDef(a) = &e.kind { Some(a.prompt.as_str()) } else { None }).collect();
+    assert_eq!(prompts, vec!["Enter value", ""]);
+}
+
+#[test]
+fn dimension_text_rotation_roundtrips() {
+    let mut d = Drawing::new_imperial();
+    let mut dm = dim(DimKind::Linear { rotation: 0.0 }, Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0));
+    dm.text_rotation = 30.0_f64.to_radians();
+    let h = d.add(&Space::Model, Common::default(), EntityKind::Dimension(dm.clone())).unwrap();
+    let back = roundtrip(&d);
+    let EntityKind::Dimension(x) = &back.entity(h).unwrap().kind else { panic!("dimension expected") };
+    assert!((x.text_rotation - dm.text_rotation).abs() < 1e-9, "got {}", x.text_rotation);
+    // The anonymous block that renders the reopened dimension carries the same text angle.
+    let b = x.block.as_deref().and_then(|n| back.block(n)).expect("dimension block");
+    let rot = b.entities.iter().find_map(|e| if let EntityKind::MText(t) = &e.kind { Some(t.rotation) } else { None });
+    assert!(rot.is_some_and(|r| (r - dm.text_rotation).abs() < 1e-9), "block text rotation {rot:?}");
+}
+
+/// Wipeout clip vertices are in image pixel space (origin top-left, y down): an asymmetric
+/// boundary must keep its orientation, both through our reader and in the file itself.
+#[test]
+fn wipeout_boundary_keeps_its_orientation() {
+    let mut d = Drawing::new_imperial();
+    // A triangle with its apex at the top.
+    let boundary = vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(0.0, 4.0)];
+    d.add(&Space::Model, Common::default(), EntityKind::Wipeout(Wipeout { boundary: boundary.clone() })).unwrap();
+    let text = write_dxf(&d);
+    // The apex (0, 4) is at the top-left corner of the image: pixel (-0.5, -0.5).
+    let pts: Vec<(f64, f64)> = {
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        let mut v = Vec::new();
+        for i in 0..lines.len().saturating_sub(3) {
+            if lines[i] == "14" && lines[i + 2] == "24" {
+                v.push((lines[i + 1].parse().unwrap(), lines[i + 3].parse().unwrap()));
+            }
+        }
+        v
+    };
+    assert!(pts.iter().any(|&(x, y)| (x + 0.5).abs() < 1e-9 && (y + 0.5).abs() < 1e-9), "{pts:?}");
+    let back = roundtrip(&d);
+    let got = first(&back, |k| if let EntityKind::Wipeout(w) = k { Some(w.boundary.clone()) } else { None });
+    assert_eq!(&got[..3], &boundary[..]);
+}
+
+#[test]
+fn arc_length_dimension_keeps_its_kind_and_centre_on_roundtrip() {
+    let mut d = Drawing::new_metric();
+    // Arc of radius 10 centred off the origin, so a missing centre would read back as zero.
+    let mut al = dim(DimKind::ArcLength, Vec3::new(15.0, 5.0, 0.0), Vec3::new(5.0, 15.0, 0.0));
+    al.p15 = Vec3::new(5.0, 5.0, 0.0);
+    let h = d.add(&Space::Model, Default::default(), EntityKind::Dimension(al)).unwrap();
+    let text = write_dxf(&d);
+    // A standard aligned DIMENSION record (type 1 | 32), so other programs can read it.
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    assert!(lines.windows(2).any(|w| w == ["70", "33"]) && !lines.windows(2).any(|w| w == ["70", "40"]), "{text}");
+    let back = read_dxf(text.as_bytes()).unwrap();
+    match &back.entity(h).unwrap().kind {
+        EntityKind::Dimension(x) => {
+            assert!(matches!(x.kind, DimKind::ArcLength));
+            assert_eq!(x.p15, Vec3::new(5.0, 5.0, 0.0));
+        }
+        _ => panic!("not a dimension"),
+    }
+    // And through DWG.
+    let dwg = cadcraft_dwg::dxf_to_dwg(text.as_bytes()).unwrap();
+    let back = read_dxf(&cadcraft_dwg::dwg_to_dxf(&dwg).unwrap()).unwrap();
+    let dims: Vec<_> = back.model.iter().filter_map(|e| if let EntityKind::Dimension(x) = &e.kind { Some(x.clone()) } else { None }).collect();
+    assert_eq!(dims.len(), 1);
+    assert!(matches!(dims[0].kind, DimKind::ArcLength), "{:?}", dims[0].kind);
+    assert!((dims[0].p15 - Vec3::new(5.0, 5.0, 0.0)).len() < 1e-9);
+}
+
+/// Two gradient hatches (true colours, shifted, rotated; index colours, centered) and a plain
+/// solid hatch over the same square.
+fn gradient_sample() -> (Drawing, Vec<Option<Gradient>>) {
+    let mut d = Drawing::new_metric();
+    let square = vec![
+        PolyVertex::new(Vec2::ZERO),
+        PolyVertex::new(Vec2::new(10.0, 0.0)),
+        PolyVertex::new(Vec2::new(10.0, 10.0)),
+        PolyVertex::new(Vec2::new(0.0, 10.0)),
+    ];
+    let gradients = vec![
+        Some(Gradient {
+            name: "LINEAR".into(),
+            color1: Color::True(cadcraft_color::Rgb(255, 0, 0)),
+            color2: Color::True(cadcraft_color::Rgb(0, 0, 255)),
+            angle: 30f64.to_radians(),
+            centered: false,
+        }),
+        Some(Gradient { name: "CURVED".into(), color1: Color::Index(5), color2: Color::ByLayer, angle: 0.0, centered: true }),
+        None,
+    ];
+    for g in &gradients {
+        let h = Hatch {
+            pattern: "SOLID".into(),
+            solid: true,
+            loops: vec![HatchLoop { vertices: square.clone(), outer: true }],
+            scale: 1.0,
+            angle: 0.0,
+            associative: false,
+            style: 0,
+            elevation: 0.0,
+            gradient: g.clone(),
+            origin: Vec2::ZERO,
+            background: None,
+        };
+        d.add(&Space::Model, Common::default(), EntityKind::Hatch(h)).unwrap();
+    }
+    (d, gradients)
+}
+
+fn hatches(d: &Drawing) -> Vec<Hatch> {
+    d.model.iter().filter_map(|e| if let EntityKind::Hatch(h) = &e.kind { Some(h.clone()) } else { None }).collect()
+}
+
+/// Issue #80: a DXF save/reopen keeps each hatch's gradient (name, both colours, angle and
+/// centered setting) as native HATCH groups 450–470, and a plain solid stays plain.
+#[test]
+fn gradient_hatch_roundtrips_through_dxf() {
+    let (d, gradients) = gradient_sample();
+    let text = write_dxf(&d);
+    for code in ["450", "451", "452", "453", "460", "461", "462", "463", "421", "470"] {
+        assert!(text.lines().any(|l| l.trim() == code), "missing group {code}");
+    }
+    let back = read_dxf(text.as_bytes()).unwrap();
+    let (a, b) = (hatches(&d), hatches(&back));
+    assert_eq!(b.len(), gradients.len());
+    for ((x, y), g) in a.iter().zip(&b).zip(&gradients) {
+        assert_eq!(&y.gradient, g);
+        assert_eq!(x.loops, y.loops);
+    }
+    assert_eq!(roundtrip(&back).model.iter().map(|e| &e.kind).collect::<Vec<_>>(), back.model.iter().map(|e| &e.kind).collect::<Vec<_>>());
+}
+
+/// R2000 readers and DWG conversions drop the native groups; CADCraft's xdata copy restores the
+/// gradient. When native groups are present (another program may have edited them) they win.
+#[test]
+fn gradient_falls_back_to_xdata_and_native_groups_win() {
+    let (d, gradients) = gradient_sample();
+    let text = write_dxf(&d);
+    // Strip groups 450–470 and 63/421 (pairs of lines) from every entity.
+    let lines: Vec<&str> = text.lines().collect();
+    let mut stripped = String::new();
+    for pair in lines.chunks(2) {
+        let code = pair.first().map(|c| c.trim().parse::<i32>().unwrap_or(-1)).unwrap_or(-1);
+        if (450..=470).contains(&code) || code == 63 || code == 421 {
+            continue;
+        }
+        for l in pair {
+            stripped.push_str(l);
+            stripped.push('\n');
+        }
+    }
+    assert!(!stripped.lines().any(|l| l.trim() == "450"));
+    let back = read_dxf(stripped.as_bytes()).unwrap();
+    assert_eq!(hatches(&back).into_iter().map(|h| h.gradient).collect::<Vec<_>>(), gradients);
+
+    // Native groups edited elsewhere (new angle, colour, name) take precedence over stale xdata.
+    let edited = text.replacen("470\r\nLINEAR", "470\r\nSPHERICAL", 1).replacen("421\r\n16711680", "421\r\n65280", 1);
+    assert_ne!(edited, text);
+    let back = read_dxf(edited.as_bytes()).unwrap();
+    let g = hatches(&back).into_iter().next().and_then(|h| h.gradient).unwrap();
+    assert_eq!(g.name, "SPHERICAL");
+    assert_eq!(g.color1, Color::True(cadcraft_color::Rgb(0, 255, 0)));
+}
+
+/// Issue #80: DWG saves (R2000, which has no native gradient fields) keep the gradient too.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn gradient_hatch_roundtrips_through_dwg() {
+    let (d, gradients) = gradient_sample();
+    let back = read(&write(&d, "x.dwg").unwrap(), "x.dwg").unwrap();
+    let hs = hatches(&back);
+    assert_eq!(hs.iter().map(|h| h.gradient.clone()).collect::<Vec<_>>(), gradients);
+    assert_eq!(hs.iter().map(|h| h.loops.clone()).collect::<Vec<_>>(), hatches(&d).into_iter().map(|h| h.loops).collect::<Vec<_>>());
+}
+
+#[test]
+fn hostile_gradient_groups_never_panic() {
+    let hatch = |tail: &str| {
+        format!(
+            "0\nSECTION\n2\nENTITIES\n0\nHATCH\n2\nSOLID\n70\n1\n91\n1\n92\n2\n72\n0\n73\n1\n93\n3\n10\n0\n20\n0\n10\n1\n20\n0\n10\n1\n20\n1\n98\n0\n{tail}0\nENDSEC\n0\nEOF\n"
+        )
+    };
+    let cases = [
+        // Native: absurd counts, colour records past two, out-of-range ACI/true colours, NaN.
+        hatch(
+            "450\n1\n453\n2147483647\n460\nnan\n461\ninf\n463\n0\n63\n99999\n421\n-1\n463\n1\n63\n-32768\n421\n99999999999\n463\n2\n63\n3\n463\n7\n470\n\n",
+        ),
+        // Native flag only, or a non-gradient flag, or groups out of order.
+        hatch("450\n1\n"),
+        hatch("450\n-7\n470\nX\n"),
+        hatch("421\n255\n63\n1\n463\n0\n450\n1\n470\nLINEAR\n"),
+        // Xdata: missing values, junk colour names, huge numbers.
+        hatch("1001\nCADCRAFT\n1000\nGRADIENT\n"),
+        hatch("1001\nCADCRAFT\n1000\nGRADIENT\n1000\nX\n1040\n1e308\n1070\n-1\n1000\nnot a colour\n1000\n999,999,999\n"),
+        hatch("1001\nCADCRAFT\n1000\nGRADIENT\n1040\nnan\n1001\nACAD\n1000\n\n"),
+    ];
+    for t in &cases {
+        let d = read(t.as_bytes(), "x.dxf").unwrap();
+        for h in hatches(&d) {
+            if let Some(g) = &h.gradient {
+                assert!(g.angle.is_finite());
+            }
+        }
+        let _ = cadcraft_render::build(&d, &Space::Model, &cadcraft_render::Options::default());
+        let back = read_dxf(write_dxf(&d).as_bytes()).unwrap();
+        assert_eq!(
+            hatches(&back).into_iter().map(|h| h.gradient).collect::<Vec<_>>(),
+            hatches(&d).into_iter().map(|h| h.gradient).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The native 470 group keeps a long name whole; the xdata copy is cut to 255 bytes at a
+/// character boundary.
+#[test]
+fn long_gradient_name_is_cut_only_in_xdata() {
+    let name = "Ä".repeat(200);
+    let mut d = Drawing::new_metric();
+    let mut h = hatches(&gradient_sample().0).into_iter().next().unwrap();
+    if let Some(g) = &mut h.gradient {
+        g.name = name.clone();
+    }
+    d.add(&Space::Model, Common::default(), EntityKind::Hatch(h)).unwrap();
+    let text = write_dxf(&d);
+    let lines: Vec<&str> = text.lines().collect();
+    // Non-ASCII text is written as \U+ escapes (R2000 files are ANSI).
+    assert!(lines.contains(&"\\U+00C4".repeat(200).as_str()));
+    assert!(lines.contains(&"\\U+00C4".repeat(127).as_str()));
+    let back = read_dxf(text.as_bytes()).unwrap();
+    assert_eq!(hatches(&back).into_iter().next().and_then(|h| h.gradient).unwrap().name, name);
+}
+
+#[test]
+fn wipeout_survives_dxf_roundtrip() {
+    let mut d = Drawing::new_imperial();
+    let boundary = vec![Vec2::new(2.0, 3.0), Vec2::new(12.0, 3.0), Vec2::new(12.0, 13.0), Vec2::new(2.0, 13.0)];
+    d.add(&Space::Model, Common::default(), EntityKind::Wipeout(Wipeout { boundary: boundary.clone() })).unwrap();
+    let back = roundtrip(&d);
+    let got = first(&back, |k| if let EntityKind::Wipeout(w) = k { Some(w.boundary.clone()) } else { None });
+    // The DXF polygon is closed, so the first vertex is repeated at the end.
+    assert_eq!(got.len(), 5);
+    assert_eq!(&got[..4], &boundary[..]);
+    assert_eq!(got[4], boundary[0]);
+}
+
+#[test]
+fn autocad_header_dim_variables_are_not_overrides() {
+    // AutoCAD writes the current style's values as $DIM* header variables; reading them back must
+    // not turn them into style overrides for new dimensions (issue #66).
+    use crate::dxf_ext::{K, dim_code};
+    let mut d = Drawing::new_imperial();
+    d.text_styles.push(TextStyle { name: "Romans".into(), font: "romans.shx".into(), ..TextStyle::default() });
+    d.dim_styles.push(full_dim_style());
+    d.header.set_str("DIMSTYLE", "Mech");
+    d.header.set_f64("DIMSCALE", full_dim_style().scale);
+    let st = serde_json::to_value(full_dim_style()).unwrap();
+    let mut vars = String::new();
+    for (var, field) in DIMVARS {
+        let Some((_, kind)) = dim_code(field) else { continue };
+        let v = &st[*field];
+        let (code, val) = match kind {
+            K::Real => (40, v.as_f64().unwrap().to_string()),
+            K::Int => (70, v.as_i64().unwrap().to_string()),
+            K::Bool => (70, i64::from(v.as_bool().unwrap()).to_string()),
+            K::Color => (70, serde_json::from_value::<Color>(v.clone()).unwrap().to_aci().to_string()),
+            K::Char => (70, u32::from(v.as_str().unwrap().chars().next().unwrap()).to_string()),
+            K::Str => (1, v.as_str().unwrap().to_string()),
+            // Names as AutoCAD may spell them.
+            K::Block => (1, v.as_str().unwrap().to_ascii_uppercase()),
+            K::TextStyle => (7, v.as_str().unwrap().to_ascii_uppercase()),
+        };
+        vars.push_str(&format!("  9\r\n${var}\r\n{code}\r\n{val}\r\n"));
+    }
+    let text = write_dxf(&d).replacen("HEADER\r\n", &format!("HEADER\r\n{vars}"), 1);
+    let back = read_dxf(text.as_bytes()).unwrap();
+    assert_eq!(back.header.str("DIMDSEP", ""), ",");
+    assert!(back.header.get("DIMTXT").is_some() && back.header.get("DIMCLRD").is_some());
+    assert_eq!(back.dim_overrides(), serde_json::Map::new());
+    // A variable that really differs from the style is an override.
+    let text = text.replacen("$DIMDEC\r\n70\r\n3\r\n", "$DIMDEC\r\n70\r\n5\r\n", 1);
+    assert_eq!(read_dxf(text.as_bytes()).unwrap().dim_overrides().get("decimals"), Some(&serde_json::json!(5)));
 }

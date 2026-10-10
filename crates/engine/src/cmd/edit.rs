@@ -4,20 +4,33 @@ use cadcraft_doc::{Entity, Handle, entity_bounds};
 use cadcraft_geom::{Bounds2, Mat3, Vec2};
 use serde_json::{Value, json};
 
+use super::machines::{SelOutcome, SelectPhase, SelectRun};
 use super::*;
 use crate::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        CommandSpec::new("undo", "Undo", run_undo).menu(&["Edit", "Undo"]).key("Cmd+Z").alias(&["u"]).params("{count?: n}").noundo(),
+        // U undoes the last operation at once (Edit > Undo, Cmd+Z); UNDO asks how many.
+        CommandSpec::new("u", "Undo", run_u).menu(&["Edit", "Undo"]).key("Cmd+Z").params("{}").noundo(),
+        CommandSpec::new("undo", "Undo", run_undo).params("{count?: n}").noundo().interactive(|_| Ok(Box::new(UndoM::default()))),
         CommandSpec::new("redo", "Redo", run_redo).menu(&["Edit", "Redo"]).key("Cmd+Shift+Z").alias(&["mredo"]).params("{count?: n}").noundo(),
-        CommandSpec::new("cutclip", "Cut", run_cut).menu(&["Edit", "Cut"]).key("Cmd+X").params("{handles?}"),
-        CommandSpec::new("copyclip", "Copy", run_copyclip).menu(&["Edit", "Copy"]).key("Cmd+C").params("{handles?}").noundo(),
+        CommandSpec::new("cutclip", "Cut", run_cut)
+            .menu(&["Edit", "Cut"])
+            .key("Cmd+X")
+            .params("{handles?}")
+            .interactive(|_| Ok(Box::new(SelectRun::new("cutclip", "CUTCLIP")))),
+        CommandSpec::new("copyclip", "Copy", run_copyclip)
+            .menu(&["Edit", "Copy"])
+            .key("Cmd+C")
+            .params("{handles?}")
+            .noundo()
+            .interactive(|_| Ok(Box::new(SelectRun::new("copyclip", "COPYCLIP")))),
         CommandSpec::new("copybase", "Copy with Base Point", run_copybase)
             .menu(&["Edit", "Copy with Base Point"])
             .key("Cmd+Shift+C")
             .params("{handles?, base: [x,y]}")
-            .noundo(),
+            .noundo()
+            .interactive(|_| Ok(Box::new(CopyBaseM::default()))),
         CommandSpec::new("pasteclip", "Paste", run_paste)
             .menu(&["Edit", "Paste"])
             .key("Cmd+V")
@@ -33,7 +46,17 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
+/// A programmatic undo/redo (`engine.execute`, MCP, control channel, scripts) first ends a running
+/// command the way Esc does, exactly as `Session::start` does for Cmd+Z, the menu or the command
+/// line. Otherwise it would swap the drawing under the command and pop the previous command's step.
+fn end_running_command(s: &mut Session) {
+    if s.running.is_some() {
+        s.cancel();
+    }
+}
+
 fn run_undo(s: &mut Session, p: &Value) -> Result<Value> {
+    end_running_command(s);
     let n = p.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 1000);
     let mut labels = Vec::new();
     for _ in 0..n {
@@ -48,7 +71,65 @@ fn run_undo(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "undone": labels, "message": labels.join(", ").to_string() }))
 }
 
+fn run_u(s: &mut Session, _p: &Value) -> Result<Value> {
+    run_undo(s, &json!({}))
+}
+
+/// UNDO at the command line: "Enter the number of operations to undo" (default 1). Its other
+/// options are not available yet; Auto and Control still take their value, so it isn't run as a
+/// command.
+#[derive(Default)]
+struct UndoM {
+    /// Auto or Control was chosen: its value is being asked for.
+    option: Option<&'static str>,
+}
+
+impl Interactive for UndoM {
+    fn name(&self) -> &'static str {
+        "UNDO"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        match self.option {
+            Some("Auto") => Prompt::new("Enter UNDO Auto mode", Accept::TEXT).kw(&["ON", "OFF"]).default("ON"),
+            Some(_) => Prompt::new("Enter an UNDO control option", Accept::TEXT).kw(&["All", "None", "One", "Combine", "Layer"]).default("All"),
+            None => Prompt::new("Enter the number of operations to undo", Accept::NUMBER)
+                .kw(&["Auto", "Control", "BEgin", "End", "Mark", "Back"])
+                .default("1"),
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if let Some(o) = self.option {
+            s.echo(format!("UNDO {o}: not available yet."));
+            return Ok(Step::Done);
+        }
+        let n = match i {
+            Input::Text(t) => {
+                t.trim().parse::<u64>().ok().filter(|n| *n >= 1).ok_or_else(|| EngineError::Other("Requires a positive integer.".into()))?
+            }
+            Input::Enter => 1,
+            Input::Keyword(k) => {
+                match k.as_str() {
+                    "Auto" => self.option = Some("Auto"),
+                    "Control" => self.option = Some("Control"),
+                    _ => {
+                        s.echo(format!("UNDO {k}: not available yet."));
+                        return Ok(Step::Done);
+                    }
+                }
+                return Ok(Step::Continue);
+            }
+            _ => return Ok(Step::Continue),
+        };
+        let r = run_undo(s, &json!({ "count": n }))?;
+        if let Some(m) = r.get("message").and_then(Value::as_str) {
+            s.echo(m.to_string());
+        }
+        Ok(Step::Done)
+    }
+}
+
 fn run_redo(s: &mut Session, p: &Value) -> Result<Value> {
+    end_running_command(s);
     let n = p.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 1000);
     let mut labels = Vec::new();
     for _ in 0..n {
@@ -84,7 +165,8 @@ fn run_copybase(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn run_cut(s: &mut Session, p: &Value) -> Result<Value> {
-    let hs = targets(s, p)?;
+    let mut hs = targets(s, p)?;
+    hs.retain(|h| !super::curves::is_locked(s, *h));
     let n = copy_to_clip(s, &hs, None)?;
     let d = s.doc_mut()?;
     for h in &hs {
@@ -131,7 +213,8 @@ fn run_pasteorig(s: &mut Session, _p: &Value) -> Result<Value> {
 }
 
 fn run_clear(s: &mut Session, _p: &Value) -> Result<Value> {
-    let hs = s.selection();
+    let mut hs = s.selection();
+    hs.retain(|h| !super::curves::is_locked(s, *h));
     let d = s.doc_mut()?;
     let mut n = 0;
     for h in hs {
@@ -229,7 +312,7 @@ impl Interactive for PasteM {
 
 #[derive(Default)]
 struct SelectM {
-    sel: super::machines::SelectPhase,
+    sel: SelectPhase,
 }
 
 impl Interactive for SelectM {
@@ -241,8 +324,56 @@ impl Interactive for SelectM {
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         match self.sel.feed(s, &i)? {
-            super::machines::SelOutcome::More => Ok(Step::Continue),
+            SelOutcome::More => Ok(Step::Continue),
             _ => Ok(Step::Done),
+        }
+    }
+}
+
+/// COPYBASE: base point first, then "Select objects:" (skipped with a pickfirst selection).
+#[derive(Default)]
+struct CopyBaseM {
+    base: Option<Vec2>,
+    sel: SelectPhase,
+}
+
+impl CopyBaseM {
+    fn copy(&self, s: &mut Session, hs: &[Handle]) -> Result<Step> {
+        copy_to_clip(s, hs, self.base)?;
+        Ok(Step::Done)
+    }
+}
+
+impl Interactive for CopyBaseM {
+    fn name(&self) -> &'static str {
+        "COPYBASE"
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        self.sel = SelectPhase::begin(s);
+        Ok(Step::Continue)
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        if self.base.is_none() { Prompt::new("Specify base point", Accept::POINT) } else { self.sel.prompt() }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if self.base.is_none() {
+            if let Input::Point(p) = i {
+                self.base = Some(p);
+                if self.sel.done {
+                    let hs = self.sel.picked.clone();
+                    return self.copy(s, &hs);
+                }
+            }
+            return Ok(Step::Continue);
+        }
+        match self.sel.feed(s, &i)? {
+            SelOutcome::More => Ok(Step::Continue),
+            SelOutcome::Empty => Ok(Step::Done),
+            SelOutcome::Done(hs) => {
+                let step = self.copy(s, &hs)?;
+                s.set_selection(Vec::new());
+                Ok(step)
+            }
         }
     }
 }

@@ -218,13 +218,19 @@ pub fn recompute(dm: &Dimension, prev: Option<&Dimension>, before: &Drawing, aft
             slot.y = p.y;
         }
     }
-    // A rigid move of every attached point carries the rest of the dimension along.
+    // A rigid move of every attached point carries the rest of the dimension along. The measured
+    // origins of a linear dimension are the exception: a free one stays where it was placed.
+    let linear = matches!(nd.kind, DimKind::Linear { .. } | DimKind::Aligned);
     if let Some(first) = deltas.first().copied()
         && deltas.iter().all(|d| d.dist(first) <= 1e-9 * (1.0 + first.len()))
         && first.len() > 0.0
     {
+        // An ordinate's `defpt` is its fixed datum (the drawing origin); it must not follow the feature.
+        let ordinate = matches!(nd.kind, DimKind::Ordinate { .. });
         for name in POINTS {
             if !moved.iter().any(|m| m == name)
+                && !(ordinate && name == "defpt")
+                && !(linear && (name == "p13" || name == "p14"))
                 && let Some(slot) = def_point_mut(&mut nd, name)
             {
                 slot.x += first.x;
