@@ -9,3 +9,4 @@ visible and is listed below with its upstream PR.
 
 | Patch | Files | Why | Upstream PR |
 |---|---|---|---|
+| 4. Command providers | `crates/engine/src/cmd/mod.rs`, `crates/engine/src/lib.rs` | `register_command_provider(fn() -> Vec<CommandSpec>)` lets a crate outside the engine add commands; a provider spec whose id matches a built-in replaces it in place (same menu slot), a new id is appended, last provider wins. Process-global; registering after the first `command_specs()` call returns `Err`. How LAMB registers `NEWPLAN`, `PLACEVIEW` and its own `fillet`. | not yet submitted |

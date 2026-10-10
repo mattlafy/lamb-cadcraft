@@ -29,7 +29,7 @@ use serde_json::Value;
 pub use cadcraft_doc as doc;
 pub use cadcraft_geom as geom;
 pub use cadcraft_render as render;
-pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
+pub use cmd::{CommandInfo, CommandSpec, Provider, command_specs, find_command, register_command_provider};
 pub use prompt::{Accept, Input, Interactive, Prompt, Step};
 
 #[derive(Debug, thiserror::Error)]

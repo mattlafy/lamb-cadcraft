@@ -1911,6 +1911,7 @@ name = "lamb-cadcraft"
 version = "0.4.0"
 dependencies = [
  "cadcraft-engine",
+ "serde_json",
 ]
 
 [[package]]

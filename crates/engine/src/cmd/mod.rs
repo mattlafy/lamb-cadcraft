@@ -143,8 +143,26 @@ pub fn has_selection(s: &Session) -> std::result::Result<(), String> {
     if s.selection().is_empty() { Err("nothing selected".into()) } else { Ok(()) }
 }
 
+/// A source of extra commands registered from outside this crate (see [`register_command_provider`]).
+pub type Provider = fn() -> Vec<CommandSpec>;
+
+static SPECS: std::sync::OnceLock<Vec<CommandSpec>> = std::sync::OnceLock::new();
+static PROVIDERS: std::sync::Mutex<Vec<Provider>> = std::sync::Mutex::new(Vec::new());
+
+/// Register a command provider. Its specs are merged after the built-ins when the registry is first
+/// built: a spec whose id matches an existing command replaces it in place (same menu slot and
+/// order); a new id is appended. Later providers win over earlier ones. Process-global, so it must
+/// be called before the first [`command_specs`] call; afterwards it returns an error.
+pub fn register_command_provider(p: Provider) -> std::result::Result<(), &'static str> {
+    let mut providers = PROVIDERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if SPECS.get().is_some() {
+        return Err("command registry already built");
+    }
+    providers.push(p);
+    Ok(())
+}
+
 pub fn command_specs() -> &'static [CommandSpec] {
-    static SPECS: std::sync::OnceLock<Vec<CommandSpec>> = std::sync::OnceLock::new();
     SPECS.get_or_init(|| {
         let mut v = Vec::new();
         v.extend(file::specs());
@@ -167,6 +185,15 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(utility::specs());
         v.extend(table::specs());
         v.extend(constraints::specs());
+        let providers = PROVIDERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for provider in providers.iter() {
+            for spec in provider() {
+                match v.iter_mut().find(|c| c.id == spec.id) {
+                    Some(slot) => *slot = spec,
+                    None => v.push(spec),
+                }
+            }
+        }
         v
     })
 }
