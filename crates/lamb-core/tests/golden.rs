@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use lamb_core::derivation::{alignment, linking, markers, projection, read, resolve, solids, synthesis, tilt, travel, underlay};
+use lamb_core::derivation::{alignment, linking, markers, projection, proposals, read, resolve, solids, synthesis, tilt, travel, underlay};
 use lamb_core::geometry::tangent_circle::{self, ApparentCurve};
 use lamb_core::geometry::{
     Point2, Point3, Polyline2, ResolvedSegment, Transform2D, VirtualCornerEntry, circle_fit, cursor_snaps, dimension, distance, fillet, halfspace,
@@ -24,12 +24,12 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 /// Calls one port with a case's decoded positional arguments and returns its encoded result.
-/// `Err(message)` means the call threw.
-type Handler = fn(&[Value]) -> Result<Value, String>;
+/// `Err(message)` means the call threw. A mutating port writes its decoded arguments back into the
+/// vector (`a[i] = to_value(&x)`) so the runner can check `argsAfter`.
+type Handler = fn(&mut Vec<Value>) -> Result<Value, String>;
 
 /// The frozen clock every fixture was captured under. A port that stamps "now" must use this when
-/// replaying (nothing ported reads the clock yet).
-#[allow(dead_code)]
+/// replaying.
 const GOLDEN_NOW: &str = "2026-01-01T00:00:00.000Z";
 
 /// |a − b| ≤ TOLERANCE · max(1, |a|, |b|).
@@ -371,6 +371,25 @@ fn dispatch() -> HashMap<&'static str, Handler> {
         ("derivation-engine/linking#findLinkForMarker", |a| {
             out(linking::find_link_for_marker(&arg::<Project>(a, 0)?, &arg(a, 1)?, arg(a, 2)?).cloned())
         }),
+        // derivation-engine/proposals
+        ("derivation-engine/proposals#aiProposalSlotKey", |a| out(proposals::ai_proposal_slot_key(arg(a, 0)?, arg(a, 1)?, arg(a, 2)?))),
+        ("derivation-engine/proposals#reconcileAiLines", |a| {
+            let mut project = arg::<Project>(a, 0)?;
+            let mut n = 0;
+            let mut mint = || {
+                n += 1;
+                Id(n)
+            };
+            let result = proposals::reconcile_ai_lines(&mut project, GOLDEN_NOW, &mut mint)?;
+            a[0] = out(&project)?;
+            out(result)
+        }),
+        ("derivation-engine/proposals#invertReconcileAiLines", |a| {
+            let mut project = arg::<Project>(a, 0)?;
+            proposals::invert_reconcile_ai_lines(&mut project, &arg::<proposals::ReconcileResult>(a, 1)?);
+            a[0] = out(&project)?;
+            Ok(serde_json::json!({"$undefined": true}))
+        }),
     ];
     table.iter().copied().collect()
 }
@@ -550,14 +569,10 @@ fn short(v: &Value) -> String {
 /// Replays one case through its handler. `Ok(())` = pass, `Err(lines)` = what differed.
 fn replay(case: &Value, handler: Handler) -> Result<(), Vec<String>> {
     let raw_args = case.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
-    let args: Vec<Value> = raw_args.iter().map(decode).collect();
-    if case.get("argsAfter").is_some() {
-        // Handlers take `&[Value]`, so a ported export that mutates its arguments can't be checked
-        // yet. Extend `Handler` to return the arguments afterwards when the first such port lands.
-        return Err(vec!["case records argsAfter (mutating call): runner has no argsAfter support yet".into()]);
-    }
+    let mut args: Vec<Value> = raw_args.iter().map(decode).collect();
+    let args_before = args.clone();
     // One string-id interner per case, covering argument decoding and result encoding.
-    let outcome = model::with_string_ids(|| handler(&args));
+    let outcome = model::with_string_ids(|| handler(&mut args));
     match (case.get("throws"), outcome) {
         (Some(_), Err(_)) => Ok(()),
         (Some(msg), Ok(v)) => Err(vec![format!("expected throw {msg}, got {}", short(&v))]),
@@ -568,10 +583,17 @@ fn replay(case: &Value, handler: Handler) -> Result<(), Vec<String>> {
                 raw_args.iter().for_each(|a| collect_strings(a, &mut s));
                 s
             };
-            let canon = canonicalize(&[v], &given);
+            // Result and arguments-afterwards canonicalize together, so a minted id numbers the same
+            // in both.
+            let canon = canonicalize(&[v, Value::Array(args)], &given);
             let expected = case.get("result").unwrap_or(&Value::Null);
             let mut diffs = Vec::new();
             compare(expected, &canon[0], "$", &mut diffs);
+            // No argsAfter recorded means the arguments must be unchanged (fixture README).
+            match case.get("argsAfter") {
+                Some(after) => compare(after, &canon[1], "argsAfter", &mut diffs),
+                None => compare(&Value::Array(args_before), &canon[1], "args", &mut diffs),
+            }
             if diffs.is_empty() { Ok(()) } else { Err(diffs) }
         }
     }

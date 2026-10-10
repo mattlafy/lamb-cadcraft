@@ -6,6 +6,7 @@ pub mod alignment;
 pub mod linking;
 pub mod markers;
 pub mod projection;
+pub mod proposals;
 pub mod read;
 pub mod resolve;
 pub mod solids;
@@ -13,6 +14,7 @@ pub mod synthesis;
 pub mod tilt;
 pub mod travel;
 pub mod underlay;
+pub mod write;
 
 /// JS `Number.prototype.toFixed(digits)`: rounds the exact binary value half away from zero (a bare
 /// `{:.6}` rounds ties to even), and prints a minus sign iff `x < 0.0`, so `-0.0` gives
