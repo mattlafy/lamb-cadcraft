@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use lamb_core::geometry::{Point2, Point3, Transform2D, point, tolerance, transform2d};
+use lamb_core::geometry::{
+    Point2, Point3, Polyline2, ResolvedSegment, Transform2D, circle_fit, distance, intersect, point, polyline, tolerance, transform2d,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -62,6 +64,85 @@ fn dispatch() -> HashMap<&'static str, Handler> {
         ("geometry-primitives/transform2d#worldToLocal2", |a| out(transform2d::world_to_local2(&arg::<Transform2D>(a, 0)?, arg(a, 1)?))),
         ("geometry-primitives/transform2d#localToWorldDir2", |a| out(transform2d::local_to_world_dir2(&arg::<Transform2D>(a, 0)?, arg(a, 1)?))),
         ("geometry-primitives/transform2d#worldToLocalDir2", |a| out(transform2d::world_to_local_dir2(&arg::<Transform2D>(a, 0)?, arg(a, 1)?))),
+        // geometry-primitives/polyline
+        ("geometry-primitives/polyline#virtualCornerSegmentIndex", |a| {
+            out(polyline::virtual_corner_segment_index(&arg::<Polyline2>(a, 0)?, arg(a, 1)?))
+        }),
+        ("geometry-primitives/polyline#virtualCornerAt", |a| out(polyline::virtual_corner_at(&arg::<Polyline2>(a, 0)?, arg(a, 1)?))),
+        ("geometry-primitives/polyline#virtualCornerEntries", |a| out(polyline::virtual_corner_entries(&arg::<Polyline2>(a, 0)?))),
+        ("geometry-primitives/polyline#line2", |a| out(polyline::line2(arg::<Point2>(a, 0)?, arg(a, 1)?))),
+        ("geometry-primitives/polyline#resolvedSegments", |a| out(polyline::resolved_segments(&arg::<Polyline2>(a, 0)?))),
+        ("geometry-primitives/polyline#reversePolyline", |a| out(polyline::reverse_polyline(&arg::<Polyline2>(a, 0)?))),
+        ("geometry-primitives/polyline#isArc", |a| {
+            Ok(Value::Bool(polyline::is_arc(arg::<Value>(a, 0)?.get("bulge").and_then(Value::as_f64).unwrap_or(0.0))))
+        }),
+        ("geometry-primitives/polyline#arcFromBulge", |a| out(polyline::arc_from_bulge(arg::<Point2>(a, 0)?, arg(a, 1)?, num(a, 2)?))),
+        ("geometry-primitives/polyline#sweepAngle", |a| Ok(num_out(polyline::sweep_angle(num(a, 0)?, num(a, 1)?, arg(a, 2)?)))),
+        ("geometry-primitives/polyline#pointAtParam", |a| out(polyline::point_at_param(&arg::<ResolvedSegment>(a, 0)?, num(a, 1)?))),
+        ("geometry-primitives/polyline#tangentAtParam", |a| out(polyline::tangent_at_param(&arg::<ResolvedSegment>(a, 0)?, num(a, 1)?))),
+        ("geometry-primitives/polyline#segmentLength", |a| Ok(num_out(polyline::segment_length(&arg::<ResolvedSegment>(a, 0)?)))),
+        ("geometry-primitives/polyline#polylineLength", |a| Ok(num_out(polyline::polyline_length(&arg::<Polyline2>(a, 0)?)))),
+        ("geometry-primitives/polyline#segmentBBox", |a| out(polyline::segment_bbox(&arg::<ResolvedSegment>(a, 0)?))),
+        ("geometry-primitives/polyline#polylineBBox", |a| out(polyline::polyline_bbox(&arg::<Polyline2>(a, 0)?))),
+        ("geometry-primitives/polyline#closestPointOnSegment", |a| {
+            out(polyline::closest_point_on_segment(&arg::<ResolvedSegment>(a, 0)?, arg(a, 1)?))
+        }),
+        ("geometry-primitives/polyline#slideSegmentByDelta", |a| {
+            out(polyline::slide_segment_by_delta(&arg::<Polyline2>(a, 0)?, arg(a, 1)?, arg(a, 2)?))
+        }),
+        ("geometry-primitives/polyline#bulgeFromThroughPoint", |a| {
+            Ok(num_out(polyline::bulge_from_through_point(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?)))
+        }),
+        ("geometry-primitives/polyline#mergeCoArcSegments", |a| out(polyline::merge_co_arc_segments(&arg::<Polyline2>(a, 0)?))),
+        ("geometry-primitives/polyline#mergeCoArcSegmentsWithMap", |a| out(polyline::merge_co_arc_segments_with_map(&arg::<Polyline2>(a, 0)?))),
+        // geometry-primitives/circleFit
+        ("geometry-primitives/circleFit#circleAsPolyline", |a| out(circle_fit::circle_as_polyline(&arg::<circle_fit::CircleFit>(a, 0)?))),
+        ("geometry-primitives/circleFit#polylineAsCircle", |a| out(circle_fit::polyline_as_circle(&arg::<Polyline2>(a, 0)?))),
+        ("geometry-primitives/circleFit#circleFromDiameter", |a| out(circle_fit::circle_from_diameter(arg::<Point2>(a, 0)?, arg(a, 1)?))),
+        ("geometry-primitives/circleFit#circumcircle", |a| out(circle_fit::circumcircle(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?))),
+        // geometry-primitives/intersect
+        ("geometry-primitives/intersect#infiniteLineIntersect", |a| {
+            out(intersect::infinite_line_intersect(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?, arg(a, 3)?))
+        }),
+        ("geometry-primitives/intersect#segmentSegmentStraight", |a| {
+            out(intersect::segment_segment_straight(
+                arg::<Point2>(a, 0)?,
+                arg(a, 1)?,
+                arg(a, 2)?,
+                arg(a, 3)?,
+                arg::<Option<f64>>(a, 4)?.unwrap_or(1e-6),
+            ))
+        }),
+        ("geometry-primitives/intersect#intersectLineWithBoundarySegment", |a| {
+            out(intersect::intersect_line_with_boundary_segment(
+                arg::<Point2>(a, 0)?,
+                arg(a, 1)?,
+                arg(a, 2)?,
+                arg(a, 3)?,
+                arg::<Option<f64>>(a, 4)?.unwrap_or(1e-6),
+            ))
+        }),
+        ("geometry-primitives/intersect#intersectLineWithBoundaryCircle", |a| {
+            out(intersect::intersect_line_with_boundary_circle(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?, num(a, 3)?))
+        }),
+        ("geometry-primitives/intersect#intersectLineWithBoundaryArc", |a| {
+            out(intersect::intersect_line_with_boundary_arc(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?, arg(a, 3)?, num(a, 4)?))
+        }),
+        ("geometry-primitives/intersect#intersectSegmentWithInfiniteLine", |a| {
+            out(intersect::intersect_segment_with_infinite_line(
+                &arg::<ResolvedSegment>(a, 0)?,
+                arg(a, 1)?,
+                arg(a, 2)?,
+                arg::<Option<f64>>(a, 3)?.unwrap_or(1e-6),
+            ))
+        }),
+        ("geometry-primitives/intersect#intersectSegments", |a| {
+            out(intersect::intersect_segments(&arg::<ResolvedSegment>(a, 0)?, &arg(a, 1)?, arg::<Option<f64>>(a, 2)?.unwrap_or(1e-6)))
+        }),
+        ("geometry-primitives/intersect#crossingAngleDeg", |a| Ok(num_out(intersect::crossing_angle_deg(arg::<Point2>(a, 0)?, arg(a, 1)?)))),
+        ("geometry-primitives/intersect#tangentAtHit", |a| out(intersect::tangent_at_hit(&arg::<ResolvedSegment>(a, 0)?, num(a, 1)?))),
+        // geometry-primitives/distance
+        ("geometry-primitives/distance#polylineDistance", |a| Ok(num_out(distance::polyline_distance(&arg::<Polyline2>(a, 0)?, &arg(a, 1)?)))),
     ];
     table.iter().copied().collect()
 }
