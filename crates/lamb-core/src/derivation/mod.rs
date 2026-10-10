@@ -6,6 +6,8 @@ pub mod alignment;
 pub mod projection;
 pub mod read;
 pub mod resolve;
+pub mod solids;
+pub mod synthesis;
 pub mod tilt;
 pub mod travel;
 pub mod underlay;

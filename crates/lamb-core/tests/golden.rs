@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use lamb_core::derivation::{alignment, projection, read, resolve, tilt, travel, underlay};
+use lamb_core::derivation::{alignment, projection, read, resolve, solids, synthesis, tilt, travel, underlay};
 use lamb_core::geometry::tangent_circle::{self, ApparentCurve};
 use lamb_core::geometry::{
     Point2, Point3, Polyline2, ResolvedSegment, Transform2D, VirtualCornerEntry, circle_fit, cursor_snaps, dimension, distance, fillet, halfspace,
@@ -339,6 +339,11 @@ fn dispatch() -> HashMap<&'static str, Handler> {
         ("derivation-engine/resolve#resolveCutSegment", |a| {
             out(resolve::resolve_cut_segment(&arg::<Project>(a, 0)?, &read::entity_ref(&arg::<DrawingEntity>(a, 1)?), arg(a, 2)?)?)
         }),
+        // derivation-engine/solids, synthesis
+        ("derivation-engine/solids#mostDoubtful", |a| out(solids::most_doubtful(&arg::<Vec<resolve::ProvenanceKind>>(a, 0)?))),
+        ("derivation-engine/solids#prismFromLoop", |a| out(solids::prism_from_loop(&arg::<Vec<Point3>>(a, 0)?, arg(a, 1)?, num(a, 2)?, num(a, 3)?))),
+        ("derivation-engine/solids#solidTriangles", |a| out(solids::solid_triangles(&arg::<solids::SynthesizedSolid>(a, 0)?))),
+        ("derivation-engine/synthesis#synthesize", |a| out(synthesis::synthesize(&arg::<Project>(a, 0)?)?)),
     ];
     table.iter().copied().collect()
 }
