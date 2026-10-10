@@ -17,6 +17,7 @@ use lamb_core::geometry::{
     Point2, Point3, Polyline2, ResolvedSegment, Transform2D, VirtualCornerEntry, circle_fit, cursor_snaps, dimension, distance, fillet, halfspace,
     hatch_pattern, intersect, loop_chain, offset, point, polyline, tolerance, transform_ops, transform2d, triangulate,
 };
+use lamb_core::model::{self, AnyView, DrawingEntity, DrawingLayer, HatchGeometry, Id, LineRole, Project};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -243,6 +244,33 @@ fn dispatch() -> HashMap<&'static str, Handler> {
         ("geometry-primitives/transformOps#mirrorPointAcrossLine", |a| {
             out(transform_ops::mirror_point_across_line(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?))
         }),
+        // document-model/entities
+        ("document-model/entities#hatchLoops", |a| out(model::hatch_loops(&arg::<HatchGeometry>(a, 0)?))),
+        ("document-model/entities#isLineLike", |a| Ok(Value::Bool(model::is_line_like(&arg::<DrawingEntity>(a, 0)?)))),
+        // document-model/layers
+        ("document-model/layers#defaultLayers", |_| out(model::default_layers())),
+        ("document-model/layers#isLayerRendered", |a| Ok(Value::Bool(model::is_layer_rendered(&arg::<DrawingLayer>(a, 0)?)))),
+        ("document-model/layers#isLayerSnappable", |a| Ok(Value::Bool(model::is_layer_snappable(&arg::<DrawingLayer>(a, 0)?)))),
+        ("document-model/layers#isLayerSelectable", |a| Ok(Value::Bool(model::is_layer_selectable(&arg::<DrawingLayer>(a, 0)?)))),
+        ("document-model/layers#isLayerEditable", |a| Ok(Value::Bool(model::is_layer_editable(&arg::<DrawingLayer>(a, 0)?)))),
+        ("document-model/layers#resolveEntityRole", |a| {
+            out(model::resolve_entity_role(&arg::<Vec<DrawingLayer>>(a, 0)?, arg::<LineRole>(a, 1)?, &arg::<String>(a, 2)?))
+        }),
+        // document-model/provenance
+        ("document-model/provenance#authoredField", |a| {
+            out(model::authored_field(arg::<Value>(a, 0)?, arg::<Id>(a, 1)?, arg(a, 2)?, &arg::<String>(a, 3)?))
+        }),
+        ("document-model/provenance#defaultedField", |a| out(model::defaulted_field(arg::<Value>(a, 0)?, &arg::<String>(a, 1)?))),
+        // document-model/views
+        ("document-model/views#isPlanView", |a| Ok(Value::Bool(model::is_plan_view(&arg::<AnyView>(a, 0)?)))),
+        ("document-model/views#isVerticalView", |a| Ok(Value::Bool(model::is_vertical_view(&arg::<AnyView>(a, 0)?)))),
+        ("document-model/views#isPlaced", |a| Ok(Value::Bool(model::is_placed(&arg::<AnyView>(a, 0)?)))),
+        // document-model/project
+        ("document-model/project#defaultProjectDefaults", |_| out(model::default_project_defaults())),
+        ("document-model/project#emptyProject", |a| out(model::empty_project(arg::<Option<String>>(a, 0)?.as_deref()))),
+        ("document-model/project#findView", |a| out(model::find_view(&arg::<Project>(a, 0)?, arg(a, 1)?))),
+        ("document-model/project#findLayer", |a| out(model::find_layer(&arg::<Project>(a, 0)?, &arg::<String>(a, 1)?))),
+        ("document-model/project#findLevel", |a| out(model::find_level(&arg::<Project>(a, 0)?, arg(a, 1)?))),
     ];
     table.iter().copied().collect()
 }
@@ -428,7 +456,8 @@ fn replay(case: &Value, handler: Handler) -> Result<(), Vec<String>> {
         // yet. Extend `Handler` to return the arguments afterwards when the first such port lands.
         return Err(vec!["case records argsAfter (mutating call): runner has no argsAfter support yet".into()]);
     }
-    let outcome = handler(&args);
+    // One string-id interner per case, covering argument decoding and result encoding.
+    let outcome = model::with_string_ids(|| handler(&args));
     match (case.get("throws"), outcome) {
         (Some(_), Err(_)) => Ok(()),
         (Some(msg), Ok(v)) => Err(vec![format!("expected throw {msg}, got {}", short(&v))]),
@@ -542,6 +571,9 @@ fn minted_id_shape() {
     assert!(!is_minted_id("1view-lx3k9a2b-1"));
     assert!(!is_minted_id("lx3k9a2b-1"));
     assert!(!is_minted_id("view-lx3k9a2b-"));
+    // The shape lamb-core gives an id the string-id interner never saw.
+    assert!(is_minted_id("lamb-00000007-0"));
+    assert!(is_minted_id(&format!("lamb-{:08x}-0", u64::MAX)));
 }
 
 #[test]
