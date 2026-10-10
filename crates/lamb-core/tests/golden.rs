@@ -12,8 +12,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
+use lamb_core::geometry::tangent_circle::{self, ApparentCurve};
 use lamb_core::geometry::{
-    Point2, Point3, Polyline2, ResolvedSegment, Transform2D, circle_fit, distance, intersect, point, polyline, tolerance, transform2d,
+    Point2, Point3, Polyline2, ResolvedSegment, Transform2D, VirtualCornerEntry, circle_fit, cursor_snaps, distance, fillet, intersect, offset,
+    point, polyline, tolerance, transform2d,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -143,6 +145,69 @@ fn dispatch() -> HashMap<&'static str, Handler> {
         ("geometry-primitives/intersect#tangentAtHit", |a| out(intersect::tangent_at_hit(&arg::<ResolvedSegment>(a, 0)?, num(a, 1)?))),
         // geometry-primitives/distance
         ("geometry-primitives/distance#polylineDistance", |a| Ok(num_out(distance::polyline_distance(&arg::<Polyline2>(a, 0)?, &arg(a, 1)?)))),
+        // geometry-primitives/fillet
+        ("geometry-primitives/fillet#filletCorner", |a| out(fillet::fillet_corner(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?, num(a, 3)?))),
+        ("geometry-primitives/fillet#chamferCorner", |a| {
+            out(fillet::chamfer_corner(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?, num(a, 3)?, num(a, 4)?))
+        }),
+        ("geometry-primitives/fillet#resolveArcFilletCorner", |a| {
+            out(fillet::resolve_arc_fillet_corner(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?, num(a, 3)?, num(a, 4)?, num(a, 5)?))
+        }),
+        ("geometry-primitives/fillet#curveFromEdge", |a| out(fillet::curve_from_edge(arg::<Point2>(a, 0)?, arg(a, 1)?, num(a, 2)?))),
+        ("geometry-primitives/fillet#apparentCurveIntersections", |a| {
+            out(fillet::apparent_curve_intersections(&arg::<ApparentCurve>(a, 0)?, &arg(a, 1)?))
+        }),
+        ("geometry-primitives/fillet#paramAlongEdge", |a| {
+            Ok(num_out(fillet::param_along_edge(arg::<Point2>(a, 0)?, arg(a, 1)?, num(a, 2)?, arg(a, 3)?)))
+        }),
+        ("geometry-primitives/fillet#chooseSharedCorner", |a| {
+            out(fillet::choose_shared_corner(
+                &arg::<Vec<Point2>>(a, 0)?,
+                arg(a, 1)?,
+                arg(a, 2)?,
+                num(a, 3)?,
+                arg(a, 4)?,
+                arg(a, 5)?,
+                arg(a, 6)?,
+                num(a, 7)?,
+                arg(a, 8)?,
+            ))
+        }),
+        ("geometry-primitives/fillet#keepForParam", |a| out(fillet::keep_for_param(num(a, 0)?, num(a, 1)?))),
+        ("geometry-primitives/fillet#resolveEndsKeeps", |a| out(fillet::resolve_ends_keeps(&arg::<fillet::EndsPick>(a, 0)?, &arg(a, 1)?))),
+        ("geometry-primitives/fillet#bulgeForArc", |a| Ok(num_out(fillet::bulge_for_arc(arg::<Point2>(a, 0)?, arg(a, 1)?, arg(a, 2)?, arg(a, 3)?)))),
+        ("geometry-primitives/fillet#resolveGapBridge", |a| {
+            out(fillet::resolve_gap_bridge(&arg::<fillet::GapBridgeSide>(a, 0)?, &arg(a, 1)?, num(a, 2)?))
+        }),
+        ("geometry-primitives/fillet#resolveVirtualCorner", |a| {
+            out(fillet::resolve_virtual_corner(&arg::<Polyline2>(a, 0)?, arg(a, 1)?, &arg::<VirtualCornerEntry>(a, 2)?))
+        }),
+        ("geometry-primitives/fillet#resolveVirtualPolyline", |a| out(fillet::resolve_virtual_polyline(&arg::<Polyline2>(a, 0)?))),
+        // geometry-primitives/tangentCircle
+        ("geometry-primitives/tangentCircle#circleCircleIntersect", |a| {
+            out(tangent_circle::circle_circle_intersect(arg::<Point2>(a, 0)?, num(a, 1)?, arg(a, 2)?, num(a, 3)?))
+        }),
+        ("geometry-primitives/tangentCircle#offsetLine", |a| out(tangent_circle::offset_line(arg::<Point2>(a, 0)?, arg(a, 1)?, num(a, 2)?))),
+        ("geometry-primitives/tangentCircle#tangentCircles", |a| {
+            out(tangent_circle::tangent_circles(&arg::<ApparentCurve>(a, 0)?, &arg(a, 1)?, num(a, 2)?))
+        }),
+        ("geometry-primitives/tangentCircle#chooseTangentCircle", |a| {
+            out(tangent_circle::choose_tangent_circle(&arg::<Vec<tangent_circle::TangentCircle>>(a, 0)?, arg(a, 1)?, arg(a, 2)?))
+        }),
+        // geometry-primitives/cursorSnaps
+        ("geometry-primitives/cursorSnaps#nearestCandidate", |a| out(cursor_snaps::nearest_candidate(&arg::<ResolvedSegment>(a, 0)?, arg(a, 1)?))),
+        ("geometry-primitives/cursorSnaps#perpendicularCandidates", |a| {
+            out(cursor_snaps::perpendicular_candidates(&arg::<ResolvedSegment>(a, 0)?, arg(a, 1)?))
+        }),
+        ("geometry-primitives/cursorSnaps#apparentIntersectionCandidates", |a| {
+            out(cursor_snaps::apparent_intersection_candidates(&arg::<ResolvedSegment>(a, 0)?, &arg(a, 1)?))
+        }),
+        // geometry-primitives/offset
+        ("geometry-primitives/offset#offsetPolyline", |a| out(offset::offset_polyline(&arg::<Polyline2>(a, 0)?, num(a, 1)?))),
+        ("geometry-primitives/offset#polylineFromPoints", |a| {
+            out(offset::polyline_from_points(&arg::<Vec<Point2>>(a, 0)?, arg::<Option<bool>>(a, 1)?.unwrap_or(false)))
+        }),
+        ("geometry-primitives/offset#chordDistance", |a| Ok(num_out(offset::chord_distance(arg::<Point2>(a, 0)?, arg(a, 1)?)))),
     ];
     table.iter().copied().collect()
 }
