@@ -12,13 +12,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use lamb_core::derivation::{alignment, projection, read};
+use lamb_core::derivation::{alignment, projection, read, resolve, tilt, travel, underlay};
 use lamb_core::geometry::tangent_circle::{self, ApparentCurve};
 use lamb_core::geometry::{
     Point2, Point3, Polyline2, ResolvedSegment, Transform2D, VirtualCornerEntry, circle_fit, cursor_snaps, dimension, distance, fillet, halfspace,
     hatch_pattern, intersect, loop_chain, offset, point, polyline, tolerance, transform_ops, transform2d, triangulate,
 };
-use lamb_core::model::{self, AnyView, DrawingEntity, DrawingLayer, HatchGeometry, Id, LineRole, Project};
+use lamb_core::model::{self, AnyView, DrawingEntity, DrawingLayer, HatchGeometry, Id, LineRole, LinkAnchor, LinkRecord, Project};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -310,6 +310,34 @@ fn dispatch() -> HashMap<&'static str, Handler> {
         }),
         ("derivation-engine/alignment#uvToPlanPoint", |a| {
             out(alignment::uv_to_plan_point(&read::view_ref(&arg::<AnyView>(a, 0)?), &arg(a, 1)?, arg(a, 2)?)?)
+        }),
+        // derivation-engine/tilt, underlay, travel, resolve
+        ("derivation-engine/tilt#tiltFromCrossing", |a| Ok(num_out(tilt::tilt_from_crossing(num(a, 0)?, num(a, 1)?)))),
+        ("derivation-engine/underlay#findUnderlayCandidates", |a| {
+            let p = arg::<Project>(a, 0)?;
+            let found = underlay::find_underlay_candidates(&p, arg(a, 1)?)?;
+            let views: Vec<Value> = found
+                .iter()
+                .map(|c| Ok(serde_json::json!({ "view": out(model::find_view(&p, c.view_id).ok_or("candidate view not found")?)?, "mirrored": c.mirrored })))
+                .collect::<Result<_, String>>()?;
+            Ok(Value::Array(views))
+        }),
+        ("derivation-engine/underlay#mapViewLocalPoint", |a| {
+            let (from, to) = (arg::<AnyView>(a, 1)?, arg::<AnyView>(a, 2)?);
+            out(underlay::map_view_local_point(&arg::<Project>(a, 0)?, &read::view_ref(&from), &read::view_ref(&to), arg(a, 3)?)?)
+        }),
+        ("derivation-engine/underlay#mapPlanVerticalCenter", |a| {
+            let (from, to) = (arg::<AnyView>(a, 1)?, arg::<AnyView>(a, 3)?);
+            out(underlay::map_plan_vertical_center(&arg::<Project>(a, 0)?, &read::view_ref(&from), arg(a, 2)?, &read::view_ref(&to), arg(a, 4)?)?)
+        }),
+        ("derivation-engine/travel#travelSegmentMove", |a| {
+            out(travel::travel_segment_move(&arg::<Project>(a, 0)?, &arg::<LinkRecord>(a, 1)?, &arg::<LinkAnchor>(a, 2)?, arg(a, 3)?)?)
+        }),
+        ("derivation-engine/resolve#resolveSeenZ", |a| {
+            out(resolve::resolve_seen_z(&arg::<Project>(a, 0)?, &read::entity_ref(&arg::<DrawingEntity>(a, 1)?), arg(a, 2)?)?)
+        }),
+        ("derivation-engine/resolve#resolveCutSegment", |a| {
+            out(resolve::resolve_cut_segment(&arg::<Project>(a, 0)?, &read::entity_ref(&arg::<DrawingEntity>(a, 1)?), arg(a, 2)?)?)
         }),
     ];
     table.iter().copied().collect()
