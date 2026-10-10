@@ -1,0 +1,5 @@
+{"format":"lamb-golden/1","source":"packages/geometry-primitives/src/circleFit.test.ts","cases":[
+{"test":"circleFromDiameter > centers on the midpoint with radius half the distance","module":"geometry-primitives/circleFit","export":"circleFromDiameter","args":[{"x":0,"y":0},{"x":10,"y":0}],"result":{"center":{"x":5,"y":0},"radius":5}},
+{"test":"circumcircle > finds the circle through three points on a known circle","module":"geometry-primitives/circleFit","export":"circumcircle","args":[{"x":7,"y":3},{"x":2,"y":8},{"x":-3,"y":3}],"result":{"center":{"x":2,"y":3},"radius":5}},
+{"test":"circumcircle > returns null for (nearly) collinear points","module":"geometry-primitives/circleFit","export":"circumcircle","args":[{"x":0,"y":0},{"x":5,"y":0},{"x":10,"y":0}],"result":null}
+]}
