@@ -2,17 +2,20 @@
 //! against the Rust port. The format is specified in `tests/golden/README.md`; the reference
 //! implementation is LAMB's `tools/golden/codec.ts`.
 //!
-//! Every case whose `"<module>#<export>"` is in [`dispatch`] must pass. Cases of exports not in the
-//! table are counted, not failed, and a per-package progress line is printed.
+//! Every fixtured `"<module>#<export>"` of every package must have a line in [`dispatch`], and
+//! every one of its cases must pass; a per-package progress line is printed. A fixtured export
+//! with no dispatch line fails the test, which names it.
 //!
-//! To port a function: implement it in `lamb_core`, add one line to [`dispatch`], run
-//! `cargo test -p lamb-core --test golden`.
+//! When LAMB adds fixtures for a new export: implement it in `lamb_core`, add one line to
+//! [`dispatch`], run `cargo test -p lamb-core --test golden`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use lamb_core::derivation::{alignment, linking, markers, projection, proposals, read, resolve, solids, synthesis, tilt, travel, underlay};
+use lamb_core::derivation::{
+    alignment, issues, linking, markers, projection, proposals, read, resolve, solid_cut_lines, solids, synthesis, tilt, travel, underlay,
+};
 use lamb_core::geometry::tangent_circle::{self, ApparentCurve};
 use lamb_core::geometry::{
     Point2, Point3, Polyline2, ResolvedSegment, Transform2D, VirtualCornerEntry, circle_fit, cursor_snaps, dimension, distance, fillet, halfspace,
@@ -390,6 +393,20 @@ fn dispatch() -> HashMap<&'static str, Handler> {
             a[0] = out(&project)?;
             Ok(serde_json::json!({"$undefined": true}))
         }),
+        // derivation-engine/solidCutLines, issues
+        ("derivation-engine/solidCutLines#solidCutSlotKey", |a| out(solid_cut_lines::solid_cut_slot_key(&arg::<Vec<Id>>(a, 0)?, arg(a, 1)?))),
+        ("derivation-engine/solidCutLines#reconcileSolidCutLines", |a| {
+            let mut project = arg::<Project>(a, 0)?;
+            let mut n = 0;
+            let mut mint = || {
+                n += 1;
+                Id(n)
+            };
+            let result = solid_cut_lines::reconcile_solid_cut_lines(&mut project, &mut mint)?;
+            a[0] = out(&project)?;
+            out(result)
+        }),
+        ("derivation-engine/issues#findIssues", |a| out(issues::find_issues(&arg::<Project>(a, 0)?)?)),
     ];
     table.iter().copied().collect()
 }
@@ -674,11 +691,9 @@ fn golden_fixtures() {
 
     assert!(failures.is_empty(), "{} golden case(s) failed for ported exports (see report above)", failures.len());
 
-    // Every geometry-primitives export with fixture cases must be ported; other packages are
-    // counted, not failed.
-    let unported: Vec<&str> = stats.keys().map(String::as_str).filter(|k| k.starts_with("geometry-primitives/") && !table.contains_key(k)).collect();
-    let (ported, exports, ..) = packages.get("geometry-primitives").copied().unwrap_or_default();
-    assert_eq!(ported, exports, "geometry-primitives exports with fixture cases but no dispatch line: {}", unported.join(", "));
+    // Every export of every package with fixture cases must be ported.
+    let unported: Vec<&str> = stats.keys().map(String::as_str).filter(|k| !table.contains_key(k)).collect();
+    assert!(unported.is_empty(), "exports with fixture cases but no dispatch line: {}", unported.join(", "));
 }
 
 // ---------------------------------------------------------------------------------------------
