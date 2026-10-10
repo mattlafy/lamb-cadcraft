@@ -24,6 +24,8 @@ cadcraft-io = { path = "crates/io" }
 cadcraft-engine = { path = "crates/engine" }
 cadcraft-ui-egui = { path = "crates/ui-egui" }
 cadcraft-mcp = { path = "crates/mcp" }
+lamb-core = { path = "crates/lamb-core" }
+lamb-cadcraft = { path = "crates/lamb-cadcraft" }
 
 # foundation
 thiserror = "2"

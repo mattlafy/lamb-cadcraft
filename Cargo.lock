@@ -1907,6 +1907,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamb-cadcraft"
+version = "0.4.0"
+dependencies = [
+ "cadcraft-engine",
+]
+
+[[package]]
+name = "lamb-core"
+version = "0.4.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"

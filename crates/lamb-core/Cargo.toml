@@ -1,0 +1,13 @@
+[package]
+name = "lamb-core"
+description = "LAMB core: views, levels, links, derivation, wall graph and sweeps over bulge polylines; no CADCraft dependency"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
