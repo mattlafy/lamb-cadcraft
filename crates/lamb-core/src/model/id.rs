@@ -61,11 +61,28 @@ pub fn with_string_ids<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+impl Id {
+    /// The string form inside [`with_string_ids`]; `None` outside it.
+    fn scoped_string(self) -> Option<String> {
+        INTERNER.with(|i| i.borrow().as_ref().map(|int| int.by_id.get(&self.0).cloned().unwrap_or_else(|| format!("lamb-{:08x}-0", self.0))))
+    }
+}
+
+/// Inside [`with_string_ids`], the same string serialization gives (the original string, or
+/// `lamb-{n:08x}-0` for an id the interner never saw); outside it, the decimal number. Use this for
+/// string keys built from ids.
+impl fmt::Display for Id {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.scoped_string() {
+            Some(t) => f.write_str(&t),
+            None => write!(f, "{}", self.0),
+        }
+    }
+}
+
 impl Serialize for Id {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let text =
-            INTERNER.with(|i| i.borrow().as_ref().map(|int| int.by_id.get(&self.0).cloned().unwrap_or_else(|| format!("lamb-{:08x}-0", self.0))));
-        match text {
+        match self.scoped_string() {
             Some(t) => s.serialize_str(&t),
             None => s.serialize_u64(self.0),
         }
@@ -134,6 +151,18 @@ mod tests {
         with_string_ids(|| {
             assert_eq!(serde_json::to_value(Id(7)).unwrap(), json!("lamb-00000007-0"));
         });
+    }
+
+    #[test]
+    fn display_interned_minted_and_unscoped() {
+        assert_eq!(Id(42).to_string(), "42");
+        with_string_ids(|| {
+            let a: Id = serde_json::from_value(json!("view-1")).unwrap();
+            assert_eq!(a.to_string(), "view-1");
+            assert_eq!(Id(7).to_string(), "lamb-00000007-0");
+            assert_eq!(format!("{}:{}", a, Id(255)), "view-1:lamb-000000ff-0");
+        });
+        assert_eq!(Id(INTERNED_BASE).to_string(), INTERNED_BASE.to_string());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use lamb_core::derivation::{alignment, projection, read, resolve, solids, synthesis, tilt, travel, underlay};
+use lamb_core::derivation::{alignment, linking, markers, projection, read, resolve, solids, synthesis, tilt, travel, underlay};
 use lamb_core::geometry::tangent_circle::{self, ApparentCurve};
 use lamb_core::geometry::{
     Point2, Point3, Polyline2, ResolvedSegment, Transform2D, VirtualCornerEntry, circle_fit, cursor_snaps, dimension, distance, fillet, halfspace,
@@ -344,6 +344,33 @@ fn dispatch() -> HashMap<&'static str, Handler> {
         ("derivation-engine/solids#prismFromLoop", |a| out(solids::prism_from_loop(&arg::<Vec<Point3>>(a, 0)?, arg(a, 1)?, num(a, 2)?, num(a, 3)?))),
         ("derivation-engine/solids#solidTriangles", |a| out(solids::solid_triangles(&arg::<solids::SynthesizedSolid>(a, 0)?))),
         ("derivation-engine/synthesis#synthesize", |a| out(synthesis::synthesize(&arg::<Project>(a, 0)?)?)),
+        // derivation-engine/markers, linking
+        ("derivation-engine/markers#computeMarkersForVerticalView", |a| {
+            out(markers::compute_markers_for_vertical_view(&arg::<Project>(a, 0)?, &read::view_ref(&arg::<AnyView>(a, 1)?))?)
+        }),
+        ("derivation-engine/markers#computeMarkersForPlanView", |a| {
+            out(markers::compute_markers_for_plan_view(&arg::<Project>(a, 0)?, &read::view_ref(&arg::<AnyView>(a, 1)?))?)
+        }),
+        ("derivation-engine/markers#computeCutLinesForView", |a| out(markers::compute_cut_lines_for_view(&arg::<Project>(a, 0)?, arg(a, 1)?)?)),
+        ("derivation-engine/markers#computePlanCutLinesForView", |a| {
+            out(markers::compute_plan_cut_lines_for_view(&arg::<Project>(a, 0)?, arg(a, 1)?))
+        }),
+        ("derivation-engine/markers#computeSolidCutsForView", |a| {
+            let solids = arg::<Option<Vec<solids::SynthesizedSolid>>>(a, 2)?;
+            out(markers::compute_solid_cuts_for_view(&arg::<Project>(a, 0)?, arg(a, 1)?, solids.as_deref())?)
+        }),
+        ("derivation-engine/linking#findAutoLinks", |a| {
+            let mut n = 0;
+            let mut mint = || {
+                n += 1;
+                Id(n)
+            };
+            let entity = arg::<DrawingEntity>(a, 1)?;
+            out(linking::find_auto_links(&arg::<Project>(a, 0)?, &read::entity_ref(&entity), &arg(a, 2)?, &arg::<String>(a, 3)?, &mut mint)?)
+        }),
+        ("derivation-engine/linking#findLinkForMarker", |a| {
+            out(linking::find_link_for_marker(&arg::<Project>(a, 0)?, &arg(a, 1)?, arg(a, 2)?).cloned())
+        }),
     ];
     table.iter().copied().collect()
 }
