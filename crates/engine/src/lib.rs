@@ -61,6 +61,15 @@ impl From<cadcraft_doc::DocError> for EngineError {
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+/// An after-command observer registered on [`Session::observers`]. It runs after every command
+/// that changed the active drawing (after CADCraft's own group, constraint and associativity
+/// passes) and before that command's undo step is recorded, so its edits land in the same undo
+/// step. The second argument is the drawing as it was before the command; read the current one
+/// through [`Session::doc`] and edit through [`Session::doc_mut`] / [`Session::add_entity`].
+/// An observer that fails reports with [`Session::echo`] and leaves the drawing consistent.
+/// It must not call [`Session::execute`] (or otherwise run a command) — that would recurse.
+pub type AfterCommand = fn(&mut Session, &Arc<Drawing>);
+
 /// A 2D view of a space: world centre and visible height in drawing units.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct View {
@@ -489,6 +498,8 @@ pub struct Session {
     pub last_used: LastUsed,
     /// Where `clipboard` came from and the layers, styles and blocks its objects need.
     pub clipboard_source: Option<cmd::clipboard::ClipSource>,
+    /// After-command observers, called in registration order (see [`AfterCommand`]).
+    pub observers: Vec<AfterCommand>,
 }
 
 impl Default for Session {
@@ -525,6 +536,7 @@ impl Session {
             last_dim: None,
             last_used: LastUsed::default(),
             clipboard_source: None,
+            observers: Vec::new(),
         }
     }
     pub fn new_drawing(&mut self, metric: bool) -> usize {
@@ -652,6 +664,13 @@ impl Session {
         cmd::groups::after_command(self, before.as_ref().map(|b| &b.0));
         cmd::constraints::after_command(self, before.as_ref().map(|b| &b.0), spec.undoable && result.is_ok());
         assoc::after_command(self, before.as_ref().map(|b| &b.0), before.as_ref().map(|b| b.2));
+        if spec.undoable
+            && result.is_ok()
+            && let Some((doc, _, uid)) = &before
+            && self.state().is_ok_and(|st| st.uid == *uid)
+        {
+            self.run_observers(doc);
+        }
         let result = match (result, &before) {
             (Ok(v), Some((doc, sel, uid))) if spec.undoable => self.refuse_non_finite(Some(*uid), doc, sel, spec.id).map(|()| v),
             (r, _) => r,
@@ -669,6 +688,17 @@ impl Session {
             }
         }
         result
+    }
+
+    /// Run the registered [`AfterCommand`] observers, unless the active drawing is unchanged
+    /// (`doc_mut` is `Arc::make_mut`, so any edit made while `before` was held made a new `Arc`).
+    fn run_observers(&mut self, before: &Arc<Drawing>) {
+        if self.observers.is_empty() || !self.state().is_ok_and(|st| !Arc::ptr_eq(&st.doc, before)) {
+            return;
+        }
+        for f in self.observers.clone() {
+            f(self, before);
+        }
     }
 
     /// Bump the revision without an undo step (view-only or settings changes that redraw).
@@ -881,6 +911,7 @@ impl Session {
         cmd::groups::after_command(self, Some(&run.before));
         cmd::constraints::after_command(self, Some(&run.before), true);
         assoc::after_command(self, Some(&run.before), None);
+        self.run_observers(&run.before);
         if let Ok(st) = self.state_mut()
             && !Arc::ptr_eq(&run.before, &st.doc)
         {
@@ -1219,5 +1250,8 @@ impl Session {
     }
 }
 
+#[cfg(test)]
+#[path = "observer_tests.rs"]
+mod observer_tests;
 #[cfg(test)]
 mod tests;
