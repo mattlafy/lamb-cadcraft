@@ -1,4 +1,6 @@
-//! Properties: per-object property edits, current properties, MATCHPROP, linetypes, units.
+//! Properties: per-object property edits, current properties, MATCHPROP, linetypes, units, RENAME.
+
+mod rename;
 
 use cadcraft_color::Color;
 use cadcraft_doc::{EntityKind, Lineweight, Transparency};
@@ -47,7 +49,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .alias(&["mls"])
             .params("{name, arrowSize?, textHeight?, landingGap?, dogleg?, textStyle?, current?} → styles"),
         CommandSpec::new("ddptype", "Point Style...", run_ptype).menu(&["Format", "Point Style..."]).params("{pdmode, pdsize}"),
-        CommandSpec::new("rename", "Rename...", run_rename).menu(&["Format", "Rename..."]).params("{table: layer|linetype|style|dimstyle|block, from, to}"),
+        CommandSpec::new("rename", "Rename...", run_rename)
+            .menu(&["Format", "Rename..."])
+            .alias(&["ren", "-rename"])
+            .params("{table: layer|linetype|style|dimstyle|block|mleaderstyle|tablestyle|view|ucs, from, to}")
+            .interactive(|_| Ok(Box::new(rename::RenameM::default()))),
     ]
 }
 
@@ -263,8 +269,13 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
                     if let Some(x) = num("widthFactor").filter(|x| *x > 0.0) {
                         t.width_factor = x;
                     }
-                    if let Some(v) = p.get("position") {
-                        set_xy(&mut t.insert, v);
+                    // The position is the point the text is placed by: moving it moves the text.
+                    if let Some(to) = p.get("position").and_then(point_value) {
+                        let d = to - t.justify_point();
+                        for q in std::iter::once(&mut t.insert).chain(t.align_pt.as_mut()) {
+                            q.x += d.x;
+                            q.y += d.y;
+                        }
                     }
                 }
                 EntityKind::MText(t) => {
@@ -372,7 +383,7 @@ fn run_color(s: &mut Session, p: &Value) -> Result<Value> {
 fn run_linetype(s: &mut Session, p: &Value) -> Result<Value> {
     let d = s.doc_mut()?;
     if let Some(load) = str_param(p, "load") {
-        let lib = cadcraft_doc::library::standard_linetypes();
+        let lib = cadcraft_doc::library::standard_linetypes_for(d);
         let mut n = 0;
         for lt in lib {
             if (load == "*" || lt.name.eq_ignore_ascii_case(load)) && d.linetype(&lt.name).is_none() {
@@ -520,7 +531,7 @@ fn run_style_current(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Text style names used by entities (in model, paper spaces and blocks) and dimension styles.
-fn text_styles_in_use(d: &cadcraft_doc::Drawing) -> Vec<String> {
+pub(super) fn text_styles_in_use(d: &cadcraft_doc::Drawing) -> Vec<String> {
     let mut out: Vec<String> = d.dim_styles.iter().map(|s| s.text_style.clone()).collect();
     out.extend(d.mleader_styles.iter().map(|s| s.text_style.clone()));
     let stores = std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities)).chain(d.blocks.values().map(|b| &b.entities));
@@ -843,8 +854,15 @@ fn run_mleaderstyle(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn run_ptype(s: &mut Session, p: &Value) -> Result<Value> {
+    // PDMODE is a shape 0..=4 plus 32 (circle) and/or 64 (square).
+    let mode = match p.get("pdmode") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_i64().filter(|m| (0..=100).contains(m) && m & !96 <= 4).ok_or_else(|| bad("ddptype", "`pdmode` must be 0..4, plus 32 and/or 64"))?,
+        ),
+    };
     let d = s.doc_mut()?;
-    if let Some(m) = p.get("pdmode").and_then(Value::as_i64) {
+    if let Some(m) = mode {
         d.header.set_i64("PDMODE", m);
     }
     if let Some(z) = p.get("pdsize").and_then(Value::as_f64) {
@@ -859,15 +877,20 @@ fn run_rename(s: &mut Session, p: &Value) -> Result<Value> {
     let to = str_param(p, "to").ok_or_else(|| bad("rename", "`to` is required"))?.to_string();
     match table.as_str() {
         "layer" => {
-            s.execute("layer.set", &json!({ "name": from, "newName": to }))?;
+            // The command body, not `execute`: RENAME records the one undo step.
+            let set = find_command("layer.set").ok_or_else(|| bad("rename", "no layer.set command"))?;
+            (set.run)(s, &json!({ "name": from, "newName": to }))?;
         }
-        "style" => {
+        "block" => rename::block(s, &from, &to)?,
+        "mleaderstyle" | "multileaderstyle" => rename::simple(s, "mleaderstyle", &from, &to)?,
+        "tablestyle" | "view" | "ucs" => rename::simple(s, &table, &from, &to)?,
+        "style" | "textstyle" => {
             run_style_rename(s, &json!({ "from": from, "to": to }))?;
         }
         "dimstyle" => {
             run_dimstyle_rename(s, &json!({ "from": from, "to": to }))?;
         }
-        "linetype" => {
+        "linetype" | "ltype" => {
             let d = s.doc_mut()?;
             if ["ByBlock", "ByLayer", "Continuous"].iter().any(|n| from.eq_ignore_ascii_case(n)) {
                 return Err(bad("rename", format!("the {from} linetype cannot be renamed")));

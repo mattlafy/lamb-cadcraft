@@ -23,6 +23,7 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
         "about" => about(ctx, &mut open),
         "commands" => commands(app, ctx, &mut open),
         "blocks" => blocks(app, ctx, &mut open),
+        "stylesmanager" => crate::plotstyles::dialog(app, ctx, &mut open),
         other => crate::managers::dialog(app, ctx, other, &mut open),
     }
     if !open {
@@ -317,7 +318,7 @@ fn blocks(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
 /// the insertion point.
 fn insert_block(app: &mut CadApp, name: &str) {
     app.start("insert");
-    if !app.session.running.as_ref().is_some_and(|r| r.id == "insert") {
+    if app.session.running.as_ref().is_none_or(|r| r.id != "insert") {
         return;
     }
     if let Err(e) = app.session.input(cadcraft_engine::Input::Text(name.to_string())) {
@@ -437,8 +438,10 @@ mod tests {
         assert_eq!(app.session.current_prompt().map(|p| p.message), Some("Specify insertion point".to_string()));
 
         app.session.input(Input::Point(Vec2::new(5.0, 6.0))).unwrap();
-        app.session.input(Input::Enter).unwrap();
-        app.session.input(Input::Enter).unwrap();
+        // X scale, Y scale and rotation take their defaults.
+        for _ in 0..3 {
+            app.session.input(Input::Enter).unwrap();
+        }
         assert!(app.session.running.is_none());
         let d = app.session.doc().unwrap();
         let mut ins = Vec::new();

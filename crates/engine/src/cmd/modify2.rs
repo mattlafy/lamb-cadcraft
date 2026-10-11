@@ -649,9 +649,7 @@ fn spline_close(sp: &Spline) -> Spline {
         return sp.clone();
     }
     let mut out = if sp.fit.len() >= 2 {
-        let mut f = sp.fit.clone();
-        f.extend(sp.fit.first().copied());
-        Spline::from_fit_points(&f)
+        sp.refit(&sp.fit, true)
     } else {
         let mut c = sp.control.clone();
         c.extend(sp.control.first().copied());
@@ -672,7 +670,7 @@ fn spline_open(sp: &Spline) -> Spline {
         }
         v
     };
-    if sp.fit.len() >= 2 { Spline::from_fit_points(&trim(&sp.fit)) } else { Spline::from_control(trim(&sp.control), sp.degree) }
+    if sp.fit.len() >= 2 { sp.refit(&trim(&sp.fit), false) } else { Spline::from_control(trim(&sp.control), sp.degree) }
 }
 
 pub(crate) fn spline_to_poly(sp: &Spline, precision: usize) -> LwPolyline {
@@ -698,15 +696,13 @@ fn run_splinedit(s: &mut Session, p: &Value) -> Result<Value> {
         "close" => EntityKind::Spline(spline_close(sp)),
         "open" => EntityKind::Spline(spline_open(sp)),
         "reverse" => EntityKind::Spline(curves::reverse_spline(sp)),
-        "purge" => EntityKind::Spline(Spline { fit: Vec::new(), ..sp.clone() }),
+        "purge" => EntityKind::Spline(Spline { fit: Vec::new(), fit_opts: Default::default(), ..sp.clone() }),
         "refit" => {
             let fit = points_param(p, "fit").unwrap_or_else(|| sp.fit.clone());
             if fit.len() < 2 || fit.len() > MAX_GEN {
                 return Err(other("The spline has no fit data; give `fit` points."));
             }
-            let mut n = Spline::from_fit_points(&fit);
-            n.closed = sp.closed;
-            EntityKind::Spline(n)
+            EntityKind::Spline(sp.refit(&fit, sp.closed))
         }
         "polyline" => EntityKind::LwPolyline(spline_to_poly(sp, p.get("precision").and_then(Value::as_u64).unwrap_or(10) as usize)),
         "move" => {
@@ -716,9 +712,7 @@ fn run_splinedit(s: &mut Session, p: &Value) -> Result<Value> {
             if !n.fit.is_empty() {
                 let f = n.fit.get_mut(i).ok_or_else(|| bad("splinedit", "index out of range"))?;
                 *f = to;
-                let closed = n.closed;
-                n = Spline::from_fit_points(&n.fit);
-                n.closed = closed;
+                n = n.refit(&n.fit, n.closed);
             } else {
                 let c = n.control.get_mut(i).ok_or_else(|| bad("splinedit", "index out of range"))?;
                 *c = to;
@@ -1007,7 +1001,8 @@ impl Interactive for LengthenM {
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         let num = |i: &Input| -> Option<f64> { if let Input::Text(t) = i { number(t) } else { None } };
-        let ang = |i: &Input| -> Option<f64> { if let Input::Text(t) = i { crate::units::parse_angle(t) } else { None } };
+        let au = s.angle_settings();
+        let ang = |i: &Input| -> Option<f64> { if let Input::Text(t) = i { au.amount(t) } else { None } };
         match (self.phase, &i) {
             (LPhase::Main, Input::Point(p)) => {
                 let h = curves::pick_at(s, *p).ok_or_else(|| other("*Invalid selection*"))?;
@@ -1433,6 +1428,7 @@ pub(crate) fn flatten_kind(k: &mut EntityKind) {
         EntityKind::MLeader(m) => {
             m.leaders.iter_mut().for_each(|l| l.iter_mut().for_each(z));
             z(&mut m.landing);
+            m.block.iter_mut().for_each(|b| z(&mut b.insert));
         }
         EntityKind::Hatch(h) => h.elevation = 0.0,
         EntityKind::Solid(so) | EntityKind::Trace(so) => so.corners.iter_mut().for_each(z),
@@ -2132,13 +2128,14 @@ pub(crate) fn arraypath(
         return Err(other("Select objects to array."));
     }
     let (n, step) = match (count, spacing) {
-        (_, Some(sp)) if sp.is_finite() && sp > 0.0 => (((l / sp).floor() as usize + 1).clamp(1, MAX_GEN), sp),
+        (_, Some(sp)) if sp.is_finite() && sp > 0.0 => (((l / sp).floor() as usize).saturating_add(1), sp),
         (Some(n), _) => {
-            let n = n.clamp(1, MAX_GEN);
+            let n = n.max(1);
             (n, if c.closed { l / n as f64 } else { l / (n.max(2) - 1) as f64 })
         }
         _ => (6, if c.closed { l / 6.0 } else { l / 5.0 }),
     };
+    super::array::check_size(s, n as u64, objs.len())?;
     let Some((p0, t0)) = c.at_length(0.0) else { return Ok(Vec::new()) };
     let mut out = Vec::new();
     for i in 1..n {
@@ -2155,17 +2152,24 @@ pub(crate) fn arraypath(
 fn run_arraypath(s: &mut Session, p: &Value) -> Result<Value> {
     let hs = targets(s, p)?;
     let path = curves::handle_param(p, "path").ok_or_else(|| bad("arraypath", "`path` (handle) is required"))?;
-    let count = p.get("count").and_then(Value::as_u64).map(|n| n.min(MAX_GEN as u64) as usize);
+    let count = p.get("count").and_then(Value::as_u64).map(|n| usize::try_from(n).unwrap_or(usize::MAX));
     let spacing = p.get("spacing").and_then(Value::as_f64);
     let r = arraypath(s, &hs, path, count, spacing, bool_or(p, "align", true))?;
     Ok(json!({ "handles": r.iter().map(|h| h.hex()).collect::<Vec<_>>() }))
 }
 
 #[derive(Default)]
-struct PathArrayM {
+pub(super) struct PathArrayM {
     sel: SelectPhase,
     objs: Vec<Handle>,
     path: Option<Handle>,
+}
+
+impl PathArrayM {
+    /// Start at the path prompt with the objects already selected (ARRAY > PAth).
+    pub(super) fn with_objects(objs: Vec<Handle>) -> Self {
+        PathArrayM { sel: SelectPhase { picked: objs.clone(), done: true, ..SelectPhase::default() }, objs, path: None }
+    }
 }
 
 impl Interactive for PathArrayM {
@@ -2208,9 +2212,7 @@ impl Interactive for PathArrayM {
             }
             (Some(path), inp @ (Input::Text(_) | Input::Enter)) => {
                 let n = match &inp {
-                    Input::Text(t) => {
-                        number(t).filter(|n| *n >= 1.0 && *n <= MAX_GEN as f64).ok_or_else(|| other("Requires a count of 1 or more."))? as usize
-                    }
+                    Input::Text(t) => number(t).filter(|n| *n >= 1.0).ok_or_else(|| other("Requires a count of 1 or more."))? as usize,
                     _ => 6,
                 };
                 arraypath(s, &self.objs, path, Some(n), None, true)?;

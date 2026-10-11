@@ -6,9 +6,12 @@ use crate::{EngineError, Result, Session};
 
 const SESSION_VARS: &[&str] = &[
     "OSMODE",
+    "OSNAPHATCH",
     "ORTHOMODE",
     "POLARMODE",
     "POLARANG",
+    "POLARADDANG",
+    "AUTOSNAP",
     "GRIDMODE",
     "SNAPMODE",
     "SNAPUNIT",
@@ -25,6 +28,7 @@ const SESSION_VARS: &[&str] = &[
     "PICKADD",
     "GRIPSIZE",
     "CURSORSIZE",
+    "MAXARRAY",
     "LASTPOINT",
     "FONTALT",
     "FONTFALLBACK",
@@ -35,8 +39,12 @@ pub fn get(s: &Session, name: &str) -> Option<Value> {
     let st = &s.settings;
     let v = match n.as_str() {
         "OSMODE" => json!(st.osmode),
+        "OSNAPHATCH" => json!(i32::from(st.osnaphatch)),
         "ORTHOMODE" => json!(i32::from(st.orthomode)),
-        "POLARMODE" => json!(i32::from(st.polarmode)),
+        "POLARMODE" => json!(st.polar_flags),
+        "POLARADDANG" => json!(st.polaraddang.iter().map(|a| format!("{}", (a.to_degrees() * 1e6).round() / 1e6)).collect::<Vec<_>>().join(";")),
+        // Marker, tooltip and tracking tooltip always on (1 + 4 + 32); polar 8, tracking 16.
+        "AUTOSNAP" => json!(37 + 8 * u32::from(st.polarmode) + 16 * u32::from(st.otrack)),
         "POLARANG" => json!(st.polarang.to_degrees()),
         "GRIDMODE" => json!(i32::from(st.gridmode)),
         "SNAPMODE" => json!(i32::from(st.snapmode)),
@@ -54,7 +62,10 @@ pub fn get(s: &Session, name: &str) -> Option<Value> {
         "PICKADD" => json!(i32::from(st.pickadd)),
         "GRIPSIZE" => json!(st.gripsize),
         "CURSORSIZE" => json!(st.cursorsize),
+        "MAXARRAY" => json!(st.maxarray),
         "LASTPOINT" => json!([s.last_point.x, s.last_point.y, 0.0]),
+        // Held in radians (as `$ANGBASE` in DXF); reported in degrees, like POLARANG.
+        "ANGBASE" => json!(s.doc().ok()?.header.f64("ANGBASE", 0.0).to_degrees()),
         // Process-wide font substitution (profile settings, not saved in the drawing).
         "FONTALT" => json!(cadcraft_fonts::ttf::font_alt()),
         "FONTFALLBACK" => json!(cadcraft_fonts::ttf::fallback_fonts()),
@@ -126,8 +137,21 @@ pub fn set(s: &mut Session, name: &str, v: &Value) -> Result<()> {
     let st = &mut s.settings;
     match n.as_str() {
         "OSMODE" => st.osmode = v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).ok_or_else(bad)? as u32 & 0x7fff,
+        "OSNAPHATCH" => st.osnaphatch = as_bool(v).ok_or_else(bad)?,
         "ORTHOMODE" => st.orthomode = as_bool(v).ok_or_else(bad)?,
-        "POLARMODE" => st.polarmode = as_bool(v).ok_or_else(bad)?,
+        "POLARMODE" => st.polar_flags = as_i(v).filter(|b| (0..=15).contains(b)).ok_or_else(bad)? as u32,
+        "POLARADDANG" => {
+            let text = v.as_str().map(str::to_string).or_else(|| as_f64(v).map(|f| f.to_string())).ok_or_else(bad)?;
+            let angles: Option<Vec<f64>> =
+                text.split(';').map(str::trim).filter(|t| !t.is_empty()).map(|t| t.parse::<f64>().ok().filter(|a| a.is_finite())).collect();
+            let angles = angles.filter(|a| a.len() <= 10).ok_or_else(bad)?;
+            st.polaraddang = angles.into_iter().map(f64::to_radians).collect();
+        }
+        "AUTOSNAP" => {
+            let bits = as_i(v).filter(|b| (0..=63).contains(b)).ok_or_else(bad)?;
+            st.polarmode = bits & 8 != 0;
+            st.otrack = bits & 16 != 0;
+        }
         "POLARANG" => st.polarang = as_f64(v).filter(|a| *a > 0.0).ok_or_else(bad)?.to_radians(),
         "GRIDMODE" => st.gridmode = as_bool(v).ok_or_else(bad)?,
         "SNAPMODE" => st.snapmode = as_bool(v).ok_or_else(bad)?,
@@ -145,8 +169,18 @@ pub fn set(s: &mut Session, name: &str, v: &Value) -> Result<()> {
         "PICKADD" => st.pickadd = as_bool(v).ok_or_else(bad)?,
         "GRIPSIZE" => st.gripsize = as_f64(v).ok_or_else(bad)?.clamp(1.0, 255.0),
         "CURSORSIZE" => st.cursorsize = as_f64(v).ok_or_else(bad)?.clamp(1.0, 100.0),
+        "MAXARRAY" => st.maxarray = as_f64(v).ok_or_else(bad)?.clamp(100.0, 10_000_000.0) as u64,
         "FONTALT" => cadcraft_fonts::ttf::set_font_alt(v.as_str().ok_or_else(bad)?),
         "FONTFALLBACK" => cadcraft_fonts::ttf::set_fallback_fonts(v.as_str().ok_or_else(bad)?),
+        // A number is in degrees; text is an angle typed in AUNITS (SETVAR at the command line).
+        "ANGBASE" => {
+            let a = match v {
+                Value::String(t) => s.angle_settings().amount(t),
+                _ => as_f64(v).map(f64::to_radians),
+            };
+            let a = a.filter(|a| a.is_finite()).ok_or_else(bad)?;
+            s.doc_mut()?.header.set_f64("ANGBASE", cadcraft_geom::norm_angle(a));
+        }
         _ => {
             let d = s.doc_mut()?;
             let val = match v {
@@ -178,6 +212,11 @@ pub fn set(s: &mut Session, name: &str, v: &Value) -> Result<()> {
                     d.header.set_i64(&n, i);
                     return Ok(());
                 }
+                // A point variable takes `x,y` typed at the command line too.
+                Some(cadcraft_doc::HVal::Point(_)) => {
+                    d.header.set(&n, cadcraft_doc::HVal::Point(as_pt(v).ok_or_else(bad)?.to3(0.0)));
+                    return Ok(());
+                }
                 _ => {}
             }
             d.header.set(&n, val);
@@ -195,7 +234,9 @@ pub fn list(s: &Session) -> Value {
     }
     if let Ok(d) = s.doc() {
         for (k, v) in &d.header.vars {
-            if !k.starts_with("CADCRAFT_") {
+            if k == "ANGBASE" {
+                m.insert(k.clone(), get(s, k).unwrap_or(Value::Null));
+            } else if !k.starts_with("CADCRAFT_") {
                 m.insert(k.clone(), serde_json::to_value(v).unwrap_or(Value::Null));
             }
         }

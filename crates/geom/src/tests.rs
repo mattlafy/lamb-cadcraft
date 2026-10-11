@@ -110,6 +110,28 @@ fn circle_circle_hits() {
 }
 
 #[test]
+fn tiny_circle_secants_and_separated_circles() {
+    let first = Circle::new(Vec2::ZERO, 1e-9);
+    // Both radii and center separation are below the old absolute tolerance.
+    let hits = circle_circle(&first, &Circle::new(Vec2::new(5e-10, 0.0), 1e-9));
+    assert_eq!(hits.len(), 2);
+    let y = (1e-18_f64 - 2.5e-10_f64.powi(2)).sqrt();
+    assert!(hits.iter().all(|p| (p.x - 2.5e-10).abs() < 1e-20 && (p.y.abs() - y).abs() < 1e-20), "{hits:?}");
+    // A half-nanometre gap is significant relative to these circles.
+    assert!(circle_circle(&first, &Circle::new(Vec2::new(2.5e-9, 0.0), 1e-9)).is_empty());
+}
+
+#[test]
+fn huge_circle_secants_remain_finite() {
+    let hits = circle_circle(&Circle::new(Vec2::ZERO, 1e160), &Circle::new(Vec2::new(1e160, 0.0), 1e160));
+    assert_eq!(hits.len(), 2);
+    assert!(
+        hits.iter().all(|p| p.is_finite() && (p.x / 1e160 - 0.5).abs() < 1e-12 && (p.y.abs() / 1e160 - 3.0_f64.sqrt() / 2.0).abs() < 1e-12),
+        "{hits:?}"
+    );
+}
+
+#[test]
 fn spline_interpolates_fit_points() {
     let fit = [Vec2::new(0.0, 0.0), Vec2::new(1.0, 2.0), Vec2::new(3.0, 1.0), Vec2::new(4.0, 4.0), Vec2::new(6.0, 0.0)];
     let s = Spline::from_fit_points(&fit);
@@ -121,6 +143,29 @@ fn spline_interpolates_fit_points() {
     }
     assert!(s.eval(0.0).near(fit[0], 1e-9));
     assert!(s.eval(1.0).near(fit[4], 1e-9));
+}
+
+#[test]
+fn closed_spline_is_smooth_at_the_seam() {
+    let fit = [Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 3.0), Vec2::new(0.0, 3.0)];
+    let s = Spline::from_fit_points_closed(&fit);
+    assert!(s.is_valid() && s.closed && s.is_periodic());
+    assert_eq!(s.fit.len(), 4, "the first fit point is not repeated");
+    let (lo, hi) = s.domain();
+    assert!(s.eval(lo).near(fit[0], 1e-9) && s.eval(hi).near(fit[0], 1e-9));
+    let pts = s.tessellate(1e-4);
+    for f in fit {
+        assert!(pts.iter().any(|p| p.dist(f) < 0.05), "fit point {f:?} missed");
+    }
+    // Same tangent leaving and arriving at the seam (an open fit through a repeated point has a corner there).
+    let h = 1e-6;
+    let out = (s.eval(lo + h) - s.eval(lo)).normalized();
+    let back = (s.eval(hi) - s.eval(hi - h)).normalized();
+    assert!(out.near(back, 1e-4), "kink at the seam: {out:?} vs {back:?}");
+    // A repeated closing point is dropped.
+    let mut dup = fit.to_vec();
+    dup.push(fit[0]);
+    assert_eq!(Spline::from_fit_points_closed(&dup).fit.len(), 4);
 }
 
 #[test]

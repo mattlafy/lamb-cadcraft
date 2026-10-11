@@ -1,7 +1,7 @@
 //! The drawing area: grid, entities, selection highlighting, grips, rubber bands, object-snap
 //! markers, crosshair cursor, ViewCube, UCS icon and mouse handling.
 
-use cadcraft_color::{Rgb, display_rgb};
+use cadcraft_color::Rgb;
 use cadcraft_doc::Handle;
 use cadcraft_engine::Input;
 use cadcraft_engine::snap::{self, SnapHit};
@@ -98,7 +98,8 @@ pub struct CanvasState {
     pub snap: Option<SnapHit>,
     /// Effective cursor point after snaps/ortho/polar.
     pub cursor: Option<Vec2>,
-    pub polar_angle: Option<f64>,
+    /// The polar or object snap tracking path(s) the cursor is on.
+    pub track: Option<snap::tracking::Track>,
     pan_last: Option<Pos2>,
     /// True when the latest scroll came from a trackpad (or other precise-scrolling device):
     /// scrolling then pans and pinch zooms. A notched mouse wheel clears it so the wheel zooms.
@@ -114,6 +115,20 @@ pub struct CanvasState {
     pub param: crate::parametric::Cache,
     /// A selection window opened by a press-and-drag, to close where the button is let go.
     drag_window: bool,
+    /// The right-click that opened the shortcut menu held Shift or Ctrl: it is the object snap
+    /// menu ([`crate::context_menu`]).
+    pub snap_menu: bool,
+    /// Tab was pressed over a snap marker: show the next candidate ([`SnapCycle`]).
+    pub snap_tab: bool,
+    pub snap_cycle: Option<SnapCycle>,
+}
+
+/// Tab cycling through the candidate snaps under the cursor: where it started and which
+/// candidate shows. Moving the cursor out of the aperture ends it.
+#[derive(Clone, Copy, Debug)]
+pub struct SnapCycle {
+    anchor: Vec2,
+    index: usize,
 }
 
 /// Primitives of `list` sorted by entity handle, built on the first highlight after each list
@@ -175,6 +190,8 @@ fn ensure_list(app: &mut CadApp, px: f64) {
         text: true,
         fill: true,
         lineweights: app.session.settings.lwdisplay,
+        view_height: st.paper_view().height,
+        plot_style_table: None,
     };
     let opts = cadcraft_render::Options { tolerance: 2f64.powi(band) * 0.5, ..opts };
     let space = st.space.clone();
@@ -254,7 +271,7 @@ fn draw_list(p: &egui::Painter, xf: &Xf, list: &DisplayList, bg: Rgb, lwdisplay:
     let mut shapes: Vec<Shape> = Vec::with_capacity(list.prims.len());
     let px = 1.0 / xf.scale;
     for prim in &list.prims {
-        let col = color32(display_rgb(prim.color, bg));
+        let col = color32(prim.display_rgb(bg));
         let pts = list.points(prim);
         match prim.kind {
             Kind::Polyline => {
@@ -277,7 +294,9 @@ fn draw_list(p: &egui::Painter, xf: &Xf, list: &DisplayList, bg: Rgb, lwdisplay:
                     shapes.push(Shape::line(screen, Stroke::new(w, col)));
                 }
             }
-            Kind::Tris => {
+            Kind::Tris | Kind::Mask => {
+                // A wipeout's mask hides what was drawn before it with the background colour.
+                let col = if prim.kind == Kind::Mask { color32(bg) } else { col };
                 let mut mesh = egui::Mesh::default();
                 for tri in pts.chunks(3) {
                     if let [a, b, c] = tri {
@@ -350,7 +369,7 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
         if let (Kind::Infinite { ray }, Some(b), Some(d)) = (prim.kind, pts.first(), pts.get(1))
             && let Some(seg) = clip_infinite(xf, *b, *d, ray)
         {
-            shapes.push(Shape::line_segment(seg, Stroke::new(1.0, color32(display_rgb(prim.color, bg)))));
+            shapes.push(Shape::line_segment(seg, Stroke::new(1.0, color32(prim.display_rgb(bg)))));
         }
     }
     p.extend(shapes);
@@ -387,7 +406,7 @@ fn draw_highlight(p: &egui::Painter, xf: &Xf, list: &DisplayList, prims: &[usize
                     shapes.push(Shape::circle_stroke(xf.to_screen(*q), 3.0, Stroke::new(1.0, color)));
                 }
             }
-            Kind::Tris => {
+            Kind::Tris | Kind::Mask => {
                 // Outline triangles' bounding region lightly.
                 let bb = Bounds2::from_points(pts.iter().copied());
                 let r = Rect::from_two_pos(xf.to_screen(bb.min), xf.to_screen(bb.max));
@@ -419,6 +438,9 @@ fn draw_snap_marker(p: &egui::Painter, at: Pos2, hit: &SnapHit) {
         mode::INT | mode::APP => {
             p.line_segment([at + vec2(-s, -s), at + vec2(s, s)], st);
             p.line_segment([at + vec2(s, -s), at + vec2(-s, s)], st);
+            if hit.mode == mode::APP {
+                p.rect_stroke(Rect::from_center_size(at, vec2(2.0 * s, 2.0 * s)), 0.0, st, egui::StrokeKind::Middle);
+            }
         }
         mode::PER => {
             p.line(vec![at + vec2(-s, -s), at + vec2(-s, s), at + vec2(s, s)], st);
@@ -458,41 +480,84 @@ fn draw_snap_marker(p: &egui::Painter, at: Pos2, hit: &SnapHit) {
     p.galley(r.min + vec2(3.0, 1.0), galley, Color32::BLACK);
 }
 
-/// The rubber-band and snap-adjusted cursor point for the current prompt.
-fn effective_point(app: &mut CadApp, raw: Vec2, xf: &Xf) -> Vec2 {
+/// Acquired tracking points (small `+`, `//` for a Parallel line), the dotted paths the cursor
+/// is on and the tooltip naming them ("Endpoint: 5.0000 < 90°").
+fn draw_tracking(p: &egui::Painter, xf: &Xf, acquired: &[snap::tracking::Acquired], track: Option<&snap::tracking::Track>, far: f64) {
+    use snap::tracking::{Acquired, PathShape};
+    let t = Tokens::get();
+    let st = Stroke::new(1.0, t.snap);
+    for a in acquired {
+        let c = xf.to_screen(a.at());
+        if let Acquired::Parallel { .. } = a {
+            p.line_segment([c + vec2(-5.0, 3.0), c + vec2(-1.0, -5.0)], st);
+            p.line_segment([c + vec2(1.0, 3.0), c + vec2(5.0, -5.0)], st);
+        } else {
+            p.line_segment([c + vec2(-4.0, 0.0), c + vec2(4.0, 0.0)], st);
+            p.line_segment([c + vec2(0.0, -4.0), c + vec2(0.0, 4.0)], st);
+        }
+    }
+    let Some(tr) = track else { return };
+    let mut tips = Vec::new();
+    for path in &tr.paths {
+        // Around the cursor only (a path's origin may be far off screen).
+        let pts: Vec<Pos2> = match path.shape {
+            PathShape::Ray { origin, dir } => {
+                let back = (tr.point - origin).dot(dir).clamp(0.0, far);
+                vec![xf.to_screen(tr.point - dir * back), xf.to_screen(tr.point + dir * far)]
+            }
+            PathShape::Line { dir, .. } => vec![xf.to_screen(tr.point - dir * far), xf.to_screen(tr.point + dir * far)],
+            PathShape::Circle { center, radius, .. } => {
+                let (a0, span) = (center.angle_to(tr.point), (far / radius).min(std::f64::consts::PI));
+                (0..=96).map(|i| xf.to_screen(Vec2::polar(center, radius, a0 - span + span * f64::from(i) / 48.0))).collect()
+            }
+        };
+        p.extend(Shape::dotted_line(&pts, t.snap, 6.0, 1.0));
+        let (distance, angle) = (
+            cadcraft_engine::units::format_distance(path.from.dist(tr.point), 2, 4),
+            (path.from.angle_to(tr.point).to_degrees().round() as i64).rem_euclid(360),
+        );
+        tips.push(if path.name == "Polar" {
+            crate::tf!("Polar: {distance} < {angle}°", distance = distance, angle = angle)
+        } else {
+            crate::tf!("{name}: {distance} < {angle}°", name = crate::i18n::t(path.name), distance = distance, angle = angle)
+        });
+    }
+    if let Some(o) = tr.object {
+        tips.push(crate::i18n::t(o).to_string());
+    }
+    let at = xf.to_screen(tr.point);
+    if tr.paths.len() > 1 || tr.object.is_some() {
+        p.line_segment([at + vec2(-4.0, -4.0), at + vec2(4.0, 4.0)], st);
+        p.line_segment([at + vec2(4.0, -4.0), at + vec2(-4.0, 4.0)], st);
+    }
+    tooltip(p, at + vec2(16.0, 18.0), &tips.join(", "));
+}
+
+/// The rubber-band and snap-adjusted cursor point for the current prompt (the engine's
+/// `Session::snap_cursor`: object snaps, acquiring tracking points, grid, tracking paths, ortho).
+fn effective_point(app: &mut CadApp, raw: Vec2, xf: &Xf, ctx: &egui::Context) -> Vec2 {
     let prompt = app.session.current_prompt();
     let hot = app.canvas.hot_grip;
     let wants_point = hot.is_some() || prompt.as_ref().is_some_and(|p| p.accept.point && !p.accept.select);
     let base = hot.map(|g| g.base).or_else(|| prompt.as_ref().and_then(|p| p.base));
     let deferred = hot.is_none() && prompt.as_ref().is_some_and(|p| p.deferred);
-    let s = app.session.settings.clone();
     app.canvas.snap = None;
-    app.canvas.polar_angle = None;
+    app.canvas.track = None;
     if !wants_point || app.session.pending_window.is_some() {
+        if !wants_point {
+            app.session.tracking.clear();
+        }
         return raw;
     }
-    let ap = s.aperture / xf.scale;
-    if let Ok(st) = app.session.state()
-        && let Some(hit) = snap::osnap(&st.doc, &st.edit_space(), raw, ap, s.osmode, base, deferred)
-    {
-        app.canvas.snap = Some(hit);
-        return hit.point;
+    let (now, shift) = ctx.input(|i| (i.time, i.modifiers.shift));
+    let q = snap::tracking::CursorQuery { base, deferred, aperture: app.session.settings.aperture / xf.scale, tol: 6.0 / xf.scale, now, shift };
+    let r = app.session.snap_cursor(raw, &q);
+    if r.wait {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(snap::tracking::DWELL / 4.0));
     }
-    let mut p = raw;
-    if s.snapmode {
-        p = snap::grid_snap(p, s.snapunit, Vec2::ZERO);
-    }
-    if let Some(b) = base {
-        if s.orthomode {
-            p = snap::ortho(b, p);
-        } else if s.polarmode
-            && let Some((q, a)) = snap::polar(b, p, s.polarang, (6.0 / xf.scale) / b.dist(p).max(1e-12))
-        {
-            p = q;
-            app.canvas.polar_angle = Some(a);
-        }
-    }
-    p
+    app.canvas.snap = r.snap;
+    app.canvas.track = r.track;
+    r.point
 }
 
 pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
@@ -564,8 +629,14 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     {
         let _ = app.session.zoom_about(f64::from(zoom_pinch), xf.to_world(hp));
     }
-    // Pan with the middle button (trackpads pan with a two-finger swipe, above).
-    if middle_down && let Some(hp) = hover_pos {
+    // Pan with the middle button (or Shift+right-drag / two-finger drag on trackpads is scroll).
+    let middle_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+    let focused = ui.input(|i| i.focused);
+    if middle_down
+        && focused
+        && (app.canvas.pan_last.is_some() || (middle_pressed && inside))
+        && let Some(hp) = hover_pos
+    {
         if let Some(last) = app.canvas.pan_last {
             let d = hp - last;
             if let Ok(st) = app.session.state_mut() {
@@ -619,7 +690,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let raw_world = hover_pos.filter(|_| inside).map(|p| xf.to_world(p));
     let dyn_frame = crate::cmdline::dyn_frame(app);
     if let Some(w) = raw_world {
-        let mut eff = effective_point(app, w, &xf);
+        let mut eff = effective_point(app, w, &xf, ui.ctx());
         // A locked Dynamic Input value (`40,` or `40<` typed) holds the cursor and overrides snaps.
         if let Some(f) = dyn_frame
             && let Some(e) = crate::dyninput::parse(&app.cmd.buffer, &f)
@@ -627,10 +698,15 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         {
             eff = crate::dyninput::constrain(&e, &f, eff);
             app.canvas.snap = None;
+            app.canvas.track = None;
         }
         app.canvas.cursor = Some(eff);
         app.session.cursor = eff;
         app.session.cursor_deferred = app.canvas.snap.and_then(|h| h.deferred);
+        // Typed or menu snap overrides (END, NON…) and Tab cycling; a locked Dynamic Input value wins.
+        if dyn_frame.and_then(|f| crate::dyninput::parse(&app.cmd.buffer, &f)).is_none_or(|e| e.first_locked().is_none()) {
+            override_cursor(app, w, &xf);
+        }
     } else {
         app.canvas.cursor = None;
         app.canvas.snap = None;
@@ -690,20 +766,23 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             }
         }
     }
+    // Right-click acts as Enter while a command runs (the classic CAD default); otherwise it opens
+    // the shortcut menu (Repeat, Clipboard, …). Shift/Ctrl+right-click opens the object snap menu.
+    let idle = app.session.running.is_none();
     if inside && pressed_secondary {
-        // Right-click acts as Enter while a command runs (the classic CAD default).
-        if app.session.running.is_some() {
-            let _ = app.session.input(Input::Enter);
-        } else if !app.session.selection().is_empty() {
-            app.session.set_selection(Vec::new());
-        } else if let Some(last) = app.session.last_command.clone() {
-            app.start(&last);
-        }
+        app.canvas.snap_menu = mods.shift || mods.ctrl;
+    }
+    if inside && pressed_secondary && !idle && !app.canvas.snap_menu {
+        let _ = app.session.input(Input::Enter);
+    }
+    if idle || app.canvas.snap_menu {
+        crate::context_menu::show(app, &resp);
     }
 
     // Hover highlight (throttled to cursor movement).
-    let prompt = app.session.current_prompt();
-    let selecting = prompt.as_ref().is_none_or(|p| p.accept.select);
+    // The cursor picks objects (pick box, rollover highlight): "Select objects" and single-object
+    // prompts, or no command with PICKFIRST on.
+    let selecting = app.session.picking_objects();
     if inside && selecting && app.session.pending_window.is_none() {
         if hover_pos != app.canvas.hover_at
             && let (Some(w), Ok(st)) = (raw_world, app.session.state())
@@ -876,17 +955,9 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             painter.rect_stroke(r, 0.0, st, egui::StrokeKind::Middle);
         }
     }
-    // Polar tracking ray.
-    if let (Some(a), Some(c), Some(base)) = (app.canvas.polar_angle, app.canvas.cursor, prompt.as_ref().and_then(|p| p.base)) {
-        let far = base + Vec2::from_angle(a) * (view.height * 4.0);
-        let pts = [xf.to_screen(base), xf.to_screen(far)];
-        painter.extend(Shape::dashed_line(&pts, Stroke::new(1.0, Color32::from_rgb(0x4c, 0xd1, 0x37)), 3.0, 3.0));
-        let tip = crate::tf!(
-            "Polar: {distance} < {angle}°",
-            distance = cadcraft_engine::units::format_distance(base.dist(c), 2, 4),
-            angle = a.to_degrees().round() as i64
-        );
-        tooltip(&painter, xf.to_screen(c) + vec2(16.0, 18.0), &tip);
+    // Acquired tracking points and the polar / tracking paths under the cursor.
+    if app.canvas.cursor.is_some() {
+        draw_tracking(&painter, &xf, &app.session.tracking.acquired, app.canvas.track.as_ref(), view.height * 4.0);
     }
     if let (Some(hit), Some(_)) = (app.canvas.snap, app.canvas.cursor) {
         draw_snap_marker(&painter, xf.to_screen(hit.point), &hit);
@@ -929,17 +1000,77 @@ fn tooltip(p: &egui::Painter, at: Pos2, text: &str) {
     p.galley(r.min + vec2(4.0, 2.0), galley, Color32::BLACK);
 }
 
+/// Half the side of the pick box: the pick aperture (PICKBOX × 1.5 pixels, as `select::pick` is
+/// called with), so the square shows what a click hits. `None` when PICKBOX is 0 (no box).
+/// The candidate Tab has cycled to, if cycling: a Tab press starts or advances it, and the
+/// cursor leaving the aperture where it started ends it.
+fn snap_cycle(app: &mut CadApp, raw: Vec2, ap: f64) -> Option<usize> {
+    let tab = std::mem::take(&mut app.canvas.snap_tab);
+    let c = &mut app.canvas.snap_cycle;
+    if c.is_some_and(|c| c.anchor.dist(raw) > ap) {
+        *c = None;
+    }
+    if tab {
+        *c = Some(c.map_or(SnapCycle { anchor: raw, index: 1 }, |c| SnapCycle { index: c.index + 1, ..c }));
+    }
+    c.map(|c| c.index)
+}
+
+/// The cursor under a one-pick object snap override (`Session::snap_override`: END, NON…) or
+/// while Tab cycles the candidates: the snap of that mode (or the cycled candidate) replaces
+/// what the running snaps found; with none, a running snap no longer holds the cursor.
+fn override_cursor(app: &mut CadApp, raw: Vec2, xf: &Xf) {
+    let over = app.session.snap_override();
+    let ap = app.session.settings.aperture / xf.scale;
+    let cycle = snap_cycle(app, raw, ap);
+    let prompt = app.session.current_prompt();
+    let wants_point = prompt.as_ref().is_some_and(|p| p.accept.point && !p.accept.select);
+    if (over.is_none() && cycle.is_none()) || !wants_point || app.canvas.hot_grip.is_some() || app.session.pending_window.is_some() {
+        return;
+    }
+    let base = prompt.as_ref().and_then(|p| p.base);
+    let deferred = prompt.as_ref().is_some_and(|p| p.deferred);
+    let s = &app.session.settings;
+    let osmode = over.unwrap_or(s.osmode) | if s.osnaphatch { snap::mode::HATCH } else { 0 };
+    let Ok(st) = app.session.state() else { return };
+    let hit = match cycle {
+        Some(i) => {
+            let cands = cadcraft_engine::pointmod::snap_candidates(&st.doc, &st.edit_space(), raw, ap, osmode, base, deferred);
+            cands.get(i % cands.len().max(1)).copied()
+        }
+        None => snap::osnap(&st.doc, &st.edit_space(), raw, ap, osmode, base, deferred),
+    };
+    let p = match (hit, app.canvas.snap) {
+        (Some(h), _) => {
+            app.canvas.snap = Some(h);
+            h.point
+        }
+        (None, Some(_)) => {
+            app.canvas.snap = None;
+            raw
+        }
+        (None, None) => return,
+    };
+    app.canvas.cursor = Some(p);
+    app.session.cursor = p;
+    app.session.cursor_deferred = app.canvas.snap.and_then(|h| h.deferred);
+}
+
+fn pickbox_half(pickbox: f64) -> Option<f32> {
+    let half = (pickbox * 1.5) as f32;
+    (half.is_finite() && half >= 1.0).then_some(half)
+}
+
 fn draw_crosshair(app: &CadApp, p: &egui::Painter, rect: Rect, at: Pos2, pickbox: bool) {
-    let c = Color32::from_rgb(0xe8, 0xe8, 0xe8);
+    let st = Stroke::new(1.0, Tokens::get().crosshair);
     let len = (rect.height() * app.session.settings.cursorsize as f32 / 100.0).max(12.0);
-    let pb = (app.session.settings.pickbox as f32 + 1.0).max(3.0);
-    let gap = if pickbox { pb } else { 0.0 };
-    let st = Stroke::new(1.0, c);
+    let pb = if pickbox { pickbox_half(app.session.settings.pickbox) } else { None };
+    let gap = pb.unwrap_or(0.0);
     p.line_segment([pos2(at.x - len, at.y), pos2(at.x - gap, at.y)], st);
     p.line_segment([pos2(at.x + gap, at.y), pos2(at.x + len, at.y)], st);
     p.line_segment([pos2(at.x, at.y - len), pos2(at.x, at.y - gap)], st);
     p.line_segment([pos2(at.x, at.y + gap), pos2(at.x, at.y + len)], st);
-    if pickbox {
+    if let Some(pb) = pb {
         p.rect_stroke(Rect::from_center_size(at, vec2(pb * 2.0, pb * 2.0)), 0.0, st, egui::StrokeKind::Middle);
     }
 }
@@ -1137,7 +1268,7 @@ mod tests {
     use cadcraft_render::DPrim;
 
     fn list(handles: &[u64]) -> DisplayList {
-        let prim = |h| DPrim { handle: Handle(h), color: Rgb(255, 255, 255), lw: 0.0, kind: Kind::Polyline, start: 0, len: 0 };
+        let prim = |h| DPrim { handle: Handle(h), color: Rgb(255, 255, 255), aci7: true, lw: 0.0, kind: Kind::Polyline, start: 0, len: 0 };
         DisplayList { prims: handles.iter().map(|&h| prim(h)).collect(), ..Default::default() }
     }
 

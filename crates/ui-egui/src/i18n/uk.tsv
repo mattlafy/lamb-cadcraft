@@ -48,10 +48,13 @@
 	Arc	Дуга
 	Arc Length	Довжина дуги
 	Area	Площа
+	Arrange Panel	Розташувати панель
 	Array	Масив
 	Attach	Приєднати
 	Attribute	Атрибут
 	Attribute Definition	Визначення атрибута
+	Attribute Display	Відображення атрибутів
+	Audit	Перевірка креслення
 	Auto (system language)	Авто (мова системи)
 	Auto Constrain	Автоматичні обмеження
 	AutoConstrain	Автоматичні обмеження
@@ -100,6 +103,7 @@
 	Circle	Коло
 	Circumference	Довжина кола
 	Clear	Очистити
+	Clipboard	Буфер обміну
 	Close	Закрити
 	Close All	Закрити всі
 	Closed	Замкнений
@@ -130,6 +134,7 @@
 	Copy	Копіювати
 	Copy Layout	Копіювати аркуш
 	Copy Nested Objects	Копіювати вкладені об'єкти
+	Copy Selection	Копіювати вибране
 	Copy with Base Point	Копіювати з базовою точкою
 	Count	Кількість
 	Create Block	Створити блок
@@ -141,8 +146,11 @@
 	Cut	Вирізати
 	Cyan	Блакитний
 	Cylinder	Циліндр
+	DWG	DWG
+	DXF	DXF
 	Dark	Темна
 	Default	Типово
+	Default Save Format	Типовий формат збереження
 	Define Attributes	Визначити атрибути
 	Define Attributes...	Визначити атрибути...
 	Defined width	Задана ширина
@@ -160,6 +168,7 @@
 	Delta X	Різниця X
 	Delta Y	Різниця Y
 	Description	Опис
+	Deselect All	Скасувати вибір
 	Diameter	Діаметр
 	Dim style	Розмірний стиль
 	Dimension	Розміри
@@ -184,8 +193,10 @@
 	Drafting Settings...	Налаштування креслення...
 	Draw	Креслення
 	Draw Order	Порядок відображення
+	Drawing (DWG)	Креслення (DWG)
 	Drawing (DXF)	Креслення (DXF)
 	Drawing Limits	Межі креслення
+	Drawing Utilities	Утиліти креслення
 	Drawings (DWG, DXF)	Креслення (DWG, DXF)
 	Dynamic Dimensions	Динамічні розміри
 	Dynamic Input	Динамічне введення
@@ -277,6 +288,7 @@
 	Freeze/Thaw	Заморозити/розморозити
 	Freeze/Thaw in all viewports	Заморозити/розморозити в усіх видових екранах
 	Freeze/Thaw in the current viewport	Заморозити/розморозити в поточному видовому екрані
+	From	Від точки
 	General	Загальні
 	Geometric Center	Геометричний центр
 	Geometric Constraint	Геометричне обмеження
@@ -284,6 +296,7 @@
 	Geometry	Геометрія
 	Get Variable	Отримати змінну
 	Get View	Отримати вид
+	Global	Глобально
 	Global width	Загальна ширина
 	Grab bag	Список
 	Gradient	Градієнт
@@ -297,6 +310,8 @@
 	Grip Rotate	Поворот ручками
 	Grip Scale	Масштабування ручками
 	Grip Stretch	Розтягування ручками
+	Group	Згрупувати
+	Group Edit	Редагувати групу
 	Hatch	Штрихування
 	Hatch Edit	Редагувати штрихування
 	Hatch...	Штрихування...
@@ -347,7 +362,9 @@
 	Last	Останній
 	Last commit	Останній коміт
 	Layer	Шар
+	Layer Delete	Видалити шар з об'єктами
 	Layer Match	Узгодити шар
+	Layer Merge	Об'єднати шари
 	Layer Off	Вимкнути шар
 	Layer Properties	Властивості шару
 	Layer Properties Manager	Диспетчер властивостей шарів
@@ -358,6 +375,7 @@
 	Layer contains objects (double-click to make current)	Шар містить об'єкти (двічі клацніть, щоб зробити поточним)
 	Layer is empty (double-click to make current)	Шар порожній (двічі клацніть, щоб зробити поточним)
 	Layers	Шари
+	Layers Palette	Палітра шарів
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Показано шарів: {shown} із {total}.   Поточний шар: {layer}
 	Layout	Аркуш
 	Layout list	Список аркушів
@@ -384,6 +402,7 @@
 	List	Список
 	List Blocks	Список блоків
 	List Dimension Styles	Список розмірних стилів
+	List Groups	Список груп
 	List Layer States	Список станів шарів
 	List Layouts	Список аркушів
 	List System Variables	Список системних змінних
@@ -410,6 +429,7 @@
 	Measure Geometry	Виміряти геометрію
 	Merge Cells	Об'єднати комірки
 	Merged PRs	Об'єднані PR
+	Mid Between 2 Points	Середина між 2 точками
 	Midpoint	Середина
 	Mirror	Дзеркальне відображення
 	Model	Модель
@@ -476,6 +496,7 @@
 	Ortho (F8)	Орто (F8)
 	Ortho Mode	Режим Орто
 	Ortho Mode (F8)	Режим Орто (F8)
+	Osnap Settings...	Параметри об'єктної прив'язки...
 	Out	Віддалити
 	Override	Перевизначити
 	PAPER	АРКУШ
@@ -494,6 +515,7 @@
 	Parameters Manager	Диспетчер параметрів
 	Parametric	Параметризація
 	Paste	Вставити
+	Paste as Block	Вставити як блок
 	Paste to Original Coordinates	Вставити у вихідні координати
 	Path Array	Масив уздовж траєкторії
 	Pattern	Візерунок
@@ -504,9 +526,33 @@
 	Plot style	Стиль друку
 	Plot style attached to	Стиль друку застосовано до
 	Plot style table	Таблиця стилів друку
+	Plot Style...	Стиль друку...
+	Plot Style Manager	Диспетчер стилів друку
+	Plot Style Manager...	Диспетчер стилів друку...
+	Plot Styles...	Стилі друку...
+	New CTB	Нова CTB
+	New STB	Нова STB
+	New style	Новий стиль
+	Reset Panel Layout	Скинути розташування панелей
+	Use for this layout	Використати для цього аркуша
+	Display plot styles	Показувати стилі друку
+	No plot style tables.	Немає таблиць стилів друку.
+	A built-in table: editing it keeps an edited copy in the drawing.	Вбудована таблиця: зміни зберігаються як її копія в кресленні.
+	Keep an editable copy of this table in the drawing	Зберегти в кресленні копію цієї таблиці для редагування
+	Layout {name}: {table}	Аркуш {name}: {table}
+	Grayscale	Відтінки сірого
+	Screening	Інтенсивність
+	Use object linetype	Тип лінії об'єкта
+	Use object lineweight	Товщина лінії об'єкта
+	Remove	Вилучити
+	Add	Додати
+	Open a drawing first.	Спершу відкрийте креслення.
 	Plot table type	Тип таблиці друку
+	Color-dependent	Залежна від кольору
+	Named	Іменована
 	Plus/minus	Плюс/мінус
 	Point	Точка
+	Point Filters	Фільтри точок
 	Point Style...	Стиль точок...
 	Polar Array	Круговий масив
 	Polar Tracking	Полярне відстеження
@@ -548,6 +594,7 @@
 	Realtime	У реальному часі
 	Reassociate Dimensions	Відновити асоціативність розмірів
 	Recent	Нещодавні
+	Recover...	Відновити...
 	Rectangle	Прямокутник
 	Rectangular	Прямокутний
 	Rectangular Array	Прямокутний масив
@@ -568,6 +615,7 @@
 	Rename Layout	Перейменувати аркуш
 	Rename Text Style	Перейменувати текстовий стиль
 	Rename...	Перейменувати...
+	Repeat {command}	Повторити {command}
 	Requires a point (x,y, @dx,dy or @d<a).	Потрібна точка (x,y, @dx,dy або @d<a).
 	Reset Palettes	Скинути палітри
 	Restore	Відновити
@@ -840,6 +888,7 @@
 	Switch Layout	Перемкнути аркуш
 	Switch between model space in a viewport and paper space	Перемкнути між простором моделі у видовому екрані та простором аркуша
 	Symmetric	Симетрія
+	Synchronize Attributes	Синхронізувати атрибути
 	Toggle PICKADD (off: each pick replaces the selection)	Перемкнути PICKADD (вимкнено: кожен вибір замінює набір вибраних об'єктів)
 	Toggle PICKADD (on: picks add to the selection)	Перемкнути PICKADD (увімкнено: вибране додається до набору вибраних об'єктів)
 	TOP	ЗВЕРХУ
@@ -879,6 +928,7 @@
 	UCS Icon	Піктограма СКК
 	Undo	Скасувати дію
 	Undo (⌘Z)	Скасувати дію (⌘Z)
+	Ungroup	Розгрупувати
 	Union	Об'єднання
 	Unisolate Layer	Скасувати ізоляцію шарів
 	Units...	Одиниці...
@@ -929,6 +979,7 @@
 	{contributors} · {commits}	{contributors} · {commits}
 	{kind} (constraint {id})	{kind} (обмеження {id})
 	{kind} constraint {name} = {expression}  (double-click to edit)	Обмеження «{kind}» {name} = {expression}  (двічі клацніть для редагування)
+	{name}: {distance} < {angle}°	{name}: {distance} < {angle}°
 	ƒx  New User Parameter	ƒx  Новий параметр користувача
 	ΔLOC	Δрядків
 	−Bin	−двійк.

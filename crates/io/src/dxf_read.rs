@@ -83,10 +83,23 @@ fn common(t: &T) -> Common {
 
 /// Apply the OCS → WCS transform for 2D entities with a non-default extrusion.
 fn ocs(c: &Common, p: Vec3) -> Vec3 {
-    if (c.extrusion.z - 1.0).abs() < 1e-12 && c.extrusion.x.abs() < 1e-12 && c.extrusion.y.abs() < 1e-12 {
-        p
-    } else {
-        cadcraft_geom::Mat4::ocs(c.extrusion).apply(p)
+    ocs_n(c.extrusion, p)
+}
+
+fn ocs_n(n: Vec3, p: Vec3) -> Vec3 {
+    if (n.z - 1.0).abs() < 1e-12 && n.x.abs() < 1e-12 && n.y.abs() < 1e-12 { p } else { cadcraft_geom::Mat4::ocs(n).apply(p) }
+}
+
+/// The properties an ATTRIB carries itself: those it has groups for. Its layer counts only when
+/// it differs from its block reference's (an attribute defined on layer 0 goes on the reference's
+/// layer, as it is drawn anyway).
+fn attrib_props(t: &T, insert_layer: &str) -> AttribProps {
+    let c = common(t);
+    AttribProps {
+        layer: t.s(8).filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case(insert_layer)),
+        color: (t.i(62).is_some() || t.i(420).is_some()).then_some(c.color),
+        linetype: t.s(6).filter(|l| !l.is_empty()),
+        lineweight: t.i(370).is_some().then_some(c.lineweight),
     }
 }
 
@@ -106,7 +119,7 @@ fn text_from(t: &T) -> Text {
         _ => VAlign::Baseline,
     };
     let align = if t.f(11).is_some() { Some(t.p(11)) } else { None };
-    Text {
+    let mut text = Text {
         insert: t.p(10),
         align_pt: if h == HAlign::Left && v == VAlign::Baseline { None } else { align },
         height: t.fd(40, 0.2).max(1e-9),
@@ -117,6 +130,41 @@ fn text_from(t: &T) -> Text {
         style: t.s(7).unwrap_or_else(|| "Standard".into()),
         halign: h,
         valign: v,
+    };
+    let n = Vec3::new(t.fd(210, 0.0), t.fd(220, 0.0), t.fd(230, 1.0));
+    if n.z < 0.0 {
+        mirror_text(&mut text, align.map(|a| ocs_n(n, a)), ocs_n(n, t.p(10)));
+    }
+    text
+}
+
+/// TEXT / ATTRIB / ATTDEF with extrusion (0,0,-1): the points are OCS and the text runs from its
+/// insertion point towards -x in the WCS, with mirrored glyphs. CADCraft draws text readable
+/// (MIRRTEXT = 0), so it keeps the mirrored footprint: the direction turns to -rotation and
+/// left/right justification swap ends (start ↔ end point).
+fn mirror_text(t: &mut Text, align: Option<Vec3>, insert: Vec3) {
+    t.rotation = cadcraft_geom::norm_angle(-t.rotation);
+    let baseline_left = |t: &Text, p: Vec3| if t.valign == VAlign::Baseline { None } else { Some(p) };
+    match t.halign {
+        HAlign::Left => {
+            // TL/ML/BL are placed by their alignment point, baseline-left text by its start point.
+            t.halign = HAlign::Right;
+            t.insert = insert;
+            t.align_pt = Some(if t.valign == VAlign::Baseline { insert } else { align.unwrap_or(insert) });
+        }
+        HAlign::Right => {
+            t.halign = HAlign::Left;
+            t.insert = align.unwrap_or(insert);
+            t.align_pt = baseline_left(t, t.insert);
+        }
+        HAlign::Aligned | HAlign::Fit => {
+            t.insert = align.unwrap_or(insert);
+            t.align_pt = Some(insert);
+        }
+        HAlign::Center | HAlign::Middle => {
+            t.insert = insert;
+            t.align_pt = align;
+        }
     }
 }
 
@@ -143,13 +191,24 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             }
             EntityKind::Arc(a)
         }
-        "ELLIPSE" => EntityKind::Ellipse(Ellipse {
-            center: t.p(10),
-            major: t.p(11),
-            ratio: t.fd(40, 1.0).clamp(1e-9, 1.0),
-            start: t.fd(41, 0.0),
-            end: t.fd(42, std::f64::consts::TAU),
-        }),
+        "ELLIPSE" => {
+            let mut e = Ellipse {
+                center: t.p(10),
+                major: t.p(11),
+                ratio: t.fd(40, 1.0).clamp(1e-9, 1.0),
+                start: t.fd(41, 0.0),
+                end: t.fd(42, std::f64::consts::TAU),
+            };
+            if c.extrusion.z < 0.0 && (cadcraft_geom::ccw_sweep(e.start, e.end) - std::f64::consts::TAU).abs() > 1e-9 {
+                // Centre and major axis are WCS, but the minor axis is extrusion × major: with (0,0,-1)
+                // it points the other way, so parameter t lands where -t does in the XY plane. A full
+                // ellipse is symmetric and stays as it is.
+                let (s, e2) = (-e.end, -e.start);
+                e.start = cadcraft_geom::norm_angle(s);
+                e.end = cadcraft_geom::norm_angle(e2);
+            }
+            EntityKind::Ellipse(e)
+        }
         "LWPOLYLINE" => {
             let mut verts = Vec::new();
             let mut cur: Option<PolyVertex> = None;
@@ -206,11 +265,23 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             let control = t.pts(10);
             let weights = t.all_f(41);
             let fit = t.pts(11);
-            let mut sp = Spline { degree, knots, control, weights, fit: fit.clone(), closed: t.i(70).unwrap_or(0) & 1 != 0 };
+            let tangent = |c: i32| t.f(c).map(|_| t.p(c).xy());
+            let fit_opts = cadcraft_geom::FitOptions {
+                knots: Default::default(),
+                start_tangent: tangent(12),
+                end_tangent: tangent(13),
+                tolerance: t.fd(44, 0.0),
+            }
+            .sanitized();
+            let closed = t.i(70).unwrap_or(0) & 1 != 0;
+            let mut sp = Spline { degree, knots, control, weights, fit: fit.clone(), closed, fit_opts };
             if !sp.is_valid() && fit.len() >= 2 {
-                sp = Spline::from_fit_points(&fit);
+                sp = Spline::fit_with(&fit, sp.closed, fit_opts);
             } else if !sp.is_valid() && sp.control.len() >= 2 {
                 sp = Spline::from_control(sp.control.clone(), degree);
+            } else if fit.len() >= 3 {
+                // DXF keeps the knots, not how they were spaced: recover it for later refits.
+                sp.fit_opts.knots = sp.infer_knot_param();
             }
             EntityKind::Spline(sp)
         }
@@ -224,19 +295,32 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
                 contents.push_str(&tg.str());
             }
             contents.push_str(&t.s(1).unwrap_or_default());
-            let rotation = match (t.f(11), t.f(21)) {
+            let mut rotation = match (t.f(11), t.f(21)) {
                 (Some(x), Some(y)) if x != 0.0 || y != 0.0 => Vec2::new(x, y).angle(),
                 _ => t.fd(50, 0.0).to_radians(),
             };
+            let mut attach = t.i(71).unwrap_or(1).clamp(1, 9) as u8;
+            if c.extrusion.z < 0.0 {
+                // Insertion point and direction are WCS, but the line height runs along extrusion ×
+                // direction: under (0,0,-1) the glyphs are mirrored. Drawn readable (MIRRTEXT = 0) with
+                // the same footprint, the text turns round and left/right attachment swap.
+                rotation = cadcraft_geom::norm_angle(rotation + std::f64::consts::PI);
+                attach = match attach {
+                    1 | 4 | 7 => attach + 2,
+                    3 | 6 | 9 => attach - 2,
+                    a => a,
+                };
+            }
             EntityKind::MText(MText {
                 insert: t.p(10),
                 height: t.fd(40, 0.2).max(1e-9),
                 width: t.fd(41, 0.0).max(0.0),
-                attach: t.i(71).unwrap_or(1).clamp(1, 9) as u8,
+                attach,
                 rotation,
                 style: t.s(7).unwrap_or_else(|| "Standard".into()),
                 contents,
                 line_spacing: t.fd(44, 1.0),
+                line_spacing_exact: t.i(73) == Some(2),
             })
         }
         "ATTDEF" => EntityKind::AttDef(Attrib {
@@ -245,18 +329,39 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             invisible: t.i(70).unwrap_or(0) & 1 != 0,
             constant: t.i(70).unwrap_or(0) & 2 != 0,
             prompt: t.s(3).unwrap_or_default(),
+            props: Default::default(),
         }),
-        "INSERT" => EntityKind::Insert(Insert {
-            block: t.s(2).unwrap_or_default(),
-            insert: t.p(10),
-            scale: Vec3::new(t.fd(41, 1.0), t.fd(42, 1.0), t.fd(43, 1.0)),
-            rotation: t.fd(50, 0.0).to_radians(),
-            attribs: Vec::new(),
-            cols: t.i(70).unwrap_or(1).clamp(1, 10_000) as u32,
-            rows: t.i(71).unwrap_or(1).clamp(1, 10_000) as u32,
-            col_spacing: t.fd(44, 0.0),
-            row_spacing: t.fd(45, 0.0),
-        }),
+        "INSERT" => {
+            // A mirrored block reference comes with extrusion (0,0,-1): its insertion point, scale,
+            // rotation and column spacing are in that OCS, where x runs the other way. In the WCS that
+            // is the mirrored point, a negative x scale, the opposite rotation and a negative column
+            // spacing. Noise of up to 1e-3 in the extrusion's x/y moves the projection by ~1e-7 of the
+            // size, so it still counts as mirrored. A truly tilted extrusion (block plane not parallel
+            // to XY) needs the full 3D block transform, which Insert cannot hold; it is left as read.
+            let n = c.extrusion;
+            let mirrored = n.z < 0.0 && n.x.hypot(n.y) <= 1e-3 * n.z.abs();
+            let mut p = t.p(10);
+            let mut scale = Vec3::new(t.fd(41, 1.0), t.fd(42, 1.0), t.fd(43, 1.0));
+            let mut rotation = t.fd(50, 0.0).to_radians();
+            let mut col_spacing = t.fd(44, 0.0);
+            if mirrored {
+                p = ocs(&c, p);
+                scale.x = -scale.x;
+                rotation = -rotation;
+                col_spacing = -col_spacing;
+            }
+            EntityKind::Insert(Insert {
+                block: t.s(2).unwrap_or_default(),
+                insert: p,
+                scale,
+                rotation,
+                attribs: Vec::new(),
+                cols: t.i(70).unwrap_or(1).clamp(1, 10_000) as u32,
+                rows: t.i(71).unwrap_or(1).clamp(1, 10_000) as u32,
+                col_spacing,
+                row_spacing: t.fd(45, 0.0),
+            })
+        }
         "DIMENSION" => {
             let ty = t.i(70).unwrap_or(0) & 0x0f;
             let kind = match ty {
@@ -273,7 +378,8 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             EntityKind::Dimension(Dimension {
                 kind,
                 defpt: t.p(10),
-                text_mid: t.p(11),
+                // The text midpoint is the one OCS point of a DIMENSION.
+                text_mid: if c.extrusion.z < 0.0 { ocs(&c, t.p(11)) } else { t.p(11) },
                 p13: t.p(13),
                 p14: t.p(14),
                 p15: t.p(15),
@@ -300,7 +406,20 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             if kind == "SOLID" { EntityKind::Solid(Solid { corners }) } else { EntityKind::Trace(Solid { corners }) }
         }
         "3DFACE" => EntityKind::Face3d(Face3d { corners: [t.p(10), t.p(11), t.p(12), t.p(13)], hidden_edges: t.i(70).unwrap_or(0) as u8 }),
-        "HATCH" => hatch(tags, &t)?,
+        "HATCH" => {
+            let mut k = hatch(tags, &t)?;
+            if c.extrusion.z < 0.0
+                && let EntityKind::Hatch(h) = &mut k
+            {
+                // Boundary in the mirrored OCS, like LWPOLYLINE; the pattern direction mirrors too.
+                for v in h.loops.iter_mut().flat_map(|l| l.vertices.iter_mut()) {
+                    v.p.x = -v.p.x;
+                    v.bulge = -v.bulge;
+                }
+                h.angle = cadcraft_geom::norm_angle(std::f64::consts::PI - h.angle);
+            }
+            k
+        }
         "ACAD_TABLE" => EntityKind::Table(acad_table(tags)),
         "VIEWPORT" => EntityKind::Viewport(Viewport {
             center: t.p(10),
@@ -520,12 +639,17 @@ fn hatch(tags: &[Tag], t: &T) -> Option<EntityKind> {
         }
         loops.push(HatchLoop { vertices: verts, outer });
     }
+    let solid = solid || pattern.eq_ignore_ascii_case("SOLID");
+    let (scale, angle) = (t.fd(41, 1.0), t.fd(52, 0.0).to_radians());
+    // Definition lines matter only for a pattern the library doesn't define.
+    let pattern_lines =
+        if solid || cadcraft_doc::library::pattern(&pattern).is_some() { Vec::new() } else { pattern_definition(tags, scale, angle, origin) };
     Some(EntityKind::Hatch(Hatch {
         pattern: pattern.to_ascii_uppercase(),
-        solid: solid || pattern.eq_ignore_ascii_case("SOLID"),
+        solid,
         loops,
-        scale: t.fd(41, 1.0),
-        angle: t.fd(52, 0.0).to_radians(),
+        scale,
+        angle,
         associative: t.i(71).unwrap_or(0) != 0,
         style: t.i(75).unwrap_or(0) as u8,
         // The first 30 is the elevation point's z (boundary points are 2D).
@@ -533,7 +657,61 @@ fn hatch(tags: &[Tag], t: &T) -> Option<EntityKind> {
         gradient: gradient(tags),
         origin,
         background,
+        pattern_lines,
     }))
+}
+
+/// Upper bounds on a HATCH's pattern definition lines and on the dashes of one line.
+const MAX_PATTERN_LINES: usize = 1024;
+const MAX_PATTERN_DASHES: usize = 256;
+
+/// The pattern definition lines of a HATCH (groups 78, then per line 53 angle, 43/44 base
+/// point, 45/46 offset, 79 dash count, 49 dash lengths). A file holds them as drawn: scaled,
+/// rotated with the hatch and the offset as a world vector. They are kept the library's way
+/// (unit scale, no hatch rotation, base point relative to the hatch origin, offset as shift
+/// along the line and spacing), which the writer and the renderer turn back. Lines with
+/// non-finite values are skipped.
+fn pattern_definition(tags: &[Tag], scale: f64, angle: f64, origin: Vec2) -> Vec<cadcraft_doc::library::PatternLine> {
+    let Some(at) = tags.iter().position(|x| x.code == 78) else { return Vec::new() };
+    let scale = if scale.is_finite() && scale > 1e-9 { scale } else { 1.0 };
+    let angle = if angle.is_finite() { angle } else { 0.0 };
+    // Raw lines: angle (degrees), base, offset, dashes.
+    let mut raw: Vec<(f64, Vec2, Vec2, Vec<f64>)> = Vec::new();
+    for x in tags.iter().skip(at + 1) {
+        let cur = raw.last_mut();
+        match (x.code, cur) {
+            (53, _) => {
+                if raw.len() >= MAX_PATTERN_LINES {
+                    break;
+                }
+                raw.push((x.f64(), Vec2::ZERO, Vec2::ZERO, Vec::new()));
+            }
+            (43, Some(l)) => l.1.x = x.f64(),
+            (44, Some(l)) => l.1.y = x.f64(),
+            (45, Some(l)) => l.2.x = x.f64(),
+            (46, Some(l)) => l.2.y = x.f64(),
+            (79, Some(_)) => {}
+            (49, Some(l)) => {
+                if l.3.len() < MAX_PATTERN_DASHES {
+                    l.3.push(x.f64());
+                }
+            }
+            _ => break,
+        }
+    }
+    raw.into_iter()
+        .filter(|(a, b, o, d)| a.is_finite() && b.is_finite() && o.is_finite() && d.iter().all(|v| v.is_finite()))
+        .map(|(a, base, offset, dashes)| {
+            let local = (base - origin).rotate(-angle) * (1.0 / scale);
+            let delta = offset.rotate(-a.to_radians()) * (1.0 / scale);
+            cadcraft_doc::library::PatternLine {
+                angle: a - angle.to_degrees(),
+                origin: (local.x, local.y),
+                delta: (delta.x, delta.y),
+                dashes: dashes.into_iter().map(|d| d / scale).collect(),
+            }
+        })
+        .collect()
 }
 
 /// Hatch origin and background colour from `CADCRAFT` xdata: `1000 HATCH`, `1011` origin,
@@ -632,6 +810,62 @@ struct Rx {
     table_style_fix: Vec<(Handle, String)>,
     /// Upper-case xref block name → the external drawing's path (BLOCK group 1).
     xref_paths: HashMap<String, String>,
+    /// Plot style name placeholder handle (upper case) → plot style name (`ACAD_PLOTSTYLENAME`).
+    pstyles: HashMap<String, String>,
+}
+
+/// The plot style names of a file: the entries of the `ACAD_PLOTSTYLENAME` dictionary of the
+/// named object dictionary (the first object), by placeholder handle.
+fn plot_style_names(secs: &[cadcraft_dxf::Section]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(objects) = secs.iter().find(|s| s.name == "OBJECTS") else { return out };
+    let recs = records(&objects.tags);
+    let entries = |tags: &[Tag]| {
+        let mut v: Vec<(String, String)> = Vec::new();
+        let mut name: Option<String> = None;
+        for t in tags {
+            match t.code {
+                3 => name = Some(t.str()),
+                350 | 360 => {
+                    if let Some(n) = name.take() {
+                        v.push((n, t.str().trim().to_ascii_uppercase()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        v
+    };
+    let Some((_, root)) = recs.iter().find(|(k, _)| k == "DICTIONARY") else { return out };
+    let Some((_, dict)) = entries(root).into_iter().find(|(n, _)| n.eq_ignore_ascii_case(crate::dxf_ext::PLOT_STYLE_NAMES_KEY)) else {
+        return out;
+    };
+    let is_dict = |k: &str| k == "DICTIONARY" || k == "ACDBDICTIONARYWDFLT";
+    let Some((_, tags)) = recs.iter().find(|(k, tg)| is_dict(k) && T(tg).s(5).is_some_and(|h| h.trim().eq_ignore_ascii_case(&dict))) else {
+        return out;
+    };
+    for (n, h) in entries(tags).into_iter().take(crate::dxf_ext::MAX_PLOT_STYLE_NAMES) {
+        if !n.trim().is_empty() {
+            out.insert(h, n.chars().take(255).collect());
+        }
+    }
+    out
+}
+
+/// The named plot style an entity record points at (group 390 among its AcDbEntity groups).
+fn entity_plot_style(tags: &[Tag], rx: &Rx) -> Option<String> {
+    let mut in_entity = false;
+    for t in tags {
+        if t.code == 100 {
+            if in_entity {
+                return None;
+            }
+            in_entity = t.str() == "AcDbEntity";
+        } else if t.code == 390 && in_entity {
+            return rx.pstyles.get(&t.str().trim().to_ascii_uppercase()).cloned();
+        }
+    }
+    None
 }
 
 /// Dimension overrides and associativity, table references: data of an entity record that
@@ -673,6 +907,11 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> 
         let paper = t.i(67) == Some(1);
         let handle = t.s(5).and_then(|h| Handle::parse_hex(&h));
         let mut kindent = entity(kind, tags);
+        if let Some((c, _)) = kindent.as_mut()
+            && let Some(n) = entity_plot_style(tags, rx)
+        {
+            c.plot_style = n;
+        }
         // More entities from this record (the faces of a polyface or polygon mesh).
         let mut extra: Vec<EntityKind> = Vec::new();
         i += 1;
@@ -713,8 +952,13 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> 
                 } else if flags & 8 != 0 {
                     EntityKind::Polyline3d(Polyline3d { points: pts.iter().map(|p| p.0).collect(), closed: flags & 1 != 0 })
                 } else {
+                    // A 2D polyline's vertices are in its OCS: mirrored like LWPOLYLINE.
+                    let m = if c.extrusion.z < 0.0 { -1.0 } else { 1.0 };
                     EntityKind::LwPolyline(LwPolyline {
-                        vertices: pts.iter().map(|p| PolyVertex { p: p.0.xy(), bulge: p.1, start_width: p.2, end_width: p.3 }).collect(),
+                        vertices: pts
+                            .iter()
+                            .map(|p| PolyVertex { p: Vec2::new(m * p.0.x, p.0.y), bulge: m * p.1, start_width: p.2, end_width: p.3 })
+                            .collect(),
                         closed: flags & 1 != 0,
                         const_width: t.fd(40, 0.0).min(t.fd(41, 0.0)).max(0.0),
                         elevation: t.p(10).z,
@@ -726,6 +970,7 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> 
             "INSERT" => {
                 if t.i(66) == Some(1) {
                     let mut attribs = Vec::new();
+                    let ins_layer = kindent.as_ref().map(|(c, _)| c.layer.clone()).unwrap_or_default();
                     while let Some((k2, t2)) = recs.get(i) {
                         if k2 == "ATTRIB" {
                             let tt = T(t2);
@@ -735,6 +980,7 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx) -> 
                                 invisible: tt.i(70).unwrap_or(0) & 1 != 0,
                                 constant: false,
                                 prompt: String::new(),
+                                props: attrib_props(&tt, &ins_layer),
                             });
                             i += 1;
                         } else {
@@ -920,6 +1166,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
             _ => {}
         }
     }
+    let mut active_vport = false;
     for (kind, tg) in recs {
         let t = T(&tg);
         match kind.as_str() {
@@ -944,6 +1191,9 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 };
                 if let Some(tc) = t.i(420) {
                     l.color = Color::True(Rgb::from_u32(tc as u32));
+                }
+                if let Some(n) = t.s(390).and_then(|h| rx.pstyles.get(&h.trim().to_ascii_uppercase())) {
+                    l.plot_style = n.clone();
                 }
                 let alpha = crate::dxf_ext::xdata(&tg, crate::dxf_ext::LAYER_TRANSPARENCY_APP).iter().find(|x| x.code == 1071);
                 if let Some(pct) = alpha.and_then(|x| crate::dxf_ext::transparency_from_dxf(x.i64())) {
@@ -987,6 +1237,19 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 match d.text_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&name)) {
                     Some(x) => *x = st,
                     None => d.text_styles.push(st),
+                }
+            }
+            // The first *ACTIVE viewport holds the snap grid's origin and rotation (degrees).
+            "VPORT" if !active_vport && t.s(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("*ACTIVE")) => {
+                active_vport = true;
+                if let (Some(x), Some(y)) = (t.f(13), t.f(23))
+                    && x.is_finite()
+                    && y.is_finite()
+                {
+                    d.header.set("SNAPBASE", HVal::Point(Vec3::new(x, y, 0.0)));
+                }
+                if let Some(a) = t.f(50).filter(|a| a.is_finite()) {
+                    d.header.set_f64("SNAPANG", a);
                 }
             }
             "VIEW" => {
@@ -1097,7 +1360,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     }
     let mut d = Drawing::new_imperial();
     d.layouts.clear();
-    let mut rx = Rx::default();
+    let mut rx = Rx { pstyles: plot_style_names(&secs), ..Rx::default() };
     let mut blocks: Vec<(String, Vec3, String, Vec<(Option<String>, bool, Entity)>, bool)> = Vec::new();
     let mut layout_objs: Vec<(String, u32, String, PageSetup)> = Vec::new();
     let mut entities = Vec::new();
@@ -1348,6 +1611,10 @@ impl Objects {
         if let Some(states) = self.xrecord_text(crate::dxf_ext::LAYER_STATES_KEY).and_then(|t| crate::dxf_ext::parse_layer_states(&t)) {
             d.layer_states = states;
         }
+        // The drawing's plot style tables.
+        if let Some(tables) = self.xrecord_text(crate::dxf_ext::PLOT_STYLES_KEY).and_then(|t| crate::dxf_ext::parse_plot_styles(&t)) {
+            d.plot_style_tables = tables;
+        }
         // Multileader styles (named by their ACAD_MLEADERSTYLE dictionary entries).
         for (h, tags) in &self.mleader_styles {
             let Some(name) = self.names.get(h).filter(|n| !n.is_empty()) else { continue };
@@ -1500,8 +1767,10 @@ fn page_setup(t: &T) -> PageSetup {
     if let Some(dev) = t.s(2).map(|s| s.trim().to_string()) {
         p.device = if dev.is_empty() || dev.eq_ignore_ascii_case("none_device") { "None".into() } else { dev };
     }
-    // Plot layout flags: 4 centred, 16 standard scale (75 = 0: scaled to fit), 128 lineweights.
+    // Plot layout flags: 2 display plot styles, 4 centred, 16 standard scale (75 = 0: scaled
+    // to fit), 128 lineweights.
     if let Some(flags) = t.i(70) {
+        p.show_plot_styles = flags & 2 != 0;
         p.center = flags & 4 != 0;
         p.lineweights = flags & 128 != 0;
         p.scale_to_fit = flags & 16 != 0 && t.i(75) == Some(0);

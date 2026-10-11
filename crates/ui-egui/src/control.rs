@@ -9,6 +9,7 @@
 //! - `engine.commands`: every command with menu path, aliases, params and enablement
 //! - `drawing.inspect {entities?, limit?}`: drawing summary and entities (verifies agent work)
 //! - `ui.inspect`: UI state, canvas rect, view, performance
+//! - `ui.elements {label?, role?, focused?}`: observed visible controls and actual egui focus
 //! - `ui.menu.list`: the menu tree; `ui.menu.invoke {command}`: like choosing a menu item
 //! - `ui.pointer {x, y, space?: "world"|"screen", button?: left|right, action?: click|move}`
 //! - `ui.click {x, y}`, `ui.move {x, y}`: real egui pointer input in screen points
@@ -18,7 +19,10 @@
 //!   render of the drawing (no window needed; fits the drawing unless `fit` is false; replies `pngBase64`)
 //! - `app.open {path}`, `app.save {path?}`, `app.quit`
 
-use std::sync::mpsc::Sender;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::Duration;
 
 use cadcraft_engine::Input;
 use cadcraft_geom::Vec2;
@@ -32,18 +36,140 @@ pub struct ControlRequest {
     pub method: String,
     pub params: Value,
     pub reply: Sender<ControlResponse>,
+    state: Arc<AtomicU8>,
 }
 
+/// [`ControlRequest`] states, shared by the app and the transport waiting for the reply.
+const QUEUED: u8 = 0;
+const STARTED: u8 = 1;
+const CANCELLED: u8 = 2;
+
 impl ControlRequest {
-    pub fn new(method: impl Into<String>, params: Value) -> (Self, std::sync::mpsc::Receiver<ControlResponse>) {
+    pub fn new(method: impl Into<String>, params: Value) -> (Self, PendingReply) {
         let (tx, rx) = std::sync::mpsc::channel();
-        (Self { method: method.into(), params, reply: tx }, rx)
+        let state = Arc::new(AtomicU8::new(QUEUED));
+        (Self { method: method.into(), params, reply: tx, state: state.clone() }, PendingReply { rx, state })
+    }
+
+    /// Mark the request as started. False when the transport already gave up on it
+    /// ([`PendingReply::wait`] timed out): the app must then skip it, since the client was told it
+    /// did not run and may send it again.
+    pub fn begin(&self) -> bool {
+        self.state.compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+}
+
+/// The transport's side of a [`ControlRequest`]: waits for the reply.
+pub struct PendingReply {
+    rx: Receiver<ControlResponse>,
+    state: Arc<AtomicU8>,
+}
+
+impl PendingReply {
+    /// The reply, or after `timeout` an error that says whether the request can still have
+    /// changed anything:
+    /// - `{"ok": false, "error": "timeout", "state": "not-run"}`: the app had not started it, and
+    ///   now never will. Sending it again is safe.
+    /// - `{"ok": false, "error": "timeout", "state": "may-have-run"}`: the app had started it, so
+    ///   it may still finish and change the drawing (its late reply is discarded). Inspect before
+    ///   sending it again.
+    pub fn wait(self, timeout: Duration) -> ControlResponse {
+        if let Ok(r) = self.rx.recv_timeout(timeout) {
+            return r;
+        }
+        if self.state.compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return json!({"ok": false, "error": "timeout", "state": "not-run"});
+        }
+        // Started: a reply that arrived just now still counts.
+        self.rx.try_recv().unwrap_or_else(|_| json!({"ok": false, "error": "timeout", "state": "may-have-run"}))
     }
 }
 
 pub enum Outcome {
     Done(Value),
     Screenshot { path: Option<String> },
+}
+
+#[derive(Clone)]
+struct Widget {
+    id: egui::Id,
+    label: String,
+    role: &'static str,
+    rect: [f32; 4],
+    enabled: bool,
+    visible: bool,
+    selected: Option<bool>,
+}
+
+fn widgets_id() -> egui::Id {
+    egui::Id::new("cadcraft-observed-widgets")
+}
+
+pub(crate) fn begin_frame(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.remove::<Vec<Widget>>(widgets_id()));
+}
+
+/// Observe a real response. This never assigns focus or changes input routing.
+pub(crate) fn record_widget(ui: &egui::Ui, response: &egui::Response, label: &str, role: &'static str, selected: Option<bool>) {
+    if !response.rect.is_finite() || !response.rect.is_positive() {
+        return;
+    }
+    let widget = Widget {
+        id: response.id,
+        label: label.chars().take(512).collect(),
+        role,
+        rect: [response.rect.left(), response.rect.top(), response.rect.width(), response.rect.height()],
+        enabled: response.enabled(),
+        visible: ui.is_rect_visible(response.rect),
+        selected,
+    };
+    ui.ctx().data_mut(|data| {
+        let widgets = data.get_temp_mut_or_default::<Vec<Widget>>(widgets_id());
+        if let Some(previous) = widgets.iter_mut().find(|previous| previous.id == widget.id) {
+            *previous = widget;
+        } else if widgets.len() < 2048 {
+            widgets.push(widget);
+        }
+    });
+}
+
+fn widgets(ctx: &egui::Context) -> Vec<Widget> {
+    ctx.data_mut(|data| data.get_temp::<Vec<Widget>>(widgets_id()).unwrap_or_default())
+}
+
+fn widget_json(widget: &Widget, focused: Option<egui::Id>) -> Value {
+    json!({
+        "id": format!("{:016x}", widget.id.value()), "label": widget.label, "role": widget.role,
+        "rect": widget.rect, "enabled": widget.enabled, "visible": widget.visible,
+        "selected": widget.selected, "focused": focused == Some(widget.id),
+    })
+}
+
+fn focus_json(ctx: &egui::Context) -> Value {
+    let focused = ctx.memory(|memory| memory.focused());
+    let observed = widgets(ctx);
+    let widget = observed.iter().find(|widget| focused == Some(widget.id));
+    json!({
+        "id": focused.map(|id| format!("{:016x}", id.value())),
+        "label": widget.map(|widget| &widget.label),
+        "role": widget.map(|widget| widget.role),
+        "keyboardInput": ctx.egui_wants_keyboard_input(),
+    })
+}
+
+fn elements(ctx: &egui::Context, params: &Value) -> Value {
+    let focused = ctx.memory(|memory| memory.focused());
+    Value::Array(
+        widgets(ctx)
+            .iter()
+            .filter(|widget| {
+                params.get("label").and_then(Value::as_str).is_none_or(|label| widget.label == label)
+                    && params.get("role").and_then(Value::as_str).is_none_or(|role| widget.role == role)
+                    && params.get("focused").and_then(Value::as_bool).is_none_or(|value| value == (focused == Some(widget.id)))
+            })
+            .map(|widget| widget_json(widget, focused))
+            .collect(),
+    )
 }
 
 fn ok(v: Value) -> Outcome {
@@ -95,6 +221,7 @@ pub fn inspect(app: &CadApp, ctx: &egui::Context) -> Value {
     json!({
         "ui": serde_json::to_value(&app.ui).unwrap_or_default(),
         "theme": if app.shown_theme() == egui::Theme::Light { "light" } else { "dark" },
+        "focus": focus_json(ctx),
         "canvasRect": app.canvas.rect.map(|c| json!([c.left(), c.top(), c.width(), c.height()])),
         "window": [r.width(), r.height()],
         "view": view.map(|v| json!({"center": [v.center.x, v.center.y], "height": v.height})),
@@ -137,11 +264,14 @@ pub fn handle(app: &mut CadApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
         "cmdline.input" => {
             let text = s("text").unwrap_or("");
             let before = app.session.log.len();
-            app.cmdline(text);
+            let error = app.cmdline(text);
             let out: Vec<String> = app.session.log.iter().skip(before).cloned().collect();
             let mut st = cmdline_state(app);
             if let Some(o) = st.as_object_mut() {
                 o.insert("output".into(), json!(out));
+                if let Some(e) = error {
+                    o.insert("error".into(), json!(e));
+                }
             }
             ok(st)
         }
@@ -155,18 +285,37 @@ pub fn handle(app: &mut CadApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
             }
         }
         "cmdline.key" => {
-            match s("key").unwrap_or("enter").to_ascii_lowercase().as_str() {
-                "escape" | "esc" => app.session.cancel(),
-                _ => {
-                    let _ = app.session.input(Input::Enter);
+            let before = app.session.log.len();
+            let error = match s("key").unwrap_or("enter").to_ascii_lowercase().as_str() {
+                "escape" | "esc" => {
+                    app.session.cancel();
+                    None
+                }
+                // As pressing Enter in the command line: a refused Enter is echoed to the history.
+                _ => app.session.input(Input::Enter).err().map(|e| e.to_string()),
+            };
+            if let Some(e) = &error {
+                app.session.echo(e.clone());
+            }
+            let out: Vec<String> = app.session.log.iter().skip(before).cloned().collect();
+            let mut st = cmdline_state(app);
+            if let Some(o) = st.as_object_mut() {
+                o.insert("output".into(), json!(out));
+                if let Some(e) = error {
+                    o.insert("error".into(), json!(e));
                 }
             }
-            ok(cmdline_state(app))
+            ok(st)
         }
         "cmdline.state" => ok(cmdline_state(app)),
         "engine.commands" => ok(all_commands(app)),
         "drawing.inspect" | "document.inspect" => wrap(app.session.execute("drawing.inspect", p).map_err(|e| e.to_string())),
         "ui.inspect" => ok(inspect(app, ctx)),
+        "ui.elements" => ok(elements(ctx, p)),
+        "ui.focus" => {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ok(Value::Null)
+        }
         "ui.menu.list" => ok(Value::Array(
             crate::menus::tree(app).iter().map(|(m, es)| json!({"label": m, "children": es.iter().map(menu_json).collect::<Vec<_>>()})).collect(),
         )),
@@ -261,6 +410,9 @@ pub fn handle(app: &mut CadApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
             }
             match serde_json::from_value::<crate::UiState>(cur) {
                 Ok(u) => {
+                    if let Err(error) = u.docking.validate() {
+                        return err(error);
+                    }
                     app.ui = u;
                     ok(serde_json::to_value(&app.ui).unwrap_or_default())
                 }
@@ -354,6 +506,44 @@ mod tests {
         let kept = render_view(&far, Vec2::ZERO, 100.0, false, 800, 500);
         assert_eq!(kept.center, Vec2::ZERO);
         assert!((kept.scale - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn timed_out_request_that_never_started_is_skipped() {
+        let (req, pending) = ControlRequest::new("engine.execute", json!({}));
+        let r = pending.wait(Duration::from_millis(1));
+        assert_eq!(r, json!({"ok": false, "error": "timeout", "state": "not-run"}));
+        // The app reaches the request after the timeout: it must not run it.
+        assert!(!req.begin());
+    }
+
+    #[test]
+    fn timed_out_request_already_running_may_have_run() {
+        let (req, pending) = ControlRequest::new("engine.execute", json!({}));
+        assert!(req.begin());
+        let r = pending.wait(Duration::from_millis(1));
+        assert_eq!(r, json!({"ok": false, "error": "timeout", "state": "may-have-run"}));
+        // The late result goes nowhere (the receiver is gone); sending it doesn't fail the app.
+        assert!(req.reply.send(json!({"ok": true})).is_err());
+    }
+
+    #[test]
+    fn reply_in_time_is_returned() {
+        let (req, pending) = ControlRequest::new("engine.execute", json!({}));
+        let app = std::thread::spawn(move || {
+            assert!(req.begin());
+            let _ = req.reply.send(json!({"ok": true, "result": 1}));
+        });
+        assert_eq!(pending.wait(Duration::from_secs(30)), json!({"ok": true, "result": 1}));
+        let _ = app.join();
+    }
+
+    #[test]
+    fn reply_sent_right_at_the_timeout_still_counts() {
+        let (req, pending) = ControlRequest::new("engine.execute", json!({}));
+        assert!(req.begin());
+        let _ = req.reply.send(json!({"ok": true}));
+        assert_eq!(pending.wait(Duration::ZERO), json!({"ok": true}));
     }
 
     #[test]

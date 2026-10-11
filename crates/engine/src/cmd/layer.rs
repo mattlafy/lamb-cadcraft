@@ -1,4 +1,6 @@
-//! Layers: LAYER (programmatic sub-ids), layer tools (LAYMCUR, LAYISO, LAYOFF, LAYFRZ…).
+//! Layers: LAYER (programmatic sub-ids, -LAYER prompts), layer tools (LAYMCUR, LAYISO, LAYOFF, LAYFRZ…).
+
+mod prompts;
 
 use cadcraft_color::Color;
 use cadcraft_doc::{Layer, Lineweight};
@@ -10,10 +12,14 @@ use crate::{Result, Session};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        CommandSpec::new("layer", "Layers", run_list).menu(&["Format", "Layers"]).alias(&["la", "layers"]).noundo(),
+        CommandSpec::new("layer", "Layers", run_list)
+            .menu(&["Format", "Layers"])
+            .alias(&["la", "layers", "-layer"])
+            .params("{} → layers, states (typed -LAYER: option prompts)")
+            .interactive(|_| Ok(Box::new(prompts::LayerM::default()))),
         CommandSpec::new("layer.new", "New Layer", run_new).params("{name, color?, linetype?, lineweight? (mm), current?: bool}"),
         CommandSpec::new("layer.set", "Set Layer Properties", run_set)
-            .params("{name, on?, frozen?, locked?, plot?, color?, linetype?, lineweight?, transparency?, description?, newVpFreeze?, newName?}"),
+            .params("{name, on?, frozen?, locked?, plot?, color?, linetype?, lineweight?, transparency?, description?, newVpFreeze?, plotStyle? (named plot style), newName?}"),
         CommandSpec::new("layer.current", "Make Current", run_current)
             .menu(&["Format", "Layer Tools", "Make Current"])
             .alias(&["clayer"])
@@ -51,6 +57,14 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("layerstate.list", "List Layer States", run_state_list).params("{} → states").noundo(),
         CommandSpec::new("layerstate.delete", "Delete Layer State", run_state_delete).params("{name}"),
         CommandSpec::new("layerstate.rename", "Rename Layer State", run_state_rename).params("{from, to}"),
+        CommandSpec::new("laymrg", "Layer Merge", merge::run_laymrg)
+            .menu(&["Format", "Layer Tools", "Layer Merge"])
+            .params("{from: [names], to} (the from layers' objects move to `to`, then the from layers are deleted)")
+            .interactive(|_| Ok(Box::new(merge::LayerRemove::merge()))),
+        CommandSpec::new("laydel", "Layer Delete", merge::run_laydel)
+            .menu(&["Format", "Layer Tools", "Layer Delete"])
+            .params("{names: [...]} (deletes the layers and every object on them)")
+            .interactive(|_| Ok(Box::new(merge::LayerRemove::delete()))),
     ]
 }
 
@@ -59,7 +73,7 @@ fn layer_json(l: &Layer, current: bool) -> Value {
         "name": l.name, "on": l.on, "frozen": l.frozen, "locked": l.locked, "plot": l.plot,
         "color": l.color.name(), "colorRgb": l.color.resolve(Color::Index(7), Color::Index(7)).hex(),
         "linetype": l.linetype, "lineweight": l.lineweight.name(), "transparency": l.transparency,
-        "description": l.description, "current": current, "newVpFreeze": l.vp_freeze_new,
+        "description": l.description, "current": current, "newVpFreeze": l.vp_freeze_new, "plotStyle": l.plot_style,
     })
 }
 
@@ -118,6 +132,12 @@ fn apply(l: &mut Layer, p: &Value) -> Result<()> {
     if let Some(v) = p.get("plot").and_then(Value::as_bool) {
         l.plot = v;
     }
+    if let Some(v) = str_param(p, "plotStyle").map(str::trim) {
+        if v.is_empty() || v.eq_ignore_ascii_case("bylayer") || v.eq_ignore_ascii_case("byblock") {
+            return Err(bad("layer", "a layer's plot style is a style name (such as Normal)"));
+        }
+        l.plot_style = v.chars().take(255).collect();
+    }
     if let Some(c) = p.get("color") {
         let c = c
             .as_str()
@@ -147,6 +167,17 @@ fn apply(l: &mut Layer, p: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The loaded linetype named by `linetype`, if given: a layer cannot use ByLayer, ByBlock or a
+/// linetype the drawing does not have.
+fn loaded_linetype(d: &cadcraft_doc::Drawing, cmd: &str, p: &Value) -> Result<Option<String>> {
+    let Some(lt) = str_param(p, "linetype") else { return Ok(None) };
+    if lt.eq_ignore_ascii_case("ByLayer") || lt.eq_ignore_ascii_case("ByBlock") {
+        return Err(bad(cmd, "a layer linetype cannot be ByLayer or ByBlock"));
+    }
+    let t = d.linetype(lt).ok_or_else(|| bad(cmd, format!("linetype `{lt}` is not loaded (load it with LINETYPE)")))?;
+    Ok(Some(t.name.clone()))
+}
+
 fn valid_name(n: &str) -> bool {
     !n.trim().is_empty() && n.len() <= 255 && !n.chars().any(|c| "<>/\\\":;?*|,=`".contains(c))
 }
@@ -160,8 +191,12 @@ fn run_new(s: &mut Session, p: &Value) -> Result<Value> {
     if d.layer(&name).is_some() {
         return Err(bad("layer.new", format!("layer `{name}` already exists")));
     }
+    let lt = loaded_linetype(d, "layer.new", p)?;
     let mut l = Layer::new(&name);
     apply(&mut l, p)?;
+    if let Some(lt) = lt {
+        l.linetype = lt;
+    }
     d.layers.push(l);
     if bool_or(p, "current", false) {
         d.header.set_str("CLAYER", &name);
@@ -178,7 +213,11 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
     let cur = d.header.str("CLAYER", "0");
     let mut updated = d.layer(&name).cloned().ok_or_else(|| bad("layer.set", format!("no layer `{name}`")))?;
     let old = updated.name.clone();
+    let lt = loaded_linetype(d, "layer.set", p)?;
     apply(&mut updated, p)?;
+    if let Some(lt) = lt {
+        updated.linetype = lt;
+    }
     if p.get("frozen").and_then(Value::as_bool) == Some(true) && old.eq_ignore_ascii_case(&cur) {
         return Err(bad("layer.set", "cannot freeze the current layer"));
     }
@@ -188,6 +227,9 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
         }
         if !valid_name(nn) {
             return Err(bad("layer.set", "invalid layer name"));
+        }
+        if !nn.eq_ignore_ascii_case(&old) && d.layer(nn).is_some() {
+            return Err(bad("layer.set", format!("layer `{nn}` already exists")));
         }
     }
     let d = s.doc_mut()?;
@@ -404,6 +446,9 @@ fn run_state_rename(s: &mut Session, p: &Value) -> Result<Value> {
     st.name = to;
     ok()
 }
+
+// LAYMRG and LAYDEL.
+mod merge;
 
 #[cfg(test)]
 mod tests {

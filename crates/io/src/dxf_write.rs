@@ -12,6 +12,8 @@ use crate::dxf_ext::{self, DimVal, K};
 struct W {
     t: Vec<Tag>,
     next: u64,
+    /// Upper-case plot style name → its `ACDBPLACEHOLDER` handle (group 390 of layers and objects).
+    pstyles: HashMap<String, String>,
 }
 
 impl W {
@@ -145,7 +147,7 @@ fn annotative_xdata(w: &mut W) {
 
 /// Override (`ACAD` DSTYLE) and associativity (`CADCRAFT` ASSOC) xdata of a dimension.
 fn dim_xdata(w: &mut W, dm: &Dimension, cx: &Ctx) {
-    let mut ov = W { t: Vec::new(), next: 0 };
+    let mut ov = W { t: Vec::new(), next: 0, pstyles: HashMap::new() };
     let mut sah = false;
     for (k, v) in &dm.overrides {
         let Some(field) = DimStyle::field_name(k) else { continue };
@@ -282,21 +284,7 @@ fn common_x(w: &mut W, e: &Entity, owner: &str, paper: bool, subclass: &str, ass
     if paper {
         w.i(67, 1);
     }
-    w.s(8, &e.common.layer);
-    if !e.common.linetype.eq_ignore_ascii_case("bylayer") {
-        w.s(6, &e.common.linetype);
-    }
-    match e.common.color {
-        Color::ByLayer => {}
-        Color::True(rgb) => {
-            w.i(62, i64::from(cadcraft_color::nearest_aci(rgb)));
-            w.i(420, i64::from(rgb.to_u32()));
-        }
-        c => w.i(62, i64::from(c.to_aci())),
-    }
-    if e.common.lineweight != Lineweight::ByLayer {
-        w.i(370, i64::from(e.common.lineweight.to_dxf()));
-    }
+    layer_and_props(w, &e.common, None);
     if (e.common.ltscale - 1.0).abs() > 1e-12 {
         w.f(48, e.common.ltscale);
     }
@@ -306,9 +294,50 @@ fn common_x(w: &mut W, e: &Entity, owner: &str, paper: bool, subclass: &str, ass
     if let Some(v) = transparency_440(e.common.transparency) {
         w.i(440, v);
     }
+    // A named plot style (not ByLayer/ByBlock): its placeholder object.
+    if let Some(h) = w.pstyles.get(&e.common.plot_style.trim().to_ascii_uppercase()).cloned() {
+        w.s(390, h);
+    }
     if !subclass.is_empty() {
         w.s(100, subclass);
     }
+}
+
+/// Layer, linetype, colour and lineweight groups (8, 6, 62/420, 370). ByLayer is left out, unless
+/// it replaces something else in `base` (an attribute's definition).
+fn layer_and_props(w: &mut W, c: &Common, base: Option<&Common>) {
+    let write = |by_layer: bool, base_by_layer: fn(&Common) -> bool| !by_layer || base.is_some_and(|b| !base_by_layer(b));
+    w.s(8, &c.layer);
+    if write(c.linetype.eq_ignore_ascii_case("bylayer"), |b| b.linetype.eq_ignore_ascii_case("bylayer")) {
+        w.s(6, &c.linetype);
+    }
+    match c.color {
+        Color::ByLayer if write(true, |b| b.color == Color::ByLayer) => w.i(62, 256),
+        Color::ByLayer => {}
+        Color::True(rgb) => {
+            w.i(62, i64::from(cadcraft_color::nearest_aci(rgb)));
+            w.i(420, i64::from(rgb.to_u32()));
+        }
+        c => w.i(62, i64::from(c.to_aci())),
+    }
+    if write(c.lineweight == Lineweight::ByLayer, |b| b.lineweight == Lineweight::ByLayer) {
+        w.i(370, i64::from(c.lineweight.to_dxf()));
+    }
+}
+
+/// The properties attribute `a` of block reference `e` (of `ins`) is drawn with: its own, else its
+/// definition's; an attribute defined on layer 0 is on the reference's layer. Also the
+/// definition's properties.
+fn attrib_common(d: &Drawing, e: &Entity, ins: &Insert, a: &Attrib) -> (Common, Common) {
+    let def = d
+        .block(&ins.block)
+        .and_then(|b| b.entities.iter().find(|be| matches!(&be.kind, EntityKind::AttDef(ad) if ad.tag.eq_ignore_ascii_case(&a.tag))));
+    let base = def.map(|de| de.common.clone()).unwrap_or_default();
+    let mut c = a.props.over(&base);
+    if c.layer == "0" {
+        c.layer.clone_from(&e.common.layer);
+    }
+    (c, base)
 }
 
 /// ATTRIB/ATTDEF flags (group 70): 1 invisible, 2 constant.
@@ -467,12 +496,24 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
         EntityKind::Spline(s) => {
             w.s(0, "SPLINE");
             common(w, e, owner, paper, "AcDbSpline");
-            let flags = 8 | i64::from(s.closed) | if s.weights.is_empty() { 0 } else { 4 };
+            let flags = 8 | i64::from(s.closed) | if s.is_periodic() { 2 } else { 0 } | if s.weights.is_empty() { 0 } else { 4 };
             w.i(70, flags);
             w.i(71, s.degree as i64);
             w.i(72, s.knots.len() as i64);
             w.i(73, s.control.len() as i64);
             w.i(74, s.fit.len() as i64);
+            w.f(42, 1e-10);
+            w.f(43, 1e-10);
+            // Fit data: tolerance and end tangents (the knot parametrisation is implied by the knots).
+            if !s.fit.is_empty() {
+                w.f(44, s.fit_opts.tolerance);
+                if let Some(t) = s.fit_opts.start_tangent {
+                    w.p(12, t.to3(0.0));
+                }
+                if let Some(t) = s.fit_opts.end_tangent {
+                    w.p(13, t.to3(0.0));
+                }
+            }
             for k in &s.knots {
                 w.f(40, *k);
             }
@@ -526,6 +567,8 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
             if t.rotation != 0.0 {
                 w.f(50, t.rotation.to_degrees());
             }
+            // Line spacing style: 1 = at least, 2 = exactly.
+            w.i(73, if t.line_spacing_exact { 2 } else { 1 });
             w.f(44, t.line_spacing);
         }
         EntityKind::Insert(i) => {
@@ -553,7 +596,8 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
                     w.s(5, ah);
                     w.s(330, e.handle.hex());
                     w.s(100, "AcDbEntity");
-                    w.s(8, &e.common.layer);
+                    let (c, base) = attrib_common(d, e, i, a);
+                    layer_and_props(w, &c, Some(&base));
                     w.s(100, "AcDbText");
                     text_tags(w, &a.text, Some((&a.tag, attrib_flags(a))), None);
                 }
@@ -707,7 +751,7 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
                 let le = Entity {
                     handle: Handle(u64::from_str_radix(&w.h(), 16).unwrap_or(0)),
                     common: e.common.clone(),
-                    kind: EntityKind::Leader(cadcraft_doc::Leader { vertices, arrow: true, spline: false, style: m.style.clone() }),
+                    kind: EntityKind::Leader(cadcraft_doc::Leader { vertices, arrow: true, spline: m.spline, style: m.style.clone() }),
                 };
                 entity(w, d, &le, owner, paper, cx);
             }
@@ -718,6 +762,15 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
                     kind: EntityKind::MText(t.clone()),
                 };
                 entity(w, d, &te, owner, paper, cx);
+            }
+            // Block content: a plain INSERT of the block.
+            if let Some(ins) = &m.block {
+                let ie = Entity {
+                    handle: Handle(u64::from_str_radix(&w.h(), 16).unwrap_or(0)),
+                    common: e.common.clone(),
+                    kind: EntityKind::Insert(ins.clone()),
+                };
+                entity(w, d, &ie, owner, paper, cx);
             }
         }
         EntityKind::Leader(l) => {
@@ -787,7 +840,8 @@ fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx
                 w.f(41, h.scale);
                 w.i(77, 0);
                 let pat = cadcraft_doc::library::pattern(&h.pattern);
-                let lines = pat.map(|p| p.lines).unwrap_or_default();
+                // A pattern the library doesn't define keeps the lines read from its file.
+                let lines = pat.map(|p| p.lines).unwrap_or_else(|| h.pattern_lines.clone());
                 w.i(78, lines.len() as i64);
                 for pl in lines {
                     let ang = pl.angle.to_radians() + h.angle;
@@ -934,8 +988,9 @@ fn hatch_xdata(w: &mut W, h: &Hatch) {
 
 /// Anonymous dimension blocks (`*D1`…) with the rendered geometry, as consumers expect.
 fn dim_block_entities(d: &Drawing, dm: &Dimension, layer: &str) -> Vec<Entity> {
-    let style = d.dim_style(&dm.style).cloned().unwrap_or_default();
-    let g = cadcraft_render::dimension_geometry(dm, &style, d.header.f64("DIMSCALE", 1.0));
+    // The dimension as drawn: its overrides, DIMSCALE (0 = the drawing's) and text font.
+    let style = d.dim_style(&dm.style).cloned().unwrap_or_default().with_overrides(&dm.overrides);
+    let g = cadcraft_render::dimension_in(d, dm);
     let mut out = Vec::new();
     let c = Common { layer: layer.into(), color: Color::ByBlock, ..Common::default() };
     for l in &g.lines {
@@ -960,13 +1015,14 @@ fn dim_block_entities(d: &Drawing, dm: &Dimension, layer: &str) -> Vec<Entity> {
             common: c,
             kind: EntityKind::MText(MText {
                 insert: g.text_pos.to3(0.0),
-                height: style.text_height * style.scale.max(1e-9),
+                height: g.text_height,
                 width: 0.0,
                 attach: 5,
                 rotation: g.text_angle,
                 style: style.text_style.clone(),
                 contents: g.value.clone(),
                 line_spacing: 1.0,
+                line_spacing_exact: false,
             }),
         });
     }
@@ -1032,6 +1088,7 @@ fn table_block_entities(d: &Drawing, t: &Table, layer: &str) -> Vec<Entity> {
                     style: "Standard".into(),
                     contents: cell.text.clone(),
                     line_spacing: 1.0,
+                    line_spacing_exact: false,
                 }),
             });
         }
@@ -1171,7 +1228,7 @@ fn record_head(w: &mut W, kind: &str, owner: &str, subclass: &str) -> String {
 /// Write a drawing as ASCII DXF.
 pub fn write(d: &Drawing) -> String {
     // Structural handles start above every entity handle.
-    let mut w = W { t: Vec::new(), next: d.handseed.max(0x100) + 0x1000 };
+    let mut w = W { t: Vec::new(), next: d.handseed.max(0x100) + 0x1000, pstyles: HashMap::new() };
     // Pre-allocate handles for block records.
     let mut paper_layouts: Vec<&Layout> = d.layouts.iter().collect();
     paper_layouts.sort_by_key(|l| l.tab_order);
@@ -1297,6 +1354,22 @@ pub fn write(d: &Drawing) -> String {
     if let Some(chunks) = dxf_ext::layer_state_chunks(&d.layer_states) {
         xrecords.push((dxf_ext::LAYER_STATES_KEY, w.h(), chunks));
     }
+    if let Some(chunks) = dxf_ext::plot_style_chunks(&d.plot_style_tables) {
+        xrecords.push((dxf_ext::PLOT_STYLES_KEY, w.h(), chunks));
+    }
+    // Plot style names used by layers and objects (Normal always), each a placeholder object.
+    let pstyle_dict = w.h();
+    let mut pstyle_names: Vec<String> = vec![cadcraft_doc::NORMAL_STYLE.to_string()];
+    let named = d.layers.iter().map(|l| l.plot_style.as_str()).chain(every.iter().map(|e| e.common.plot_style.as_str()));
+    for n in named {
+        let n = n.trim();
+        let logical = n.is_empty() || n.eq_ignore_ascii_case("bylayer") || n.eq_ignore_ascii_case("byblock");
+        if !logical && pstyle_names.len() < dxf_ext::MAX_PLOT_STYLE_NAMES && !pstyle_names.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+            pstyle_names.push(n.to_string());
+        }
+    }
+    let pstyles: Vec<(String, String)> = pstyle_names.into_iter().map(|n| (n, w.h())).collect();
+    w.pstyles = pstyles.iter().map(|(n, h)| (n.to_ascii_uppercase(), h.clone())).collect();
     let model_layout = w.h();
     let layout_handles: Vec<String> = ps_brs.iter().map(|_| w.h()).collect();
 
@@ -1328,7 +1401,12 @@ pub fn write(d: &Drawing) -> String {
     // ---------------- CLASSES ----------------
     w.s(0, "SECTION");
     w.s(2, "CLASSES");
-    let mut classes = vec![("TABLESTYLE", "AcDbTableStyle", 4095, false), ("MLEADERSTYLE", "AcDbMLeaderStyle", 4095, false)];
+    let mut classes = vec![
+        ("TABLESTYLE", "AcDbTableStyle", 4095, false),
+        ("MLEADERSTYLE", "AcDbMLeaderStyle", 4095, false),
+        ("ACDBDICTIONARYWDFLT", "AcDbDictionaryWithDefault", 0, false),
+        ("ACDBPLACEHOLDER", "AcDbPlaceHolder", 0, false),
+    ];
     if !cx.tables.is_empty() {
         classes.push(("ACAD_TABLE", "AcDbTable", 1025, true));
     }
@@ -1366,7 +1444,8 @@ pub fn write(d: &Drawing) -> String {
     w.p2(10, Vec2::ZERO);
     w.p2(11, Vec2::new(1.0, 1.0));
     w.p2(12, if ext.is_empty() { Vec2::new(6.0, 4.5) } else { ext.center() });
-    w.p2(13, Vec2::ZERO);
+    // Snap grid origin and rotation (SNAPBASE, SNAPANG in degrees): R13+ files keep them here.
+    w.p2(13, d.header.point("SNAPBASE").map(|p| p.xy()).filter(|p| p.is_finite()).unwrap_or(Vec2::ZERO));
     w.p2(14, Vec2::new(0.5, 0.5));
     w.p2(15, Vec2::new(0.5, 0.5));
     w.p(16, Vec3::Z);
@@ -1374,6 +1453,7 @@ pub fn write(d: &Drawing) -> String {
     w.f(40, if ext.is_empty() { 9.0 } else { (ext.height() * 1.1).max(1e-6) });
     w.f(41, 1.6);
     w.f(42, 50.0);
+    w.f(50, d.header.f64("SNAPANG", 0.0));
     w.s(0, "ENDTAB");
     // LTYPE. Embedded text and shapes point at STYLE records (340), which get their handles
     // in the STYLE table below: (tag position, style name, is a shape) are filled in there.
@@ -1434,6 +1514,10 @@ pub fn write(d: &Drawing) -> String {
             w.i(290, 0);
         }
         w.i(370, i64::from(l.lineweight.to_dxf()));
+        let normal = w.pstyles.get(&cadcraft_doc::NORMAL_STYLE.to_ascii_uppercase()).cloned();
+        if let Some(h) = w.pstyles.get(&l.plot_style.trim().to_ascii_uppercase()).cloned().or(normal) {
+            w.s(390, h);
+        }
         if l.transparency > 0 {
             w.s(1001, dxf_ext::LAYER_TRANSPARENCY_APP);
             w.i(1071, dxf_ext::transparency_to_dxf(l.transparency));
@@ -1717,6 +1801,8 @@ pub fn write(d: &Drawing) -> String {
     w.s(350, layout_dict.clone());
     w.s(3, "ACAD_MLEADERSTYLE");
     w.s(350, mleader_dict.clone());
+    w.s(3, dxf_ext::PLOT_STYLE_NAMES_KEY);
+    w.s(350, pstyle_dict.clone());
     w.s(3, "ACAD_TABLESTYLE");
     w.s(350, table_style_dict.clone());
     for (key, h, _) in &xrecords {
@@ -1762,7 +1848,27 @@ pub fn write(d: &Drawing) -> String {
     for (s, (_, h)) in table_styles.iter().zip(&cx.table_styles) {
         table_style_obj(&mut w, s, h, &table_style_dict);
     }
-    // Parametric constraints and parameters, saved layer states (CADCraft data).
+    // Plot style names: a dictionary with a default (Normal) of placeholder objects.
+    w.s(0, "ACDBDICTIONARYWDFLT");
+    w.s(5, pstyle_dict.clone());
+    w.group("ACAD_REACTORS", 330, &[&root_dict]);
+    w.s(330, root_dict.clone());
+    w.s(100, "AcDbDictionary");
+    w.i(281, 1);
+    for (n, h) in &pstyles {
+        w.s(3, n);
+        w.s(350, h);
+    }
+    w.s(100, "AcDbDictionaryWithDefault");
+    w.s(340, pstyles.first().map(|(_, h)| h.clone()).unwrap_or_default());
+    for (_, h) in &pstyles {
+        w.s(0, "ACDBPLACEHOLDER");
+        w.s(5, h);
+        w.group("ACAD_REACTORS", 330, &[&pstyle_dict]);
+        w.s(330, pstyle_dict.clone());
+    }
+    // Parametric constraints and parameters, saved layer states, plot style tables (CADCraft
+    // data).
     for (_, h, chunks) in &xrecords {
         w.s(0, "XRECORD");
         w.s(5, h);
@@ -1831,7 +1937,12 @@ pub fn write(d: &Drawing) -> String {
         // per 143 drawing units).
         let scale = if page.scale.is_finite() && page.scale > 0.0 { page.scale } else { 1.0 };
         let standard = page.scale_to_fit || scale == 1.0;
-        let plot_flags = 512 | 32 | if standard { 16 } else { 0 } | if page.lineweights { 128 } else { 0 } | if page.center { 4 } else { 0 };
+        let plot_flags = 512
+            | 32
+            | if standard { 16 } else { 0 }
+            | if page.lineweights { 128 } else { 0 }
+            | if page.center { 4 } else { 0 }
+            | if page.show_plot_styles { 2 } else { 0 };
         let plot_type = match page.plot_area.as_str() {
             "display" => 0,
             "extents" => 1,

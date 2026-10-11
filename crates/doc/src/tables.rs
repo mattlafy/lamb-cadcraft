@@ -212,11 +212,19 @@ pub struct DimStyle {
     pub tol_decimals: u8,
     /// DIMTFAC tolerance text height relative to the dimension text.
     pub tol_scale: f64,
+    /// DIMTZIN zero suppression of tolerance values (DIMZIN bits).
+    pub tol_zero_suppression: u8,
     /// DIMALT alternate units, DIMALTF factor, DIMALTD decimals, DIMAPOST template.
     pub alt: bool,
     pub alt_factor: f64,
     pub alt_decimals: u8,
     pub alt_post: String,
+    /// DIMALTRND rounding increment of alternate units (0 = none); DIMRND doesn't apply to them.
+    pub alt_round: f64,
+    /// DIMALTU: 1 sci, 2 dec, 3 eng, 4 arch stacked, 5 frac stacked, 6 arch, 7 frac, 8 windows.
+    pub alt_unit: u8,
+    /// DIMALTZ zero suppression of alternate units (DIMZIN bits).
+    pub alt_zero_suppression: u8,
     /// DIMAUNIT: 0 decimal degrees, 1 deg/min/sec, 2 grads, 3 radians.
     pub angular_unit: u8,
     /// DIMSE1 / DIMSE2 suppress extension lines.
@@ -262,10 +270,14 @@ pub const DIMVARS: &[(&str, &str)] = &[
     ("DIMLIM", "limits"),
     ("DIMTDEC", "tolDecimals"),
     ("DIMTFAC", "tolScale"),
+    ("DIMTZIN", "tolZeroSuppression"),
     ("DIMALT", "alt"),
     ("DIMALTF", "altFactor"),
     ("DIMALTD", "altDecimals"),
     ("DIMAPOST", "altPost"),
+    ("DIMALTRND", "altRound"),
+    ("DIMALTU", "altUnit"),
+    ("DIMALTZ", "altZeroSuppression"),
     ("DIMAUNIT", "angularUnit"),
     ("DIMSE1", "suppressExt1"),
     ("DIMSE2", "suppressExt2"),
@@ -312,10 +324,14 @@ impl Default for DimStyle {
             limits: false,
             tol_decimals: 4,
             tol_scale: 1.0,
+            tol_zero_suppression: 0,
             alt: false,
             alt_factor: 25.4,
             alt_decimals: 2,
             alt_post: String::new(),
+            alt_round: 0.0,
+            alt_unit: 2,
+            alt_zero_suppression: 0,
             angular_unit: 0,
             suppress_ext1: false,
             suppress_ext2: false,
@@ -373,6 +389,17 @@ impl DimStyle {
                 }
                 _ => coerced,
             };
+            // Sizes that can't be negative (text height and tolerance scale: not zero either).
+            let x = coerced.as_f64();
+            let out_of_range = match field {
+                "textHeight" | "tolScale" => x.is_some_and(|x| x <= 0.0),
+                "scale" | "arrowSize" | "tickSize" => x.is_some_and(|x| x < 0.0),
+                _ => false,
+            };
+            if out_of_range {
+                rejected.push(k.clone());
+                continue;
+            }
             obj.insert(field.to_string(), coerced);
             match serde_json::from_value::<DimStyle>(cur.clone()) {
                 Ok(ns) => *self = ns,
@@ -511,6 +538,9 @@ pub struct PageSetup {
     pub plot_style_table: String,
     pub center: bool,
     pub lineweights: bool,
+    /// Draw the layout on screen (and in its PNG/SVG exports) with its plot style table
+    /// applied ("Display plot styles"; DXF plot layout flag 2).
+    pub show_plot_styles: bool,
 }
 
 impl Default for PageSetup {
@@ -528,6 +558,7 @@ impl Default for PageSetup {
             plot_style_table: String::new(),
             center: false,
             lineweights: true,
+            show_plot_styles: false,
         }
     }
 }

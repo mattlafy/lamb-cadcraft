@@ -11,6 +11,7 @@ mod entity;
 mod extents;
 mod header;
 pub mod library;
+mod plotstyle;
 mod store;
 mod tables;
 
@@ -22,6 +23,7 @@ pub use constraint::*;
 pub use entity::*;
 pub use extents::{MAX_BLOCK_DEPTH, entity_bounds};
 pub use header::{HVal, Header};
+pub use plotstyle::*;
 pub use store::EntityStore;
 pub use tables::*;
 
@@ -64,6 +66,9 @@ pub struct Drawing {
     pub ucss: Vec<Ucs>,
     pub layer_states: Vec<LayerState>,
     pub groups: Vec<Group>,
+    /// Plot style tables kept with the drawing (STYLESMANAGER); they shadow built-in tables of
+    /// the same name.
+    pub plot_style_tables: Vec<PlotStyleTable>,
     /// Parametric constraints (GEOMCONSTRAINT / DIMCONSTRAINT).
     pub constraints: Vec<Constraint>,
     /// User parameters and parametric settings.
@@ -113,6 +118,7 @@ impl Drawing {
             ucss: Vec::new(),
             layer_states: Vec::new(),
             groups: Vec::new(),
+            plot_style_tables: Vec::new(),
             constraints: Vec::new(),
             parametric: Parametric::default(),
             handseed: 0x100,
