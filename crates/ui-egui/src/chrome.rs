@@ -287,7 +287,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         // Layout tabs.
         let mut tabs: Vec<String> = vec!["Model".into()];
         let cur = app.session.state().map(|s| match &s.space {
-            cadcraft_doc::Space::Model => "Model".to_string(),
+            cadcraft_doc::Space::Model | cadcraft_doc::Space::Block(_) => "Model".to_string(),
             cadcraft_doc::Space::Paper(n) => n.clone(),
         });
         if let Ok(st) = app.session.state() {

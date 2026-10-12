@@ -89,7 +89,7 @@ impl LayoutM {
         let names: Vec<String> = ls.iter().filter(|l| pats.iter().any(|p| wildcard(p, &l.name))).map(|l| l.name.clone()).collect();
         let current = match s.layout_space() {
             Space::Paper(n) => n,
-            Space::Model => "Model".into(),
+            Space::Model | Space::Block(_) => "Model".into(),
         };
         s.echo(format!("Active Layout: {current}"));
         if names.is_empty() {
@@ -133,7 +133,7 @@ impl Interactive for LayoutM {
             Stage::Set => {
                 let tab = match s.layout_space() {
                     Space::Paper(n) => n,
-                    Space::Model => "Model".into(),
+                    Space::Model | Space::Block(_) => "Model".into(),
                 };
                 Prompt::new("Enter layout to make current", Accept::TEXT).default(tab)
             }
@@ -201,7 +201,7 @@ impl Interactive for LayoutM {
                     Some(n) => n,
                     None => match s.layout_space() {
                         Space::Paper(n) => n,
-                        Space::Model => "Model".into(),
+                        Space::Model | Space::Block(_) => "Model".into(),
                     },
                 };
                 let set = find_command("layout.set").ok_or_else(|| EngineError::UnknownCommand("layout.set".into()))?;

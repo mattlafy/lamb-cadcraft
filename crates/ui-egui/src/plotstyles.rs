@@ -53,7 +53,7 @@ fn window(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) -> Action {
     let names = cadcraft_doc::plot_style_table_names(d);
     let layout = match app.session.layout_space() {
         cadcraft_doc::Space::Paper(n) => d.layout(&n).map(|l| (n.clone(), l.page.plot_style_table.clone(), l.page.show_plot_styles)),
-        cadcraft_doc::Space::Model => None,
+        cadcraft_doc::Space::Model | cadcraft_doc::Space::Block(_) => None,
     };
     let mut sel = temp::<String>(ctx, "pstyle_sel")
         .filter(|s| names.iter().any(|n| n.eq_ignore_ascii_case(s)))

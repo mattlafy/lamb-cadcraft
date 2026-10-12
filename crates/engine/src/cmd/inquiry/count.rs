@@ -68,6 +68,7 @@ impl Scope {
         match self {
             Scope::Space(Space::Model) => "model space".into(),
             Scope::Space(Space::Paper(n)) => format!("layout {n}"),
+            Scope::Space(Space::Block(n)) => format!("block {n}"),
             Scope::All => "all spaces".into(),
             Scope::Objects(_) => "the selection".into(),
         }
@@ -76,7 +77,7 @@ impl Scope {
     fn objects<'a>(&self, d: &'a Drawing) -> Vec<(String, &'a std::sync::Arc<Entity>)> {
         let name = |sp: &Space| match sp {
             Space::Model => "Model".to_string(),
-            Space::Paper(n) => n.clone(),
+            Space::Paper(n) | Space::Block(n) => n.clone(),
         };
         let mut out = Vec::new();
         let mut add = |sp: &Space| {

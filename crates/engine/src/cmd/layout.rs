@@ -263,7 +263,7 @@ fn run_rename(s: &mut Session, p: &Value) -> Result<Value> {
     let from = match (str_param(p, "from"), s.layout_space()) {
         (Some(f), _) => f.to_string(),
         (None, Space::Paper(n)) => n,
-        (None, Space::Model) => return Err(bad("layout.rename", "`from` is required in the Model tab")),
+        (None, Space::Model | Space::Block(_)) => return Err(bad("layout.rename", "`from` is required in the Model tab")),
     };
     let from = layout_name("layout.rename", s.doc()?, &from)?;
     let to = str_param(p, "to").ok_or_else(|| bad("layout.rename", "`to` is required"))?;
@@ -373,7 +373,7 @@ fn target_layout(s: &Session, cmd: &str, p: &Value) -> Result<Space> {
         return Ok(Space::Paper(layout_name(cmd, s.doc()?, n)?));
     }
     match s.layout_space() {
-        Space::Model => Err(bad(cmd, "** Command not allowed in Model Tab ** (switch to a layout or pass `layout`)")),
+        Space::Model | Space::Block(_) => Err(bad(cmd, "** Command not allowed in Model Tab ** (switch to a layout or pass `layout`)")),
         sp => Ok(sp),
     }
 }
@@ -639,7 +639,7 @@ fn run_pagesetup(s: &mut Session, p: &Value) -> Result<Value> {
     let name = match (str_param(p, "layout"), s.space()) {
         (Some(n), _) => Some(layout_name(cmd, s.doc()?, n)?),
         (None, Space::Paper(n)) => Some(n),
-        (None, Space::Model) => None,
+        (None, Space::Model | Space::Block(_)) => None,
     };
     let Some(name) = name else {
         if changes {
@@ -787,7 +787,7 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
     let layout = match (&sheets, &space) {
         (Some(names), _) => names.first().cloned().unwrap_or_default(),
         (None, Space::Model) => "Model".to_string(),
-        (None, Space::Paper(n)) => n.clone(),
+        (None, Space::Paper(n) | Space::Block(n)) => n.clone(),
     };
     let pages = sheets.as_ref().map_or(1, Vec::len);
     match str_param(p, "path") {
@@ -813,9 +813,9 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
 fn plot_window(s: &Session, p: &Value, cmd: &str, space: &Space) -> Result<Option<Bounds2>> {
     let area = str_param(p, "plotArea").map(str::to_ascii_lowercase);
     let w = match (space, area.as_deref()) {
-        (_, None) | (Space::Model, Some("extents")) | (Space::Paper(_), Some("layout")) => return Ok(None),
+        (_, None) | (Space::Model | Space::Block(_), Some("extents")) | (Space::Paper(_), Some("layout")) => return Ok(None),
         (Space::Paper(_), Some(_)) => return Err(bad(cmd, "a layout plots its whole sheet: `plotArea` must be layout")),
-        (Space::Model, Some("display")) => {
+        (Space::Model | Space::Block(_), Some("display")) => {
             let st = s.state()?;
             let v = st.views.iter().find(|(sp, _)| *sp == Space::Model).map(|(_, v)| *v).unwrap_or_default();
             let (px, py) = s.viewport_px;
@@ -823,13 +823,13 @@ fn plot_window(s: &Session, p: &Value, cmd: &str, space: &Space) -> Result<Optio
             let half = Vec2::new(v.height * aspect / 2.0, v.height / 2.0);
             Bounds2::new(v.center - half, v.center + half)
         }
-        (Space::Model, Some("limits")) => {
+        (Space::Model | Space::Block(_), Some("limits")) => {
             let d = s.doc()?;
             let lo = d.header.point("LIMMIN").map(|p| p.xy()).unwrap_or(Vec2::ZERO);
             let hi = d.header.point("LIMMAX").map(|p| p.xy()).unwrap_or(Vec2::new(12.0, 9.0));
             Bounds2::new(lo, hi)
         }
-        (Space::Model, Some("window")) => {
+        (Space::Model | Space::Block(_), Some("window")) => {
             let corners = p.get("window").and_then(Value::as_array);
             let a = corners.and_then(|c| c.first()).and_then(point_value);
             let b = corners.and_then(|c| c.get(1)).and_then(point_value);
@@ -838,7 +838,7 @@ fn plot_window(s: &Session, p: &Value, cmd: &str, space: &Space) -> Result<Optio
             };
             Bounds2::new(a, b)
         }
-        (Space::Model, Some(_)) => return Err(bad(cmd, "`plotArea` must be extents, display, limits or window (layouts: layout)")),
+        (Space::Model | Space::Block(_), Some(_)) => return Err(bad(cmd, "`plotArea` must be extents, display, limits or window (layouts: layout)")),
     };
     let ok = w.min.is_finite() && w.max.is_finite() && w.width() > 1e-9 && w.height() > 1e-9;
     if ok { Ok(Some(w)) } else { Err(bad(cmd, "the plot area is empty")) }

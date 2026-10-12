@@ -55,13 +55,15 @@ pub type Result<T> = std::result::Result<T, DocError>;
 /// every clone, so entity copies and undo snapshots keep it. Not yet read or written by DXF I/O.
 pub type Extension = BTreeMap<String, serde_json::Value>;
 
-/// Which entity collection: model space or a named layout's paper space.
+/// Which entity collection: model space, a named layout's paper space, or a named block
+/// definition's own entities (editing inside a block, as BEDIT does).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Space {
     #[default]
     Model,
     Paper(String),
+    Block(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -273,24 +275,36 @@ impl Drawing {
         match space {
             Space::Model => Some(&self.model),
             Space::Paper(n) => self.layouts.iter().find(|l| &l.name == n).map(|l| &l.entities),
+            Space::Block(n) => self.block(n).map(|b| &b.entities),
         }
     }
     pub fn space_mut(&mut self, space: &Space) -> Option<&mut EntityStore> {
         match space {
             Space::Model => Some(&mut self.model),
             Space::Paper(n) => self.layouts.iter_mut().find(|l| &l.name == n).map(|l| &mut l.entities),
+            Space::Block(n) => {
+                // Same lookup as `block()`: exact key, then case-insensitive.
+                let key = if self.blocks.contains_key(n) { n.clone() } else { self.blocks.keys().find(|k| k.eq_ignore_ascii_case(n))?.clone() };
+                self.blocks.get_mut(&key).map(|b| &mut std::sync::Arc::make_mut(b).entities)
+            }
         }
     }
 
-    /// Find an entity in model space or any layout.
+    /// Find an entity in model space, then any layout, then any block definition.
     pub fn entity(&self, h: Handle) -> Option<&std::sync::Arc<Entity>> {
-        self.model.get(h).or_else(|| self.layouts.iter().find_map(|l| l.entities.get(h)))
+        self.model
+            .get(h)
+            .or_else(|| self.layouts.iter().find_map(|l| l.entities.get(h)))
+            .or_else(|| self.blocks.values().find_map(|b| b.entities.get(h)))
     }
     pub fn space_of(&self, h: Handle) -> Option<Space> {
         if self.model.contains(h) {
             return Some(Space::Model);
         }
-        self.layouts.iter().find(|l| l.entities.contains(h)).map(|l| Space::Paper(l.name.clone()))
+        if let Some(l) = self.layouts.iter().find(|l| l.entities.contains(h)) {
+            return Some(Space::Paper(l.name.clone()));
+        }
+        self.blocks.iter().find(|(_, b)| b.entities.contains(h)).map(|(k, _)| Space::Block(k.clone()))
     }
     pub fn modify_entity<F: FnOnce(&mut Entity)>(&mut self, h: Handle, f: F) -> Result<()> {
         let sp = self.space_of(h).ok_or(DocError::NoEntity(h))?;

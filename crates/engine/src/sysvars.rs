@@ -119,7 +119,7 @@ pub fn get(s: &Session, name: &str) -> Option<Value> {
         "CTAB" => json!(
             s.state()
                 .map(|d| match &d.space {
-                    cadcraft_doc::Space::Model => "Model".to_string(),
+                    cadcraft_doc::Space::Model | cadcraft_doc::Space::Block(_) => "Model".to_string(),
                     cadcraft_doc::Space::Paper(n) => n.clone(),
                 })
                 .unwrap_or_default()

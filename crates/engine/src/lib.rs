@@ -174,6 +174,14 @@ impl DocState {
     /// layout no longer exists, follow it to its other name when it was renamed (same tab order,
     /// a name `before` did not have), else go to the Model tab.
     fn follow_layout(&mut self, before: &Drawing) {
+        if let Space::Block(name) = &self.space {
+            // Undo/redo removed the block being edited: fall back to model space.
+            if self.doc.block(name).is_none() {
+                self.space = Space::Model;
+                self.mspace = None;
+            }
+            return;
+        }
         let Space::Paper(name) = &self.space else { return };
         if self.doc.layouts.iter().any(|l| l.name == *name) {
             return;
@@ -1504,6 +1512,9 @@ impl Session {
     }
 }
 
+#[cfg(test)]
+#[path = "block_space_tests.rs"]
+mod block_space_tests;
 #[cfg(test)]
 #[path = "ext_tests.rs"]
 mod ext_tests;

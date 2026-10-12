@@ -1408,6 +1408,7 @@ fn chspace(s: &mut Session, hs: &[Handle], to: Option<&str>, vp: Option<Handle>)
             (Space::Paper(real.clone()), real)
         }
         (Space::Paper(n), _) => (Space::Model, n.clone()),
+        (Space::Block(_), _) => return Err(other("CHSPACE is not available inside a block definition.")),
     };
     let m = match viewport_of(s, &layout, vp) {
         Some(v) => {
@@ -1445,7 +1446,7 @@ fn chspace(s: &mut Session, hs: &[Handle], to: Option<&str>, vp: Option<Handle>)
 fn run_chspace(s: &mut Session, p: &Value) -> Result<Value> {
     let hs = targets(s, p)?;
     let (n, _, target) = chspace(s, &hs, str_param(p, "to"), curves::handle_param(p, "viewport"))?;
-    Ok(json!({ "moved": n, "to": match target { Space::Model => "model".to_string(), Space::Paper(n) => n } }))
+    Ok(json!({ "moved": n, "to": match target { Space::Model => "model".to_string(), Space::Paper(n) | Space::Block(n) => n } }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

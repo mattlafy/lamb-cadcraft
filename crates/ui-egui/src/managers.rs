@@ -476,7 +476,7 @@ fn page_setup(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) -> Action 
     layouts.sort_by_key(|l| l.0);
     let shown = match app.session.layout_space() {
         cadcraft_doc::Space::Paper(n) => Some(n),
-        cadcraft_doc::Space::Model => None,
+        cadcraft_doc::Space::Model | cadcraft_doc::Space::Block(_) => None,
     };
     let mut sel = temp::<String>(ctx, "pagesetup_sel")
         .filter(|s| layouts.iter().any(|l| l.1 == *s))
@@ -723,7 +723,7 @@ fn plot(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) -> Action {
     let mut st = temp::<PlotState>(ctx, "plot_state").filter(|s| s.generation == generation && targets.contains(&s.target)).unwrap_or_else(|| {
         let target = match app.session.layout_space() {
             cadcraft_doc::Space::Paper(n) => n,
-            cadcraft_doc::Space::Model => "Model".into(),
+            cadcraft_doc::Space::Model | cadcraft_doc::Space::Block(_) => "Model".into(),
         };
         let mut ext = d.extents(&cadcraft_doc::Space::Model);
         if ext.is_empty() {

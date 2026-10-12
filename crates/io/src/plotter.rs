@@ -79,7 +79,7 @@ fn png(d: &Drawing, space: &Space, opts: &Value) -> Result<Vec<u8>> {
     let (width, height) = (px(sheet.size.x), px(sheet.size.y));
     let lineweights = o.lineweights.unwrap_or(match space {
         Space::Paper(_) => page.lineweights,
-        Space::Model => true,
+        Space::Model | Space::Block(_) => true,
     });
     let table = cadcraft_doc::plot_style_table(d, &page.plot_style_table).map(Arc::new);
     // Paper units per drawing unit: 1 for a layout at 1:1, the fitted scale for model space.

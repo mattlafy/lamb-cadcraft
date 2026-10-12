@@ -749,7 +749,7 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
         // The current layout's plot style table; named tables give the current plot style.
         let layout = match app.session.layout_space() {
             cadcraft_doc::Space::Paper(n) => d.layout(&n).map(|l| (n.clone(), l.page.plot_style_table.clone())),
-            cadcraft_doc::Space::Model => None,
+            cadcraft_doc::Space::Model | cadcraft_doc::Space::Block(_) => None,
         };
         let table = layout.as_ref().and_then(|(_, t)| cadcraft_doc::plot_style_table(d, t));
         match table.as_ref().filter(|t| !t.is_color_dependent()) {

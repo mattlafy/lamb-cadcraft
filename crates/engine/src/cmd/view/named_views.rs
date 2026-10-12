@@ -155,7 +155,9 @@ fn restore(s: &mut Session, name: &str) -> Result<Value> {
             let target = match (l.is_empty(), s.layout_space()) {
                 (false, _) => l.clone(),
                 (true, Space::Paper(cur)) => cur,
-                (true, Space::Model) => s.doc()?.layouts.iter().min_by_key(|x| x.tab_order).map(|x| x.name.clone()).unwrap_or_default(),
+                (true, Space::Model | Space::Block(_)) => {
+                    s.doc()?.layouts.iter().min_by_key(|x| x.tab_order).map(|x| x.name.clone()).unwrap_or_default()
+                }
             };
             if s.doc()?.layout(&target).is_none() {
                 return Err(EngineError::Other(format!("View \"{}\" belongs to layout \"{target}\", which does not exist.", v.name)));

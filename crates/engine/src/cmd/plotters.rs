@@ -287,7 +287,7 @@ pub(crate) fn plot_options(s: &Session, p: &Value, cmd: &str) -> Result<Value> {
         Some(n) => s.doc()?.layout(n).map(|l| l.page.clone()),
         None => match s.space() {
             cadcraft_doc::Space::Paper(n) => s.doc()?.layout(&n).map(|l| l.page.clone()),
-            cadcraft_doc::Space::Model => None,
+            cadcraft_doc::Space::Model | cadcraft_doc::Space::Block(_) => None,
         },
     };
     let dev = match given {
