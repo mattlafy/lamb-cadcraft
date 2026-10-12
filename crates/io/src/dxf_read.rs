@@ -55,7 +55,12 @@ fn transparency_440(v: i64) -> Transparency {
 }
 
 fn common(t: &T) -> Common {
-    let mut c = Common { layer: t.s(8).unwrap_or_else(|| "0".into()), linetype: t.s(6).unwrap_or_else(|| "ByLayer".into()), ..Common::default() };
+    let mut c = Common {
+        layer: t.s(8).unwrap_or_else(|| "0".into()),
+        linetype: t.s(6).unwrap_or_else(|| "ByLayer".into()),
+        ext: crate::dxf_ext::read_ext(t.0),
+        ..Common::default()
+    };
     if let Some(v) = t.i(62) {
         c.color = Color::from_aci(v as i16);
         if v < 0 {
@@ -1332,6 +1337,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                     locked: flags & 4 != 0,
                     vp_freeze_new: flags & 2 != 0,
                     plot: t.i(290).unwrap_or(1) != 0,
+                    ext: crate::dxf_ext::read_ext(&tg),
                     ..Layer::default()
                 };
                 if let Some(tc) = t.i(420) {
@@ -1701,6 +1707,11 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         d.layers.insert(0, Layer::default());
     }
     crate::dxf_raw::read(&secs, &mut d);
+    // Extension slots read into the model are not also kept as other applications' xdata.
+    let f = std::sync::Arc::make_mut(&mut d.foreign);
+    for x in f.entities.values_mut().chain(f.records.values_mut()) {
+        crate::dxf_ext::drop_ext_raw(&mut x.xdata);
+    }
     Ok(d)
 }
 
@@ -1879,6 +1890,18 @@ impl Objects {
         }
         if let Some(p) = self.xrecord_text(crate::dxf_ext::ANNOTATION_KEY).and_then(|t| crate::dxf_ext::parse_anno(&t)) {
             crate::dxf_ext::apply_anno(d, p);
+        }
+        // The drawing's extension slots (CADCRAFT_EXT_<key> entries).
+        let mut ext_names: Vec<&String> = self.names.values().filter(|n| n.starts_with(crate::dxf_ext::EXT_XRECORD_PREFIX)).collect();
+        ext_names.sort();
+        for name in ext_names {
+            let key = name.get(crate::dxf_ext::EXT_XRECORD_PREFIX.len()..).unwrap_or_default();
+            if crate::dxf_ext::ext_key_ok(key)
+                && !d.ext.contains_key(key)
+                && let Some(v) = self.xrecord_text(name).and_then(|t| serde_json::from_str(&t).ok())
+            {
+                d.ext.insert(key.to_string(), v);
+            }
         }
         // Saved layer states.
         if let Some(states) = self.xrecord_text(crate::dxf_ext::LAYER_STATES_KEY).and_then(|t| crate::dxf_ext::parse_layer_states(&t)) {

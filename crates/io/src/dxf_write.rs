@@ -3,7 +3,8 @@
 //! `$ACADVER`, from 2004 in the newer DIMSTYLE groups, and from 2007 in UTF-8 text (the caller
 //! picks the text encoding) and MULTILEADER entities (older files get LEADER + MTEXT).
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 use cadcraft_color::Color;
 use cadcraft_doc::*;
@@ -442,7 +443,27 @@ fn text_tags(w: &mut W, t: &Text, attrib_tag: Option<(&str, i64)>, attdef_prompt
     }
 }
 
+/// One entity, then its extension slots (`Common::ext`) as xdata at the end of its own record:
+/// after the record's groups and other xdata, before any following record (VERTEX, ATTRIB,
+/// SEQEND…). A slot the record already carries (a part of a multileader written as several
+/// entities) is not written twice.
 fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx) {
+    let start = w.t.len();
+    entity_body(w, d, e, owner, paper, cx);
+    if e.common.ext.is_empty() || w.t.len() == start {
+        return;
+    }
+    let end = w.t.get(start + 1..).and_then(|r| r.iter().position(|t| t.code == 0)).map_or(w.t.len(), |i| start + 1 + i);
+    let has: HashSet<String> =
+        w.t.get(start..end).unwrap_or(&[]).iter().filter(|t| t.code == 1001).map(|t| t.str().trim().to_ascii_uppercase()).collect();
+    let tags: Vec<Tag> = dxf_ext::ext_keys(&e.common.ext)
+        .filter(|(k, _)| !has.contains(&k.to_ascii_uppercase()))
+        .flat_map(|(k, v)| dxf_ext::ext_xdata(k, v))
+        .collect();
+    w.t.splice(end..end, tags);
+}
+
+fn entity_body(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx) {
     match &e.kind {
         EntityKind::Line(l) => {
             w.s(0, "LINE");
@@ -1606,24 +1627,30 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
     let layout_dict = w.h();
     let table_style_dict = w.h();
     // CADCraft data in XRECORDs of the named object dictionary: (key, handle, text chunks).
-    let mut xrecords: Vec<(&str, String, Vec<String>)> = Vec::new();
+    let mut xrecords: Vec<(Cow<'_, str>, String, Vec<String>)> = Vec::new();
     // The drawing's own next handle: table records and objects are numbered above it, so
     // reading it back (instead of $HANDSEED) keeps their handles across saves (#495).
-    xrecords.push((dxf_ext::HANDSEED_KEY, w.h(), vec![format!("{:X}", d.handseed)]));
+    xrecords.push((dxf_ext::HANDSEED_KEY.into(), w.h(), vec![format!("{:X}", d.handseed)]));
     if let Some(name) = d.header.get("CMLEADERSTYLE").and_then(HVal::as_str) {
-        xrecords.push((dxf_ext::MLEADER_STYLE_KEY, w.h(), vec![name.to_string()]));
+        xrecords.push((dxf_ext::MLEADER_STYLE_KEY.into(), w.h(), vec![name.to_string()]));
     }
     if let Some(chunks) = dxf_ext::constraint_chunks(&d.constraints, &d.parametric) {
-        xrecords.push((dxf_ext::CONSTRAINTS_KEY, w.h(), chunks));
+        xrecords.push((dxf_ext::CONSTRAINTS_KEY.into(), w.h(), chunks));
     }
     if let Some(chunks) = dxf_ext::layer_state_chunks(&d.layer_states) {
-        xrecords.push((dxf_ext::LAYER_STATES_KEY, w.h(), chunks));
+        xrecords.push((dxf_ext::LAYER_STATES_KEY.into(), w.h(), chunks));
     }
     if let Some(chunks) = dxf_ext::plot_style_chunks(&d.plot_style_tables) {
-        xrecords.push((dxf_ext::PLOT_STYLES_KEY, w.h(), chunks));
+        xrecords.push((dxf_ext::PLOT_STYLES_KEY.into(), w.h(), chunks));
     }
     if let Some(chunks) = dxf_ext::anno_chunks(d) {
-        xrecords.push((dxf_ext::ANNOTATION_KEY, w.h(), chunks));
+        xrecords.push((dxf_ext::ANNOTATION_KEY.into(), w.h(), chunks));
+    }
+    // The drawing's extension slots, one XRECORD per key.
+    for (key, value) in dxf_ext::ext_keys(&d.ext) {
+        if let Some(chunks) = dxf_ext::ext_chunks(value) {
+            xrecords.push((format!("{}{key}", dxf_ext::EXT_XRECORD_PREFIX).into(), w.h(), chunks));
+        }
     }
     // The annotation scale list: the ACAD_SCALELIST dictionary of SCALE objects.
     let scale_dict = w.h();
@@ -1784,6 +1811,7 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
             w.s(1000, "");
             w.s(1000, dxf_ext::xdata_str(&l.description));
         }
+        w.xdata(dxf_ext::ext_tags(&l.ext));
     }
     w.s(0, "ENDTAB");
     // STYLE. Linetype shapes from a shape file that isn't a text style get an unnamed shape
@@ -1888,7 +1916,17 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
         w.f(146, 0.0);
     }
     w.s(0, "ENDTAB");
-    let apps = ["ACAD", dxf_ext::APP, "AcadAnnotative", dxf_ext::LAYER_TRANSPARENCY_APP, dxf_ext::LAYER_DESCRIPTION_APP];
+    let mut apps: Vec<&str> = vec!["ACAD", dxf_ext::APP, "AcadAnnotative", dxf_ext::LAYER_TRANSPARENCY_APP, dxf_ext::LAYER_DESCRIPTION_APP];
+    // One registered application per extension slot key on any entity or layer.
+    let entities = std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities)).chain(d.blocks.values().map(|b| &b.entities));
+    let exts = entities.flat_map(|s| s.iter().map(|e| &e.common.ext)).chain(d.layers.iter().map(|l| &l.ext));
+    for ext in exts {
+        for (k, _) in dxf_ext::ext_keys(ext) {
+            if !apps.iter().any(|a| a.eq_ignore_ascii_case(k)) {
+                apps.push(k);
+            }
+        }
+    }
     let th = table_head(&mut w, "APPID", apps.len());
     for app in apps {
         record_head(&mut w, "APPID", &th, "AcDbRegAppTableRecord");
@@ -2089,7 +2127,7 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
     w.s(3, "ACAD_TABLESTYLE");
     w.s(350, table_style_dict.clone());
     for (key, h, _) in &xrecords {
-        w.s(3, *key);
+        w.s(3, key.as_ref());
         w.s(350, h);
     }
     w.s(3, "ACAD_SCALELIST");

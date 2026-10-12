@@ -666,8 +666,15 @@ fn json_chunks(json: &str) -> Vec<String> {
 /// characters are written as `\U+XXXX` escapes, `1002 }`.
 pub(crate) fn array_xdata(p: &ArrayParams) -> Vec<Tag> {
     let Ok(json) = serde_json::to_string(p) else { return Vec::new() };
-    let safe = json_chunks(&json).concat();
-    let mut v = vec![Tag::s(1000, "ARRAY"), Tag::s(1002, "{")];
+    json_list(Vec::new(), "ARRAY", &json)
+}
+
+/// `v` followed by `1000 <name>`, `1002 {`, `json` in `1000` strings (backslashes escaped as in
+/// [`json_chunks`]; each string costs at most 240 even with non-ASCII characters written as
+/// `\U+XXXX`), `1002 }`.
+fn json_list(mut v: Vec<Tag>, name: &str, json: &str) -> Vec<Tag> {
+    let safe = json_chunks(json).concat();
+    v.extend([Tag::s(1000, name), Tag::s(1002, "{")]);
     let (mut cur, mut cost) = (String::new(), 0usize);
     for c in safe.chars() {
         let n = if c.is_ascii() { 1 } else { 7 * c.len_utf16() };
@@ -683,6 +690,112 @@ pub(crate) fn array_xdata(p: &ArrayParams) -> Vec<Tag> {
     }
     v.push(Tag::s(1002, "}"));
     v
+}
+
+/// Named-object-dictionary entries holding the drawing's extension slots (`Drawing.ext`): one
+/// XRECORD per key, named this prefix plus the key, its text the JSON value in chunks.
+pub(crate) const EXT_XRECORD_PREFIX: &str = "CADCRAFT_EXT_";
+/// The marker that opens an extension-slot payload in xdata: `1000 EXT`, `1002 {`.
+const EXT_MARK: &str = "EXT";
+/// Applications CADCraft writes itself; an extension key with one of these names is skipped.
+const RESERVED_APPS: &[&str] = &["ACAD", APP, "AcadAnnotative", LAYER_TRANSPARENCY_APP, LAYER_DESCRIPTION_APP];
+/// Characters a symbol name (a registered application, a dictionary entry) may not hold.
+const BAD_KEY_CHARS: &str = "<>/\\\":;?*|,=`";
+
+/// True when an extension key can be written: it becomes a registered application name (entity
+/// and layer slots) or part of a dictionary entry name (drawing slots), so it must be a valid
+/// symbol name (1–255 characters, none of [`BAD_KEY_CHARS`], no control characters or
+/// surrounding blanks) and not an application CADCraft already uses.
+pub(crate) fn ext_key_ok(key: &str) -> bool {
+    !key.is_empty()
+        && key.chars().count() <= 255
+        && key.trim() == key
+        && !key.chars().any(|c| c.is_control() || BAD_KEY_CHARS.contains(c))
+        && !RESERVED_APPS.iter().any(|a| a.eq_ignore_ascii_case(key))
+}
+
+/// The writable slots of an extension, in key order; of keys equal but for case, the first.
+pub(crate) fn ext_keys(ext: &cadcraft_doc::Extension) -> impl Iterator<Item = (&String, &Value)> {
+    let mut seen = std::collections::HashSet::new();
+    ext.iter().filter(move |(k, _)| ext_key_ok(k) && seen.insert(k.to_ascii_uppercase()))
+}
+
+/// One extension slot as xdata: `1001 <key>`, then the value as a marked JSON list
+/// (`1000 EXT`, `1002 {`, JSON strings, `1002 }`). Empty for a key that can't be written.
+pub(crate) fn ext_xdata(key: &str, value: &Value) -> Vec<Tag> {
+    if !ext_key_ok(key) {
+        return Vec::new();
+    }
+    let Ok(json) = serde_json::to_string(value) else { return Vec::new() };
+    json_list(vec![Tag::s(1001, key)], EXT_MARK, &json)
+}
+
+/// The xdata of every writable slot of `ext`.
+pub(crate) fn ext_tags(ext: &cadcraft_doc::Extension) -> Vec<Tag> {
+    ext_keys(ext).flat_map(|(k, v)| ext_xdata(k, v)).collect()
+}
+
+/// The extension slots a record's xdata carries: every application whose groups start with the
+/// `1000 EXT`, `1002 {` marker and whose text parses as JSON. Other xdata is not read.
+pub(crate) fn read_ext(tags: &[Tag]) -> cadcraft_doc::Extension {
+    let mut ext = cadcraft_doc::Extension::new();
+    let Some(start) = tags.iter().position(|t| t.code == 1001) else { return ext };
+    let rest = tags.get(start..).unwrap_or(&[]);
+    let mut i = 0;
+    while let Some(first) = rest.get(i) {
+        let body = rest.get(i + 1..).unwrap_or(&[]);
+        let len = body.iter().position(|t| t.code == 1001).unwrap_or(body.len());
+        i += 1 + len;
+        if let Some((key, value)) = ext_entry(&first.str(), body.get(..len).unwrap_or(&[])) {
+            ext.entry(key).or_insert(value);
+        }
+    }
+    ext
+}
+
+/// The slot one application's xdata holds (`app`, then its groups `x`), if it is a marked one.
+fn ext_entry(app: &str, x: &[Tag]) -> Option<(String, Value)> {
+    let app = app.trim();
+    if !ext_key_ok(app) {
+        return None;
+    }
+    x.first().filter(|t| t.code == 1000 && t.str().trim() == EXT_MARK)?;
+    x.get(1).filter(|t| t.code == 1002 && t.str().trim() == "{")?;
+    let mut text = String::new();
+    for t in xdata_list(x, EXT_MARK).iter().take(MAX_XDATA_ITEMS).filter(|t| t.code == 1000) {
+        if text.len() > MAX_PAYLOAD {
+            return None;
+        }
+        text.push_str(&t.str());
+    }
+    let v: Value = serde_json::from_str(&text).ok()?;
+    Some((app.to_string(), v))
+}
+
+/// Removes from kept raw xdata (other applications' data, written back on save) every
+/// application that [`read_ext`] reads as an extension slot, so the model holds the only copy
+/// and a slot removed in the model stays removed.
+pub(crate) fn drop_ext_raw(x: &mut Vec<cadcraft_doc::RawTag>) {
+    let mut out = Vec::with_capacity(x.len());
+    let mut i = 0;
+    while i < x.len() {
+        let len = x.get(i + 1..).map_or(0, |r| r.iter().position(|t| t.code == 1001).unwrap_or(r.len()));
+        let chunk = x.get(i..i + 1 + len).unwrap_or(&[]);
+        i += 1 + len;
+        let claimed = chunk.first().is_some_and(|f| {
+            let tags: Vec<Tag> = chunk.iter().skip(1).map(|t| Tag::s(t.code, t.value.clone())).collect();
+            f.code == 1001 && ext_entry(&f.value, &tags).is_some()
+        });
+        if !claimed {
+            out.extend_from_slice(chunk);
+        }
+    }
+    *x = out;
+}
+
+/// The JSON chunks of a drawing extension slot's value, for its XRECORD.
+pub(crate) fn ext_chunks(value: &Value) -> Option<Vec<String>> {
+    serde_json::to_string(value).ok().map(|j| json_chunks(&j))
 }
 
 /// The array parameters written by [`array_xdata`]; `None` for other records and for

@@ -187,4 +187,6 @@ pub fn write_dxf(d: &Drawing) -> String {
 mod dxf_region;
 
 #[cfg(test)]
+mod ext_dxf_tests;
+#[cfg(test)]
 mod tests;
