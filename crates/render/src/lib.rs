@@ -378,6 +378,30 @@ pub fn build(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     build_space(d, space, opts, false)
 }
 
+/// A drawing source outside the renderer: a display list drawn over the drawing's own (markers,
+/// guides). Never plotted; see [`overlays`].
+pub type OverlayProvider = fn(&Drawing, &Space, &Options) -> DisplayList;
+
+static OVERLAY_PROVIDERS: std::sync::RwLock<Vec<OverlayProvider>> = std::sync::RwLock::new(Vec::new());
+
+/// Register a process-global [`OverlayProvider`]; allowed at any time. Fails only when the
+/// registry's lock is poisoned.
+pub fn register_overlay_provider(p: OverlayProvider) -> Result<(), &'static str> {
+    let mut v = OVERLAY_PROVIDERS.write().map_err(|_| "overlay provider registry is poisoned")?;
+    v.push(p);
+    Ok(())
+}
+
+/// The registered overlay providers' display lists for a space, one per provider in
+/// registration order, empty lists left out. Separate from [`build`], which they never change.
+pub fn overlays(d: &Drawing, space: &Space, opts: &Options) -> Vec<DisplayList> {
+    let providers: Vec<OverlayProvider> = match OVERLAY_PROVIDERS.read() {
+        Ok(v) => v.clone(),
+        Err(_) => return Vec::new(),
+    };
+    providers.into_iter().map(|p| p(d, space, opts)).filter(|l| !l.prims.is_empty()).collect()
+}
+
 /// Like [`build`] but for plotting: layers marked "do not plot" (such as `Defpoints`) are left out.
 pub fn build_plot(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     build_space(d, space, opts, true)

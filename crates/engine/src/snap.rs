@@ -31,6 +31,8 @@ pub mod mode {
     pub const OFF: u32 = 16384;
     /// Not an OSMODE bit: snaps also find hatch objects (OSNAPHATCH = 1).
     pub const HATCH: u32 = 1 << 16;
+    /// Not an OSMODE bit: the mode of every hit a registered [`super::SnapProvider`] returns.
+    pub const PROVIDER: u32 = 1 << 17;
     pub const ALL: [(u32, &str); 14] = [
         (END, "Endpoint"),
         (MID, "Midpoint"),
@@ -158,6 +160,7 @@ pub(crate) fn osnap_with(
         return None;
     }
     let mut best = osnap_in(d, space, ix, cursor, aperture, osmode, base, deferred, &[], None);
+    best = with_providers(d, space, cursor, aperture, best);
     let views = viewport::near(d, space, cursor, aperture);
     if views.is_empty() {
         return best;
@@ -188,6 +191,46 @@ pub(crate) fn osnap_with(
             && best.as_ref().is_none_or(|b| snap_score(hit.mode, hit.point, cursor, aperture) < snap_score(b.mode, b.point, cursor, aperture))
         {
             best = Some(hit);
+        }
+    }
+    best
+}
+
+/// A snap source outside the engine: returns its candidate points for this space, cursor and
+/// aperture (world units). Its hits compete with the built-in snaps in every [`osnap`] call.
+pub type SnapProvider = fn(&Drawing, &Space, Vec2, f64) -> Vec<SnapHit>;
+
+static SNAP_PROVIDERS: std::sync::RwLock<Vec<SnapProvider>> = std::sync::RwLock::new(Vec::new());
+
+/// Register a process-global [`SnapProvider`]; allowed at any time. Fails only when the
+/// registry's lock is poisoned.
+pub fn register_snap_provider(p: SnapProvider) -> Result<(), &'static str> {
+    let mut v = SNAP_PROVIDERS.write().map_err(|_| "snap provider registry is poisoned")?;
+    v.push(p);
+    Ok(())
+}
+
+/// Merge the registered providers' hits into `best`: a hit within `aperture` of the cursor
+/// replaces it only when strictly nearer (built-in snaps win ties). Provider hits always carry
+/// [`mode::PROVIDER`] and keep their own name.
+fn with_providers(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64, mut best: Option<SnapHit>) -> Option<SnapHit> {
+    let providers: Vec<SnapProvider> = match SNAP_PROVIDERS.read() {
+        Ok(v) => v.clone(),
+        Err(_) => return best,
+    };
+    for p in providers {
+        for mut hit in p(d, space, cursor, aperture) {
+            if !hit.point.is_finite() {
+                continue;
+            }
+            let dist = hit.point.dist(cursor);
+            if !dist.is_finite() || dist > aperture {
+                continue;
+            }
+            if best.as_ref().is_none_or(|b| dist < b.point.dist(cursor)) {
+                hit.mode = mode::PROVIDER;
+                best = Some(hit);
+            }
         }
     }
     best
