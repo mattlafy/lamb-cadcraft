@@ -5,14 +5,15 @@
 //! constraints).
 //!
 //! CADCraft's own data lives under the registered application `CADCRAFT` (xdata) and the
-//! named-object-dictionary entries `CADCRAFT_CONSTRAINTS`, `CADCRAFT_LAYERSTATES` and
-//! `CADCRAFT_PLOTSTYLES` (XRECORDs). Other readers keep or ignore them.
+//! named-object-dictionary entries `CADCRAFT_CONSTRAINTS`, `CADCRAFT_LAYERSTATES`,
+//! `CADCRAFT_PLOTSTYLES`, `CADCRAFT_HANDSEED` and `CADCRAFT_MLEADERSTYLE` (XRECORDs). Other
+//! readers keep or ignore them.
 
 use std::collections::HashMap;
 
 use cadcraft_color::Color;
-use cadcraft_doc::{AssocSnap, Constraint, DimAssoc, DimStyle, Handle, LayerState, Parametric, PlotStyleTable};
-use cadcraft_dxf::Tag;
+use cadcraft_doc::{ArrayParams, AssocSnap, Constraint, DimAssoc, DimStyle, Handle, LayerState, Parametric, PlotStyleTable};
+use cadcraft_dxf::{Tag, Version};
 use cadcraft_render::Arrowhead;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,9 +26,15 @@ pub(crate) const CONSTRAINTS_KEY: &str = "CADCRAFT_CONSTRAINTS";
 pub(crate) const LAYER_STATES_KEY: &str = "CADCRAFT_LAYERSTATES";
 /// Named-object-dictionary key of the drawing's plot style tables XRECORD.
 pub(crate) const PLOT_STYLES_KEY: &str = "CADCRAFT_PLOTSTYLES";
+/// Named-object-dictionary key of the annotative scaling XRECORD.
+pub(crate) const ANNOTATION_KEY: &str = "CADCRAFT_ANNOTATION";
 /// Named-object-dictionary key of the plot style names dictionary (DXF Reference): its entries
 /// name `ACDBPLACEHOLDER` objects, and layers and objects point at them with group 390.
 pub(crate) const PLOT_STYLE_NAMES_KEY: &str = "ACAD_PLOTSTYLENAME";
+/// Named-object-dictionary key of the XRECORD holding the drawing's next entity handle (hex).
+pub(crate) const HANDSEED_KEY: &str = "CADCRAFT_HANDSEED";
+/// Named-object-dictionary key of the XRECORD holding the current multileader style.
+pub(crate) const MLEADER_STYLE_KEY: &str = "CADCRAFT_MLEADERSTYLE";
 /// Most plot style tables and plot style names read from a file.
 pub(crate) const MAX_PLOT_STYLE_TABLES: usize = 1000;
 pub(crate) const MAX_PLOT_STYLE_NAMES: usize = 100_000;
@@ -51,8 +58,12 @@ pub(crate) enum K {
     Char,
     /// Handle of a STYLE record (DIMTXSTY).
     TextStyle,
-    /// Handle of an arrowhead BLOCK_RECORD (DIMBLK, DIMBLK1, DIMBLK2).
+    /// Handle of an arrowhead BLOCK_RECORD (DIMBLK, DIMBLK1, DIMBLK2, DIMLDRBLK).
     Block,
+    /// Handle of an LTYPE record (DIMLTYPE, DIMLTEX1, DIMLTEX2); "" (ByBlock) isn't written.
+    Linetype,
+    /// An angle: degrees in the style, radians in the file (DIMJOGANG).
+    Angle,
 }
 
 /// [`DimStyle`] field (camelCase) → DIMSTYLE group code (DXF Reference, DIMSTYLE table). The
@@ -105,10 +116,41 @@ pub(crate) const DIM_CODES: &[(&str, i32, K)] = &[
     ("arrowBlock", 342, K::Block),
     ("arrowBlock1", 343, K::Block),
     ("arrowBlock2", 344, K::Block),
+    ("fixedExtLength", 49, K::Real),
+    ("jogAngle", 50, K::Angle),
+    ("angularZeroSuppression", 79, K::Int),
+    ("arcSymbol", 90, K::Int),
+    ("textVerticalPos", 145, K::Real),
+    ("forceLineInside", 172, K::Bool),
+    ("textInside", 174, K::Bool),
+    ("suppressOutsideArrows", 175, K::Bool),
+    ("textMove", 279, K::Int),
+    ("suppressDim1", 281, K::Bool),
+    ("suppressDim2", 282, K::Bool),
+    ("tolJust", 283, K::Int),
+    ("fit", 289, K::Int),
+    ("fixedExt", 290, K::Bool),
+    ("leaderArrowBlock", 341, K::Block),
+    ("dimLinetype", 345, K::Linetype),
+    ("extLinetype1", 346, K::Linetype),
+    ("extLinetype2", 347, K::Linetype),
+    ("dimLineweight", 371, K::Int),
+    ("extLineweight", 372, K::Int),
 ];
 
 /// DIMSAH: separate arrow blocks in use.
 pub(crate) const DIMSAH: i32 = 173;
+
+/// Variables newer than R2000: DIMFXL, DIMJOGANG, DIMARCSYM, DIMFXLON, DIMLTYPE, DIMLTEX1,
+/// DIMLTEX2. Files of [`NEWER_SINCE`] or later get them as DIMSTYLE groups; R2000 files get them
+/// in a style's `CADCRAFT` "DIMVARS" xdata (`1070 <code>` then the value, like DSTYLE) instead of
+/// groups an R2000 reader doesn't expect. The reader takes both.
+pub(crate) const NEWER_CODES: &[i32] = &[49, 50, 90, 290, 345, 346, 347];
+/// The first version with [`NEWER_CODES`] as DIMSTYLE groups: all came with AutoCAD 2006, whose
+/// files are the 2004 format (AC1018).
+pub(crate) const NEWER_SINCE: Version = Version::R2004;
+/// Xdata list name of [`NEWER_CODES`] values.
+pub(crate) const DIMVARS_LIST: &str = "DIMVARS";
 
 pub(crate) fn dim_code(field: &str) -> Option<(i32, K)> {
     DIM_CODES.iter().find(|(f, _, _)| *f == field).map(|(_, c, k)| (*c, *k))
@@ -139,8 +181,11 @@ pub(crate) enum DimVal {
     Handle(String),
 }
 
-/// Encode a canonical field value. `style` / `block` map names to handles.
-pub(crate) fn encode(kind: K, v: &Value, style: &dyn Fn(&str) -> Option<String>, block: &dyn Fn(&str) -> Option<String>) -> Option<DimVal> {
+/// Name → handle lookups of the writer: text styles, arrowhead blocks and linetypes.
+pub(crate) type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// Encode a canonical field value. `style` / `block` / `ltype` map names to handles.
+pub(crate) fn encode(kind: K, v: &Value, style: Lookup, block: Lookup, ltype: Lookup) -> Option<DimVal> {
     Some(match kind {
         K::Real => DimVal::Real(v.as_f64().filter(|x| x.is_finite())?),
         K::Int => DimVal::Int(v.as_i64()?),
@@ -153,12 +198,20 @@ pub(crate) fn encode(kind: K, v: &Value, style: &dyn Fn(&str) -> Option<String>,
             let name = v.as_str()?;
             DimVal::Handle(if name.trim().is_empty() { "0".to_string() } else { block(name)? })
         }
+        K::Linetype => DimVal::Handle(ltype(v.as_str().filter(|n| !n.trim().is_empty())?)?),
+        K::Angle => DimVal::Real(v.as_f64().filter(|x| x.is_finite())?.to_radians()),
     })
 }
 
-/// Decode a group value into the JSON a [`DimStyle`] field takes. `styles` / `blocks` map
-/// upper-case handles to names.
-pub(crate) fn decode(kind: K, t: &Tag, styles: &HashMap<String, String>, blocks: &HashMap<String, String>) -> Option<Value> {
+/// Decode a group value into the JSON a [`DimStyle`] field takes. `styles` / `blocks` /
+/// `ltypes` map upper-case handles to names.
+pub(crate) fn decode(
+    kind: K,
+    t: &Tag,
+    styles: &HashMap<String, String>,
+    blocks: &HashMap<String, String>,
+    ltypes: &HashMap<String, String>,
+) -> Option<Value> {
     Some(match kind {
         K::Real => {
             let x = t.f64();
@@ -176,6 +229,18 @@ pub(crate) fn decode(kind: K, t: &Tag, styles: &HashMap<String, String>, blocks:
         K::Block => {
             let h = t.str().trim().to_ascii_uppercase();
             if h.is_empty() || h == "0" { Value::String(String::new()) } else { Value::String(blocks.get(&h)?.clone()) }
+        }
+        K::Linetype => {
+            let h = t.str().trim().to_ascii_uppercase();
+            if h.is_empty() || h == "0" { Value::String(String::new()) } else { Value::String(ltypes.get(&h)?.clone()) }
+        }
+        K::Angle => {
+            // Rounded so that whole degrees come back whole.
+            let x = (t.f64().to_degrees() * 1e9).round() / 1e9;
+            if !x.is_finite() {
+                return None;
+            }
+            serde_json::json!(x)
         }
     })
 }
@@ -300,8 +365,32 @@ pub(crate) fn owner(tags: &[Tag]) -> Option<String> {
 }
 
 /// Per-dimension overrides from the `ACAD` "DSTYLE" xdata: `1070 <code>` followed by the value.
-pub(crate) fn read_dstyle(tags: &[Tag], styles: &HashMap<String, String>, blocks: &HashMap<String, String>) -> serde_json::Map<String, Value> {
-    let list = xdata_list(xdata(tags, "ACAD"), "DSTYLE");
+pub(crate) fn read_dstyle(
+    tags: &[Tag],
+    styles: &HashMap<String, String>,
+    blocks: &HashMap<String, String>,
+    ltypes: &HashMap<String, String>,
+) -> serde_json::Map<String, Value> {
+    read_dimvar_list(xdata_list(xdata(tags, "ACAD"), "DSTYLE"), styles, blocks, ltypes)
+}
+
+/// A style's [`NEWER_CODES`] variables from its `CADCRAFT` "DIMVARS" xdata.
+pub(crate) fn read_newer_dimvars(
+    tags: &[Tag],
+    styles: &HashMap<String, String>,
+    blocks: &HashMap<String, String>,
+    ltypes: &HashMap<String, String>,
+) -> serde_json::Map<String, Value> {
+    read_dimvar_list(xdata_list(xdata(tags, APP), DIMVARS_LIST), styles, blocks, ltypes)
+}
+
+/// `1070 <code>` / value pairs of dimension variables.
+fn read_dimvar_list(
+    list: &[Tag],
+    styles: &HashMap<String, String>,
+    blocks: &HashMap<String, String>,
+    ltypes: &HashMap<String, String>,
+) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
     let mut it = list.iter().take(MAX_XDATA_ITEMS * 2);
     while let Some(t) = it.next() {
@@ -311,7 +400,7 @@ pub(crate) fn read_dstyle(tags: &[Tag], styles: &HashMap<String, String>, blocks
         let code = t.i64();
         let Some(v) = it.next() else { break };
         let Some((field, kind)) = i32::try_from(code).ok().and_then(dim_field) else { continue };
-        if let Some(val) = decode(kind, v, styles, blocks).and_then(|j| canonical(field, &j)) {
+        if let Some(val) = decode(kind, v, styles, blocks, ltypes).and_then(|j| canonical(field, &j)) {
             out.insert(field.to_string(), val);
         }
     }
@@ -368,6 +457,78 @@ pub(crate) fn assoc_xdata(assoc: &[DimAssoc]) -> Vec<Tag> {
 /// (DXF has no arc-length DIMENSION type), so other programs still read it.
 pub(crate) fn arclen_xdata(center: cadcraft_geom::Vec3) -> Vec<Tag> {
     vec![Tag::s(1000, "ARCLEN"), Tag::s(1002, "{"), Tag::f(1010, center.x), Tag::f(1020, center.y), Tag::f(1030, center.z), Tag::s(1002, "}")]
+}
+
+/// Dimension marks as CADCraft xdata (`1000 MARKS`, `1002 {`, items, `1002 }`): `1000 JOGLINE`
+/// and a point; `1000 JOGGED`, the centre and the jog point; `1000 BREAK`, a point, `1040` size
+/// and `1070` auto; `1000 INSPECT`, `1070` shape, `1000` label and `1000` rate. Points are
+/// `1010/1020/1030`. The oblique angle is the standard group 52 instead.
+pub(crate) fn marks_xdata(m: &cadcraft_doc::DimMarks) -> Vec<Tag> {
+    let pt = |v: &mut Vec<Tag>, p: cadcraft_geom::Vec3| v.extend([Tag::f(1010, p.x), Tag::f(1020, p.y), Tag::f(1030, p.z)]);
+    let mut v = Vec::new();
+    if let Some(j) = m.jog_line {
+        v.push(Tag::s(1000, "JOGLINE"));
+        pt(&mut v, j);
+    }
+    if let Some(j) = &m.jogged {
+        v.push(Tag::s(1000, "JOGGED"));
+        pt(&mut v, j.center);
+        pt(&mut v, j.jog);
+    }
+    for b in m.breaks.iter().take(MAX_XDATA_ITEMS / 8) {
+        v.push(Tag::s(1000, "BREAK"));
+        pt(&mut v, b.at);
+        v.extend([Tag::f(1040, b.size), Tag::i(1070, i64::from(b.auto))]);
+    }
+    if let Some(i) = &m.inspect {
+        v.extend([Tag::s(1000, "INSPECT"), Tag::i(1070, i64::from(i.shape)), Tag::s(1000, i.label.clone()), Tag::s(1000, i.rate.clone())]);
+    }
+    if v.is_empty() {
+        return v;
+    }
+    let mut out = vec![Tag::s(1000, "MARKS"), Tag::s(1002, "{")];
+    out.extend(v);
+    out.push(Tag::s(1002, "}"));
+    out
+}
+
+/// The marks written by [`marks_xdata`] (no oblique angle); empty for other writers. Damaged
+/// items are skipped.
+pub(crate) fn read_marks(tags: &[Tag]) -> cadcraft_doc::DimMarks {
+    let list = xdata_list(xdata(tags, APP), "MARKS");
+    let list = list.get(..list.len().min(MAX_XDATA_ITEMS)).unwrap_or(&[]);
+    let mut m = cadcraft_doc::DimMarks::default();
+    let num = |i: usize, code: i32| list.get(i).filter(|t| t.code == code).map(Tag::f64).filter(|x| x.is_finite());
+    let point = |i: usize| Some(cadcraft_geom::Vec3::new(num(i, 1010)?, num(i + 1, 1020)?, num(i + 2, 1030)?));
+    let text = |i: usize| list.get(i).filter(|t| t.code == 1000).map(Tag::str);
+    for (i, t) in list.iter().enumerate() {
+        if t.code != 1000 {
+            continue;
+        }
+        match t.str().as_str() {
+            "JOGLINE" => m.jog_line = point(i + 1).or(m.jog_line),
+            "JOGGED" => {
+                if let (Some(center), Some(jog)) = (point(i + 1), point(i + 4)) {
+                    m.jogged = Some(cadcraft_doc::JoggedRadius { center, jog });
+                }
+            }
+            "BREAK" => {
+                let size = list.get(i + 4).filter(|t| t.code == 1040).map(Tag::f64).filter(|x| x.is_finite() && *x > 0.0);
+                let auto = list.get(i + 5).filter(|t| t.code == 1070).is_some_and(|t| t.i64() != 0);
+                if let (Some(at), Some(size)) = (point(i + 1), size) {
+                    m.breaks.push(cadcraft_doc::DimBreak { at, size, auto });
+                }
+            }
+            "INSPECT" => {
+                let shape = list.get(i + 1).filter(|t| t.code == 1070).and_then(|t| u8::try_from(t.i64()).ok()).filter(|s| *s <= 2);
+                if let (Some(shape), Some(label), Some(rate)) = (shape, text(i + 2), text(i + 3)) {
+                    m.inspect = Some(cadcraft_doc::Inspection { shape, label, rate });
+                }
+            }
+            _ => {}
+        }
+    }
+    m
 }
 
 /// The arc centre written by [`arclen_xdata`]; None for other dimensions and other writers.
@@ -500,6 +661,42 @@ fn json_chunks(json: &str) -> Vec<String> {
     chars.chunks(250).map(|c| c.iter().collect()).collect()
 }
 
+/// An associative array's parameters as CADCraft xdata on its block record: `1000 ARRAY`,
+/// `1002 {`, the JSON text in `1000` strings short enough for the 255-byte limit even when
+/// characters are written as `\U+XXXX` escapes, `1002 }`.
+pub(crate) fn array_xdata(p: &ArrayParams) -> Vec<Tag> {
+    let Ok(json) = serde_json::to_string(p) else { return Vec::new() };
+    let safe = json_chunks(&json).concat();
+    let mut v = vec![Tag::s(1000, "ARRAY"), Tag::s(1002, "{")];
+    let (mut cur, mut cost) = (String::new(), 0usize);
+    for c in safe.chars() {
+        let n = if c.is_ascii() { 1 } else { 7 * c.len_utf16() };
+        if cost + n > 240 {
+            v.push(Tag::s(1000, std::mem::take(&mut cur)));
+            cost = 0;
+        }
+        cur.push(c);
+        cost += n;
+    }
+    if !cur.is_empty() {
+        v.push(Tag::s(1000, cur));
+    }
+    v.push(Tag::s(1002, "}"));
+    v
+}
+
+/// The array parameters written by [`array_xdata`]; `None` for other records and for
+/// parameters that are not usable.
+pub(crate) fn read_array(tags: &[Tag]) -> Option<ArrayParams> {
+    let list = xdata_list(xdata(tags, APP), "ARRAY");
+    let mut text = String::new();
+    for t in list.iter().take(MAX_XDATA_ITEMS).filter(|t| t.code == 1000) {
+        text.push_str(&t.str());
+    }
+    let p: ArrayParams = serde_json::from_str(&text).ok()?;
+    p.is_valid().then_some(p)
+}
+
 /// The saved layer states stored in the `CADCRAFT_LAYERSTATES` XRECORD.
 #[derive(Serialize, Deserialize)]
 struct LayerStatesPayload {
@@ -558,6 +755,103 @@ pub(crate) fn parse_plot_styles(text: &str) -> Option<Vec<PlotStyleTable>> {
         return None;
     }
     Some(p.tables.into_iter().map(PlotStyleTable::sanitized).filter(|t| !t.name.is_empty()).collect())
+}
+
+/// Annotative scaling stored in the `CADCRAFT_ANNOTATION` XRECORD: the current annotation scale
+/// (CANNOSCALE), ANNOALLVISIBLE, the annotative blocks and the scales each annotative object
+/// supports, by handle. The DXF Reference doesn't document how objects refer to their scales,
+/// so this is CADCraft's own record; the scale list itself is the standard `ACAD_SCALELIST`.
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct AnnoPayload {
+    version: u32,
+    #[serde(default)]
+    cannoscale: Option<String>,
+    #[serde(default)]
+    annoallvisible: Option<i64>,
+    #[serde(default)]
+    blocks: Vec<String>,
+    #[serde(default)]
+    objects: Vec<AnnoObject>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AnnoObject {
+    handle: String,
+    scales: Vec<cadcraft_doc::AnnoScale>,
+}
+
+/// Most annotative objects read from one file.
+const MAX_ANNO_OBJECTS: usize = 1_000_000;
+
+/// JSON chunks for the annotative scaling XRECORD, or `None` when nothing differs from a new
+/// drawing (1:1, ANNOALLVISIBLE 1, no annotative objects or blocks).
+pub(crate) fn anno_chunks(d: &cadcraft_doc::Drawing) -> Option<Vec<String>> {
+    let cannoscale = d.header.str("CANNOSCALE", "1:1");
+    let annoallvisible = d.header.i64("ANNOALLVISIBLE", 1);
+    let blocks: Vec<String> = d.blocks.values().filter(|b| b.annotative).map(|b| b.name.clone()).collect();
+    let objects: Vec<AnnoObject> = d
+        .model
+        .iter()
+        .chain(d.layouts.iter().flat_map(|l| l.entities.iter()))
+        .filter(|e| cadcraft_doc::is_annotative(e))
+        .map(|e| AnnoObject { handle: e.handle.hex(), scales: e.common.anno_scales.clone() })
+        .collect();
+    if cannoscale == "1:1" && annoallvisible == 1 && blocks.is_empty() && objects.is_empty() {
+        return None;
+    }
+    let p = AnnoPayload { version: 1, cannoscale: Some(cannoscale), annoallvisible: Some(annoallvisible), blocks, objects };
+    Some(json_chunks(&serde_json::to_string(&p).ok()?))
+}
+
+/// Parse the annotative scaling XRECORD text; `None` when it is not a payload we understand.
+pub(crate) fn parse_anno(text: &str) -> Option<AnnoPayload> {
+    if text.len() > MAX_PAYLOAD {
+        return None;
+    }
+    let p: AnnoPayload = serde_json::from_str(text).ok()?;
+    (p.version == 1 && p.objects.len() <= MAX_ANNO_OBJECTS && p.blocks.len() <= MAX_ANNO_OBJECTS).then_some(p)
+}
+
+/// Apply a parsed annotative scaling record: variables, annotative blocks and each object's
+/// scales (invalid scales and objects that can't be annotative are skipped).
+pub(crate) fn apply_anno(d: &mut cadcraft_doc::Drawing, p: AnnoPayload) {
+    if let Some(c) = p.cannoscale.filter(|c| !c.trim().is_empty() && c.len() <= 255) {
+        d.header.set_str("CANNOSCALE", &c);
+    }
+    if let Some(v) = p.annoallvisible {
+        d.header.set_i64("ANNOALLVISIBLE", i64::from(v != 0));
+    }
+    // Block names compare case-insensitively; one map keeps a long hostile list linear.
+    let by_upper: std::collections::HashMap<String, String> = d.blocks.keys().map(|k| (k.to_ascii_uppercase(), k.clone())).collect();
+    for name in &p.blocks {
+        let key = by_upper.get(&name.to_ascii_uppercase()).cloned();
+        if let Some(b) = key.and_then(|k| d.blocks.get_mut(&k)) {
+            std::sync::Arc::make_mut(b).annotative = true;
+        }
+    }
+    for o in p.objects {
+        let Some(h) = Handle::parse_hex(&o.handle) else { continue };
+        let mut scales: Vec<cadcraft_doc::AnnoScale> = Vec::new();
+        for s in o.scales.into_iter().filter(|s| s.is_valid() && !s.name.trim().is_empty()) {
+            if scales.len() < cadcraft_doc::MAX_SCALES && !scales.iter().any(|x| x.name.eq_ignore_ascii_case(&s.name)) {
+                scales.push(s);
+            }
+        }
+        let _ = d.modify_entity(h, |e| {
+            if cadcraft_doc::can_be_annotative(&e.kind) {
+                e.common.anno_scales = scales;
+            }
+        });
+    }
+}
+
+/// A SCALE object (DXF Reference, OBJECTS section): name (300), paper units (140), drawing
+/// units (141); `None` when unusable.
+pub(crate) fn read_scale(tags: &[Tag]) -> Option<cadcraft_doc::AnnoScale> {
+    let name = tags.iter().find(|t| t.code == 300).map(Tag::str)?;
+    let num = |c: i32| tags.iter().find(|t| t.code == c).map(Tag::f64);
+    let s = cadcraft_doc::AnnoScale::new(name.trim(), num(140)?, num(141)?);
+    (s.is_valid() && !s.name.is_empty() && s.name.len() <= 255).then_some(s)
 }
 
 /// Parse the constraint XRECORD text; `None` when it is not a payload we understand.

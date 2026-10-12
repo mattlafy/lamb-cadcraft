@@ -9,6 +9,9 @@ use crate::CadApp;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
+/// The QuickCalc palette.
+pub mod quickcalc;
+
 type Tool = (Icon, &'static str, &'static str);
 
 /// Tool Sets groups: (name, large tools, small tools).
@@ -157,6 +160,8 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
         let body = Rect::from_min_max(pos2(r.left(), r.top() + tab_h), r.max);
         let mut clicked: Option<&'static str> = None;
         let mut toggle_group = None;
+        let mut tool_visible: Option<(String, bool)> = None;
+        let mut restore: Vec<String> = Vec::new();
         ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -179,11 +184,28 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
                         egui::FontId::proportional(12.5),
                         t.text,
                     );
-                    icons::paint(pp, Rect::from_center_size(pos2(hr.right() - 12.0, hr.center().y), vec2(11.0, 11.0)), Icon::Gear, false);
+                    let gear = Rect::from_center_size(pos2(hr.right() - 12.0, hr.center().y), vec2(13.0, 13.0));
+                    let gresp = ui.interact(gear, ui.id().with(("ts_gear", name)), Sense::click());
+                    icons::paint(pp, Rect::from_center_size(gear.center(), vec2(11.0, 11.0)), Icon::Gear, false);
                     icons::describe_control(ui, &hresp, name, Some(!collapsed), false);
+                    icons::describe_control(ui, &gresp, &format!("{name} options"), None, false);
+                    let gresp = gresp.on_hover_text(crate::tl!("Show and hide the tools of this category"));
                     if hresp.clicked() {
                         toggle_group = Some(name.to_string());
                     }
+                    let hidden = |cmd: &str| app.ui.hidden_tools.iter().any(|h| h == cmd);
+                    egui::Popup::from_toggle_button_response(&gresp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                        ui.label(crate::tl!("Show in Tool Sets"));
+                        for (_, cmd, tip) in large.iter().chain(small.iter()) {
+                            let mut shown = !hidden(cmd);
+                            if ui.checkbox(&mut shown, *tip).changed() {
+                                tool_visible = Some((cmd.to_string(), shown));
+                            }
+                        }
+                        if ui.selectable_label(false, crate::tl!("Show All")).clicked() {
+                            restore = large.iter().chain(small.iter()).map(|(_, cmd, _)| cmd.to_string()).collect();
+                        }
+                    });
                     if !collapsed {
                         ui.add_space(4.0);
                         // Large icons.
@@ -192,6 +214,9 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
                                 ui.add_space(8.0);
                                 ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
                                 for (icon, cmd, tip) in large.iter() {
+                                    if hidden(cmd) {
+                                        continue;
+                                    }
                                     ui.add_enabled_ui(command_known(cmd), |ui| {
                                         if icons::button(ui, *icon, 40.0, tip, false).clicked() {
                                             clicked = Some(cmd);
@@ -201,7 +226,8 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
                             });
                         }
                         // Small icons, 8 per row.
-                        for row in small.chunks(8) {
+                        let visible: Vec<Tool> = small.iter().copied().filter(|(_, cmd, _)| !hidden(cmd)).collect();
+                        for row in visible.chunks(8) {
                             ui.add_space(2.0);
                             ui.horizontal(|ui| {
                                 ui.add_space(8.0);
@@ -222,6 +248,16 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
                 }
             });
         });
+        if let Some((cmd, shown)) = tool_visible {
+            if shown {
+                app.ui.hidden_tools.retain(|h| h != &cmd);
+            } else if !app.ui.hidden_tools.contains(&cmd) {
+                app.ui.hidden_tools.push(cmd);
+            }
+        }
+        if !restore.is_empty() {
+            app.ui.hidden_tools.retain(|h| !restore.contains(h));
+        }
         if let Some(g) = toggle_group {
             if let Some(i) = app.ui.collapsed_groups.iter().position(|x| *x == g) {
                 app.ui.collapsed_groups.remove(i);
@@ -271,6 +307,9 @@ fn swatch(p: &egui::Painter, r: Rect, c: Color) {
 }
 
 pub fn right_palettes(app: &mut CadApp, ui: &mut egui::Ui) {
+    if !app.ui.show_palettes {
+        return;
+    }
     let t = Tokens::get();
     egui::Panel::right("cc_palettes").exact_size(300.0).resizable(false).frame(egui::Frame::NONE.fill(t.panel)).show(ui, |ui| {
         let r = ui.max_rect();
@@ -282,7 +321,13 @@ pub fn right_palettes(app: &mut CadApp, ui: &mut egui::Ui) {
             let br = Rect::from_center_size(pos2(r.left() + 30.0 + i as f32 * 52.0, r.top() + tab_h / 2.0), vec2(20.0, 20.0));
             icons::paint(&p, br, *icon, false);
         }
-        icons::paint(&p, Rect::from_center_size(pos2(r.right() - 14.0, r.top() + tab_h / 2.0), vec2(14.0, 14.0)), Icon::ChevronRight, false);
+        let cr = Rect::from_center_size(pos2(r.right() - 14.0, r.top() + tab_h / 2.0), vec2(14.0, 14.0));
+        let cresp = ui.interact(cr, ui.id().with("palettes_collapse"), Sense::click());
+        icons::paint(&p, cr, Icon::ChevronRight, false);
+        icons::describe_control(ui, &cresp, "Collapse Palettes", None, false);
+        if cresp.on_hover_text(crate::tl!("Collapse Palettes")).clicked() {
+            app.ui.show_palettes = false;
+        }
         let body = Rect::from_min_max(pos2(r.left(), r.top() + tab_h), r.max);
         ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -421,9 +466,11 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
                 }
                 let (sr, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
                 swatch(ui.painter(), sr, *color);
-                if ui.selectable_label(name.eq_ignore_ascii_case(&cur), name).clicked() {
+                let r = ui.selectable_label(name.eq_ignore_ascii_case(&cur), name);
+                if r.clicked() {
                     set_current = Some(name.clone());
                 }
+                crate::shortcut_menus::attach(app, &r, |app| crate::shortcut_menus::layer_entries(app, name));
             });
         }
     }

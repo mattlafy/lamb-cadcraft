@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use super::*;
 use crate::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 
+pub(super) mod iso;
+
 fn toggle(s: &mut Session, p: &Value, get: fn(&mut crate::Settings) -> &mut bool, name: &str) -> Result<Value> {
     let v = get(&mut s.settings);
     *v = p.get("on").and_then(Value::as_bool).unwrap_or(!*v);
@@ -56,11 +58,19 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(always)
             .noundo()
             .transparent(),
-        CommandSpec::new("isodraft", "Isometric Drafting", |s, p| toggle(s, p, |st| &mut st.isodraft, "Isodraft"))
-            .params("{on?: bool}")
+        CommandSpec::new("isodraft", "Isometric Drafting", iso::run_isodraft)
+            .params("{on?: bool, plane?: \"left\"|\"top\"|\"right\"|\"orthographic\"} (neither: toggle)")
             .enabled(always)
             .noundo()
-            .transparent(),
+            .transparent()
+            .interactive(|_| Ok(Box::new(iso::IsodraftM))),
+        CommandSpec::new("isoplane", "Isometric Plane", iso::run_isoplane)
+            .key("F5")
+            .params("{plane?: \"left\"|\"top\"|\"right\"} (none: the next plane)")
+            .enabled(always)
+            .noundo()
+            .transparent()
+            .interactive(|_| Ok(Box::new(iso::IsoplaneM))),
         CommandSpec::new("transparencydisplay", "Show/Hide Transparency", |s, p| toggle(s, p, |st| &mut st.transparency_display, "Transparency"))
             .params("{on?: bool}")
             .enabled(always)
@@ -85,8 +95,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .menu(&["Tools", "Drafting Settings..."])
             .alias(&["ds", "se"])
             .params("{snapunit?: [x,y], gridunit?: [x,y], polarang? (degrees), gridmajor?}")
-            .enabled(always)
-            .noundo(),
+            .enabled(always),
         CommandSpec::new("setvar", "Set Variable", run_setvar)
             .menu(&["Tools", "Inquiry", "Set Variable"])
             .alias(&["set"])
@@ -143,10 +152,10 @@ fn run_osnap(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn run_dsettings(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(v) = point_param(p, "snapunit").filter(|v| v.x > 0.0 && v.y > 0.0) {
-        s.settings.snapunit = v;
+        crate::sysvars::set(s, "SNAPUNIT", &json!([v.x, v.y]))?;
     }
-    if let Some(v) = point_param(p, "gridunit").filter(|v| v.x > 0.0 && v.y > 0.0) {
-        s.settings.gridunit = v;
+    if let Some(v) = point_param(p, "gridunit").filter(|v| v.x >= 0.0 && v.y >= 0.0) {
+        crate::sysvars::set(s, "GRIDUNIT", &json!([v.x, v.y]))?;
     }
     if let Some(a) = p.get("polarang").and_then(Value::as_f64).filter(|a| *a > 0.0) {
         s.settings.polarang = a.to_radians();
@@ -155,7 +164,7 @@ fn run_dsettings(s: &mut Session, p: &Value) -> Result<Value> {
         s.settings.gridmajor = (m as u32).clamp(1, 100);
     }
     s.touch();
-    Ok(serde_json::to_value(&s.settings).unwrap_or(Value::Null))
+    Ok(serde_json::to_value(s.drafting_settings()).unwrap_or(Value::Null))
 }
 
 fn run_setvar(s: &mut Session, p: &Value) -> Result<Value> {

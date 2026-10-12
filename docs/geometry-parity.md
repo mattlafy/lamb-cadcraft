@@ -1,6 +1,6 @@
 # Geometry parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (first audit of the geometry kernel's precision against AutoCAD) · **Target:** Autodesk AutoCAD 2027
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-11 · **Change:** minor (constraint solver: DOF report, G2 Smooth, ellipse/spline/block geometry, CONSTRAINTINFER, #546) · **Target:** Autodesk AutoCAD 2027
 
 CAD users trust numbers: a trimmed endpoint, an offset, an intersection or an area is either right
 to the last displayed digit or the tool is unusable for production drawings. This document
@@ -76,17 +76,17 @@ constraints 10%.
 | Polyline with arcs | exact, with self-intersection trimming, OFFSETGAPTYPE (extend, fillet, chamfer) | segments offset and joined at neighbours' intersections; **arc bulges not recomputed** after endpoints move (comment at L413), **no loop cleanup**, collapsed segments not removed; OFFSETGAPTYPE only echoed |
 | Options: Through, Erase, Layer, Multiple | yes | see [gaps.md](gaps.md) |
 
-## Trim, extend, fillet, chamfer, break, join, lengthen (≈ 45%)
+## Trim, extend, fillet, chamfer, break, join, lengthen (≈ 70%)
 
 | Command | AutoCAD supports | CADCraft supports |
 |---|---|---|
-| TRIM | every curve type, quick and standard modes | line, arc, circle, polyline; ellipse and spline via sampled cutting (`modify.rs:485-656`, `modify2.rs:1996`) |
-| EXTEND | every open curve | line, arc, polyline, ellipse; **no spline** |
-| FILLET | lines, arcs, circles, polylines, ellipses, splines, xlines, rays; Trim/No trim | lines, arcs, circles (TTR circle), polyline mode; **no ellipse or spline** (`modify2.rs:1804`) |
-| CHAMFER | lines, polylines, xlines, rays | lines (`modify.rs:756`); polyline chamfer not confirmed |
+| TRIM | every curve type, quick and standard modes | line, arc, circle, polyline; ellipse and spline via sampled cutting (`modify.rs:485-656`, `modify2.rs` `trim_other`); a closed spline leaves one open spline |
+| EXTEND | every open curve | line, arc, polyline, elliptical arc, open spline (runs on along its end tangent, `modify2/curve_edits.rs`) |
+| FILLET | lines, arcs, circles, polylines, ellipses, splines, xlines, rays; Trim/No trim | lines, arcs, circles (TTR circle), polyline mode, Trim/No trim, Multiple; elliptical arcs and splines with any of these (tangent circle from sampled offsets refined by Newton's method, `geom/src/fillet.rs`; arcs trimmed or extended round the ellipse, splines split at the touch point); two straight segments of one polyline (adjacent, or with one between that the corner replaces), a polyline's straight end segment with a line (the line joins it); not polyline arc segments, xlines or rays |
+| CHAMFER | lines, polylines, xlines, rays | lines, Distance/Angle, whole polylines (Polyline option), polyline segments as for FILLET (`modify2/fillet_pline.rs`); refuses arcs, ellipses and splines with a message, as AutoCAD; not xlines or rays |
 | BREAK | every curve | line, arc, circle, polyline |
-| JOIN | lines, arcs, polylines, ellipses, splines, helixes | line, arc, polyline |
-| LENGTHEN | lines, arcs, polylines, elliptical arcs, splines | line, arc, polyline |
+| JOIN | lines, arcs, polylines, ellipses, splines, helixes | line, arc, polyline into a polyline; elliptical arcs on one ellipse into a larger arc or the full ellipse (gaps close); splines with lines, arcs, polylines and elliptical arcs into one exact NURBS (degree elevation, rational arcs; `geom/src/nurbs.rs`); no helixes |
+| LENGTHEN | lines, arcs, polylines, elliptical arcs, splines | line, arc, polyline; elliptical arc (arc length along the ellipse); open spline (cut along the curve, or run on along its end tangent) |
 
 Where line and arc are supported the results are exact.
 
@@ -97,7 +97,7 @@ Where line and arc are supported the results are exact.
 | Closest point: line, arc, circle, polyline | exact | exact |
 | Closest point: ellipse, spline | exact to tolerance | **sampled** (`curve.rs:264`, `curves.rs:637`) |
 | Tangent points, common tangents | every curve | circles and arcs only (`curve.rs:170-183`) |
-| AREA: circle, ellipse | exact | exact area (ellipse perimeter by Ramanujan, not exact) |
+| AREA: circle, ellipse | exact | exact area (ellipse perimeter by Ramanujan, not exact); an open elliptical arc has no area, like an arc |
 | AREA: polyline with arcs | exact (bulge segments) | **tessellated at 1e-4** (`curve.rs:491`) |
 | MASSPROP (regions: area, perimeter, centroid, moments) | exact on regions and solids | shoelace over a tessellated circle, polyline or first hatch loop (`utility.rs:310-352`); no regions |
 | LIST/DIST/ID precision | full double | full double |
@@ -116,13 +116,13 @@ lines are scanline families clipped against the tessellated loops (`render/src/h
 
 | Item | AutoCAD | CADCraft (`crates/constraints`) |
 |---|---|---|
-| Geometric constraints (12) | coincident, collinear, concentric, fix, parallel, perpendicular, horizontal, vertical, tangent, smooth (G2), symmetric, equal | all 12; **Smooth solved as tangency, not G2** |
+| Geometric constraints (12) | coincident, collinear, concentric, fix, parallel, perpendicular, horizontal, vertical, tangent, smooth (G2), symmetric, equal | all 12; Smooth is G2 (common point, tangent and curvature, `curves.rs`) between a spline and a line, arc, elliptical arc, polyline segment or spline; between two non-spline curves it stays tangency |
 | Dimensional constraints | linear, horizontal, vertical, aligned, angular, radial, diameter; dynamic and annotational; reference | distance (aligned/horizontal/vertical), angular, radius, diameter; parameters and expressions (`expr.rs`) |
-| Geometry | lines, arcs, circles, polylines, ellipses, splines, blocks | line, circle, arc, polyline, point (`model.rs:42`); **no ellipse, spline or block** |
-| Algorithm | proprietary | damped Gauss–Newton / Levenberg–Marquardt, numeric Jacobian, per connected component; MAX_ITER 200, MAX_ROWS 800 |
-| Over-constraint | refused with a message | redundancy by Jacobian rank, conflicts by removal probing (up to 48 probes) |
-| Degrees of freedom, fully constrained state | shown (constraint bars, status) | **not reported** |
-| Inference while drawing (CONSTRAINTINFER) | yes | no |
+| Geometry | lines, arcs, circles, polylines, ellipses, splines, blocks | line, circle, arc, polyline, point; ellipse and elliptical arc (centre, axis ends and arc ends as points; tangent, coincident, concentric, horizontal/vertical on the major axis); spline (fit or control points as points; tangent and smooth at its ends; open clamped or fit splines); block reference (insertion point, and the block's own points riding rigidly with position and rotation) (`model.rs`) |
+| Algorithm | proprietary | damped Gauss–Newton / Levenberg–Marquardt, numeric Jacobian, per connected component; MAX_ITER 200, MAX_ROWS 800; curve–curve tangency with an ellipse through auxiliary contact parameters |
+| Over-constraint | refused with a message | redundancy by Jacobian rank (Householder QR with column pivoting, rows and columns balanced), including Fix; the message names the constraints the new one duplicates; conflicts by removal probing (up to 48 probes) |
+| Degrees of freedom, fully constrained state | shown (constraint bars, status) | `constraints.dof` and `constraints.inspect`: free parameters minus Jacobian rank per component, per-object DOF from the null space, under/fully/over-constrained status (`dof.rs`); a status strip on each constraint bar and the drawing's state on the canvas |
+| Inference while drawing (CONSTRAINTINFER) | yes | CONSTRAINTINFER (variable and command): after a drawing or editing command, what it placed exactly onto existing geometry (snaps, ortho, polar) gets Coincident (end, mid, centre, on object), Tangent, Perpendicular, Parallel and Horizontal/Vertical, filtered by the AutoConstrain types (`auto.rs` `infer_placed`) |
 
 ## Tests
 
@@ -138,11 +138,10 @@ exist for parsing, not for numerics.
    spline/ellipse offset as fitted splines within a tolerance. 15–25 h.
 3. A tolerance context relative to the drawing's extents, and a known-answer test suite at
    origin and at 1e6–1e7 coordinates. 8–12 h.
-4. FILLET/JOIN/LENGTHEN/EXTEND for ellipses and splines; CHAMFER on polylines. 10–15 h.
-5. Exact areas and MASSPROP for bulge polylines, regions (2D) and hatch loops. 6–10 h.
-6. Hatch gap tolerance and curved boundaries. 8–12 h.
-7. Solver: DOF reporting, G2 Smooth, ellipse/spline geometry, constraint inference. 20–30 h.
-8. Spline fit options (end tangents, knot parameterisation, fit tolerance, periodic). 6–10 h.
+4. Exact areas and MASSPROP for bulge polylines, regions (2D) and hatch loops. 6–10 h.
+5. Hatch gap tolerance and curved boundaries. 8–12 h.
+6. ~~Solver: DOF reporting, G2 Smooth, ellipse/spline geometry, constraint inference.~~ Done (#546).
+7. Spline fit options (end tangents, knot parameterisation, fit tolerance, periodic). 6–10 h.
 
 Total ≈ 90–140 h; items 1–6 parallelise across two or three agents.
 
@@ -151,3 +150,7 @@ Total ≈ 90–140 h; items 1–6 parallelise across two or three agents.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-10 | major | First geometry-precision audit: tolerances, curves, intersections, offsets, modify commands, measurement, hatch, solver |
+| 2026-10-11 | minor | EXTEND, JOIN and LENGTHEN on elliptical arcs and splines; closed splines trim to one piece; trim/extend section 45% → 55% (#466) |
+| 2026-10-11 | minor | FILLET with elliptical arcs and splines; trim/extend section 55% → 65% (#466) |
+| 2026-10-11 | minor | FILLET/CHAMFER with polyline segments (same polyline, end segment with a line); section 65% → 70% (#466) |
+| 2026-10-11 | minor | Constraint solver (#546): DOF report, G2 Smooth, ellipse/spline/block geometry, CONSTRAINTINFER |

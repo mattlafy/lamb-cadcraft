@@ -53,6 +53,7 @@ fn sample() -> Drawing {
             contents: "line one\\Pline two".into(),
             line_spacing: 1.0,
             line_spacing_exact: false,
+            columns: None,
         }),
     )
     .unwrap();
@@ -93,6 +94,7 @@ fn sample() -> Drawing {
             block: None,
             overrides: Default::default(),
             assoc: Vec::new(),
+            marks: Default::default(),
         }),
     )
     .unwrap();
@@ -105,6 +107,7 @@ fn sample() -> Drawing {
             loops: vec![HatchLoop {
                 vertices: vec![PolyVertex::new(Vec2::ZERO), PolyVertex::new(Vec2::new(2.0, 0.0)), PolyVertex::new(Vec2::new(2.0, 2.0))],
                 outer: true,
+                sources: Vec::new(),
             }],
             scale: 1.0,
             angle: 0.0,
@@ -498,6 +501,8 @@ fn pdf_layout_one_to_one_with_viewport() {
             locked: false,
             frozen_layers: Vec::new(),
             layer_colors: Vec::new(),
+            clip: None,
+            on: true,
         }),
     )
     .unwrap();
@@ -573,6 +578,7 @@ fn dim(kind: DimKind, p13: Vec3, p14: Vec3) -> Dimension {
         block: None,
         overrides: Default::default(),
         assoc: Vec::new(),
+        marks: Default::default(),
     }
 }
 
@@ -599,6 +605,8 @@ fn viewport_frozen_layers_roundtrip() {
             locked: true,
             frozen_layers: frozen,
             layer_colors: Vec::new(),
+            clip: None,
+            on: true,
         })
     };
     d.add(&paper, Common::default(), vp(2, vec!["Walls".into(), "A B".into()])).unwrap();
@@ -632,6 +640,8 @@ fn viewport_layer_colors_roundtrip() {
             locked: false,
             frozen_layers: frozen,
             layer_colors: colors,
+            clip: None,
+            on: true,
         })
     };
     let colors = vec![("Walls".to_string(), Color::Index(5)), ("A B".to_string(), Color::True(cadcraft_color::Rgb(255, 128, 0)))];
@@ -705,6 +715,7 @@ fn full_dim_style() -> DimStyle {
         angular_unit: 1,
         suppress_ext1: true,
         suppress_ext2: true,
+        ..DimStyle::default()
     }
 }
 
@@ -1025,7 +1036,7 @@ fn layer_states_roundtrip_next_to_constraints() {
 }
 
 fn table_sample() -> Table {
-    let cell = |t: &str| TableCell { text: t.into(), merged: None };
+    let cell = |t: &str| TableCell { text: t.into(), ..Default::default() };
     let mut rows = vec![
         vec![cell("Door schedule"), cell(""), cell("")],
         vec![cell("Mark"), cell("Size"), cell("Notes")],
@@ -1043,13 +1054,14 @@ fn table_sample() -> Table {
         text_height: 0.2,
         title: true,
         header: true,
+        ..Table::default()
     }
 }
 
 #[test]
 fn tables_roundtrip_with_title_header_and_merges() {
     let mut d = Drawing::new_imperial();
-    d.table_styles.push(TableStyle { name: "Schedule".into(), text_height: 0.25, margin: 0.1, title: false, header: true });
+    d.table_styles.push(TableStyle { name: "Schedule".into(), text_height: 0.25, margin: 0.1, title: false, header: true, ..TableStyle::default() });
     let t = table_sample();
     d.add(&Space::Model, Common::default(), EntityKind::Table(t.clone())).unwrap();
     let text = write_dxf(&d);
@@ -1129,6 +1141,7 @@ fn intl_sample() -> Drawing {
             contents: format!("{INTL}\\P第二行 Ünïcødé"),
             line_spacing: 1.0,
             line_spacing_exact: false,
+            columns: None,
         }),
     )
     .unwrap();
@@ -1275,7 +1288,7 @@ fn extension_sample() -> Drawing {
     let mut d = sample();
     d.text_styles.push(TextStyle { name: "Romans".into(), font: "romans.shx".into(), backwards: true, annotative: true, ..TextStyle::default() });
     d.dim_styles.push(full_dim_style());
-    d.table_styles.push(TableStyle { name: "Schedule".into(), text_height: 0.25, margin: 0.1, title: true, header: true });
+    d.table_styles.push(TableStyle { name: "Schedule".into(), text_height: 0.25, margin: 0.1, title: true, header: true, ..TableStyle::default() });
     d.add(&Space::Model, Common::default(), EntityKind::Table(table_sample())).unwrap();
     let l1 = d.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::new(0.0, 30.0, 0.0), b: Vec3::new(0.0, 35.0, 0.0) })).unwrap();
     let l2 = d.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::new(8.0, 30.0, 0.0), b: Vec3::new(8.0, 35.0, 0.0) })).unwrap();
@@ -1321,7 +1334,9 @@ fn extension_sample_roundtrips_and_can_be_exported() {
 fn dwg_roundtrip_keeps_extension_data() {
     let d = extension_sample();
     let back = read(&write(&d, "x.dwg").unwrap(), "x.dwg").unwrap();
-    assert_eq!(back.dim_style("Mech"), d.dim_style("Mech"));
+    // The bridge loses DIMFXL and DIMJOGANG (0 and its 5° minimum come back).
+    let norm = |s: Option<&DimStyle>| s.cloned().map(|s| DimStyle { fixed_ext_length: 1.0, jog_angle: 45.0, ..s });
+    assert_eq!(norm(back.dim_style("Mech")), norm(d.dim_style("Mech")));
     assert_eq!(back.constraints, d.constraints);
     assert_eq!(back.parametric, d.parametric);
     let dims =
@@ -1339,7 +1354,7 @@ fn dwg_roundtrip_keeps_extension_data() {
 }
 
 #[test]
-fn mleader_is_written_as_leader_and_mtext() {
+fn mleader_is_written_as_multileader() {
     let mut d = Drawing::new_metric();
     let text = cadcraft_doc::MText {
         insert: Vec3::new(12.0, 5.0, 0.0),
@@ -1351,6 +1366,7 @@ fn mleader_is_written_as_leader_and_mtext() {
         style: "Standard".into(),
         line_spacing: 1.0,
         line_spacing_exact: false,
+        columns: None,
     };
     let m = cadcraft_doc::MLeader {
         leaders: vec![vec![Vec3::new(0.0, 0.0, 0.0)]],
@@ -1362,10 +1378,13 @@ fn mleader_is_written_as_leader_and_mtext() {
         spline: false,
         block: None,
     };
-    d.add(&Space::Model, Default::default(), EntityKind::MLeader(m)).unwrap();
-    let back = roundtrip(&d);
-    assert!(back.model.iter().any(|e| matches!(e.kind, EntityKind::Leader(_))));
-    assert!(back.model.iter().any(|e| matches!(&e.kind, EntityKind::MText(t) if t.contents == "Note")));
+    d.add(&Space::Model, Default::default(), EntityKind::MLeader(m.clone())).unwrap();
+    // MULTILEADER is a 2007 entity (R2000/2004 files get LEADER + MTEXT).
+    let back =
+        crate::read(&crate::write_with(&d, "x.dxf", &crate::SaveOptions { version: Some(crate::Version::R2007), binary: false }).unwrap(), "x.dxf")
+            .unwrap();
+    assert!(back.model.iter().any(|e| matches!(&e.kind, EntityKind::MLeader(x) if *x == m)));
+    assert!(!back.model.iter().any(|e| matches!(e.kind, EntityKind::Leader(_) | EntityKind::MText(_))));
 }
 
 #[test]
@@ -1495,7 +1514,7 @@ fn gradient_sample() -> (Drawing, Vec<Option<Gradient>>) {
         let h = Hatch {
             pattern: "SOLID".into(),
             solid: true,
-            loops: vec![HatchLoop { vertices: square.clone(), outer: true }],
+            loops: vec![HatchLoop { vertices: square.clone(), outer: true, sources: Vec::new() }],
             scale: 1.0,
             angle: 0.0,
             associative: false,
@@ -1672,6 +1691,8 @@ fn autocad_header_dim_variables_are_not_overrides() {
             // Names as AutoCAD may spell them.
             K::Block => (1, v.as_str().unwrap().to_ascii_uppercase()),
             K::TextStyle => (7, v.as_str().unwrap().to_ascii_uppercase()),
+            K::Linetype => (6, v.as_str().unwrap().to_string()),
+            K::Angle => (40, v.as_f64().unwrap().to_radians().to_string()),
         };
         vars.push_str(&format!("  9\r\n${var}\r\n{code}\r\n{val}\r\n"));
     }
@@ -1744,6 +1765,36 @@ fn mirrored_hatch_extrusion_flips_boundary() {
     }
 }
 
+/// The model extents of a one-loop solid HATCH whose edge boundary is `edges` (group 72 onwards).
+fn hatch_edge_extents(edges: &str) -> Bounds2 {
+    let n = edges.matches("72\n").count();
+    let text = format!(
+        "0\nSECTION\n2\nENTITIES\n0\nHATCH\n8\n0\n10\n0\n20\n0\n30\n0\n210\n0\n220\n0\n230\n1\n2\nSOLID\n70\n1\n71\n0\n\
+         91\n1\n92\n1\n93\n{n}\n{edges}97\n0\n75\n0\n76\n1\n98\n0\n0\nENDSEC\n0\nEOF\n"
+    );
+    read(text.as_bytes(), "h.dxf").unwrap().extents(&Space::Model)
+}
+
+/// Issues #492, #493, #494: a full-circle arc edge, spline edges (knots come before the control
+/// points) and clockwise ellipse edges all keep their curve.
+#[test]
+fn hatch_edges_keep_full_circles_splines_and_clockwise_ellipses() {
+    let near = |b: Bounds2, want: [f64; 4]| {
+        let got = [b.min.x, b.min.y, b.max.x, b.max.y];
+        assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-3), "extents {got:?}, want {want:?}");
+    };
+    // #492: one arc edge from 0 to 360.
+    near(hatch_edge_extents("72\n2\n10\n0\n20\n0\n40\n5\n50\n0\n51\n360\n73\n1\n"), [-5.0, -5.0, 5.0, 5.0]);
+    // #493: a cubic Bezier through (0,0)..(4,0) peaking at y = 3, closed by a line.
+    let spline = "72\n4\n94\n3\n73\n0\n74\n0\n95\n8\n96\n4\n40\n0\n40\n0\n40\n0\n40\n0\n40\n1\n40\n1\n40\n1\n40\n1\n\
+                  10\n0\n20\n0\n10\n0\n20\n4\n10\n4\n20\n4\n10\n4\n20\n0\n97\n0\n";
+    near(hatch_edge_extents(&format!("{spline}72\n1\n10\n4\n20\n0\n11\n0\n21\n0\n")), [0.0, 0.0, 4.0, 3.0]);
+    // #494: the clockwise half-ellipse from 0 to 180 is the lower half, closed by its diameter.
+    let ellipse = |ccw| format!("72\n3\n10\n0\n20\n0\n11\n5\n21\n0\n40\n0.5\n50\n0\n51\n180\n73\n{ccw}\n72\n1\n10\n-5\n20\n0\n11\n5\n21\n0\n");
+    near(hatch_edge_extents(&ellipse(0)), [-5.0, -2.5, 5.0, 0.0]);
+    near(hatch_edge_extents(&ellipse(1)), [-5.0, 0.0, 5.0, 2.5]);
+}
+
 #[test]
 fn mirrored_text_extrusion_keeps_its_footprint() {
     // TEXT at OCS (-10,5) under extrusion (0,0,-1) starts at WCS (10,5) and runs towards -x (with
@@ -1772,4 +1823,165 @@ fn mirrored_mtext_extrusion_keeps_its_footprint() {
     assert!((t.rotation - std::f64::consts::PI).abs() < 1e-12, "{}", t.rotation);
     let b = cadcraft_render::build(&d, &Space::Model, &cadcraft_render::Options::default()).bounds;
     assert!(b.min.x > -0.2 && b.max.x > 0.5 && b.min.y > -0.2 && b.max.y > 0.5, "box right of and above (0,0): {b:?}");
+}
+
+// --- SVG import ---
+
+/// One 20mm×10mm page whose user units are millimetres; the reader flips Y, so a point at
+/// SVG y lands at `10 - y` in the drawing.
+const SVG_PAGE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="10mm" viewBox="0 0 20 10">"#;
+
+fn kinds(d: &Drawing) -> Vec<&'static str> {
+    d.model.iter().map(|e| e.kind.type_name()).collect()
+}
+
+fn gzip_of(data: &[u8]) -> Vec<u8> {
+    let mut crc: u32 = 0xffff_ffff;
+    for b in data {
+        crc ^= u32::from(*b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320u32 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(data, 6));
+    out.extend_from_slice(&(!crc).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out
+}
+
+#[test]
+fn svg_shapes_become_entities_in_millimetres() {
+    let svg = format!(
+        "{SVG_PAGE}<rect x=\"1\" y=\"1\" width=\"4\" height=\"3\"/><circle cx=\"10\" cy=\"5\" r=\"2\"/>\
+         <ellipse cx=\"10\" cy=\"5\" rx=\"4\" ry=\"2\"/><line x1=\"0\" y1=\"0\" x2=\"20\" y2=\"10\"/>\
+         <polyline points=\"0,0 5,0 5,5\"/><polygon points=\"0,0 2,0 1,1\"/></svg>"
+    );
+    let d = read(svg.as_bytes(), "shapes.svg").unwrap();
+    assert_eq!(kinds(&d), ["Polyline", "Circle", "Ellipse", "Line", "Polyline", "Polyline"]);
+    let r = first(&d, |k| if let EntityKind::LwPolyline(p) = k { Some(p.clone()) } else { None });
+    assert!(r.closed);
+    let got: Vec<Vec2> = r.vertices.iter().map(|v| v.p).collect();
+    let want = [Vec2::new(1.0, 9.0), Vec2::new(5.0, 9.0), Vec2::new(5.0, 6.0), Vec2::new(1.0, 6.0)];
+    for (g, w) in got.iter().zip(want.iter()) {
+        assert!((*g - *w).len() < 1e-9, "{g:?} vs {w:?}");
+    }
+    let c = first(&d, |k| if let EntityKind::Circle(c) = k { Some(c.clone()) } else { None });
+    assert!((c.radius - 2.0).abs() < 1e-9 && (c.center.x - 10.0).abs() < 1e-9 && (c.center.y - 5.0).abs() < 1e-9, "{c:?}");
+    let e = first(&d, |k| if let EntityKind::Ellipse(e) = k { Some(e.clone()) } else { None });
+    let major = Vec2::new(e.major.x - e.center.x, e.major.y - e.center.y);
+    assert!((major.len() - 4.0).abs() < 1e-9 && (e.ratio - 0.5).abs() < 1e-9, "{e:?}");
+    let l = first(&d, |k| if let EntityKind::Line(l) = k { Some(l.clone()) } else { None });
+    assert!((l.a.y - 10.0).abs() < 1e-9 && (l.b.y).abs() < 1e-9, "{l:?}");
+}
+
+#[test]
+fn svg_path_lines_curves_and_arcs() {
+    let svg = format!("{SVG_PAGE}<path d=\"M1 1 L5 1 C6 1 7 2 8 3\"/><path d=\"M0 0 A5 5 0 0 1 10 0 Z\"/></svg>");
+    let d = read(svg.as_bytes(), "paths.svg").unwrap();
+    assert_eq!(kinds(&d), ["Polyline", "Spline", "Polyline"]);
+    let line_run = first(&d, |k| if let EntityKind::LwPolyline(p) = k { Some(p.clone()) } else { None });
+    assert!(!line_run.closed && line_run.vertices.len() == 2, "{line_run:?}");
+    let spline = first(&d, |k| if let EntityKind::Spline(s) = k { Some(s.clone()) } else { None });
+    assert!(spline.is_valid(), "{spline:?}");
+    let arc = d
+        .model
+        .iter()
+        .find_map(|e| match &e.kind {
+            EntityKind::LwPolyline(p) if p.vertices.first().is_some_and(|v| v.bulge != 0.0) => Some(p.clone()),
+            _ => None,
+        })
+        .expect("an arc becomes a bulge vertex");
+    assert!(arc.closed && arc.vertices.len() == 2, "{arc:?}");
+    let bulge = arc.vertices[0].bulge;
+    assert!((bulge.abs() - 1.0).abs() < 1e-6, "semicircle bulge is ±1, got {bulge}");
+}
+
+#[test]
+fn svg_group_transforms_apply() {
+    let svg = format!("{SVG_PAGE}<g transform=\"translate(5,2)\"><line x1=\"0\" y1=\"0\" x2=\"10\" y2=\"0\"/></g></svg>");
+    let d = read(svg.as_bytes(), "t.svg").unwrap();
+    let l = first(&d, |k| if let EntityKind::Line(l) = k { Some(l.clone()) } else { None });
+    assert!((l.a - Vec3::new(5.0, 8.0, 0.0)).len() < 1e-9, "{l:?}");
+    assert!((l.b - Vec3::new(15.0, 8.0, 0.0)).len() < 1e-9, "{l:?}");
+}
+
+#[test]
+fn svg_viewbox_scaling_and_mm_units() {
+    let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="10mm" viewBox="0 0 200 100"><circle cx="100" cy="50" r="50"/></svg>"#;
+    let d = read(svg.as_bytes(), "vb.svg").unwrap();
+    let c = first(&d, |k| if let EntityKind::Circle(c) = k { Some(c.clone()) } else { None });
+    assert!((c.radius - 5.0).abs() < 1e-9, "{c:?}");
+    assert!((c.center.x - 10.0).abs() < 1e-9 && (c.center.y - 5.0).abs() < 1e-9, "{c:?}");
+}
+
+#[test]
+fn svg_inkscape_layers_are_kept() {
+    let svg = format!(
+        "{SVG_PAGE}<g inkscape:groupmode=\"layer\" inkscape:label=\"Cut\"><rect x=\"0\" y=\"0\" width=\"2\" height=\"2\"/></g>\
+         <g inkscape:groupmode=\"layer\" inkscape:label=\"Engrave\"><circle cx=\"5\" cy=\"5\" r=\"1\"/></g></svg>",
+        SVG_PAGE = SVG_PAGE.replace("<svg ", "<svg xmlns:inkscape=\"http://www.inkscape.org/namespaces/inkscape\" ")
+    );
+    let d = read(svg.as_bytes(), "layers.svg").unwrap();
+    let layers: Vec<&str> = d.layers.iter().map(|l| l.name.as_str()).collect();
+    assert!(layers.contains(&"Cut") && layers.contains(&"Engrave"), "{layers:?}");
+    let per_layer = |name: &str| d.model.iter().filter(|e| e.common.layer == name).count();
+    assert_eq!(per_layer("Cut"), 1);
+    assert_eq!(per_layer("Engrave"), 1);
+}
+
+#[test]
+fn svg_hidden_and_defs_subtrees_are_skipped() {
+    let svg = format!(
+        "{SVG_PAGE}<defs><rect x=\"0\" y=\"0\" width=\"9\" height=\"9\"/></defs><text x=\"0\" y=\"0\">hi</text>\
+         <rect x=\"0\" y=\"0\" width=\"1\" height=\"1\" display=\"none\"/><rect x=\"0\" y=\"0\" width=\"1\" height=\"1\" style=\"fill:red;display:none\"/>\
+         <rect x=\"1\" y=\"1\" width=\"2\" height=\"2\"/></svg>"
+    );
+    let d = read(svg.as_bytes(), "skip.svg").unwrap();
+    assert_eq!(kinds(&d), ["Polyline"]);
+}
+
+#[test]
+fn svgz_gunzips_to_the_same_drawing() {
+    let svg = format!("{SVG_PAGE}<rect x=\"1\" y=\"1\" width=\"4\" height=\"3\"/></svg>");
+    let plain = read(svg.as_bytes(), "a.svg").unwrap();
+    let packed = read(&gzip_of(svg.as_bytes()), "a.svgz").unwrap();
+    assert_eq!(kinds(&plain), kinds(&packed));
+    assert_eq!(plain.model.iter().map(|e| &e.kind).collect::<Vec<_>>(), packed.model.iter().map(|e| &e.kind).collect::<Vec<_>>());
+}
+
+#[test]
+fn svg_read_dispatches_by_extension() {
+    let svg = format!("{SVG_PAGE}<circle cx=\"5\" cy=\"5\" r=\"1\"/></svg>");
+    assert!(read(svg.as_bytes(), "a.svg").is_ok());
+    assert!(read(&gzip_of(svg.as_bytes()), "a.svgz").is_ok());
+}
+
+#[test]
+fn svg_hostile_input_errors_without_panicking() {
+    let deep = format!("{SVG_PAGE}{}<line x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"/>{}</svg>", "<g>".repeat(200), "</g>".repeat(200));
+    for (bytes, name) in [
+        (b"not xml at all".to_vec(), "a.svg"),
+        (Vec::new(), "a.svg"),
+        (b"<svg><rect x=\"1e309\" width=\"NaN\" height=\"inf\"/></svg>".to_vec(), "a.svg"),
+        (deep.clone().into_bytes(), "a.svg"),
+        (b"<svg><path d=\"M0 0 X5 5\"/></svg>".to_vec(), "a.svg"),
+        (b"<svg><path d=\"M0 0 L\"/></svg>".to_vec(), "a.svg"),
+        (b"<svg><path d=\"M0 0 A1 1 0 5 1 2 2\"/></svg>".to_vec(), "a.svg"),
+        (b"<svg><polyline points=\"1 2 3\"/></svg>".to_vec(), "a.svg"),
+        (b"<svg><g transform=\"bogus(1)\"><rect width=\"1\" height=\"1\"/></g></svg>".to_vec(), "a.svg"),
+        (vec![0x1f, 0x8b, 8, 0, b'j', b'u', b'n', b'k', 0, 0, 0, 0, 0, 0, 0, 0], "a.svgz"),
+        (vec![0xff, 0xfe, 0x00, 0x01, 0x02, 0x03], "a.svg"),
+    ] {
+        let _ = read(&bytes, name);
+    }
+    let deep = read(deep.as_bytes(), "a.svg");
+    assert!(deep.is_err(), "200 nested groups are refused, not walked");
+}
+
+#[test]
+fn svg_no_geometry_yields_an_empty_drawing() {
+    let svg = format!("{SVG_PAGE}</svg>");
+    let d = read(svg.as_bytes(), "empty.svg").unwrap();
+    assert!(kinds(&d).is_empty());
 }

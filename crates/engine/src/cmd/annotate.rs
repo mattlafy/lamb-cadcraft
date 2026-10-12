@@ -1,13 +1,14 @@
 //! Dimensions and leaders: DIMLINEAR, DIMALIGNED, DIMRADIUS, DIMDIAMETER, DIMANGULAR, DIMARC,
 //! DIMORDINATE, DIMCONTINUE, DIMBASELINE, QDIM, DIM (smart), MLEADER, LEADER, DIMOVERRIDE,
-//! DIMREASSOCIATE / DIMDISASSOCIATE, DIMTEDIT, DIMSPACE.
+//! DIMREASSOCIATE / DIMDISASSOCIATE, DIMTEDIT, DIMSPACE; DIMEDIT, DIMJOGGED, DIMJOGLINE,
+//! DIMBREAK and DIMINSPECT in `annotate_dimedit.rs`.
 
 use cadcraft_doc::{AssocSnap, DimAssoc, DimKind, Dimension, EntityKind, Handle, MLeader, MText, Prim};
 use cadcraft_geom::{Segment, Vec2, Vec3};
 use serde_json::{Value, json};
 
 use super::helpers::v3;
-use super::machines::SelectRun;
+use super::machines::{SelOutcome, SelectPhase, SelectRun};
 use super::*;
 use crate::{Accept, EngineError, Input, Interactive, LeaderOrder, MLeaderOptions, Prompt, Result, Session, Step};
 
@@ -58,9 +59,10 @@ pub fn specs() -> Vec<CommandSpec> {
             .alias(&["dba", "dimbase"])
             .params("{points: [[x,y]...]} (baseline from the last linear dimension)")
             .interactive(|s| Ok(Box::new(ChainM::new(s, true)))),
-        CommandSpec::new("qdim", "Quick Dimension", run_qdim)
+        CommandSpec::new("qdim", "Quick Dimension", qdim::run)
             .menu(&["Dimension", "Quick Dimension"])
-            .params("{handles?, at: [x,y], vertical?: bool}"),
+            .params(qdim::PARAMS)
+            .interactive(|_| Ok(Box::new(qdim::QDimM::new()))),
         CommandSpec::new("dim", "Dimension", run_linear)
             .menu(&["Dimension", "Dimension"])
             .params("{p1, p2, at}")
@@ -92,7 +94,8 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("dimtedit.home", "Home", |s, p| run_tedit(s, p, "home")).menu(&["Dimension", "Align Text", "Home"]).params("{handles?}"),
         CommandSpec::new("dimtedit.angle", "Angle", |s, p| run_tedit(s, p, "angle"))
             .menu(&["Dimension", "Align Text", "Angle"])
-            .params("{handles?, angle: degrees}"),
+            .params("{handles?, angle: degrees}")
+            .interactive(|_| Ok(Box::new(tedit::TEditM::angle()))),
         CommandSpec::new("dimtedit.left", "Left", |s, p| run_tedit(s, p, "left")).menu(&["Dimension", "Align Text", "Left"]).params("{handles?}"),
         CommandSpec::new("dimtedit.center", "Center", |s, p| run_tedit(s, p, "center"))
             .menu(&["Dimension", "Align Text", "Center"])
@@ -104,8 +107,12 @@ pub fn specs() -> Vec<CommandSpec> {
             .interactive(|_| Ok(Box::new(tedit::TEditM::default()))),
         CommandSpec::new("dimspace", "Dimension Space", run_dimspace)
             .menu(&["Dimension", "Dimension Space"])
-            .params("{base: hex, handles: [hex], spacing?: number (default DIMDLI)}"),
+            .params("{base: hex, handles: [hex], spacing?: number (default DIMDLI)}")
+            .interactive(|_| Ok(Box::new(DimSpaceM::default()))),
     ]
+    .into_iter()
+    .chain(dimedit::specs())
+    .collect()
 }
 
 fn style(s: &Session) -> String {
@@ -129,6 +136,7 @@ fn dim(s: &Session, kind: DimKind, defpt: Vec2, p13: Vec2, p14: Vec2, p15: Vec2,
         block: None,
         overrides: s.doc().map(|d| d.dim_overrides()).unwrap_or_default(),
         assoc: Vec::new(),
+        marks: Default::default(),
     })
 }
 
@@ -371,6 +379,7 @@ fn chained(s: &Session, prev: &Dimension, next: Vec2, baseline: bool) -> EntityK
         text: String::new(),
         block: None,
         assoc: Vec::new(),
+        marks: Default::default(),
         user_text_pos: false,
         ..prev.clone()
     })
@@ -410,55 +419,9 @@ fn run_baseline(s: &mut Session, p: &Value) -> Result<Value> {
     chain_run(s, p, true)
 }
 
-/// QDIM: continuous dimensions across the endpoints of the selected objects.
-fn run_qdim(s: &mut Session, p: &Value) -> Result<Value> {
-    let hs = targets(s, p)?;
-    if hs.len() > MAX_CHAIN {
-        return Err(bad("qdim", format!("at most {MAX_CHAIN} objects per call")));
-    }
-    let at = point_req("qdim", p, "at")?;
-    let vertical = bool_or(p, "vertical", false);
-    let d = s.doc()?;
-    let mut pts: Vec<Vec2> = Vec::new();
-    for h in &hs {
-        if let Some(e) = d.entity(*h) {
-            for pr in e.kind.prims() {
-                match pr {
-                    Prim::Seg(seg) => pts.extend([seg.start(), seg.end()]),
-                    Prim::Circle(c) => pts.push(c.center),
-                    Prim::Point(q) => pts.push(q),
-                    _ => {}
-                }
-            }
-        }
-    }
-    let key = |q: &Vec2| if vertical { q.y } else { q.x };
-    pts.sort_by(|a, b| key(a).total_cmp(&key(b)));
-    pts.dedup_by(|a, b| (key(a) - key(b)).abs() < 1e-9);
-    if pts.len() < 2 {
-        return Err(bad("qdim", "select objects with at least two distinct points"));
-    }
-    if pts.len() > MAX_CHAIN {
-        return Err(bad("qdim", format!("at most {MAX_CHAIN} distinct points per call")));
-    }
-    let rot = if vertical { std::f64::consts::FRAC_PI_2 } else { 0.0 };
-    // One snap index for all the dimensions, as DIMCONTINUE does: looking up each dimension's
-    // objects by scanning the drawing made QDIM quadratic (the added dimensions are no snap targets).
-    let snaps = if assoc_enabled(s) { Some(crate::assoc::SnapIndex::new(s.doc()?, &s.space())) } else { None };
-    let mut out = Vec::new();
-    for w in pts.windows(2) {
-        if let [a, b] = w {
-            let mut k = dim(s, DimKind::Linear { rotation: rot }, at, *a, *b, Vec2::ZERO, Vec2::ZERO, "");
-            if let (Some(ix), EntityKind::Dimension(dm)) = (&snaps, &mut k) {
-                dm.assoc = ix.auto_assoc(&[("p13", dm.p13.xy()), ("p14", dm.p14.xy())]);
-            }
-            let h = s.add_entity(k)?;
-            s.last_dim = Some(h);
-            out.push(h.hex());
-        }
-    }
-    Ok(json!({ "handles": out }))
-}
+/// QDIM: its modes and prompts.
+#[path = "annotate_qdim.rs"]
+mod qdim;
 
 /// A multileader from arrowhead to landing; `landing` false leaves out the landing line (dogleg).
 fn mleader_kind(s: &Session, pts: &[Vec2], text: &str, landing: bool) -> Option<EntityKind> {
@@ -466,7 +429,8 @@ fn mleader_kind(s: &Session, pts: &[Vec2], text: &str, landing: bool) -> Option<
     let d = s.doc().ok()?;
     let cur = d.header.str("CMLEADERSTYLE", "Standard");
     let st = d.mleader_styles.iter().find(|m| m.name.eq_ignore_ascii_case(&cur)).or(d.mleader_styles.first()).cloned().unwrap_or_default();
-    let k = d.header.f64("DIMSCALE", 1.0);
+    // An annotative style's sizes are paper sizes: the annotation scale applies when drawn.
+    let k = if st.annotative { 1.0 } else { d.header.f64("DIMSCALE", 1.0) };
     let th = st.text_height * k;
     let dir = if arrow_pts.first().is_some_and(|a| a.x > landing_pt.x) { -1.0 } else { 1.0 };
     let attach = if dir > 0.0 { 4 } else { 6 };
@@ -486,6 +450,7 @@ fn mleader_kind(s: &Session, pts: &[Vec2], text: &str, landing: bool) -> Option<
             contents: text.replace('\n', "\\P"),
             line_spacing: 1.0,
             line_spacing_exact: false,
+            columns: None,
         }),
         style: st.name.clone(),
         arrow_size: st.arrow_size * k,
@@ -532,6 +497,7 @@ fn run_leader(s: &mut Session, p: &Value) -> Result<Value> {
                 contents: t.into(),
                 line_spacing: 1.0,
                 line_spacing_exact: false,
+                columns: None,
             }))?
             .hex(),
         );
@@ -669,13 +635,20 @@ fn run_dimtedit(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("dimtedit", "`angle` (degrees) is required"));
     }
     let d = s.doc_mut()?;
+    let dimscale = d.header.f64("DIMSCALE", 1.0);
     for h in &hs {
+        let st = match d.entity(*h).map(|e| &e.kind) {
+            Some(EntityKind::Dimension(dm)) => d.dim_style(&dm.style).cloned().unwrap_or_default().with_overrides(&dm.overrides),
+            _ => continue,
+        };
         d.modify_entity(*h, |e| {
             let EntityKind::Dimension(dm) = &mut e.kind else { return };
             dm.block = None;
             if let Some(q) = at {
                 dm.text_mid = v3(q);
                 dm.user_text_pos = true;
+                // DIMTMOVE 0: the dimension line moves with the text.
+                st.follow_text(dm, dimscale);
             }
             match mode.as_str() {
                 "home" => {
@@ -746,6 +719,90 @@ fn run_dimspace(s: &mut Session, p: &Value) -> Result<Value> {
         })?;
     }
     Ok(json!({ "spaced": others.len() }))
+}
+
+/// DIMSPACE at the command line: select the base dimension, select the dimensions to space, then
+/// the spacing (Enter or Auto takes the DIMDLI-based default).
+#[derive(Default)]
+struct DimSpaceM {
+    base: Option<Handle>,
+    sel: SelectPhase,
+    spacing_phase: bool,
+}
+
+impl DimSpaceM {
+    fn apply(&self, s: &mut Session, base: Handle, spacing: Option<f64>) -> Result<Step> {
+        let mut p = serde_json::Map::new();
+        p.insert("base".into(), json!(base.hex()));
+        p.insert("handles".into(), json!(self.sel.picked.iter().map(|h| h.hex()).collect::<Vec<_>>()));
+        if let Some(v) = spacing {
+            p.insert("spacing".into(), json!(v));
+        }
+        let r = run_dimspace(s, &Value::Object(p))?;
+        s.set_selection(Vec::new());
+        s.echo(format!("{} dimension(s) spaced.", r.get("spaced").and_then(Value::as_u64).unwrap_or(0)));
+        Ok(Step::Done)
+    }
+}
+
+impl Interactive for DimSpaceM {
+    fn name(&self) -> &'static str {
+        "DIMSPACE"
+    }
+    fn begin(&mut self, _s: &mut Session) -> Result<Step> {
+        self.sel = SelectPhase::single();
+        Ok(Step::Continue)
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        if self.spacing_phase {
+            return Prompt::new("Enter value", Accept::NUMBER).kw(&["Auto"]).default("Auto");
+        }
+        if self.base.is_none() {
+            return Prompt::new("Select base dimension", Accept::SELECT);
+        }
+        Prompt::new("Select dimensions to space", Accept::SELECT)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if self.spacing_phase {
+            let Some(base) = self.base else { return Ok(Step::Cancel) };
+            return match i {
+                Input::Enter => self.apply(s, base, None),
+                Input::Keyword(k) | Input::Text(k) if k.trim().eq_ignore_ascii_case("a") || k.trim().eq_ignore_ascii_case("auto") => {
+                    self.apply(s, base, None)
+                }
+                Input::Text(t) => match super::machines::number(&t).filter(|v| v.is_finite() && *v >= 0.0) {
+                    Some(v) => self.apply(s, base, Some(v)),
+                    None => {
+                        s.echo("Requires a non-negative number or Auto.");
+                        Ok(Step::Continue)
+                    }
+                },
+                _ => Ok(Step::Continue),
+            };
+        }
+        match self.sel.feed(s, &i)? {
+            SelOutcome::More => Ok(Step::Continue),
+            SelOutcome::Empty => Ok(Step::Done),
+            SelOutcome::Done(hs) => {
+                if self.base.is_none() {
+                    match hs.first().copied().filter(|h| !dims_of(s, &[*h]).is_empty()) {
+                        Some(b) => {
+                            self.base = Some(b);
+                            self.sel = SelectPhase::default();
+                        }
+                        None => {
+                            s.echo("Select a dimension.");
+                            self.sel = SelectPhase::single();
+                        }
+                    }
+                } else {
+                    self.sel.picked = hs;
+                    self.spacing_phase = true;
+                }
+                Ok(Step::Continue)
+            }
+        }
+    }
 }
 
 /// DIMOVERRIDE at the command line: variable, value (repeat), Enter, then select dimensions.
@@ -1769,6 +1826,9 @@ impl Interactive for MLeaderM {
 
 #[path = "annotate_tedit.rs"]
 mod tedit;
+
+#[path = "annotate_dimedit.rs"]
+mod dimedit;
 
 #[cfg(test)]
 #[path = "annotate_tests.rs"]

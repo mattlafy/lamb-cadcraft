@@ -7,6 +7,8 @@ use crate::CadApp;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
+pub mod annoscale;
+
 const TOOLBAR: &[&[(Icon, &str, &str, Option<&str>)]] = &[
     &[
         (Icon::New, "new", "New Drawing", Some("Cmd+N")),
@@ -163,7 +165,7 @@ pub fn title_and_toolbar(app: &mut CadApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
-                response.on_hover_text("More toolbar commands");
+                response.on_hover_text(crate::tl!("More toolbar commands"));
             }
             if let Some(c) = clicked {
                 app.start(c);
@@ -190,7 +192,7 @@ pub fn file_tabs(app: &mut CadApp, ui: &mut egui::Ui) {
             app.ui.start_tab = false;
         }
         x += 24.0;
-        let mut tab = |ui: &mut egui::Ui, label: &str, active: bool, closable: bool, w: f32, id: egui::Id| -> (bool, bool) {
+        let mut tab = |ui: &mut egui::Ui, label: &str, active: bool, closable: bool, w: f32, id: egui::Id| -> (bool, bool, egui::Response) {
             let tr = Rect::from_min_size(pos2(x, r.top()), vec2(w, r.height()));
             let resp = ui.interact(tr, id, Sense::click());
             ui.painter().rect_filled(
@@ -222,9 +224,9 @@ pub fn file_tabs(app: &mut CadApp, ui: &mut egui::Ui) {
             icons::describe_control(ui, &resp, label, Some(active), true);
             ui.painter().vline(tr.right(), tr.y_range(), Stroke::new(1.0, t.border));
             x += w;
-            (resp.clicked(), close)
+            (resp.clicked(), close, resp)
         };
-        let (c, _) = tab(ui, crate::tl!("Start"), app.ui.start_tab || app.session.docs.is_empty(), false, 110.0, ui.id().with("tab_start"));
+        let (c, _, _) = tab(ui, crate::tl!("Start"), app.ui.start_tab || app.session.docs.is_empty(), false, 110.0, ui.id().with("tab_start"));
         if c {
             app.ui.start_tab = true;
         }
@@ -238,7 +240,8 @@ pub fn file_tabs(app: &mut CadApp, ui: &mut egui::Ui) {
             .map(|(i, d)| (i, format!("{}{}", d.title, if d.is_dirty() { "*" } else { "" }), i == app.session.active))
             .collect();
         for (i, title, active) in titles {
-            let (c, x) = tab(ui, &title, active && !app.ui.start_tab, true, 170.0, ui.id().with(("tab", i)));
+            let (c, x, resp) = tab(ui, &title, active && !app.ui.start_tab, true, 170.0, ui.id().with(("tab", i)));
+            crate::shortcut_menus::attach(app, &resp, |app| crate::shortcut_menus::drawing_tab_entries(app, i));
             if c {
                 switch_to = Some(i);
             }
@@ -309,6 +312,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             if resp.clicked() {
                 switch = Some(name.clone());
             }
+            crate::shortcut_menus::attach(app, &resp, |app| crate::shortcut_menus::layout_tab_entries(app, name));
             x += w + 2.0;
             if i == 0 {
                 let pr = Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(16.0, 16.0));
@@ -329,6 +333,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         }
         // Right side: toggles, right-aligned.
         let s = app.session.settings.clone();
+        let anno_all = app.session.doc().is_ok_and(|d| d.anno_all_visible());
         use cadcraft_engine::snap::mode;
         let toggles: Vec<(Icon, bool, &str, &str)> = vec![
             (Icon::Grid, s.gridmode, "grid", "Grid (F7)"),
@@ -342,7 +347,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             (Icon::Transparency, s.transparency_display, "transparencydisplay", "Show/Hide Transparency"),
             (Icon::DynInput, s.dynmode, "dynmode", "Dynamic Input (F12)"),
             (Icon::QuickProps, s.qpmode, "qpmode", "Quick Properties"),
-            (Icon::Annotation, s.annoallvisible, "ui.noop", "Annotation Visibility"),
+            (Icon::Annotation, anno_all, "annovisible.toggle", "Annotation Visibility"),
             (Icon::Workspace, false, "ui.noop", "Workspace Switching"),
             (Icon::Gear, false, "ui.dialog.dsettings", "Drafting Settings"),
         ];
@@ -360,6 +365,8 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         });
         // MODEL / PAPER (layouts only): toggles MSPACE and PSPACE like AutoCAD's status button.
         let mut coord_right = rx - 8.0;
+        // The annotation scale list (model space).
+        coord_right = annoscale::status(app, ui, coord_right, r.center().y);
         if matches!(app.session.layout_space(), cadcraft_doc::Space::Paper(_)) {
             let model = app.session.state().is_ok_and(|st| st.mspace.is_some());
             let label = if model { "MODEL" } else { "PAPER" };
@@ -373,6 +380,8 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
                 app.canvas.list = None;
             }
             coord_right = br.left() - 10.0;
+            // Scale and lock of the active or selected viewport.
+            coord_right = crate::vpscale::status(app, ui, coord_right + 4.0, r.center().y) - 10.0;
         }
         // A transient message occupies the same bounded readout slot as coordinates.
         // Ellipsis and a tooltip keep either value readable without covering layout tabs.

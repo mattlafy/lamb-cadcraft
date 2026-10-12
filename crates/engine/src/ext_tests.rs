@@ -65,7 +65,24 @@ fn mirror_keeps_ext() {
 #[test]
 fn arrayrect_keeps_ext() {
     let (mut s, hs) = setup();
-    created_carry_ext(&mut s, "arrayrect", json!({"handles": hex(&hs), "rows": 2, "cols": 3, "rowSpacing": 20, "colSpacing": 40}));
+    created_carry_ext(
+        &mut s,
+        "arrayrect",
+        json!({"handles": hex(&hs), "rows": 2, "cols": 3, "rowSpacing": 20, "colSpacing": 40, "associative": false}),
+    );
+}
+
+/// An associative array moves the objects into its source block; they keep their `ext` there.
+#[test]
+fn associative_arrayrect_keeps_ext_in_source_block() {
+    let (mut s, hs) = setup();
+    s.execute("arrayrect", &json!({"handles": hex(&hs), "rows": 2, "cols": 3, "rowSpacing": 20, "colSpacing": 40, "associative": true})).unwrap();
+    let d = s.doc().unwrap();
+    let src: Vec<_> = d.blocks.values().filter(|b| b.entities.len() == 2).flat_map(|b| b.entities.iter()).collect();
+    assert_eq!(src.len(), 2, "source block not found");
+    for e in src {
+        assert_eq!(e.common.ext, lamb_ext());
+    }
 }
 
 #[test]

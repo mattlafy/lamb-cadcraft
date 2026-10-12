@@ -9,6 +9,8 @@ use cadcraft_geom::{PolyVertex, Spline, Vec2, Vec3};
 
 use crate::{IoError, Result};
 
+pub(crate) mod mtext_dxf;
+
 /// Value lookup helpers over an entity's tags.
 struct T<'a>(&'a [Tag]);
 
@@ -251,13 +253,15 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
                     v.bulge = -v.bulge;
                 }
             }
-            EntityKind::LwPolyline(LwPolyline {
+            let pl = LwPolyline {
                 vertices: verts,
                 closed: flags & 1 != 0,
                 const_width: t.fd(43, 0.0),
                 elevation: t.fd(38, 0.0),
                 plinegen: flags & 128 != 0,
-            })
+            };
+            // A region CADCraft wrote as polylines (`dxf_region`).
+            crate::dxf_region::from_polyline(tags, pl)?
         }
         "SPLINE" => {
             let degree = t.i(71).unwrap_or(3).clamp(1, 10) as usize;
@@ -285,6 +289,7 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             }
             EntityKind::Spline(sp)
         }
+        "HELIX" => EntityKind::Helix(helix(tags)),
         "RAY" => EntityKind::Ray(RayLine { base: t.p(10), dir: t.p(11) }),
         "XLINE" => EntityKind::XLine(RayLine { base: t.p(10), dir: t.p(11) }),
         "TEXT" => EntityKind::Text(text_from(&t)),
@@ -295,9 +300,11 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
                 contents.push_str(&tg.str());
             }
             contents.push_str(&t.s(1).unwrap_or_default());
+            let contents = mtext_dxf::decode_contents(&contents);
+            let columns = mtext_dxf::read_columns(tags);
             let mut rotation = match (t.f(11), t.f(21)) {
                 (Some(x), Some(y)) if x != 0.0 || y != 0.0 => Vec2::new(x, y).angle(),
-                _ => t.fd(50, 0.0).to_radians(),
+                _ => T(mtext_dxf::before_columns(tags)).fd(50, 0.0).to_radians(),
             };
             let mut attach = t.i(71).unwrap_or(1).clamp(1, 9) as u8;
             if c.extrusion.z < 0.0 {
@@ -314,13 +321,17 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             EntityKind::MText(MText {
                 insert: t.p(10),
                 height: t.fd(40, 0.2).max(1e-9),
-                width: t.fd(41, 0.0).max(0.0),
+                width: match &columns {
+                    Some((_, w)) if t.fd(41, 0.0) <= 0.0 => *w,
+                    _ => t.fd(41, 0.0).max(0.0),
+                },
                 attach,
                 rotation,
                 style: t.s(7).unwrap_or_else(|| "Standard".into()),
                 contents,
                 line_spacing: t.fd(44, 1.0),
                 line_spacing_exact: t.i(73) == Some(2),
+                columns: columns.map(|(c, _)| c),
             })
         }
         "ATTDEF" => EntityKind::AttDef(Attrib {
@@ -392,6 +403,7 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
                 block: t.s(2).filter(|s| !s.is_empty()),
                 overrides: Default::default(),
                 assoc: Vec::new(),
+                marks: Default::default(),
             })
         }
         "LEADER" => EntityKind::Leader(Leader {
@@ -400,11 +412,14 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             spline: t.i(72).unwrap_or(0) != 0,
             style: t.s(3).unwrap_or_else(|| "Standard".into()),
         }),
+        // Names behind handles follow in `entity_extras` and `Objects::apply`.
+        "MULTILEADER" | "MLEADER" => EntityKind::MLeader(crate::dxf_mleader::read(tags)),
         "SOLID" | "TRACE" => {
             let corners = [t.p(10), t.p(11), t.p(12), if t.f(13).is_some() { t.p(13) } else { t.p(12) }];
             let corners = corners.map(|p| ocs(&c, p));
             if kind == "SOLID" { EntityKind::Solid(Solid { corners }) } else { EntityKind::Trace(Solid { corners }) }
         }
+        "MLINE" => EntityKind::MLine(crate::dxf_mline::read_entity(tags)),
         "3DFACE" => EntityKind::Face3d(Face3d { corners: [t.p(10), t.p(11), t.p(12), t.p(13)], hidden_edges: t.i(70).unwrap_or(0) as u8 }),
         "HATCH" => {
             let mut k = hatch(tags, &t)?;
@@ -431,6 +446,9 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             locked: t.i(90).unwrap_or(0) & 16384 != 0,
             frozen_layers: crate::dxf_ext::read_frozen(tags),
             layer_colors: crate::dxf_ext::read_layer_colors(tags),
+            // Status flags: 65536 = non-rectangular clipping (by the 340 entity), 131072 = off.
+            clip: t.s(340).and_then(|h| Handle::parse_hex(&h)).filter(|h| h.0 != 0 && t.i(90).unwrap_or(0) & 65536 != 0),
+            on: t.i(90).unwrap_or(0) & 131072 == 0,
         }),
         "WIPEOUT" => {
             let o = t.p(10);
@@ -442,6 +460,16 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
         }
         // The file path comes from the IMAGEDEF object (`dxf_image::resolve`).
         "IMAGE" => EntityKind::Image(crate::dxf_image::read_entity(tags)),
+        "TOLERANCE" => {
+            let dir = t.p(11);
+            let dir = if dir.xy().is_finite() && dir.xy().len() > 1e-12 { dir } else { Vec3::new(1.0, 0.0, 0.0) };
+            EntityKind::Tolerance(Tolerance {
+                insert: t.p(10),
+                dir,
+                style: t.s(3).unwrap_or_else(|| "Standard".into()),
+                text: t.s(1).unwrap_or_default().chars().take(MAX_FRAME_CHARS).collect(),
+            })
+        }
         other => EntityKind::Unknown(Unknown {
             dxf_type: other.to_string(),
             tags: tags.iter().map(|tg| RawTag { code: tg.code, value: tg.str() }).collect(),
@@ -496,9 +524,9 @@ fn acad_table(tags: &[Tag]) -> Table {
             (true, Some(rs), Some(cs)) if rs >= 1 && cs >= 1 && (rs, cs) != (1, 1) => Some((rs, cs)),
             _ => None,
         };
-        flat.push(TableCell { text, merged });
+        flat.push(TableCell { text, merged, ..TableCell::default() });
     }
-    flat.resize(rows * cols, TableCell { text: String::new(), merged: None });
+    flat.resize(rows * cols, TableCell::default());
     let cells: Vec<Vec<TableCell>> = if cols == 0 { vec![Vec::new(); rows] } else { flat.chunks(cols).map(<[TableCell]>::to_vec).collect() };
     let x = crate::dxf_ext::xdata(tags, crate::dxf_ext::APP);
     let ours = x.iter().position(|t| t.code == 1000 && t.str() == "TABLE").map(|p| x.get(p + 1..).unwrap_or(&[]));
@@ -512,7 +540,9 @@ fn acad_table(tags: &[Tag]) -> Table {
         // Other writers: a first row merged across every column reads as a title.
         None => (cols > 1 && cells.first().and_then(|r| r.first()).and_then(|c| c.merged) == Some((1, cols as u32)), false, 0.18, "Standard".into()),
     };
-    Table { insert: T(tags).p(10), col_widths, row_heights, cells, style, text_height, title, header }
+    let mut t = Table { insert: T(tags).p(10), col_widths, row_heights, cells, style, text_height, title, header, ..Table::default() };
+    crate::dxf_table::read_table_xdata(tags, &mut t);
+    t
 }
 
 fn hatch(tags: &[Tag], t: &T) -> Option<EntityKind> {
@@ -591,8 +621,15 @@ fn hatch(tags: &[Tag], t: &T) -> Option<EntityKind> {
                         if verts.last().is_none_or(|l| !l.p.near(p0, 1e-9)) {
                             verts.push(PolyVertex::new(p0));
                         }
+                        // A full circle (0 to 360) starts and ends on the same point, which one
+                        // bulge can't span: it goes in as two half circles.
+                        let full = (sweep.abs() - std::f64::consts::TAU).abs() < 1e-9;
+                        let bulge = cadcraft_geom::arc_to_bulge(if full { sweep / 2.0 } else { sweep });
                         if let Some(l) = verts.last_mut() {
-                            l.bulge = cadcraft_geom::arc_to_bulge(sweep);
+                            l.bulge = bulge;
+                        }
+                        if full {
+                            verts.push(PolyVertex::with_bulge(Vec2::polar(c, r, s + sweep / 2.0), bulge));
                         }
                         verts.push(PolyVertex::new(p1));
                     }
@@ -603,32 +640,73 @@ fn hatch(tags: &[Tag], t: &T) -> Option<EntityKind> {
                         let ratio = f(i + 4);
                         let sa = f(i + 5).to_radians();
                         let ea = f(i + 6).to_radians();
+                        let ccw = get(i + 7).filter(|t| t.code == 73).map(Tag::i64).unwrap_or(1) != 0;
                         i += 8;
-                        let e = cadcraft_geom::Ellipse { center: c, major: m, ratio, start: sa, end: ea };
+                        // A clockwise edge stores its parameters mirrored, as an arc edge does: it
+                        // runs from -start clockwise to -end, the ccw sweep from -end to -start
+                        // walked backwards.
+                        let (s, e) = if ccw { (sa, ea) } else { (-ea, -sa) };
+                        let e = cadcraft_geom::Ellipse { center: c, major: m, ratio, start: s, end: e };
                         let mut pts = Vec::new();
                         e.tessellate(m.len() * 1e-3, &mut pts);
+                        if !ccw {
+                            pts.reverse();
+                        }
                         verts.extend(pts.into_iter().map(PolyVertex::new));
                     }
                     4 => {
-                        // Spline edge: 94 degree, 73 rational, 74 periodic, 95 knots, 96 ctrl.
-                        let _deg = get(i).map(Tag::i64).unwrap_or(3);
-                        while get(i).is_some_and(|x| x.code != 96) {
+                        // Spline edge: 94 degree, 73 rational, 74 periodic, 95 knot count, 96
+                        // control point count, then the 40 knots, the 10/20 control points (each
+                        // with a 42 weight when rational), and 97 fit point count with 11/21 fit
+                        // points and 12/22, 13/23 end tangents (R2010+).
+                        let (mut degree, mut nk, mut nc) = (3, 0, 0);
+                        while let Some(x) = get(i).filter(|x| matches!(x.code, 94 | 73 | 74 | 95 | 96)) {
+                            let n = x.i64().clamp(0, 100_000) as usize;
+                            match x.code {
+                                94 => degree = n,
+                                95 => nk = n,
+                                96 => nc = n,
+                                _ => {}
+                            }
                             i += 1;
                         }
-                        let nc = get(i).map(Tag::i64).unwrap_or(0).clamp(0, 100_000) as usize;
-                        i += 1;
-                        let mut ctrl = Vec::new();
-                        for _ in 0..nc {
-                            if get(i).is_some_and(|t| t.code == 10) {
-                                ctrl.push(Vec2::new(f(i), f(i + 1)));
-                                i += 2;
-                                if get(i).is_some_and(|t| t.code == 42) {
-                                    i += 1;
-                                }
+                        let mut knots = Vec::new();
+                        while knots.len() < nk && get(i).is_some_and(|x| x.code == 40) {
+                            knots.push(f(i));
+                            i += 1;
+                        }
+                        let (mut control, mut weights) = (Vec::new(), Vec::new());
+                        while control.len() < nc && get(i).is_some_and(|x| x.code == 10) {
+                            control.push(Vec2::new(f(i), f(i + 1)));
+                            i += 2;
+                            if get(i).is_some_and(|t| t.code == 42) {
+                                weights.push(f(i));
+                                i += 1;
                             }
                         }
-                        let sp = Spline::from_control(ctrl, 3);
-                        verts.extend(sp.tessellate(1e-3).into_iter().map(PolyVertex::new));
+                        let mut fit = Vec::new();
+                        if get(i).is_some_and(|x| x.code == 97) {
+                            let n = get(i).map(Tag::i64).unwrap_or(0).clamp(0, 100_000) as usize;
+                            i += 1;
+                            while fit.len() < n && get(i).is_some_and(|x| x.code == 11) {
+                                fit.push(Vec2::new(f(i), f(i + 1)));
+                                i += 2;
+                            }
+                        }
+                        if weights.len() != control.len() {
+                            weights.clear();
+                        }
+                        let sp = Spline { degree, knots, control, weights, ..Spline::default() };
+                        let sp = if sp.is_valid() {
+                            sp
+                        } else if sp.control.is_empty() && fit.len() > 1 {
+                            Spline::from_fit_points(&fit)
+                        } else {
+                            Spline::from_control(sp.control, degree)
+                        };
+                        let pts = sp.tessellate(1e-3);
+                        let skip = usize::from(verts.last().zip(pts.first()).is_some_and(|(l, p)| l.p.near(*p, 1e-9)));
+                        verts.extend(pts.into_iter().skip(skip).map(PolyVertex::new));
                     }
                     _ => {}
                 }
@@ -637,13 +715,37 @@ fn hatch(tags: &[Tag], t: &T) -> Option<EntityKind> {
         if verts.len() > 1 && verts.first().map(|f| f.p).zip(verts.last().map(|l| l.p)).is_some_and(|(a, b)| a.near(b, 1e-9)) {
             verts.pop();
         }
-        loops.push(HatchLoop { vertices: verts, outer });
+        // 97: number of source boundary objects, then their handles (330). A spline edge's fit
+        // data count is a 97 too, followed by its fit points instead.
+        let mut sources = Vec::new();
+        for _ in 0..2 {
+            while get(i).is_some_and(|x| !matches!(x.code, 97 | 92 | 75)) {
+                i += 1;
+            }
+            if get(i).is_none_or(|x| x.code != 97) {
+                break;
+            }
+            let n = get(i).map(Tag::i64).unwrap_or(0).clamp(0, MAX_HATCH_SOURCES as i64) as usize;
+            i += 1;
+            if get(i).is_some_and(|x| !matches!(x.code, 330 | 92 | 75)) {
+                continue;
+            }
+            while sources.len() < n
+                && let Some(x) = get(i).filter(|x| x.code == 330)
+            {
+                sources.extend(Handle::parse_hex(&x.str()).filter(|h| h.0 != 0));
+                i += 1;
+            }
+            break;
+        }
+        loops.push(HatchLoop { vertices: verts, outer, sources });
     }
     let solid = solid || pattern.eq_ignore_ascii_case("SOLID");
     let (scale, angle) = (t.fd(41, 1.0), t.fd(52, 0.0).to_radians());
-    // Definition lines matter only for a pattern the library doesn't define.
-    let pattern_lines =
-        if solid || cadcraft_doc::library::pattern(&pattern).is_some() { Vec::new() } else { pattern_definition(tags, scale, angle, origin) };
+    // Keep the file's definition lines even for a name the library knows: the library's versions
+    // of some patterns (AR-CONC) only approximate AutoCAD's, and drawing them at the file's scale
+    // could be hundreds of times denser than the hatch the author saw.
+    let pattern_lines = if solid { Vec::new() } else { pattern_definition(tags, scale, angle, origin) };
     Some(EntityKind::Hatch(Hatch {
         pattern: pattern.to_ascii_uppercase(),
         solid,
@@ -660,6 +762,9 @@ fn hatch(tags: &[Tag], t: &T) -> Option<EntityKind> {
         pattern_lines,
     }))
 }
+
+/// Upper bound on the source boundary objects of one HATCH loop.
+const MAX_HATCH_SOURCES: usize = 4096;
 
 /// Upper bounds on a HATCH's pattern definition lines and on the dashes of one line.
 const MAX_PATTERN_LINES: usize = 1024;
@@ -800,6 +905,8 @@ struct Rx {
     styles: HashMap<String, String>,
     /// BLOCK_RECORD handle (upper case) → block name.
     brs: HashMap<String, String>,
+    /// LTYPE record handle (upper case) → linetype name (DIMLTYPE, DIMLTEX1, DIMLTEX2).
+    ltypes: HashMap<String, String>,
     /// Upper-case block name → (insertion units, explodable) from its BLOCK_RECORD.
     block_props: HashMap<String, (u8, bool)>,
     /// Upper-case names of anonymous `*T` blocks drawn by ACAD_TABLE entities.
@@ -808,10 +915,14 @@ struct Rx {
     inserted: std::collections::HashSet<String>,
     /// Tables whose style is known only by TABLESTYLE handle: (table, style handle).
     table_style_fix: Vec<(Handle, String)>,
+    /// Multileaders' style handles and block attribute values, resolved with the objects.
+    mleader_fix: Vec<(Handle, crate::dxf_mleader::Pending)>,
     /// Upper-case xref block name → the external drawing's path (BLOCK group 1).
     xref_paths: HashMap<String, String>,
     /// Plot style name placeholder handle (upper case) → plot style name (`ACAD_PLOTSTYLENAME`).
     pstyles: HashMap<String, String>,
+    /// Upper-case block name → associative array parameters from its BLOCK_RECORD.
+    block_arrays: HashMap<String, cadcraft_doc::ArrayParams>,
 }
 
 /// The plot style names of a file: the entries of the `ACAD_PLOTSTYLENAME` dictionary of the
@@ -873,11 +984,21 @@ fn entity_plot_style(tags: &[Tag], rx: &Rx) -> Option<String> {
 fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &mut Rx) {
     match (kind, k) {
         ("DIMENSION", EntityKind::Dimension(dm)) => {
-            dm.overrides = crate::dxf_ext::read_dstyle(tags, &rx.styles, &rx.brs);
+            dm.overrides = crate::dxf_ext::read_dstyle(tags, &rx.styles, &rx.brs, &rx.ltypes);
             dm.assoc = crate::dxf_ext::read_assoc(tags);
             if let Some(center) = crate::dxf_ext::read_arclen(tags) {
                 dm.kind = DimKind::ArcLength;
                 dm.p15 = center;
+            }
+            dm.marks = crate::dxf_ext::read_marks(tags);
+            // Group 52: the extension lines' angle relative to the dimension line (DIMEDIT Oblique).
+            let base = match dm.kind {
+                DimKind::Linear { rotation } => Some(rotation),
+                DimKind::Aligned => Some((dm.p14.xy() - dm.p13.xy()).angle()),
+                _ => None,
+            };
+            if let (Some(base), Some(o)) = (base, T(tags).f(52).filter(|o| o.is_finite() && o.rem_euclid(180.0) != 0.0)) {
+                dm.marks.oblique = Some(cadcraft_geom::norm_angle(base + o.to_radians()));
             }
         }
         ("ACAD_TABLE", EntityKind::Table(_)) => {
@@ -892,6 +1013,13 @@ fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &m
         }
         ("INSERT", EntityKind::Insert(ins)) => {
             rx.inserted.insert(ins.block.to_ascii_uppercase());
+        }
+        ("MULTILEADER" | "MLEADER", EntityKind::MLeader(m)) => {
+            let pending = crate::dxf_mleader::resolve(tags, m, &rx.styles, &rx.brs);
+            if let Some(b) = &m.block {
+                rx.inserted.insert(b.block.to_ascii_uppercase());
+            }
+            rx.mleader_fix.push((h, pending));
         }
         _ => {}
     }
@@ -1091,6 +1219,15 @@ fn header(tags: &[Tag], d: &mut Drawing) {
                 vals.push(v);
                 i += 1;
             }
+            // Legacy files keep spacing in HEADER; modern *ACTIVE VPORT entries override it.
+            if matches!(name.as_str(), "SNAPUNIT" | "GRIDUNIT") {
+                let (Some(x), Some(y)) = (vals.iter().find(|t| t.code == 10), vals.iter().find(|t| t.code == 20)) else { continue };
+                let p = Vec2::new(x.f64(), y.f64());
+                if p.is_finite() && if name == "GRIDUNIT" { p.x >= 0.0 && p.y >= 0.0 } else { p.x > 0.0 && p.y > 0.0 } {
+                    d.header.set(&name, HVal::Point(p.to3(0.0)));
+                }
+                continue;
+            }
             let hv = match vals.as_slice() {
                 [x, y, z] if x.code == 10 => HVal::Point(Vec3::new(x.f64(), y.f64(), z.f64())),
                 [x, y] if x.code == 10 => HVal::Point(Vec3::new(x.f64(), y.f64(), 0.0)),
@@ -1108,6 +1245,8 @@ fn header(tags: &[Tag], d: &mut Drawing) {
                     Some(c) => HVal::Str(c.to_string()),
                     None => continue,
                 },
+                // $DIMJOGANG is in radians; the variable (like the style) holds degrees.
+                HVal::Real(r) if name == "DIMJOGANG" => HVal::Real((r.to_degrees() * 1e9).round() / 1e9),
                 hv => hv,
             };
             d.header.set(&name, hv);
@@ -1161,7 +1300,13 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
             "BLOCK_RECORD" => {
                 let units = t.i(70).and_then(|u| u8::try_from(u).ok()).unwrap_or(0);
                 rx.block_props.insert(n.to_ascii_uppercase(), (units, t.i(280).unwrap_or(1) != 0));
+                if let Some(a) = crate::dxf_ext::read_array(tg) {
+                    rx.block_arrays.insert(n.to_ascii_uppercase(), a);
+                }
                 rx.brs.insert(h.trim().to_ascii_uppercase(), n);
+            }
+            "LTYPE" => {
+                rx.ltypes.insert(h.trim().to_ascii_uppercase(), n);
             }
             _ => {}
         }
@@ -1239,9 +1384,18 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                     None => d.text_styles.push(st),
                 }
             }
-            // The first *ACTIVE viewport holds the snap grid's origin and rotation (degrees).
+            // The first *ACTIVE viewport holds the current snap/grid settings.
             "VPORT" if !active_vport && t.s(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("*ACTIVE")) => {
                 active_vport = true;
+                vport_record(d, &t);
+                for (name, code) in [("SNAPUNIT", 14), ("GRIDUNIT", 15)] {
+                    if let (Some(x), Some(y)) = (t.f(code), t.f(code + 10)) {
+                        let p = Vec2::new(x, y);
+                        if p.is_finite() && if name == "GRIDUNIT" { p.x >= 0.0 && p.y >= 0.0 } else { p.x > 0.0 && p.y > 0.0 } {
+                            d.header.set(name, HVal::Point(p.to3(0.0)));
+                        }
+                    }
+                }
                 if let (Some(x), Some(y)) = (t.f(13), t.f(23))
                     && x.is_finite()
                     && y.is_finite()
@@ -1263,13 +1417,13 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                     continue;
                 }
                 let x = crate::dxf_ext::xdata(&tg, crate::dxf_ext::APP);
-                let layer_state = x
-                    .iter()
-                    .position(|t| t.code == 1000 && t.str() == "LAYERSTATE")
-                    .and_then(|i| x.get(i + 1))
-                    .filter(|t| t.code == 1000)
-                    .map(Tag::str);
-                let v = NamedView { name: name.clone(), center, height: h, width: w, layer_state };
+                let field = |key: &str| {
+                    x.iter().position(|t| t.code == 1000 && t.str() == key).and_then(|i| x.get(i + 1)).filter(|t| t.code == 1000).map(Tag::str)
+                };
+                // 70 bit 1: a paper space view; its layout is CADCraft xdata.
+                let layout = (t.i(70).unwrap_or(0) & 1 != 0).then(|| field("LAYOUT").unwrap_or_default());
+                let twist = t.f(50).filter(|a| a.is_finite()).map_or(0.0, |a| a.rem_euclid(360.0).to_radians());
+                let v = NamedView { name: name.clone(), center, height: h, width: w, layer_state: field("LAYERSTATE"), twist, layout };
                 match d.views.iter_mut().find(|x| x.name.eq_ignore_ascii_case(&name)) {
                     Some(x) => *x = v,
                     None => d.views.push(v),
@@ -1298,10 +1452,11 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 let mut fields = serde_json::Map::new();
                 for tag in tg.iter().take_while(|x| x.code < 1000) {
                     let Some((field, kind)) = crate::dxf_ext::dim_field(tag.code) else { continue };
-                    if let Some(v) = crate::dxf_ext::decode(kind, tag, &rx.styles, &rx.brs) {
+                    if let Some(v) = crate::dxf_ext::decode(kind, tag, &rx.styles, &rx.brs, &rx.ltypes) {
                         fields.insert(field.to_string(), v);
                     }
                 }
+                fields.extend(crate::dxf_ext::read_newer_dimvars(&tg, &rx.styles, &rx.brs, &rx.ltypes));
                 let mut st = DimStyle { name: name.clone(), annotative: annotative(&tg), ..DimStyle::default() };
                 st.apply_fields(&fields);
                 match d.dim_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&name)) {
@@ -1309,8 +1464,43 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                     None => d.dim_styles.push(st),
                 }
             }
+            "VPORT" => vport_record(d, &t),
             _ => {}
         }
+    }
+    // One *Active viewport is no tiling: the view is the editor's (it zooms to the extents).
+    d.vports.retain(|c| c.tiles.len() > usize::from(c.is_active()));
+}
+
+/// Most tiles a viewport configuration keeps.
+const MAX_VPORT_TILES: usize = 64;
+
+/// A VPORT record: one tile of the configuration it names (`*ACTIVE` the one shown). Corners
+/// are fractions of the drawing area; unusable tiles are skipped.
+fn vport_record(d: &mut Drawing, t: &T) {
+    let name = t.s(2).map(|n| n.trim().to_string()).unwrap_or_default();
+    let (min, max, center) = (t.p(10).xy(), t.p(11).xy(), t.p(12).xy());
+    let height = t.fd(40, 0.0);
+    let unit = |v: f64| v.is_finite() && (-1e-9..=1.0 + 1e-9).contains(&v);
+    let ok = [min.x, min.y, max.x, max.y].into_iter().all(unit)
+        && max.x > min.x + 1e-6
+        && max.y > min.y + 1e-6
+        && center.is_finite()
+        && height.is_finite()
+        && height > 0.0;
+    if name.is_empty() || !ok {
+        return;
+    }
+    let aspect = t.f(41).filter(|a| a.is_finite() && *a > 0.0).unwrap_or(0.0);
+    let clamp = |p: Vec2| Vec2::new(p.x.clamp(0.0, 1.0), p.y.clamp(0.0, 1.0));
+    let tile = VportTile { min: clamp(min), max: clamp(max), center, height, aspect };
+    let name = if name.eq_ignore_ascii_case(VportConfig::ACTIVE) { VportConfig::ACTIVE.to_string() } else { name };
+    let room = d.vports.len() < MAX_OBJECTS;
+    match d.vports.iter_mut().find(|c| c.name.eq_ignore_ascii_case(&name)) {
+        Some(c) if c.tiles.len() < MAX_VPORT_TILES => c.tiles.push(tile),
+        Some(_) => {}
+        None if room => d.vports.push(VportConfig { name, tiles: vec![tile] }),
+        None => {}
     }
 }
 
@@ -1361,7 +1551,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     let mut d = Drawing::new_imperial();
     d.layouts.clear();
     let mut rx = Rx { pstyles: plot_style_names(&secs), ..Rx::default() };
-    let mut blocks: Vec<(String, Vec3, String, Vec<(Option<String>, bool, Entity)>, bool)> = Vec::new();
+    let mut blocks: Vec<(String, Vec3, String, Vec<(Option<String>, bool, Entity)>, i64)> = Vec::new();
     let mut layout_objs: Vec<(String, u32, String, PageSetup)> = Vec::new();
     let mut entities = Vec::new();
     let mut objs = Objects::default();
@@ -1384,7 +1574,8 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                         let name = t.s(2).unwrap_or_default();
                         let base = t.p(10);
                         let description = t.s(4).unwrap_or_default();
-                        let xref = t.i(70).unwrap_or(0) & 4 != 0;
+                        // Block flags: 4 xref, 8 overlay.
+                        let xref = t.i(70).unwrap_or(0) & 12;
                         let mut j = i + 1;
                         while recs.get(j).is_some_and(|(k, _)| k != "ENDBLK") {
                             j += 1;
@@ -1417,6 +1608,9 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
             _ => {}
         }
     }
+    // A file CADCraft wrote names its own next handle (#495): its table records and objects
+    // are numbered above it and rebuilt on save, so following $HANDSEED would drift every save.
+    let own_seed = objs.xrecord_text(crate::dxf_ext::HANDSEED_KEY).and_then(|t| Handle::parse_hex(t.trim()));
     // Layouts.
     let mut paper_block_for: HashMap<String, String> = HashMap::new();
     layout_objs.sort_by_key(|l| l.1);
@@ -1464,12 +1658,17 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         if let Some(&(units, explodable)) = rx.block_props.get(&up) {
             (b.units, b.explodable) = (units, explodable);
         }
-        if xref {
+        if xref & 4 != 0 {
             b.xref_path = Some(String::new());
+            b.xref_overlay = xref & 8 != 0;
+        } else {
+            for (_, _, e) in ents {
+                b.entities.push(e);
+            }
         }
-        for (_, _, e) in ents {
-            b.entities.push(e);
-        }
+        // Array parameters, with the block names the items use (other programs may rename
+        // anonymous blocks); dropped when the items no longer match them.
+        b.array = rx.block_arrays.get(&up).cloned().and_then(|mut a| a.sync_names(b.entities.iter().map(|e| e.as_ref())).then_some(a));
         if let Some(path) = rx.xref_paths.remove(&up) {
             b.xref_path = Some(path);
         }
@@ -1489,17 +1688,71 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
             d.model.push(e);
         }
     }
+    apply_sortents(&mut d, &objs.sortents, &rx.brs, &paper_block_for, &first_layout);
     objs.apply(&mut d, &rx);
     crate::dxf_image::resolve(&secs, &mut d);
+    crate::dxf_mline::resolve(&secs, &mut d);
     // Keep handles unique against the header's seed.
     let seed = d.header.str("HANDSEED", "");
-    if let Some(h) = Handle::parse_hex(&seed) {
+    if let Some(h) = own_seed.or_else(|| Handle::parse_hex(&seed)) {
         d.bump_handseed(Handle(h.0.saturating_sub(1)));
     }
     if d.layer("0").is_none() {
         d.layers.insert(0, Layer::default());
     }
+    crate::dxf_raw::read(&secs, &mut d);
     Ok(d)
+}
+
+/// A SORTENTSTABLE (DXF Reference, OBJECTS section): after its AcDbSortentsTable marker, the
+/// owning block record (330), then pairs of an entity handle (331) and the sort handle (5) it is
+/// drawn by.
+fn sortents_table(tags: &[Tag]) -> Option<(String, HashMap<Handle, u64>)> {
+    let start = tags.iter().position(|t| t.code == 100 && t.str() == "AcDbSortentsTable")?;
+    let tail = tags.get(start + 1..)?;
+    let owner = tail.iter().find(|t| t.code == 330)?.str().trim().to_ascii_uppercase();
+    let mut map = HashMap::new();
+    let mut ent: Option<Handle> = None;
+    for t in tail {
+        match t.code {
+            331 => ent = Handle::parse_hex(&t.str()),
+            5 => {
+                if let (Some(e), Some(k)) = (ent.take(), Handle::parse_hex(&t.str()))
+                    && map.len() < MAX_OBJECTS
+                {
+                    map.insert(e, k.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    (!map.is_empty()).then_some((owner, map))
+}
+
+/// Draw each space with a SORTENTSTABLE in sort-handle order: an entity listed in the table by
+/// its sort handle, any other by its own handle.
+fn apply_sortents(
+    d: &mut Drawing,
+    tables: &[(String, HashMap<Handle, u64>)],
+    brs: &HashMap<String, String>,
+    paper_for: &HashMap<String, String>,
+    first_layout: &str,
+) {
+    for (owner, map) in tables {
+        let Some(name) = brs.get(owner) else { continue };
+        let up = name.to_ascii_uppercase();
+        let key = |e: &Entity| map.get(&e.handle).copied().unwrap_or(e.handle.0);
+        if up == "*MODEL_SPACE" {
+            d.model.sort_by_key(key);
+        } else if up.starts_with("*PAPER_SPACE") {
+            let lname = paper_for.get(&up).map(String::as_str).unwrap_or(first_layout);
+            if let Some(l) = d.layouts.iter_mut().find(|l| l.name == lname) {
+                l.entities.sort_by_key(key);
+            }
+        } else if let Some(b) = d.blocks.get_mut(name.as_str()) {
+            std::sync::Arc::make_mut(b).entities.sort_by_key(key);
+        }
+    }
 }
 
 /// Non-graphical objects applied once every entity is placed.
@@ -1507,6 +1760,8 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
 struct Objects {
     /// Dictionary entry handle (upper case) → entry name.
     names: HashMap<String, String>,
+    /// SCALE objects (the annotation scale list), in file order.
+    scales: Vec<cadcraft_doc::AnnoScale>,
     /// XRECORD handle (upper case) → its groups.
     xrecords: HashMap<String, Vec<Tag>>,
     /// TABLESTYLE objects: (handle, groups).
@@ -1519,6 +1774,8 @@ struct Objects {
     groups: Vec<(String, Vec<Tag>)>,
     /// Saved paper-space views of layouts: (layout name, view).
     layout_views: Vec<(String, (Vec2, f64))>,
+    /// SORTENTSTABLE objects: (owning block record handle, entity handle → sort handle).
+    sortents: Vec<(String, HashMap<Handle, u64>)>,
 }
 
 const MAX_OBJECTS: usize = 1_000_000;
@@ -1527,6 +1784,13 @@ impl Objects {
     fn add(&mut self, kind: &str, tags: &[Tag]) {
         let h = T(tags).s(5).map(|h| h.trim().to_ascii_uppercase()).unwrap_or_default();
         match kind {
+            "SCALE" if self.scales.len() < cadcraft_doc::MAX_SCALES => {
+                if let Some(s) = crate::dxf_ext::read_scale(tags)
+                    && !self.scales.iter().any(|x| x.name.eq_ignore_ascii_case(&s.name))
+                {
+                    self.scales.push(s);
+                }
+            }
             "DICTIONARY" => {
                 let mut name: Option<String> = None;
                 for t in tags {
@@ -1550,6 +1814,11 @@ impl Objects {
             "DIMASSOC" if self.dimassocs.len() < MAX_OBJECTS => self.dimassocs.push(tags.to_vec()),
             "MLEADERSTYLE" if self.mleader_styles.len() < MAX_OBJECTS => self.mleader_styles.push((h, tags.to_vec())),
             "GROUP" if self.groups.len() < MAX_OBJECTS => self.groups.push((h, tags.to_vec())),
+            "SORTENTSTABLE" if self.sortents.len() < MAX_OBJECTS => {
+                if let Some(t) = sortents_table(tags) {
+                    self.sortents.push(t);
+                }
+            }
             "LAYOUT" if self.layout_views.len() < MAX_OBJECTS => {
                 let start = tags.iter().position(|x| x.code == 100 && x.str() == "AcDbLayout").unwrap_or(0);
                 if let (Some(name), Some(view)) = (T(tags.get(start..).unwrap_or(&[])).s(1), layout_view(tags)) {
@@ -1575,19 +1844,13 @@ impl Objects {
     }
 
     fn apply(self, d: &mut Drawing, rx: &Rx) {
+        if let Some(style) = self.xrecord_text(crate::dxf_ext::MLEADER_STYLE_KEY).filter(|s| !s.trim().is_empty()) {
+            d.header.set_str("CMLEADERSTYLE", &style);
+        }
         // Table styles (named by their ACAD_TABLESTYLE dictionary entries).
         for (h, tags) in &self.table_styles {
             let Some(name) = self.names.get(h).filter(|n| !n.is_empty()) else { continue };
-            let t = T(tags);
-            let def = TableStyle::default();
-            let pos = |v: f64, d: f64| if v.is_finite() && v > 0.0 { v } else { d };
-            let st = TableStyle {
-                name: name.clone(),
-                text_height: pos(t.fd(140, def.text_height), def.text_height),
-                margin: t.f(40).filter(|m| m.is_finite() && *m >= 0.0).unwrap_or(def.margin),
-                title: t.i(280).unwrap_or(0) == 0,
-                header: t.i(281).unwrap_or(0) == 0,
-            };
+            let st = crate::dxf_table::read_table_style(name, tags);
             match d.table_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(name)) {
                 Some(x) => *x = st,
                 None => d.table_styles.push(st),
@@ -1606,6 +1869,16 @@ impl Objects {
         if let Some((c, p)) = self.xrecord_text(crate::dxf_ext::CONSTRAINTS_KEY).and_then(|t| crate::dxf_ext::parse_constraints(&t)) {
             d.constraints = c;
             d.parametric = p;
+        }
+        // The annotation scale list (a metric drawing without one gets the metric defaults),
+        // then CADCraft's annotative scaling record.
+        if !self.scales.is_empty() {
+            d.scales = self.scales.clone();
+        } else if d.header.i64("MEASUREMENT", 0) == 1 {
+            d.scales = cadcraft_doc::metric_scales();
+        }
+        if let Some(p) = self.xrecord_text(crate::dxf_ext::ANNOTATION_KEY).and_then(|t| crate::dxf_ext::parse_anno(&t)) {
+            crate::dxf_ext::apply_anno(d, p);
         }
         // Saved layer states.
         if let Some(states) = self.xrecord_text(crate::dxf_ext::LAYER_STATES_KEY).and_then(|t| crate::dxf_ext::parse_layer_states(&t)) {
@@ -1629,12 +1902,14 @@ impl Objects {
                 landing_gap: num(42, def.landing_gap, 0.0),
                 dogleg: num(43, def.dogleg, 0.0),
                 text_style: text_style.unwrap_or(def.text_style),
+                annotative: t.i(296).unwrap_or(0) != 0,
             };
             match d.mleader_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(name)) {
                 Some(x) => *x = st,
                 None => d.mleader_styles.push(st),
             }
         }
+        crate::dxf_mleader::apply(d, &rx.mleader_fix, &self.names);
         for (name, view) in &self.layout_views {
             if let Some(l) = d.layouts.iter_mut().find(|l| l.name == *name) {
                 l.view = Some(*view);
@@ -1798,4 +2073,49 @@ fn layout_view(tags: &[Tag]) -> Option<(Vec2, f64)> {
     let list = crate::dxf_ext::xdata_list(crate::dxf_ext::xdata(tags, crate::dxf_ext::APP), "PSVIEW");
     let g = |c: i32| list.iter().find(|t| t.code == c).map(Tag::f64).filter(|v| v.is_finite());
     Some((Vec2::new(g(1010)?, g(1020)?), g(1040)?))
+}
+
+/// A HELIX (DXF Reference): the axis base point, start point, axis, radius, turns, turn height,
+/// handedness and constraint after the AcDbHelix marker; the top radius is how far the end of its
+/// spline (AcDbSpline: the last control point, else fit point) lies from the axis.
+fn helix(tags: &[Tag]) -> Helix {
+    let hs = tags.iter().position(|t| t.code == 100 && t.str() == "AcDbHelix").unwrap_or(tags.len());
+    let ss = tags.iter().position(|t| t.code == 100 && t.str() == "AcDbSpline").unwrap_or(0).min(hs);
+    let spline = tags.get(ss..hs).unwrap_or(&[]);
+    let t = T(tags.get(hs..).unwrap_or(&[]));
+    // The last point of the spline (3D) with group `code`.
+    let last = |code: i32| {
+        let i = spline.iter().rposition(|g| g.code == code)?;
+        let f = |c: i32| spline.get(i..).and_then(|r| r.iter().find(|g| g.code == c)).map(Tag::f64).unwrap_or(0.0);
+        Some(Vec3::new(f(code), f(code + 10), f(code + 20)))
+    };
+    let center = t.p(10);
+    let start = t.p(11);
+    let axis = t.p(12);
+    let axis = if axis.is_finite() && axis.len() > 1e-12 { axis.normalized() } else { Vec3::Z };
+    // Distance from the axis.
+    let radius = |p: Vec3| {
+        let v = Vec3::new(p.x - center.x, p.y - center.y, p.z - center.z);
+        let along = v.dot(axis);
+        Vec3::new(v.x - axis.x * along, v.y - axis.y * along, v.z - axis.z * along).len()
+    };
+    let base_radius = t.f(40).filter(|r| r.is_finite() && *r >= 0.0).unwrap_or_else(|| radius(start));
+    let turns = t.fd(41, 1.0);
+    let end = last(10).or_else(|| last(11));
+    let height = match (t.f(42), end) {
+        (Some(th), _) if th.is_finite() => th * turns,
+        (_, Some(e)) => e.z - center.z,
+        _ => 0.0,
+    };
+    Helix {
+        center,
+        base_radius,
+        top_radius: end.map(radius).unwrap_or(base_radius),
+        height,
+        turns,
+        start_angle: center.xy().angle_to(start.xy()),
+        ccw: t.i(290).unwrap_or(1) != 0,
+        constrain: HelixConstrain::from_dxf(t.i(280).unwrap_or(2)),
+    }
+    .sanitized()
 }

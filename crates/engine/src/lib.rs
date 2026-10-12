@@ -10,17 +10,21 @@
 
 pub mod assoc;
 pub mod audit;
+pub mod autosave;
 pub mod cmd;
 mod finite;
+pub mod grip_dims;
 pub mod grips;
 mod guard;
 pub mod pointmod;
 pub mod prompt;
+mod recent;
 pub mod sample;
 pub mod select;
 pub mod snap;
 pub mod spatial;
 pub mod sysvars;
+pub mod undoctl;
 pub mod units;
 
 use std::sync::Arc;
@@ -34,7 +38,7 @@ pub use cadcraft_doc as doc;
 pub use cadcraft_geom as geom;
 pub use cadcraft_render as render;
 pub use cmd::{CommandInfo, CommandSpec, Provider, command_specs, find_command, register_command_provider};
-pub use prompt::{Accept, Input, Interactive, Prompt, Step};
+pub use prompt::{Accept, Drag, Input, Interactive, Prompt, Step};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -83,6 +87,28 @@ impl Default for View {
     }
 }
 
+/// Tiled model viewports (VPORTS): the session side of the drawing's `*Active` configuration.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelTiles {
+    /// The tile corners these views belong to (when the drawing's tiles change, by VPORTS or
+    /// undo, its views take over).
+    pub rects: Vec<(Vec2, Vec2)>,
+    /// Each tile's view; the current tile shows the model space view itself.
+    pub views: Vec<View>,
+    /// The current tile.
+    pub active: usize,
+}
+
+/// One tile of the model space drawing area, for the UI ([`Session::model_tiles`]): its corners
+/// as fractions of the drawing area (0,0 lower left) and its view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelTile {
+    pub min: Vec2,
+    pub max: Vec2,
+    pub view: View,
+    pub active: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub label: String,
@@ -96,6 +122,8 @@ pub struct DocState {
     pub doc: Arc<Drawing>,
     pub undo: Vec<Snapshot>,
     pub redo: Vec<Snapshot>,
+    /// UNDO marks, BEgin/End group and Control (see [`undoctl`]).
+    pub undo_ctl: undoctl::UndoCtl,
     pub selection: Vec<Handle>,
     pub previous_selection: Vec<Handle>,
     pub path: Option<String>,
@@ -103,11 +131,15 @@ pub struct DocState {
     pub saved: Arc<Drawing>,
     pub revision: u64,
     pub space: Space,
+    /// Tiled model viewports (VPORTS).
+    pub tiles: ModelTiles,
     /// MSPACE: the layout viewport whose model space is being edited (None = paper space).
     pub mspace: Option<Handle>,
     pub views: Vec<(Space, View)>,
     pub view_history: Vec<View>,
     pub uid: u64,
+    /// The drawing is saved as binary DXF (it was opened from one, or last saved as one).
+    pub binary_dxf: bool,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -120,16 +152,19 @@ impl DocState {
             doc,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_ctl: undoctl::UndoCtl::default(),
             selection: Vec::new(),
             previous_selection: Vec::new(),
             path,
             title: title.into(),
             revision: 1,
             space: Space::Model,
+            tiles: ModelTiles::default(),
             mspace: None,
             views: Vec::new(),
             view_history: Vec::new(),
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            binary_dxf: false,
         }
     }
     pub fn is_dirty(&self) -> bool {
@@ -277,7 +312,8 @@ impl DocState {
     }
 }
 
-/// Session-level drafting settings (the AutoCAD system variables stored in the registry/profile).
+/// Session-level drafting settings. [`Session::drafting_settings`] supplies the active drawing's
+/// snap/grid spacing in the corresponding fields for UI and JSON consumers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
@@ -288,22 +324,41 @@ pub struct Settings {
     pub polarang: f64,
     pub gridmode: bool,
     pub snapmode: bool,
+    /// SNAPUNIT in a drafting settings snapshot; stored in the drawing header.
     pub snapunit: Vec2,
     /// OSNAPHATCH: object snaps find hatch objects (off by default, as in AutoCAD).
     pub osnaphatch: bool,
+    /// GRIDUNIT in a drafting settings snapshot; zero components follow SNAPUNIT.
     pub gridunit: Vec2,
     /// Major grid line every N minor lines (GRIDMAJOR).
     pub gridmajor: u32,
+    /// ZOOMFACTOR: how far one mouse wheel step zooms (3..=100).
+    pub zoomfactor: u32,
+    /// -VIEW sEttings > Layer snapshot: named views save the layer settings with them.
+    pub view_layer_snapshot: bool,
     pub dynmode: bool,
+    /// DYNDIGRIP: which dimensions grip dimensional input shows while a grip is stretched (bits:
+    /// 1 resulting length, 2 length change, 4 absolute angle, 8 angle change, 16 radius); read
+    /// when DYNDIVIS = 2.
+    pub dyndigrip: u32,
+    /// DYNDIVIS: how many of them: 0 the first, 1 the first two (default), 2 all DYNDIGRIP asks for.
+    pub dyndivis: u8,
     /// DYNPIFORMAT = 1: Dynamic Input shows second and next points as Cartesian `x,y` instead of
     /// polar `distance<angle` (the default).
     pub dynpi_cartesian: bool,
     /// DYNPICOORDS = 1: second and next points typed into Dynamic Input are absolute instead of
     /// relative to the last point (the default).
     pub dynpi_absolute: bool,
+    /// DYNPROMPT: Dynamic Input shows the prompt beside the cursor, and Down Arrow opens the
+    /// prompt's options there (on by default).
+    pub dynprompt: bool,
     pub lwdisplay: bool,
     pub transparency_display: bool,
     pub selection_cycling: bool,
+    /// SELECTSIMILARMODE: what SELECTSIMILAR matches besides the object type (bits: 1 colour,
+    /// 2 layer, 4 linetype, 8 linetype scale, 16 lineweight, 32 plot style, 64 object style,
+    /// 128 name).
+    pub selectsimilarmode: u32,
     pub otrack: bool,
     /// PICKBOX in pixels.
     pub pickbox: f64,
@@ -311,11 +366,17 @@ pub struct Settings {
     pub aperture: f64,
     pub pickfirst: bool,
     pub pickadd: bool,
+    /// PICKSTYLE: bit 1 picks whole selectable groups ([`cmd::groups`]), bit 2 associative hatches
+    /// with their boundaries (stored, not used yet).
+    pub pickstyle: u8,
     pub gripsize: f64,
     pub cursorsize: f64,
     /// MAXARRAY: the most objects one array command creates (items × selected objects).
     pub maxarray: u64,
+    /// SNAPSTYL 1: isometric snap and grid, ortho and crosshair along the isometric plane's axes.
     pub isodraft: bool,
+    /// SNAPISOPAIR: the current isometric plane (ISOPLANE, F5).
+    pub isoplane: snap::iso::IsoPlane,
     pub annoallvisible: bool,
     pub annoautoscale: bool,
     /// QPMODE: show the Quick Properties palette when objects are selected.
@@ -325,6 +386,11 @@ pub struct Settings {
     pub polar_flags: u32,
     /// POLARADDANG: additional polar tracking angles (radians), used with POLARMODE bit 4.
     pub polaraddang: Vec<f64>,
+    /// SNAPTYPE 1: snap mode (F9) snaps along tracking paths at POLARDIST steps (PolarSnap)
+    /// instead of to the grid.
+    pub polarsnap: bool,
+    /// POLARDIST: the PolarSnap step; 0 uses the snap X spacing.
+    pub polardist: f64,
 }
 
 impl Default for Settings {
@@ -340,26 +406,36 @@ impl Default for Settings {
             osnaphatch: false,
             gridunit: Vec2::new(0.5, 0.5),
             gridmajor: 5,
+            zoomfactor: 60,
+            view_layer_snapshot: true,
             dynmode: true,
+            dyndigrip: 31,
+            dyndivis: 1,
             dynpi_cartesian: false,
             dynpi_absolute: false,
+            dynprompt: true,
             lwdisplay: false,
             transparency_display: false,
             selection_cycling: false,
+            selectsimilarmode: 130,
             otrack: true,
             pickbox: 3.0,
             aperture: 10.0,
             pickfirst: true,
             pickadd: true,
+            pickstyle: 1,
             gripsize: 5.0,
             cursorsize: 5.0,
             maxarray: 100_000,
             isodraft: false,
+            isoplane: snap::iso::IsoPlane::Left,
             annoallvisible: true,
             annoautoscale: false,
             qpmode: false,
             polar_flags: 0,
             polaraddang: Vec::new(),
+            polarsnap: false,
+            polardist: 0.0,
         }
     }
 }
@@ -394,6 +470,8 @@ pub struct LastUsed {
     pub rotate_angle: f64,
     /// SCALE factor.
     pub scale_factor: f64,
+    /// MATCHPROP Settings: the properties it copies.
+    pub matchprop: cmd::MatchProps,
     /// MLEADER placement order and Options.
     pub mleader: MLeaderOptions,
     /// MLEADER's block content name (Options > Content type > Block).
@@ -407,6 +485,7 @@ impl Default for LastUsed {
             polygon_circumscribed: false,
             rotate_angle: 0.0,
             scale_factor: 1.0,
+            matchprop: cmd::MatchProps::default(),
             mleader: MLeaderOptions::default(),
             mleader_block: String::new(),
         }
@@ -472,10 +551,16 @@ pub struct Session {
     pub active: usize,
     pub settings: Settings,
     pub running: Option<Running>,
+    /// The command suspended while a transparent command (`'ZOOM`, `'PAN`…) prompts inside it;
+    /// it resumes when that command ends. One level, as in AutoCAD.
+    pub suspended: Option<Running>,
     pub log: Vec<String>,
     pub last_command: Option<String>,
     /// LASTPOINT.
     pub last_point: Vec2,
+    /// The last segment given at a point prompt (its base point and the point): polar angles
+    /// relative to the last segment (POLARMODE bit 1) are measured from it.
+    pub last_segment: Option<(Vec2, Vec2)>,
     /// Point modifiers pending at the current point prompt (`FROM`, `M2P`, `.x`, `<a`…).
     pub point_mods: Vec<pointmod::Frame>,
     /// Cursor position in world coordinates (from the UI; used for direct distance entry).
@@ -483,6 +568,10 @@ pub struct Session {
     /// The deferred tangent/perpendicular snap under the cursor, if any (from the UI; lets the
     /// rubber band show the line it resolves to).
     pub cursor_deferred: Option<snap::Deferred>,
+    /// Origin of the point currently being fed by `input_snapped`; never reused by typed points.
+    picked_viewport: Option<snap::ViewportPoint>,
+    /// The last drawing comparison (COMPARE), drawn over the drawing it was made for.
+    pub compare: Option<cmd::file::compare::Comparison>,
     /// Object snap tracking: acquired points and the path under the cursor (from the UI's
     /// [`Session::snap_cursor`] calls; direct distance entry follows the path).
     pub tracking: snap::tracking::Tracker,
@@ -491,6 +580,10 @@ pub struct Session {
     pub clipboard: Vec<Entity>,
     pub clipboard_base: Vec2,
     pub pending_window: Option<PendingWindow>,
+    /// A selection mode typed at "Select objects" (W, C, F, WP, CP) collecting its points.
+    pub select_mode: Option<select::SelectMode>,
+    /// SIngle typed at "Select objects": the next selection ends the prompt.
+    pub select_single: bool,
     pub untitled_counter: u32,
     /// The last dimension created (DIMCONTINUE / DIMBASELINE).
     pub last_dim: Option<Handle>,
@@ -521,17 +614,23 @@ impl Session {
             active: 0,
             settings: Settings::default(),
             running: None,
+            suspended: None,
             log: Vec::new(),
             last_command: None,
             last_point: Vec2::ZERO,
+            last_segment: None,
             point_mods: Vec::new(),
             cursor: Vec2::ZERO,
             cursor_deferred: None,
+            picked_viewport: None,
+            compare: None,
             tracking: snap::tracking::Tracker::default(),
             viewport_px: (1200.0, 800.0),
             clipboard: Vec::new(),
             clipboard_base: Vec2::ZERO,
             pending_window: None,
+            select_mode: None,
+            select_single: false,
             untitled_counter: 0,
             last_dim: None,
             last_used: LastUsed::default(),
@@ -574,6 +673,15 @@ impl Session {
     /// Copy-on-write access to the drawing.
     pub fn doc_mut(&mut self) -> Result<&mut Drawing> {
         Ok(Arc::make_mut(&mut self.state_mut()?.doc))
+    }
+    /// Settings for the active drawing, without caching drawing variables in the profile.
+    pub fn drafting_settings(&self) -> Settings {
+        let mut settings = self.settings.clone();
+        if let Ok(d) = self.doc() {
+            settings.snapunit = d.header.snap_unit();
+            settings.gridunit = d.header.grid_unit();
+        }
+        settings
     }
     /// The space commands act on (model space while working inside a layout viewport).
     pub fn space(&self) -> Space {
@@ -626,6 +734,12 @@ impl Session {
         let mut common = common;
         if let Some(rgb) = true_color {
             common.color = cadcraft_color::Color::True(cadcraft_color::Rgb::from_u32(rgb as u32));
+        }
+        // Text, dimensions, multileaders, hatches and block references of annotative styles are
+        // annotative, supporting the current annotation scale.
+        let d = self.doc()?;
+        if d.annotative_by_style(&kind) {
+            common.anno_scales = vec![d.current_anno_scale()];
         }
         let h = self.doc_mut()?.add(&space, common, kind)?;
         Ok(h)
@@ -680,12 +794,8 @@ impl Session {
             && let Some(st) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&doc, &st.doc)
         {
-            st.undo.push(Snapshot { label: spec.label.to_string(), doc, selection: sel });
-            st.redo.clear();
+            st.push_undo(Snapshot { label: spec.label.to_string(), doc, selection: sel });
             st.revision += 1;
-            if st.undo.len() > 2000 {
-                st.undo.remove(0);
-            }
         }
         result
     }
@@ -728,19 +838,32 @@ impl Session {
                 self.echo(format!(">>{}", spec.label));
                 return self.execute(spec.id, &Value::Null).map(|_| ());
             }
+            if self.suspended.is_some() {
+                self.echo("A transparent command is already in progress.");
+                return Ok(());
+            }
         }
-        if self.running.is_some() {
+        let nested = transparent && spec.transparent && self.running.is_some() && spec.interactive.is_some();
+        if !nested && self.running.is_some() {
             self.cancel();
         }
         (spec.enabled)(self).map_err(|m| EngineError::Disabled(spec.id.into(), m))?;
-        self.last_command = Some(spec.id.to_string());
-        self.echo(format!("Command: {}", spec.id.to_ascii_uppercase()));
+        if nested {
+            // The outer command stays the one Enter repeats.
+            self.echo(format!(">>{}", spec.id.to_ascii_uppercase()));
+        } else {
+            self.last_command = Some(spec.id.to_string());
+            self.echo(format!("Command: {}", spec.id.to_ascii_uppercase()));
+        }
         match spec.interactive {
             Some(factory) => {
                 let machine = guard::Guarded::create(spec.id, factory, self)?;
                 let st = self.state()?;
                 let before = st.doc.clone();
                 let selection_before = st.selection.clone();
+                if nested {
+                    self.suspended = self.running.take();
+                }
                 self.running = Some(Running { id: spec.id.to_string(), machine, before, selection_before });
                 self.pending_window = None;
                 // Some commands complete immediately (e.g. ERASE with a pickfirst selection).
@@ -761,6 +884,16 @@ impl Session {
                 Ok(())
             }
         }
+    }
+
+    /// Feed an object-snap pick, retaining its viewport origin for measurements. Point modifiers
+    /// that combine or constrain coordinates produce ordinary drawing-space points.
+    pub fn input_snapped(&mut self, hit: snap::SnapHit) -> Result<()> {
+        let source = hit.viewport.filter(|_| self.point_mods.iter().all(|f| matches!(f, pointmod::Frame::Snap { mode } if *mode != 0)));
+        let previous = std::mem::replace(&mut self.picked_viewport, source);
+        let result = self.input(hit.input());
+        self.picked_viewport = previous;
+        result
     }
 
     /// Give an input to the running command. With no command running, `Enter` repeats the last
@@ -786,15 +919,51 @@ impl Session {
         // Generic selection handling during "Select objects:" prompts.
         let input = self.preprocess_selection(input)?;
         match input {
-            Some(i) => self.feed(Some(i)),
+            Some(i) => {
+                // SIngle: the first selection that finds objects also ends the prompt.
+                let single = self.select_single && matches!(&i, Input::Pick(hs) if !hs.is_empty());
+                self.feed(Some(i))?;
+                if single {
+                    self.select_single = false;
+                    if self.current_prompt().is_some_and(|p| p.accept.select) {
+                        self.feed(Some(Input::Enter))?;
+                    }
+                }
+                Ok(())
+            }
             None => Ok(()),
         }
     }
 
     fn preprocess_selection(&mut self, input: Input) -> Result<Option<Input>> {
-        let Some(prompt) = self.current_prompt() else { return Ok(Some(input)) };
+        // The command's own prompt: a typed selection mode only applies at its "Select objects".
+        let Some(prompt) = self.running.as_ref().map(|r| r.machine.prompt(self)) else { return Ok(Some(input)) };
         if !prompt.accept.select {
             return Ok(Some(input));
+        }
+        if self.select_mode.is_some() {
+            return self.select_mode_input(input);
+        }
+        if let Input::Text(t) | Input::Keyword(t) = &input
+            && let Some(m) = select::SelectMode::from_keyword(t)
+        {
+            self.pending_window = None;
+            self.select_mode = Some(m);
+            return Ok(None);
+        }
+        if let Input::Text(t) | Input::Keyword(t) = &input
+            && !prompt.keywords.iter().any(|k| k.eq_ignore_ascii_case(t.trim()))
+        {
+            match t.trim().to_ascii_lowercase().as_str() {
+                "si" | "single" => {
+                    self.select_single = true;
+                    return Ok(None);
+                }
+                // AUto (a pick, or a window where nothing is picked) is how points always select;
+                // Multiple picks the same way until Enter.
+                "au" | "auto" | "m" | "multiple" => return Ok(None),
+                _ => {}
+            }
         }
         let space = self.space();
         match input {
@@ -803,10 +972,10 @@ impl Session {
                 if let Some(pw) = self.pending_window.take() {
                     let crossing = p.x < pw.corner.x;
                     let hs = select::select_window(self.doc()?, &space, Bounds2::new(pw.corner, p), crossing);
-                    return Ok(Some(Input::Pick(hs)));
+                    return Ok(Some(Input::Pick(cmd::groups::expand(self, hs))));
                 }
                 match select::pick(self.doc()?, &space, p, ap) {
-                    Some(h) => Ok(Some(Input::Pick(vec![h]))),
+                    Some(h) => Ok(Some(Input::Pick(cmd::groups::expand(self, vec![h])))),
                     None => {
                         self.pending_window = Some(PendingWindow { corner: p, during_command: true });
                         Ok(None)
@@ -824,7 +993,7 @@ impl Session {
                     _ => None,
                 };
                 match picked {
-                    Some(hs) => Ok(Some(Input::Pick(hs))),
+                    Some(hs) => Ok(Some(Input::Pick(cmd::groups::expand(self, hs)))),
                     None => Ok(Some(input)),
                 }
             }
@@ -836,13 +1005,60 @@ impl Session {
         }
     }
 
+    /// Input while a typed selection mode (W, C, F, WP, CP) collects its points: the selected
+    /// objects go to the command as a pick once the mode is complete.
+    fn select_mode_input(&mut self, input: Input) -> Result<Option<Input>> {
+        let Some(mut mode) = self.select_mode.take() else { return Ok(Some(input)) };
+        if mode.kind == select::SelectKind::Group {
+            return match input {
+                Input::Text(name) | Input::Keyword(name) => match select::select_group(self.doc()?, &self.space(), &name) {
+                    Some(hs) => Ok(Some(Input::Pick(hs))),
+                    None => {
+                        self.echo(format!("No group named \"{}\".", name.trim()));
+                        Ok(None)
+                    }
+                },
+                // Enter or Esc leaves the group name prompt.
+                Input::Cancel => Ok(Some(input)),
+                Input::Enter => Ok(None),
+                _ => {
+                    self.echo("Invalid group name.");
+                    self.select_mode = Some(mode);
+                    Ok(None)
+                }
+            };
+        }
+        match input {
+            Input::Point(p) => {
+                if mode.push(p) {
+                    return Ok(mode.select(self.doc()?, &self.space()).map(Input::Pick));
+                }
+            }
+            Input::Keyword(k) if k == "Undo" => {
+                mode.pts.pop();
+            }
+            // Enter ends a fence or polygon; with too few points the mode is dropped.
+            Input::Enter => return Ok(mode.select(self.doc()?, &self.space()).map(Input::Pick)),
+            Input::Cancel | Input::Pick(_) => return Ok(Some(input)),
+            _ => self.echo("Invalid point."),
+        }
+        self.select_mode = Some(mode);
+        Ok(None)
+    }
+
     fn feed(&mut self, input: Option<Input>) -> Result<()> {
+        let base = if matches!(input, Some(Input::Point(_))) { self.current_prompt().and_then(|p| p.base) } else { None };
         let Some(mut run) = self.running.take() else { return Ok(()) };
         let step = match input {
             Some(Input::Cancel) => Ok(Step::Cancel),
             Some(i) => {
                 if let Input::Point(p) = &i {
                     self.last_point = *p;
+                    if let Some(b) = base.filter(|b| b.is_finite() && p.is_finite() && b.dist(*p) > 1e-12) {
+                        self.last_segment = Some((b, *p));
+                    }
+                    // A temporary tracking point (TT) serves one point.
+                    self.tracking.release_temporary();
                 }
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.machine.input(self, i)));
                 match r {
@@ -869,11 +1085,13 @@ impl Session {
             }
             Ok(Step::Done) => {
                 self.finish(run, false);
+                self.resume_suspended();
                 Ok(())
             }
             Ok(Step::Cancel) => {
                 self.echo("*Cancel*");
                 self.finish(run, true);
+                self.resume_suspended();
                 Ok(())
             }
             Err(EngineError::Internal(id, m)) => {
@@ -882,6 +1100,7 @@ impl Session {
                     st.doc = run.before.clone();
                 }
                 self.echo(format!("Internal error in {id}: {m}"));
+                self.resume_suspended();
                 Err(EngineError::Internal(id, m))
             }
             Err(e) => {
@@ -894,6 +1113,9 @@ impl Session {
     }
 
     fn finish(&mut self, run: Running, cancelled: bool) {
+        // A typed selection mode or SIngle never outlives its command.
+        self.select_mode = None;
+        self.select_single = false;
         if find_command(&run.id).is_some_and(|c| c.undoable)
             && let Err(e) = self.refuse_non_finite(None, &run.before, &run.selection_before, &run.id)
         {
@@ -906,25 +1128,50 @@ impl Session {
             return;
         }
         self.pending_window = None;
+        self.select_mode = None;
         let label = find_command(&run.id).map(|c| c.label).unwrap_or("Command");
         let _ = cancelled;
         cmd::groups::after_command(self, Some(&run.before));
         cmd::constraints::after_command(self, Some(&run.before), true);
         assoc::after_command(self, Some(&run.before), None);
+        if self.suspended.is_some() {
+            // A transparent command's changes belong to the undo step of the command it ran inside.
+            if let Ok(st) = self.state_mut()
+                && !Arc::ptr_eq(&run.before, &st.doc)
+            {
+                st.revision += 1;
+            }
+            return;
+        }
+        // Observers run once, for the outer command, so their edits share its undo step.
         self.run_observers(&run.before);
         if let Ok(st) = self.state_mut()
             && !Arc::ptr_eq(&run.before, &st.doc)
         {
-            st.undo.push(Snapshot { label: label.to_string(), doc: run.before, selection: run.selection_before });
-            st.redo.clear();
+            st.push_undo(Snapshot { label: label.to_string(), doc: run.before, selection: run.selection_before });
             st.revision += 1;
         }
     }
 
-    /// Cancel the running command (Esc). With no command, clears the selection.
+    /// After a transparent command ends, the command it interrupted prompts again.
+    fn resume_suspended(&mut self) {
+        if let Some(outer) = self.suspended.take() {
+            self.echo(format!("Resuming {} command.", outer.id.to_ascii_uppercase()));
+            self.running = Some(outer);
+        }
+    }
+
+    /// Cancel the running command (Esc). With no command, clears the selection. Inside a
+    /// transparent command, cancels it and the command it interrupted.
     pub fn cancel(&mut self) {
         self.point_mods.clear();
         if self.running.is_some() {
+            if self.suspended.is_some() {
+                if let Some(nested) = self.running.take() {
+                    self.finish(nested, true);
+                }
+                self.running = self.suspended.take();
+            }
             let _ = self.feed(Some(Input::Cancel));
         } else {
             self.pending_window = None;
@@ -933,7 +1180,13 @@ impl Session {
     }
 
     pub fn current_prompt(&self) -> Option<Prompt> {
-        self.running.as_ref().map(|r| r.machine.prompt(self))
+        self.running.as_ref().map(|r| {
+            let p = r.machine.prompt(self);
+            match &self.select_mode {
+                Some(m) if p.accept.select => m.prompt(),
+                _ => p,
+            }
+        })
     }
 
     /// Whether the cursor picks objects right now, so the UI shows the pick box (PICKBOX) at the
@@ -949,6 +1202,7 @@ impl Session {
     /// The text shown on the command line: the active prompt, or "Command:".
     pub fn prompt_text(&self) -> String {
         match &self.running {
+            Some(r) if self.suspended.is_some() => format!(">>{} {}", r.id.to_ascii_uppercase(), r.machine.prompt(self).display()),
             Some(r) => format!("{} {}", r.id.to_ascii_uppercase(), r.machine.prompt(self).display()),
             None => "Command:".into(),
         }
@@ -961,17 +1215,46 @@ impl Session {
         r.machine.preview(self, cursor).into_iter().map(|k| Entity { handle: Handle(0), common: common.clone(), kind: k }).collect()
     }
 
-    /// Process one line typed at the command line (Enter pressed).
+    /// The active command's preview as a transform of existing objects (see
+    /// [`Interactive::drag`]), with its extra rubber-band geometry as entities.
+    pub fn drag(&self, cursor: Vec2) -> Option<(Drag, Vec<Entity>)> {
+        let r = self.running.as_ref()?;
+        let d = r.machine.drag(self, cursor)?;
+        let common = self.current_common();
+        let extra = d.extra.iter().map(|k| Entity { handle: Handle(0), common: common.clone(), kind: k.clone() }).collect();
+        Some((d, extra))
+    }
+
+    /// Process one line typed at the command line (Enter pressed). Spaces separate inputs as in a
+    /// script line (see [`Session::script`]), so `MOVE L  0,0 5,5` ends the selection with the
+    /// second space and `ERASE L ` with the trailing one. Input after the command ends is ignored.
     pub fn cmdline(&mut self, text: &str) -> Result<()> {
         let t = text.trim_end_matches(['\r', '\n']);
-        match &self.running {
-            None => {
-                let t = t.trim();
-                if t.is_empty() {
-                    return self.input(Input::Enter);
+        // The command line types spaces literally at free-text prompts: the line is one input.
+        if self.current_prompt().is_some_and(|p| p.accept.text && !p.accept.point && !p.accept.number) {
+            return self.typed(t);
+        }
+        // At `Command:` leading blanks before a command name are not Enter (`" LINE"` from the
+        // control channel starts LINE); a line of only blanks still is.
+        let t = if self.running.is_none() && !t.trim().is_empty() { t.trim_start() } else { t };
+        self.input_line(t, false)
+    }
+
+    /// One line of input: each space ends an input and an empty input (two spaces in a row, a
+    /// trailing space, an empty line) is Enter, which at `Command:` repeats the last command. In a
+    /// script, a free-text prompt (TEXT/MTEXT contents) takes the rest of the line, a prompt with
+    /// keywords still splits so `I 15` reaches the keyword and the value, and the line goes on
+    /// after its command ends; at the command line the rest after the command ends is ignored.
+    fn input_line(&mut self, line: &str, script: bool) -> Result<()> {
+        let mut rest = line;
+        let mut first = true;
+        loop {
+            if self.running.is_none() {
+                if !script && !first {
+                    return Ok(());
                 }
                 // `cmd {json}`: programmatic call with parameters.
-                if let Some((name, json)) = t.split_once(' ')
+                if let Some((name, json)) = rest.trim().split_once(' ')
                     && json.trim_start().starts_with('{')
                 {
                     let params: Value =
@@ -983,31 +1266,24 @@ impl Session {
                     }
                     return Ok(());
                 }
-                // Expressions like "LINE 0,0 5,5" in one line: first token is the command.
-                let mut parts = t.split_whitespace();
-                let name = parts.next().unwrap_or("");
-                self.start(name)?;
-                for rest in parts {
-                    if self.running.is_none() {
-                        break;
-                    }
-                    self.typed(rest)?;
-                }
-                Ok(())
+            } else if script && self.current_prompt().is_some_and(|p| p.accept.text && !p.accept.point && !p.accept.number && p.keywords.is_empty()) {
+                return self.typed(rest);
             }
-            Some(_) => {
-                // Space acts as Enter except where the prompt wants free text.
-                let text_prompt = self.current_prompt().is_some_and(|p| p.accept.text && !p.accept.point && !p.accept.number);
-                if text_prompt || !t.contains(' ') {
-                    return self.typed(t);
-                }
-                for tok in t.split_whitespace() {
-                    if self.running.is_none() {
-                        break;
-                    }
-                    self.typed(tok)?;
-                }
-                Ok(())
+            first = false;
+            let (tok, more) = match rest.split_once([' ', '\t']) {
+                Some((tok, more)) => (tok, Some(more)),
+                None => (rest, None),
+            };
+            if self.running.is_some() {
+                self.typed(tok)?;
+            } else if tok.trim().is_empty() {
+                self.input(Input::Enter)?;
+            } else {
+                self.start(tok)?;
+            }
+            match more {
+                Some(more) => rest = more,
+                None => return Ok(()),
             }
         }
     }
@@ -1040,17 +1316,20 @@ impl Session {
             if let Some(p) = prompt::parse_point_with(tt, self.last_point, &self.angle_settings()) {
                 return self.input(Input::Point(p));
             }
+            // Direct distance entry along the tracking path the cursor is on, from the point it
+            // comes from (an acquired or temporary tracking point needs no base point).
+            if let Some(dist) = units::parse_distance(tt).filter(|_| !prompt.accept.number)
+                && let Some((from, dir)) = self.tracking.last.as_ref().filter(|t| t.point.near(self.cursor, 1e-9)).and_then(|t| t.along())
+            {
+                return self.input(Input::Point(from + dir * dist));
+            }
             // Direct distance entry along the rubber band.
             if let (Some(base), Some(dist)) = (prompt.base, units::parse_distance(tt))
                 && !prompt.accept.number
             {
-                // Along the tracking path the cursor is on, from the point it comes from.
-                if let Some((from, dir)) = self.tracking.last.as_ref().filter(|t| t.point.near(self.cursor, 1e-9)).and_then(|t| t.along()) {
-                    return self.input(Input::Point(from + dir * dist));
-                }
                 let mut c = self.cursor;
                 if self.settings.orthomode {
-                    c = snap::ortho(base, c);
+                    c = snap::iso::constrain(&self.drafting_settings(), base, c);
                 }
                 let dir = (c - base).normalized();
                 let dir = if dir == Vec2::ZERO { Vec2::X } else { dir };
@@ -1060,45 +1339,17 @@ impl Session {
         self.input(Input::Text(tt.to_string()))
     }
 
-    /// Run a script: one input per line; within a line, spaces separate inputs except at text
-    /// prompts (as AutoCAD scripts do).
+    /// Run a script, as AutoCAD reads one: a space or a line end ends an input, and an empty
+    /// input (two spaces in a row, a space at the end of a line, an empty line) is Enter. At
+    /// free-text prompts spaces are part of the text. Lines starting with `;` are comments.
     pub fn script(&mut self, text: &str) -> Result<()> {
         for line in text.lines() {
-            let line = line.trim_end();
+            // Trailing spaces are inputs (Enter); other trailing whitespace (`\r`) is not.
+            let line = line.trim_end_matches(|c: char| c.is_whitespace() && c != ' ');
             if line.trim_start().starts_with(';') {
                 continue;
             }
-            if line.is_empty() {
-                self.cmdline("")?;
-                continue;
-            }
-            let mut rest = line;
-            loop {
-                // Free text only when the prompt has no keywords; otherwise split so `I 15` reaches the keyword and the value.
-                let text_prompt = self.current_prompt().is_some_and(|p| p.accept.text && !p.accept.point && p.keywords.is_empty());
-                if text_prompt || self.running.is_none() && rest.contains('{') {
-                    self.cmdline(rest)?;
-                    break;
-                }
-                match rest.split_once(' ') {
-                    Some((tok, r)) => {
-                        if self.running.is_none() {
-                            self.start(tok)?;
-                        } else {
-                            self.typed(tok)?;
-                        }
-                        rest = r;
-                    }
-                    None => {
-                        if self.running.is_none() {
-                            self.start(rest)?;
-                        } else {
-                            self.typed(rest)?;
-                        }
-                        break;
-                    }
-                }
-            }
+            self.input_line(line, true)?;
         }
         Ok(())
     }
@@ -1153,6 +1404,7 @@ impl Session {
         if let Some(pw) = self.pending_window.take() {
             let crossing = p.x < pw.corner.x;
             let hs = select::select_window(self.doc()?, &space, Bounds2::new(pw.corner, p), crossing);
+            let hs = cmd::groups::expand(self, hs);
             let mut sel = if pickadd || shift { self.selection() } else { Vec::new() };
             if shift && pickadd {
                 sel.retain(|h| !hs.contains(h));
@@ -1165,12 +1417,14 @@ impl Session {
         let ap = self.pixel_size() * self.settings.pickbox.max(1.0) * 1.5;
         match select::pick(self.doc()?, &space, p, ap) {
             Some(h) => {
+                // With group selection the object's selectable groups come (or go) with it.
+                let hs = cmd::groups::expand(self, vec![h]);
                 let mut sel = if pickadd || shift { self.selection() } else { Vec::new() };
                 let had = sel.contains(&h);
                 if shift && (pickadd || had) {
-                    sel.retain(|x| *x != h);
+                    sel.retain(|x| !hs.contains(x));
                 } else if !had {
-                    sel.push(h);
+                    sel.extend(hs);
                 }
                 self.set_selection(sel);
             }
@@ -1245,7 +1499,7 @@ impl Session {
             "prompt": self.prompt_text(),
             "running": self.running.as_ref().map(|r| r.id.clone()),
             "selection": self.selection().iter().map(|h| h.hex()).collect::<Vec<_>>(),
-            "settings": self.settings,
+            "settings": self.drafting_settings(),
         })
     }
 }

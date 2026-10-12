@@ -12,6 +12,7 @@ workspace = true
 cadcraft-geom = { workspace = true }
 cadcraft-color = { workspace = true }
 cadcraft-doc = { workspace = true }
+cadcraft-dxf = { workspace = true }
 cadcraft-constraints = { workspace = true }
 cadcraft-fonts = { workspace = true }
 cadcraft-render = { workspace = true }
@@ -21,3 +22,7 @@ thiserror = { workspace = true }
 log = { workspace = true }
 # R-tree spatial index for picking, window selection and object snaps (MIT OR Apache-2.0).
 rstar = { version = "0.12", default-features = false }
+
+[dev-dependencies]
+# Real DXF files for the external reference tests (io is a lower layer).
+cadcraft-io = { workspace = true }

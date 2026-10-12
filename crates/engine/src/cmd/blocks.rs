@@ -14,13 +14,14 @@ use super::*;
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
 
 mod attedit;
+mod extract;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec::new("block", "Make...", run_block)
             .menu(&["Draw", "Block", "Make..."])
             .alias(&["b", "bmake"])
-            .params("{name, base: [x,y], handles?, keep?: \"convert\"|\"retain\"|\"delete\" (default \"convert\"), description?}")
+            .params("{name, base: [x,y], handles?, keep?: \"convert\"|\"retain\"|\"delete\" (default \"convert\"), description?, annotative?}")
             .interactive(|_| Ok(Box::new(BlockM::default()))),
         // -BLOCK erases the selected objects once the block is defined.
         CommandSpec::new("-block", "Create Block", run_dash_block)
@@ -46,13 +47,15 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{type?: all|blocks|dimstyles|groups|layers|linetypes|mleaderstyles|tablestyles|textstyles|zerolength|emptytext (default all: every named type), names?: \"A*,B\" (default *)} → purged")
             .interactive(|_| Ok(Box::new(purge::PurgeM::default()))),
         CommandSpec::new("blocks.list", "List Blocks", run_list).enabled(has_doc).noundo(),
-        CommandSpec::new("battman", "Block Attribute Manager...", run_battman)
-            .menu(&["Modify", "Object", "Attribute", "Block Attribute Manager..."])
-            .params("{name}")
-            .noundo(),
+        battman::battman_spec(),
         attribs::attdisp_spec(),
         attribs::attsync_spec(),
+        extract::dataextraction_spec(),
+        extract::eattext_spec(),
     ]
+    .into_iter()
+    .chain(xref::specs())
+    .collect()
 }
 
 fn valid_block_name(n: &str) -> bool {
@@ -189,6 +192,17 @@ fn run_block(s: &mut Session, p: &Value) -> Result<Value> {
     let hs = targets(s, p)?;
     let keep = str_param(p, "keep").unwrap_or("convert").to_string();
     let r = make_block(s, &name, base, &hs, &keep, str_param(p, "description").unwrap_or(""))?;
+    // An annotative block: its references (the converted selection too) are annotative.
+    if bool_or(p, "annotative", false) {
+        let d = s.doc_mut()?;
+        let cur = d.current_anno_scale();
+        if let Some(b) = d.blocks.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(&name)).map(|(_, b)| b) {
+            Arc::make_mut(b).annotative = true;
+        }
+        if let Some(h) = r {
+            d.modify_entity(h, |e| cadcraft_doc::set_annotative(e, true, &cur))?;
+        }
+    }
     Ok(json!({ "block": name, "insert": r.map(|h| h.hex()) }))
 }
 
@@ -211,7 +225,9 @@ fn run_insert(s: &mut Session, p: &Value) -> Result<Value> {
     let vals = p.get("attribs").and_then(Value::as_object).cloned().unwrap_or_default();
     let h = insert_with(s, &name, at, scale, rot, point_param(p, "basePoint"), &vals)?;
     if bool_or(p, "explode", false) {
-        return s.execute("explode", &json!({ "handles": [h.hex()] }));
+        // The EXPLODE command body, not `execute`: INSERT records the one undo step.
+        let explode = find_command("explode").ok_or_else(|| EngineError::UnknownCommand("explode".into()))?;
+        return (explode.run)(s, &json!({ "handles": [h.hex()] }));
     }
     Ok(attedit::with_unknown_tags(s, h, &vals, json!({ "handle": h.hex() })))
 }
@@ -308,23 +324,6 @@ fn run_list(s: &mut Session, _p: &Value) -> Result<Value> {
     Ok(
         json!({ "blocks": d.blocks.values().filter(|b| !b.anonymous).map(|b| json!({"name": b.name, "entities": b.entities.len(), "base": [b.base.x, b.base.y], "description": b.description})).collect::<Vec<_>>() }),
     )
-}
-
-fn run_battman(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = str_param(p, "name").ok_or_else(|| bad("battman", "`name` is required"))?;
-    let b = s.doc()?.block(name).cloned().ok_or_else(|| bad("battman", "no such block"))?;
-    let atts: Vec<Value> = b
-        .entities
-        .iter()
-        .filter_map(|e| {
-            if let EntityKind::AttDef(a) = &e.kind {
-                Some(json!({"tag": a.tag, "prompt": a.prompt, "default": a.text.value, "invisible": a.invisible}))
-            } else {
-                None
-            }
-        })
-        .collect();
-    Ok(json!({ "block": name, "attributes": atts }))
 }
 
 // ---------------- interactive ----------------
@@ -424,6 +423,7 @@ impl BlockM {
 }
 
 mod insert_file;
+pub(crate) mod xref;
 
 /// Where the command-line INSERT is in its prompt sequence.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -759,3 +759,4 @@ impl Interactive for AttdefM {
 }
 
 mod attribs;
+mod battman;

@@ -174,7 +174,7 @@ fn splinedit_json_and_command_line() {
     assert!(matches!(last(&s), EntityKind::Spline(x) if x.closed));
     s.cmdline("o r u").unwrap();
     assert!(matches!(last(&s), EntityKind::Spline(x) if !x.closed && near(x.control[0], 0.0, 0.0)));
-    s.cmdline("f p p").unwrap();
+    s.cmdline("f p 4").unwrap();
     assert!(s.running.is_none());
     assert!(matches!(last(&s), EntityKind::LwPolyline(_)));
 }
@@ -369,6 +369,8 @@ fn chspace_json_and_command_line() {
         locked: false,
         frozen_layers: Vec::new(),
         layer_colors: Vec::new(),
+        clip: None,
+        on: true,
     };
     s.doc_mut().unwrap().add(&Space::Paper("Layout1".into()), Default::default(), EntityKind::Viewport(vp)).unwrap();
     let r = s.execute("chspace", &json!({"handles": [l]})).unwrap();

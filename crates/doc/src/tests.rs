@@ -386,6 +386,7 @@ fn mtext_kind(contents: &str) -> EntityKind {
         contents: contents.into(),
         line_spacing: 1.0,
         line_spacing_exact: false,
+        columns: None,
     })
 }
 
@@ -442,6 +443,7 @@ fn invisible_dimblock_entity_is_ignored_in_dimension_extents() {
                 block: Some("*D1".into()),
                 overrides: Default::default(),
                 assoc: vec![],
+                marks: Default::default(),
             }),
         )
         .unwrap();

@@ -17,16 +17,53 @@ pub enum Preference {
     English,
     #[serde(rename = "uk")]
     Ukrainian,
+    #[serde(rename = "pt-BR")]
+    BrazilianPortuguese,
+    #[serde(rename = "de")]
+    German,
+    #[serde(rename = "es")]
+    Spanish,
+    #[serde(rename = "cs")]
+    Czech,
+    #[serde(rename = "ru")]
+    Russian,
+    #[serde(rename = "fr")]
+    French,
 }
 
 impl Preference {
-    pub const ALL: [Self; 3] = [Self::Auto, Self::English, Self::Ukrainian];
+    pub const ALL: [Self; 9] = [
+        Self::Auto,
+        Self::English,
+        Self::Ukrainian,
+        Self::BrazilianPortuguese,
+        Self::German,
+        Self::Spanish,
+        Self::Czech,
+        Self::Russian,
+        Self::French,
+    ];
+
+    /// The codes a preference can be given as, for messages ("auto, en or uk").
+    pub fn codes() -> String {
+        let codes: Vec<&str> = Self::ALL.iter().map(|p| p.code()).collect();
+        match codes.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+            _ => codes.join(""),
+        }
+    }
 
     pub fn code(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::English => "en",
             Self::Ukrainian => "uk",
+            Self::BrazilianPortuguese => "pt-BR",
+            Self::German => "de",
+            Self::Spanish => "es",
+            Self::Czech => "cs",
+            Self::Russian => "ru",
+            Self::French => "fr",
         }
     }
 
@@ -35,6 +72,12 @@ impl Preference {
             Self::Auto => t("Auto (system language)"),
             Self::English => "English",
             Self::Ukrainian => "Українська",
+            Self::BrazilianPortuguese => "Português (Brasil)",
+            Self::German => "Deutsch",
+            Self::Spanish => "Español",
+            Self::Czech => "Čeština",
+            Self::Russian => "Русский",
+            Self::French => "Français",
         }
     }
 
@@ -51,6 +94,12 @@ impl Preference {
         match self {
             Self::English => "en",
             Self::Ukrainian => "uk",
+            Self::BrazilianPortuguese => "pt-BR",
+            Self::German => "de",
+            Self::Spanish => "es",
+            Self::Czech => "cs",
+            Self::Russian => "ru",
+            Self::French => "fr",
             Self::Auto => locales.iter().find_map(|s| locale_language(s)).unwrap_or("en"),
         }
     }
@@ -60,18 +109,42 @@ pub struct Language {
     pub code: &'static str,
     pub name: &'static str,
     pub source: &'static str,
+    /// Index of the `@plural` form for an integer count.
+    pub plural: fn(u64) -> usize,
+    /// Number of `|`-separated forms every `@plural` row must carry.
+    pub plural_forms: usize,
     catalog: OnceLock<Catalog<'static>>,
 }
 
-pub static LANGUAGES: [Language; 2] = [
-    Language { code: "en", name: "English", source: "", catalog: OnceLock::new() },
-    Language { code: "uk", name: "Українська", source: include_str!("uk.tsv"), catalog: OnceLock::new() },
+pub static LANGUAGES: [Language; 8] = [
+    Language { code: "en", name: "English", source: "", plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
+    Language {
+        code: "uk", name: "Українська", source: include_str!("uk.tsv"), plural: plural_uk, plural_forms: 3, catalog: OnceLock::new()
+    },
+    Language {
+        code: "pt-BR",
+        name: "Português (Brasil)",
+        source: include_str!("pt_br.tsv"),
+        plural: plural_pt,
+        plural_forms: 2,
+        catalog: OnceLock::new(),
+    },
+    // German plurals follow the English rule: one (1), other.
+    Language { code: "de", name: "Deutsch", source: include_str!("de.tsv"), plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
+    // Spanish integer plurals follow the English rule too.
+    Language { code: "es", name: "Español", source: include_str!("es.tsv"), plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
+    Language { code: "cs", name: "Čeština", source: include_str!("cs.tsv"), plural: plural_cs, plural_forms: 3, catalog: OnceLock::new() },
+    // Russian integer plurals follow the Ukrainian rule: one (1, 21), few (2–4), many.
+    Language { code: "ru", name: "Русский", source: include_str!("ru.tsv"), plural: plural_uk, plural_forms: 3, catalog: OnceLock::new() },
+    // French integer plurals (CLDR `fr`): one (0, 1), other, the Portuguese rule.
+    Language { code: "fr", name: "Français", source: include_str!("fr.tsv"), plural: plural_pt, plural_forms: 2, catalog: OnceLock::new() },
 ];
 
-/// BCP 47 and POSIX locale tags, including `uk-UA` and `uk_UA.UTF-8`.
+/// BCP 47 and POSIX locale tags, including `uk-UA`, `uk_UA.UTF-8` and `pt_BR.UTF-8`.
+/// A catalog is chosen by the tag's primary language, so any `pt-*` tag selects `pt-BR`.
 pub fn locale_language(tag: &str) -> Option<&'static str> {
     let primary = tag.trim().split(['-', '_', '.', '@']).next()?;
-    LANGUAGES.iter().find(|l| l.code.eq_ignore_ascii_case(primary)).map(|l| l.code)
+    LANGUAGES.iter().find(|l| l.code.split('-').next().is_some_and(|p| p.eq_ignore_ascii_case(primary))).map(|l| l.code)
 }
 
 thread_local! {
@@ -125,6 +198,16 @@ pub fn t(source: &str) -> &str {
     CURRENT.with(|l| tr(l.get(), source))
 }
 
+/// Menu headings can differ from command or object labels (e.g. Czech Kótování / Kóta).
+/// Catalogs without a `menu` entry retain their ordinary translation.
+pub fn tr_menu<'a>(language: &str, source: &'a str) -> &'a str {
+    catalog(language).and_then(|c| c.get(&("menu", source))).copied().unwrap_or_else(|| tr(language, source))
+}
+
+pub fn menu(source: &str) -> &str {
+    CURRENT.with(|l| tr_menu(l.get(), source))
+}
+
 /// Named placeholders allow translations to reorder values. Inserted values are never looked up
 /// or substituted again, so a user's name containing `{n}` is preserved verbatim.
 pub fn format(source: &str, values: &[(&str, String)]) -> String {
@@ -161,10 +244,29 @@ pub fn plural_uk(n: u64) -> usize {
     }
 }
 
+/// Portuguese integer plurals (CLDR `pt`): one (0, 1), other (2 and up).
+pub fn plural_pt(n: u64) -> usize {
+    usize::from(n > 1)
+}
+
+fn plural_en(n: u64) -> usize {
+    usize::from(n != 1)
+}
+
+/// Czech integer plurals: one (1), few (2–4), other (0 and 5 or more).
+pub fn plural_cs(n: u64) -> usize {
+    match n {
+        1 => 0,
+        2..=4 => 1,
+        _ => 2,
+    }
+}
+
 pub fn count(n: u64, one: &str, other: &str) -> String {
     let language = CURRENT.get();
     let source = catalog(language).and_then(|c| c.get(&("@plural", one))).copied();
-    let form = source.and_then(|s| s.split('|').nth(plural_uk(n))).unwrap_or(if n == 1 { one } else { other });
+    let plural = LANGUAGES.iter().find(|l| l.code == language).map_or(plural_en as fn(u64) -> usize, |l| l.plural);
+    let form = source.and_then(|s| s.split('|').nth(plural(n))).unwrap_or(if n == 1 { one } else { other });
     format(form, &[("n", n.to_string())])
 }
 

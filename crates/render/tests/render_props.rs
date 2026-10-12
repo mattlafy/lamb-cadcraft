@@ -46,6 +46,7 @@ fn dimensions_take_the_viewport_layer_colour() {
         block: None,
         overrides: Default::default(),
         assoc: Vec::new(),
+        marks: Default::default(),
     };
     d.add(&Space::Model, on("A"), EntityKind::Dimension(dim)).unwrap();
     d.add(&Space::Model, on("A"), EntityKind::Line(Line { a: Vec3::new(0.0, -1.0, 0.0), b: Vec3::new(10.0, -1.0, 0.0) })).unwrap();
@@ -59,6 +60,8 @@ fn dimensions_take_the_viewport_layer_colour() {
         locked: false,
         frozen_layers: Vec::new(),
         layer_colors: vec![("a".into(), Color::Index(3))],
+        clip: None,
+        on: true,
     };
     d.add(&Space::Paper("Layout1".into()), Common::default(), EntityKind::Viewport(vp)).unwrap();
     let l = build(&d, &Space::Paper("Layout1".into()), &Options::default());

@@ -15,6 +15,11 @@ pub(super) struct TEditM {
 }
 
 impl TEditM {
+    /// Align Text > Angle: select the dimension (or use the preselected one), then ask for the angle.
+    pub(super) fn angle() -> Self {
+        Self { dim: None, asking_angle: true }
+    }
+
     fn run(&self, s: &mut Session, mut p: Value) -> Result<Step> {
         let Some(h) = self.dim else { return Ok(Step::Cancel) };
         if let Some(o) = p.as_object_mut() {
@@ -94,6 +99,10 @@ impl Interactive for TEditM {
         let Some(EntityKind::Dimension(mut d)) = self.dim.and_then(|h| s.doc().ok()?.entity(h).map(|e| e.kind.clone())) else { return Vec::new() };
         d.text_mid = v3(c);
         d.user_text_pos = true;
+        if let Ok(doc) = s.doc() {
+            let st = doc.dim_style(&d.style).cloned().unwrap_or_default().with_overrides(&d.overrides);
+            st.follow_text(&mut d, doc.header.f64("DIMSCALE", 1.0));
+        }
         d.block = None;
         vec![EntityKind::Dimension(d)]
     }

@@ -15,11 +15,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod control_server;
+mod desktop_theme;
 #[cfg(any(target_os = "windows", test))]
 mod graphics;
 mod logging;
 #[cfg(target_os = "macos")]
 mod native_menu;
+mod spacemouse;
 mod workspace;
 
 use cadcraft_engine::Session;
@@ -27,6 +29,9 @@ use cadcraft_ui_egui::{CadApp, Services, i18n};
 
 struct App {
     cad: CadApp,
+    spacemouse: spacemouse::SpaceMouse,
+    /// The desktop's light/dark choice where winit reports none (Linux, the BSDs).
+    desktop_theme: desktop_theme::DesktopTheme,
     workspace: workspace::Workspace,
     workspace_error: Option<String>,
     #[cfg(target_os = "macos")]
@@ -48,6 +53,14 @@ impl App {
     }
 }
 
+/// View ▸ Theme ▸ System resolves against `raw.system_theme`, which winit leaves empty on Linux
+/// and the BSDs: the desktop's answer, where it gives one, stands in for it.
+fn follow_desktop(raw: &mut egui::RawInput, desktop: Option<egui::Theme>) {
+    if desktop.is_some() {
+        raw.system_theme = desktop;
+    }
+}
+
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(target_os = "macos")]
@@ -60,12 +73,14 @@ impl eframe::App for App {
             }
         }
         self.cad.logic(ctx);
+        self.spacemouse.poll(&mut self.cad, ctx);
         self.persist_workspace(false);
         if std::mem::take(&mut self.cad.quit_requested) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        follow_desktop(raw, self.desktop_theme.current());
         self.cad.raw_input_hook(raw);
         cadcraft_ui_egui::cmdline::capture_tab(ctx, raw);
     }
@@ -73,12 +88,17 @@ impl eframe::App for App {
         self.cad.ui(ui);
         self.persist_workspace(false);
     }
+    /// A normal exit: the workspace is saved, and this run's autosave files are not needed (a
+    /// crash leaves them for recovery).
     fn on_exit(&mut self) {
         self.persist_workspace(true);
+        self.cad.shutdown_autosave();
     }
     /// Preferences (the interface theme) survive restarts; window and egui state are not kept.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(cadcraft_ui_egui::options::PROFILE_KEY, self.cad.profile_json());
         storage.set_string(cadcraft_ui_egui::PREFS_KEY, self.cad.prefs_json());
+        storage.set_string(cadcraft_ui_egui::autosave::PREFS_KEY, cadcraft_ui_egui::autosave::prefs_json());
     }
     fn persist_egui_memory(&self) -> bool {
         false
@@ -90,7 +110,10 @@ pub fn install_io() {
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
-        plot: Some(|d, space, opts| cadcraft_io::plot(d, space, opts).map_err(|e| e.to_string())),
+        plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+    });
+    cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
+        cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
     });
 }
 
@@ -98,7 +121,8 @@ fn services() -> Services {
     Services {
         pick_open: Some(Box::new(|| {
             rfd::FileDialog::new()
-                .add_filter(i18n::t("Drawings (DWG, DXF)"), &["dwg", "dxf"])
+                .add_filter(i18n::t("Drawings (DWG, DXF)"), &["dwg", "dxf", "dwt"])
+                .add_filter(i18n::t("SVG drawings (SVG, SVGZ)"), &["svg", "svgz"])
                 .add_filter(i18n::t("All files"), &["*"])
                 .pick_file()
                 .map(|p| p.to_string_lossy().to_string())
@@ -117,14 +141,15 @@ fn services() -> Services {
 /// filter's extension, and macOS accepts only listed extensions, replacing any other with the
 /// first one. DWG must be listed for a `.dwg` name to survive, and a drawing opened from DWG
 /// then defaults to DWG; other names keep DXF first.
-fn filters_for_save(name: &str) -> [(&'static str, &'static str); 5] {
-    let mut filters = [("Drawing (DXF)", "dxf"), ("Drawing (DWG)", "dwg"), ("SVG", "svg"), ("PNG", "png"), ("PDF", "pdf")];
+fn filters_for_save(name: &str) -> [(&'static str, &'static str); 6] {
+    let mut filters =
+        [("Drawing (DXF)", "dxf"), ("Drawing (DWG)", "dwg"), ("Drawing Template (DWT)", "dwt"), ("SVG", "svg"), ("PNG", "png"), ("PDF", "pdf")];
     let lower = name.to_ascii_lowercase();
     filters.sort_by_key(|(_, ext)| !lower.ends_with(&format!(".{ext}")));
     filters
 }
 
-/// The per-user settings directory (today it holds `logs/`): `CADCRAFT_CONFIG_DIR` if set, else
+/// The per-user settings directory (it holds `logs/` and `autosave/`): `CADCRAFT_CONFIG_DIR` if set, else
 /// `$XDG_CONFIG_HOME/cadcraft` or `~/.config/cadcraft` on Linux and the BSDs,
 /// `~/Library/Application Support/CADCraft` on macOS, `%APPDATA%\CADCraft` on Windows.
 fn config_dir() -> Option<std::path::PathBuf> {
@@ -228,9 +253,20 @@ fn main() -> eframe::Result {
     if let Some(icon) = app_icon() {
         options.viewport = options.viewport.with_icon(icon);
     }
-    // Before eframe creates the wgpu instance: default Windows to DirectX 12 only (see graphics.rs).
+    // Before eframe creates the wgpu instance: default Windows to DirectX 12 with FXC (see graphics.rs).
     #[cfg(target_os = "windows")]
-    graphics::configure(&mut options, eframe::wgpu::Backends::from_env());
+    graphics::configure(&mut options, eframe::wgpu::Backends::from_env(), eframe::wgpu::Dx12Compiler::from_env());
+    // Command previews (COPY, MOVE...) of large selections are tessellated by egui, whose index
+    // buffer outgrew wgpu's default 256 MiB cap; the validation error is fatal. Ask for what the
+    // adapter actually supports.
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup {
+        let base = std::sync::Arc::clone(&create.device_descriptor);
+        create.device_descriptor = std::sync::Arc::new(move |adapter| {
+            let mut d = base(adapter);
+            d.required_limits.max_buffer_size = d.required_limits.max_buffer_size.max(adapter.limits().max_buffer_size);
+            d
+        });
+    }
     // winit has no file drag-and-drop on Wayland (only on X11), so dropping files from the file
     // manager showed a "no" cursor. Run through XWayland when it's there; CADCRAFT_WAYLAND=1
     // keeps the native Wayland backend.
@@ -255,8 +291,19 @@ fn main() -> eframe::Result {
                 app.set_status(error);
             }
             app.system_languages = std::env::var("CADCRAFT_LOCALE").map(|s| vec![s]).unwrap_or_else(|_| sys_locale::get_locales().collect());
+            // The user profile (Options): drafting settings, selection sizes, drawing-area colours.
+            if let Some(profile) = cc.storage.and_then(|s| s.get_string(cadcraft_ui_egui::options::PROFILE_KEY)) {
+                app.load_profile(&profile);
+            }
             if let Some(prefs) = cc.storage.and_then(|s| s.get_string(cadcraft_ui_egui::PREFS_KEY)) {
                 app.load_prefs(&prefs);
+            }
+            if let Some(prefs) = cc.storage.and_then(|s| s.get_string(cadcraft_ui_egui::autosave::PREFS_KEY)) {
+                cadcraft_ui_egui::autosave::load_prefs(&prefs);
+            }
+            // Autosave files (SAVEFILEPATH) default to `<settings dir>/autosave`.
+            if let Some(dir) = config_dir() {
+                app.enable_autosave(&dir.join("autosave"));
             }
             app.integrated_titlebar = cfg!(target_os = "macos");
             if surface.present_mode == eframe::wgpu::PresentMode::AutoNoVsync {
@@ -278,8 +325,12 @@ fn main() -> eframe::Result {
             if app.session.docs.is_empty() {
                 app.session.new_drawing(false);
             }
+            let ctx = cc.egui_ctx.clone();
+            let desktop_theme = desktop_theme::DesktopTheme::start(move || ctx.request_repaint());
             Ok(Box::new(App {
+                desktop_theme,
                 cad: app,
+                spacemouse: spacemouse::SpaceMouse::start(cc.egui_ctx.clone()),
                 workspace,
                 workspace_error,
                 #[cfg(target_os = "macos")]
@@ -291,7 +342,7 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{config_dir_from, control_port_from, filters_for_save};
+    use super::{config_dir_from, control_port_from, filters_for_save, follow_desktop};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -308,6 +359,7 @@ mod tests {
         assert_eq!(first("Drawing1.dxf"), "dxf");
         assert_eq!(first("Drawing1"), "dxf");
         assert_eq!(first("plan.pdf"), "pdf");
+        assert_eq!(first("office.dwt"), "dwt");
         for name in ["a.dwg", "b.dxf", "c"] {
             let exts: Vec<_> = filters_for_save(name).iter().map(|(_, e)| *e).collect();
             assert!(exts.contains(&"dwg") && exts.contains(&"dxf"), "{name}");
@@ -355,5 +407,20 @@ mod tests {
             config_dir_from(env(&[("APPDATA", "C:\\Users\\u\\AppData\\Roaming")])),
             Some(PathBuf::from("C:\\Users\\u\\AppData\\Roaming").join("CADCraft"))
         );
+    }
+
+    /// View ▸ Theme ▸ System on Linux: winit reports no theme, so the desktop's answer stands in;
+    /// without one (or where winit answers and the desktop doesn't) the input is left alone.
+    #[test]
+    fn the_desktop_answers_for_the_system_theme() {
+        let mut raw = egui::RawInput::default();
+        follow_desktop(&mut raw, Some(egui::Theme::Light));
+        assert_eq!(raw.system_theme, Some(egui::Theme::Light));
+        let mut raw = egui::RawInput { system_theme: Some(egui::Theme::Dark), ..Default::default() };
+        follow_desktop(&mut raw, None);
+        assert_eq!(raw.system_theme, Some(egui::Theme::Dark));
+        let mut raw = egui::RawInput::default();
+        follow_desktop(&mut raw, None);
+        assert_eq!(raw.system_theme, None);
     }
 }

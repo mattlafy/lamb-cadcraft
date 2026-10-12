@@ -343,6 +343,31 @@ fn copy_rotate_scale_mirror() {
 }
 
 #[test]
+fn copy_and_rotate_drag_as_a_transform_of_the_selection() {
+    fn start(cmd: &str) -> Session {
+        let mut s = Session::new();
+        s.execute("line", &json!({"points": [[0, 0], [1, 0]]})).unwrap();
+        for t in [cmd, "all", "", "0,0"] {
+            s.cmdline(t).unwrap();
+        }
+        s
+    }
+    let s = start("copy");
+    let (d, extra) = s.drag(Vec2::new(3.0, 4.0)).expect("COPY drags its selection");
+    assert_eq!(d.handles.len(), 1);
+    assert!(d.matrix.apply(Vec2::new(1.0, 0.0)).near(Vec2::new(4.0, 4.0), 1e-9));
+    assert_eq!(extra.len(), 1, "the base-to-cursor line");
+
+    let (d, _) = start("rotate").drag(Vec2::new(0.0, 5.0)).expect("ROTATE drags its selection");
+    assert!(d.matrix.apply(Vec2::new(1.0, 0.0)).near(Vec2::new(0.0, 1.0), 1e-9));
+
+    // MIRROR keeps the per-entity preview (MIRRTEXT).
+    let s = start("mirror");
+    assert!(s.drag(Vec2::new(0.0, 5.0)).is_none());
+    assert!(!s.preview(Vec2::new(0.0, 5.0)).is_empty());
+}
+
+#[test]
 fn scale_reference_typed_and_picked() {
     // Issue #17: SCALE ▸ Reference scales by new length / reference length.
     fn end(s: &Session) -> Vec2 {
@@ -441,6 +466,19 @@ fn zoom_extents_fits_drawing() {
 }
 
 #[test]
+fn setvar_point_variables_take_point_objects() {
+    let mut s = Session::new();
+    for name in ["SNAPBASE", "LIMMIN", "LIMMAX", "INSBASE"] {
+        // GETVAR's own value (an object with z) writes back, and an {x, y} object equals the array form.
+        let got = sysvars::get(&s, name).unwrap();
+        s.execute("setvar", &json!({"name": name, "value": got})).unwrap();
+        s.execute("setvar", &json!({"name": name, "value": {"x": 5, "y": 7}})).unwrap();
+        assert_eq!(sysvars::get(&s, name), Some(json!({"x": 5.0, "y": 7.0, "z": 0.0})), "{name}");
+        assert!(s.execute("setvar", &json!({"name": name, "value": {"x": "a", "y": 1}})).is_err());
+    }
+}
+
+#[test]
 fn sysvars_roundtrip() {
     let mut s = Session::new();
     s.execute("setvar", &json!({"name": "osmode", "value": 7})).unwrap();
@@ -456,6 +494,26 @@ fn sysvars_roundtrip() {
     assert!(s.execute("setvar", &json!({"name": "FONTALT", "value": 3})).is_err());
     s.execute("setvar", &json!({"name": "FONTALT", "value": "."})).unwrap();
     assert_eq!(sysvars::get(&s, "FONTALT"), Some(json!("")));
+}
+
+#[test]
+fn setvar_clayer_keeps_numeric_layer_name() {
+    let mut s = Session::new();
+    s.execute("layer.new", &json!({"name": "10"})).unwrap();
+    s.execute("setvar", &json!({"name": "CLAYER", "value": "10"})).unwrap();
+    assert_eq!(sysvars::get(&s, "CLAYER"), Some(json!("10")));
+    let c = s.execute("circle", &json!({"center": [0, 0], "radius": 1})).unwrap();
+    let h = cadcraft_doc::Handle::parse_hex(c["handle"].as_str().unwrap()).unwrap();
+    assert_eq!(s.doc().unwrap().entity(h).unwrap().common.layer, "10");
+    s.execute("setvar", &json!({"name": "CLAYER", "value": "0"})).unwrap();
+    assert_eq!(sysvars::get(&s, "CLAYER"), Some(json!("0")));
+    // Typed at the command line too.
+    s.cmdline("SETVAR CLAYER 10").unwrap();
+    assert!(s.running.is_none());
+    assert_eq!(sysvars::get(&s, "CLAYER"), Some(json!("10")));
+    // Numeric variables still parse typed text.
+    s.execute("setvar", &json!({"name": "LUNITS", "value": "3"})).unwrap();
+    assert_eq!(sysvars::get(&s, "LUNITS"), Some(json!(3)));
 }
 
 #[test]
@@ -597,13 +655,15 @@ fn sample_drawing_builds() {
 #[test]
 fn count_from_the_menu_shows_its_result() {
     let mut s = Session::new();
-    s.start("count").unwrap();
+    s.cmdline("count").unwrap();
+    s.cmdline("").unwrap();
     assert_eq!(s.log.last().map(String::as_str), Some("No block references in model space."));
     s.execute("circle", &json!({"center": [0, 0], "radius": 1})).unwrap();
     s.execute("selectall", &json!({})).unwrap();
     s.cmdline("block Valve 0,0").unwrap();
     s.cmdline("insert Valve 10,0 1 1 0").unwrap();
-    s.start("count").unwrap();
+    s.cmdline("count").unwrap();
+    s.cmdline("").unwrap();
     let n = s.log.len();
     assert_eq!(&s.log[n - 3..], ["Block references in model space:", "  Valve: 2", "  Total: 2"]);
     let r = s.execute("count", &json!({"block": "Valve"})).unwrap();
@@ -1085,4 +1145,23 @@ fn press_and_drag_selection_window() {
     s.cancel();
     assert!(!s.begin_window(Vec2::new(f64::NAN, 0.0)));
     assert!(s.pending_window.is_none());
+}
+
+#[test]
+fn block_rotation_property_turns_attribute_text() {
+    let mut s = Session::new();
+    s.execute("attdef", &json!({"tag": "TAG", "at": [10, 0], "default": "D", "height": 2.5})).unwrap();
+    let def = s.doc().unwrap().model.last().unwrap().handle;
+    s.execute("block", &json!({"name": "B", "base": [0, 0], "handles": [def.hex()], "keep": "delete"})).unwrap();
+    s.execute("insert", &json!({"name": "B", "at": [0, 0], "attribs": {"TAG": "hello"}})).unwrap();
+    let h = s.doc().unwrap().model.last().unwrap().handle;
+    s.execute("properties.set", &json!({"handles": [h.hex()], "rotation": 90})).unwrap();
+    let doc = s.doc().unwrap();
+    let Some(EntityKind::Insert(i)) = doc.model.last().map(|e| &e.kind) else { panic!("no insert") };
+    let t = &i.attribs[0].text;
+    assert!((i.rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+    assert!(t.insert.x.abs() < 1e-9 && (t.insert.y - 10.0).abs() < 1e-9, "text at {:?}", t.insert);
+    assert!((t.rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+    assert_eq!(t.value, "hello");
+    assert!((t.height - 2.5).abs() < 1e-12);
 }

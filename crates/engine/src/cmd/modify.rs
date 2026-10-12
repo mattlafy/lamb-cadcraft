@@ -1,5 +1,5 @@
 //! Modify commands: ERASE, MOVE, COPY, ROTATE, SCALE, MIRROR, OFFSET, TRIM, EXTEND, FILLET,
-//! CHAMFER, EXPLODE, STRETCH, DRAWORDER, BREAK, JOIN (arrays: `array`).
+//! CHAMFER, EXPLODE, STRETCH, BREAK, JOIN (arrays: `array`; draw order: `draworder`).
 
 use cadcraft_doc::{Entity, EntityKind, Handle, Prim};
 use cadcraft_geom::{
@@ -8,7 +8,7 @@ use cadcraft_geom::{
 use serde_json::{Value, json};
 
 use super::helpers::*;
-use super::machines::{SelOutcome, SelectPhase, SelectRun, number};
+use super::machines::{SelOutcome, SelectPhase, number};
 use super::trimextend::{self, TrimM};
 use super::*;
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
@@ -82,14 +82,6 @@ pub fn specs() -> Vec<CommandSpec> {
             .alias(&["x"])
             .params("{handles?}")
             .interactive(|_| Ok(Box::new(SelectThen::new(Op::Explode)))),
-        CommandSpec::new("draworder.front", "Bring to Front", run_front)
-            .menu(&["Tools", "Draw Order", "Bring to Front"])
-            .params("{handles?}")
-            .interactive(|_| Ok(Box::new(SelectRun::new("draworder.front", "DRAWORDER")))),
-        CommandSpec::new("draworder.back", "Send to Back", run_back)
-            .menu(&["Tools", "Draw Order", "Send to Back"])
-            .params("{handles?}")
-            .interactive(|_| Ok(Box::new(SelectRun::new("draworder.back", "DRAWORDER")))),
         CommandSpec::new("break", "Break", run_break)
             .menu(&["Modify", "Break"])
             .alias(&["br"])
@@ -101,7 +93,6 @@ pub fn specs() -> Vec<CommandSpec> {
             .alias(&["j"])
             .params("{handles?}")
             .interactive(|_| Ok(Box::new(SelectThen::new(Op::Join)))),
-        CommandSpec::new("overkill", "Delete Duplicate Objects", run_overkill).menu(&["Modify", "Delete Duplicate Objects"]).params("{handles?}"),
     ]
 }
 
@@ -513,9 +504,10 @@ pub(crate) fn offset_kind(k: &EntityKind, dist: f64, side: Vec2) -> Option<Entit
                 ge.tessellate(e.major.xy().len() * 1e-3, &mut pts);
                 cadcraft_geom::point_in_polygon(&pts, side)
             };
+            // offset_points shifts along the left normal, which points into a counter-clockwise ellipse.
             let mut pts = Vec::new();
             ge.tessellate(e.major.xy().len() * 1e-3, &mut pts);
-            let off = offset_points(&pts, if inside { -dist } else { dist }, ge.is_full());
+            let off = offset_points(&pts, if inside { dist } else { -dist }, ge.is_full());
             Some(lwpoly(off.into_iter().map(PolyVertex::new).collect(), ge.is_full()))
         }
         EntityKind::LwPolyline(p) => {
@@ -1011,6 +1003,10 @@ pub(crate) fn extend(s: &mut Session, h: Handle, pick: Vec2, edges: Edges) -> Re
 
 // ---------------- fillet / chamfer ----------------
 
+/// What CHAMFER takes (as in AutoCAD, not arcs, circles, ellipses or splines).
+const CHAMFER_LINES_ONLY: &str =
+    "CHAMFER works on lines (and polylines with the Polyline option); it cannot chamfer arcs, circles, ellipses or splines.";
+
 fn as_line(e: &Entity) -> Option<Line> {
     match &e.kind {
         EntityKind::Line(l) => Some(Line::new(l.a.xy(), l.b.xy())),
@@ -1038,7 +1034,7 @@ pub(crate) fn fillet_lines(
         if chamfer.is_none() {
             return super::modify2::fillet_curves(s, h1, p1, h2, p2, radius);
         }
-        return Err(EngineError::Other("Chamfer currently works on lines.".into()));
+        return Err(EngineError::Other(CHAMFER_LINES_ONLY.into()));
     };
     let (x, _, _) = line_line_infinite(l1.a, l1.b, l2.a, l2.b).ok_or_else(|| EngineError::Other("Lines are parallel.".into()))?;
     // Keep the far end on the picked side of the corner.
@@ -1139,6 +1135,15 @@ fn run_chamfer(s: &mut Session, p: &Value) -> Result<Value> {
 // ---------------- explode / array / order / break / join ----------------
 
 pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<Entity>> {
+    // An annotative object explodes into plain objects as it draws at the current annotation scale.
+    if cadcraft_doc::is_annotative(e) {
+        let mut se = match d.anno_draw(e) {
+            cadcraft_doc::AnnoDraw::Scaled(f) => cadcraft_doc::anno_scaled(e, f),
+            _ => e.clone(),
+        };
+        se.common.anno_scales.clear();
+        return explode_kind(d, &se);
+    }
     match &e.kind {
         EntityKind::LwPolyline(p) => {
             let pl = Polyline { vertices: p.vertices.clone(), closed: p.closed };
@@ -1156,6 +1161,9 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
             )
         }
         EntityKind::Insert(ins) => {
+            if let Some(items) = super::array::explode_array(d, e) {
+                return Some(items);
+            }
             let blk = d.block(&ins.block)?;
             let m = ins.transform(blk.base.xy());
             Some(
@@ -1175,6 +1183,8 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
                     .collect(),
             )
         }
+        // A helix explodes into its spline (seen from above).
+        EntityKind::Helix(h) => Some(vec![Entity { handle: Handle(0), common: e.common.clone(), kind: EntityKind::Spline(h.spline()) }]),
         EntityKind::Polyline3d(p) => Some(
             p.points
                 .windows(2)
@@ -1184,6 +1194,7 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
                 })
                 .collect(),
         ),
+        EntityKind::MLine(m) => Some(super::draw2::mline::explode(e, m)),
         EntityKind::MText(m) => Some(
             cadcraft_fonts::plain_mtext(&m.contents)
                 .split('\n')
@@ -1206,6 +1217,19 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
                             valign: Default::default(),
                         }),
                     }
+                })
+                .collect(),
+        ),
+        // A region explodes into its boundary's lines and arcs.
+        EntityKind::Region(r) => Some(
+            r.segments()
+                .into_iter()
+                .map(|s| {
+                    let k = match s {
+                        Segment::Line(l) => line(l.a, l.b),
+                        Segment::Arc { arc: a, .. } => arc(&a),
+                    };
+                    Entity { handle: Handle(0), common: e.common.clone(), kind: k }
                 })
                 .collect(),
         ),
@@ -1251,11 +1275,13 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
                         contents: g.value.clone(),
                         line_spacing: 1.0,
                         line_spacing_exact: false,
+                        columns: None,
                     }),
                 });
             }
             Some(v)
         }
+        EntityKind::Tolerance(t) => Some(super::tolerance::explode(d, e, t)),
         _ => None,
     }
 }
@@ -1287,30 +1313,6 @@ fn run_explode(s: &mut Session, p: &Value) -> Result<Value> {
     let hs = targets(s, p)?;
     let r = explode(s, &hs)?;
     Ok(json!({ "handles": r.iter().map(|h| h.hex()).collect::<Vec<_>>() }))
-}
-
-fn run_front(s: &mut Session, p: &Value) -> Result<Value> {
-    let hs = targets(s, p)?;
-    let space = s.space();
-    let d = s.doc_mut()?;
-    if let Some(st) = d.space_mut(&space) {
-        for h in hs {
-            st.bring_to_front(h);
-        }
-    }
-    ok()
-}
-
-fn run_back(s: &mut Session, p: &Value) -> Result<Value> {
-    let hs = targets(s, p)?;
-    let space = s.space();
-    let d = s.doc_mut()?;
-    if let Some(st) = d.space_mut(&space) {
-        for h in hs.into_iter().rev() {
-            st.send_to_back(h);
-        }
-    }
-    ok()
 }
 
 /// Break `h` between two points (or at one point when p1 == p2).
@@ -1421,6 +1423,9 @@ fn run_breakat(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Join lines/arcs/polylines that share endpoints into one polyline (or merge collinear lines).
 pub(crate) fn join(s: &mut Session, hs: &[Handle]) -> Result<Option<Handle>> {
+    if let Some(h) = super::modify2::join_curves(s, hs)? {
+        return Ok(Some(h));
+    }
     let d = s.doc()?;
     let mut segs: Vec<Segment> = Vec::new();
     // Source entity of each segment in `segs`, so only entities that end up in the chain are removed.
@@ -1501,24 +1506,6 @@ fn run_join(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "handle": r.map(|h| h.hex()) }))
 }
 
-fn run_overkill(s: &mut Session, p: &Value) -> Result<Value> {
-    let hs = if p.get("handles").is_some() { targets(s, p)? } else { s.doc()?.space(&s.space()).map(|st| st.handles()).unwrap_or_default() };
-    let d = s.doc()?;
-    let mut seen: Vec<(String, String)> = Vec::new();
-    let mut dup = Vec::new();
-    for h in hs {
-        let Some(e) = d.entity(h) else { continue };
-        let key = (serde_json::to_string(&e.kind).unwrap_or_default(), serde_json::to_string(&e.common).unwrap_or_default());
-        if seen.contains(&key) {
-            dup.push(h);
-        } else {
-            seen.push(key);
-        }
-    }
-    let n = erase(s, &dup)?;
-    Ok(json!({ "deleted": n, "message": format!("{n} duplicate(s) deleted") }))
-}
-
 // ---------------- interactive ----------------
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1583,10 +1570,17 @@ impl SelectThen {
             }
             Op::Join => {
                 match join(s, &self.objs) {
-                    Ok(_) => {
-                        // Objects outside the joined chain are kept, so count only the ones JOIN consumed.
-                        let n = s.doc().map(|d| self.objs.iter().filter(|h| d.entity(**h).is_none()).count()).unwrap_or(0);
-                        s.echo(format!("{n} objects joined into 1 polyline"))
+                    Ok(h) => {
+                        // Objects outside the joined chain are kept, so count only the ones JOIN consumed
+                        // (and the source object an ellipse or spline join keeps).
+                        let d = s.doc()?;
+                        let n = self.objs.iter().filter(|o| d.entity(**o).is_none() || h == Some(**o)).count();
+                        let what = match h.and_then(|h| d.entity(h)).map(|e| &e.kind) {
+                            Some(EntityKind::Spline(_)) => "spline",
+                            Some(EntityKind::Ellipse(_)) => "ellipse",
+                            _ => "polyline",
+                        };
+                        s.echo(format!("{n} objects joined into 1 {what}"))
                     }
                     Err(e) => s.echo(e.to_string()),
                 }
@@ -1933,6 +1927,21 @@ impl Interactive for SelectThen {
         out.push(line(base, c));
         out
     }
+    fn drag(&self, _s: &Session, c: Vec2) -> Option<crate::prompt::Drag> {
+        // Mirror stays on `preview`: MIRRTEXT keeps text readable, which a plain matrix can't.
+        if (self.op == Op::Rotate && self.reference) || !self.sel.done {
+            return None;
+        }
+        let base = self.pts.first().copied()?;
+        let matrix = match self.op {
+            Op::Move | Op::Copy => Mat3::translate(c - base),
+            Op::Rotate => Mat3::rotate_about(base, base.angle_to(c)),
+            Op::Scale if !self.reference => Mat3::scale_about(base, base.dist(c).max(1e-9)),
+            Op::Scale => Mat3::scale_about(base, self.ref_len.and_then(|r| positive_length(Some(base.dist(c) / r)))?),
+            _ => return None,
+        };
+        Some(crate::prompt::Drag { handles: self.objs.clone(), matrix, extra: vec![line(base, c)] })
+    }
 }
 
 /// An OFFSET option prompt opened from "Specify offset distance".
@@ -1944,6 +1953,7 @@ enum OffsetAsk {
 
 struct OffsetM {
     dist: Option<f64>,
+    distance_first: Option<Vec2>,
     through: bool,
     picked: Option<Handle>,
     ask: Option<OffsetAsk>,
@@ -1956,7 +1966,17 @@ struct OffsetM {
 impl OffsetM {
     fn new(s: &Session) -> Self {
         let _ = s;
-        OffsetM { dist: None, through: false, picked: None, ask: None, multiple: false, undo: Vec::new() }
+        OffsetM { dist: None, distance_first: None, through: false, picked: None, ask: None, multiple: false, undo: Vec::new() }
+    }
+
+    fn set_distance(&mut self, s: &mut Session, distance: f64) -> Result<()> {
+        if !(distance.is_finite() && distance > 0.0) {
+            return Err(EngineError::Other("Requires a positive distance.".into()));
+        }
+        s.doc_mut()?.header.set_f64("OFFSETDIST", distance);
+        self.dist = Some(distance);
+        self.distance_first = None;
+        Ok(())
     }
 }
 
@@ -2000,6 +2020,12 @@ impl Interactive for OffsetM {
             None => {}
         }
         let last = s.doc().map(|d| d.header.f64("OFFSETDIST", -1.0)).unwrap_or(-1.0);
+        if self.dist.is_none()
+            && !self.through
+            && let Some(base) = self.distance_first
+        {
+            return Prompt::new("Specify second point", Accept::POINT).base(base);
+        }
         match (self.dist.is_some() || self.through, self.picked) {
             (false, _) => Prompt::new("Specify offset distance", Accept::POINT_OR_NUMBER).kw(&["Through", "Erase", "Layer"]).default(if last < 0.0 {
                 "Through".to_string()
@@ -2044,14 +2070,26 @@ impl Interactive for OffsetM {
         if self.dist.is_none() && !self.through {
             match i {
                 Input::Text(t) => {
-                    let d = number(&t).filter(|d| *d > 0.0).ok_or_else(|| EngineError::Other("Requires a positive distance.".into()))?;
-                    self.dist = Some(d);
-                    s.doc_mut()?.header.set_f64("OFFSETDIST", d);
+                    let d = number(&t).ok_or_else(|| EngineError::Other("Requires a positive distance.".into()))?;
+                    self.set_distance(s, d)?;
                 }
-                Input::Keyword(k) if k == "Through" => self.through = true,
+                Input::Point(p) => {
+                    if !p.is_finite() {
+                        return Err(EngineError::Other("Invalid point.".into()));
+                    }
+                    match self.distance_first {
+                        Some(base) => self.set_distance(s, base.dist(p))?,
+                        None => self.distance_first = Some(p),
+                    }
+                }
+                Input::Keyword(k) if k == "Through" => {
+                    self.through = true;
+                    self.distance_first = None;
+                }
                 Input::Keyword(k) if k == "Erase" => self.ask = Some(OffsetAsk::Erase),
                 Input::Keyword(k) if k == "Layer" => self.ask = Some(OffsetAsk::Layer),
                 Input::Enter => {
+                    self.distance_first = None;
                     let last = s.doc()?.header.f64("OFFSETDIST", -1.0);
                     if last > 0.0 {
                         self.dist = Some(last);
@@ -2145,6 +2183,11 @@ impl Interactive for OffsetM {
         }
     }
     fn preview(&self, s: &Session, c: Vec2) -> Vec<EntityKind> {
+        if let Some(base) = self.distance_first
+            && c.is_finite()
+        {
+            return vec![line(base, c)];
+        }
         let (Some(h), Ok(d)) = (self.picked, s.doc()) else { return Vec::new() };
         let Some(e) = d.entity(h) else { return Vec::new() };
         let dist = match self.dist {
@@ -2494,13 +2537,17 @@ impl ChamferCut {
 /// arc or line is added and both objects are left as they were.
 #[allow(clippy::too_many_arguments)]
 fn fillet_corner(s: &mut Session, h1: Handle, p1: Vec2, h2: Handle, p2: Vec2, r: f64, cut: Option<ChamferCut>, trim: bool) -> Result<Option<Handle>> {
+    let dist = cut.map(|c| move |u1: Vec2, u2: Vec2| c.distances(u1, u2));
+    if let Some(made) = super::modify2::fillet_pline(s, h1, p1, h2, p2, r, dist.as_ref().map(|f| f as super::modify2::ChamferDistances), trim)? {
+        return Ok(made);
+    }
     let d = s.doc()?;
     let k1 = d.entity(h1).map(|e| e.kind.clone());
     let k2 = d.entity(h2).map(|e| e.kind.clone());
     let chamfer = match cut {
         None => None,
         Some(c) => {
-            let l = |h| d.entity(h).and_then(|e| as_line(e)).ok_or_else(|| EngineError::Other("Chamfer currently works on lines.".into()));
+            let l = |h| d.entity(h).and_then(|e| as_line(e)).ok_or_else(|| EngineError::Other(CHAMFER_LINES_ONLY.into()));
             let (l1, l2) = (l(h1)?, l(h2)?);
             let (x, _, _) = line_line_infinite(l1.a, l1.b, l2.a, l2.b).ok_or_else(|| EngineError::Other("Lines are parallel.".into()))?;
             // The direction along each line towards its picked side.
@@ -2697,6 +2744,12 @@ impl Interactive for DisplaceM {
             return Vec::new();
         }
         self.inner.preview(s, c)
+    }
+    fn drag(&self, s: &Session, c: Vec2) -> Option<crate::prompt::Drag> {
+        if self.displacement {
+            return None;
+        }
+        self.inner.drag(s, c)
     }
 }
 

@@ -10,14 +10,19 @@ pub const MENUS: &[&str] = &["File", "Edit", "View", "Insert", "Format", "Tools"
 
 /// UI-only commands: (id, label, menu path, shortcut).
 pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
+    ("ui.spacemouse", "3D Mouse...", &["Tools", "3D Mouse..."], None),
+    ("ui.spacemouse.calibrate", "Calibrate 3D Mouse", &[], None),
+    ("ui.spacemouse.navigate", "3D Mouse Navigation", &[], None),
     ("ui.dock", "Arrange Panel", &[], None),
     ("ui.dock.reset", "Reset Panel Layout", &["Window", "Reset Panel Layout"], None),
     ("ui.open", "Open...", &[], Some("Cmd+O")),
+    ("ui.newtemplate", "New from Template...", &["File", "New from Template..."], None),
     ("ui.saveas", "Save As...", &[], None),
     ("ui.sample", "Open Sample Drawing", &["Help", "Open Sample Drawing"], None),
     ("ui.toggle.toolsets", "Tool Sets", &["Window", "Tool Sets"], Some("Cmd+3")),
     ("ui.panel.properties", "Properties Inspector", &["Window", "Properties Inspector"], Some("Cmd+1")),
     ("ui.panel.layers", "Layers Palette", &["Window", "Layers Palette"], None),
+    ("ui.panel.quickcalc", "QuickCalc", &["Window", "QuickCalc"], Some("Cmd+8")),
     ("ui.toggle.systemcursor", "Show System Cursor", &["View", "Accessibility", "Show System Cursor"], None),
     ("ui.toggle.toolbar", "Tool Bar", &["Window", "Tool Bar"], None),
     ("ui.toggle.filetabs", "File Tab", &["Window", "File Tab"], None),
@@ -32,6 +37,13 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("ui.saveformat.dxf", "DXF", &["File", "Default Save Format", "DXF"], None),
     ("ui.saveformat.dwg", "DWG", &["File", "Default Save Format", "DWG"], None),
     ("ui.saveformat", "Default Save Format", &[], None),
+    ("ui.saveversion.2018", "Version 2018", &["File", "Default Save Format", "Version 2018"], None),
+    ("ui.saveversion.2013", "Version 2013", &["File", "Default Save Format", "Version 2013"], None),
+    ("ui.saveversion.2010", "Version 2010", &["File", "Default Save Format", "Version 2010"], None),
+    ("ui.saveversion.2007", "Version 2007", &["File", "Default Save Format", "Version 2007"], None),
+    ("ui.saveversion.2004", "Version 2004", &["File", "Default Save Format", "Version 2004"], None),
+    ("ui.saveversion.2000", "Version 2000", &["File", "Default Save Format", "Version 2000"], None),
+    ("ui.saveversion", "Default Save Version", &[], None),
     ("ui.toggle.menubar", "In-window Menu Bar", &["Window", "In-window Menu Bar"], None),
     ("ui.hidepalettes", "Hide Palettes", &["Window", "Hide Palettes"], None),
     ("ui.resetpalettes", "Reset Palettes", &["Window", "Reset Palettes"], None),
@@ -45,6 +57,7 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("ui.dialog.commands", "Command Reference", &["Help", "CADCraft Help"], Some("F1")),
     ("ui.toggle.history", "Command History", &["Window", "Command History"], Some("F2")),
     ("ui.cmdline.lines", "Command Line History Lines", &[], None),
+    ("ui.cmdline.clear", "Clear Command History", &[], None),
     ("ui.dialog.language", "Interface Language", &["Edit", "Interface Language"], None),
     ("ui.language", "Language", &[], None),
     ("ui.noop", "", &[], None),
@@ -61,6 +74,12 @@ pub fn run_ui_command(app: &mut CadApp, id: &str, params: &Value) -> Option<Resu
 }
 
 fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
+    if let Some(result) = crate::spacemouse::route(app, id, params) {
+        return Some(result);
+    }
+    if let Some(r) = crate::xrefs::route(app, id, params) {
+        return Some(r);
+    }
     if let Some(r) = crate::managers::route(app, id, params) {
         return Some(r);
     }
@@ -71,7 +90,14 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
         let panel = if id == "ui.panel.properties" { "properties" } else { "layers" };
         return Some(crate::docking::command(app, false, &json!({"operation":"open", "panel":panel})));
     }
+    // QUICKCALC typed or from a menu opens the palette; with parameters it is CAL.
+    if id == "ui.panel.quickcalc" || (matches!(id, "quickcalc" | "qc") && params.is_null()) {
+        return Some(crate::palettes::quickcalc::open(app));
+    }
     if let Some(r) = crate::plotstyles::route(app, id, params) {
+        return Some(r);
+    }
+    if let Some(r) = crate::options::route(app, id, params) {
         return Some(r);
     }
     let toggle = |b: &mut bool, p: &Value| {
@@ -85,7 +111,7 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
     let r = match id {
         "ui.language" => {
             let Some(preference) = params.get("lang").and_then(Value::as_str).and_then(crate::i18n::Preference::parse) else {
-                return Some(Err("language must be auto, en or uk".into()));
+                return Some(Err(format!("language must be {}", crate::i18n::Preference::codes())));
             };
             app.ui.interface_language = preference;
             Ok(json!({"interfaceLanguage": preference.code()}))
@@ -94,6 +120,13 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
             let picked = app.services.pick_open.as_ref().and_then(|f| f());
             if let Some(p) = picked {
                 app.open_path(&p);
+            }
+            Ok(Value::Null)
+        }
+        // Pick a template (.dwt or .dxf) and start a new drawing from it.
+        "ui.newtemplate" => {
+            if let Some(p) = app.services.pick_open.as_ref().and_then(|f| f()) {
+                return Some(app.session.execute("new", &json!({ "template": p })).map_err(|e| e.to_string()));
             }
             Ok(Value::Null)
         }
@@ -110,20 +143,20 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
             let title = app.session.state().map(|s| s.title.clone()).ok();
             let name = app.ui.save_format.suggested_name(title.as_deref());
             if let Some(p) = app.services.pick_save.as_ref().and_then(|f| f(&name)) {
-                return Some(app.session.execute("saveas", &json!({ "path": p })).map_err(|e| e.to_string()));
+                return Some(app.session.execute("saveas", &saveas_params(&app.ui, &app.session, &p)).map_err(|e| e.to_string()));
             }
             Ok(Value::Null)
         }
         "qsave" if no_path && app.session.state().is_ok_and(|s| s.path.is_none()) => return run_ui_command(app, "ui.saveas", &Value::Null),
-        // Menu, toolbar, Cmd+P or typed: ask where to save the PDF. JSON calls (scripts, control
-        // channel, MCP) always carry params, never get here and never open a dialog.
-        "plot" | "print" | "exportpdf" if params.is_null() && app.session.state().is_ok() => {
+        // EXPORTPDF from the menu or typed: ask where to save the PDF (PLOT and PRINT open the Plot
+        // dialog, `managers::route`). JSON calls (scripts, control channel, MCP) always carry
+        // params, never get here and never open a dialog.
+        "exportpdf" if params.is_null() && app.session.state().is_ok() => {
             let pick = app.services.pick_save.as_ref()?;
             let title = app.session.state().map(|s| s.title.clone()).unwrap_or_default();
             let stem = std::path::Path::new(&title).file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.is_empty());
             let Some(path) = pick(&format!("{}.pdf", stem.unwrap_or_else(|| "Drawing".into()))) else { return Some(Ok(Value::Null)) };
-            let cmd = if id == "exportpdf" { "exportpdf" } else { "plot" };
-            let r = app.session.execute(cmd, &json!({ "path": path })).map_err(|e| e.to_string());
+            let r = app.session.execute("exportpdf", &json!({ "path": path })).map_err(|e| e.to_string());
             app.session.echo(match &r {
                 Ok(_) => format!("Plotted to {path}"),
                 Err(e) => e.clone(),
@@ -155,6 +188,10 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
         "ui.toggle.filetabs" => {
             toggle(&mut app.ui.show_file_tabs, params);
             Ok(Value::Null)
+        }
+        // Typed or chosen from a menu or the tool bar: ask for the file (or show the preview).
+        "export" | "exp" | "import" | "imp" | "publish" | "preview" | "pre" if params.is_null() && app.session.state().is_ok() => {
+            return Some(crate::exchange::route(app, id));
         }
         "ui.toggle.statusbar" => {
             toggle(&mut app.ui.show_status_bar, params);
@@ -205,6 +242,25 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
             },
             None => Ok(json!({ "saveFormat": app.ui.save_format.as_str() })),
         },
+        // `{"version": "2000"…"2018"}` sets the version new drawings are saved in; without it,
+        // reports it.
+        id if id.starts_with("ui.saveversion") => {
+            let name = id
+                .strip_prefix("ui.saveversion.")
+                .map(str::to_string)
+                .or_else(|| params.get("version").map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string)));
+            match name {
+                Some(name) => match crate::SaveVersion::parse(&name) {
+                    Some(v) => {
+                        app.ui.save_version = v.year().to_string();
+                        app.session.echo(format!("New drawings will be saved as version {v}"));
+                        Ok(json!({ "saveVersion": app.ui.save_version }))
+                    }
+                    None => Err(format!("unknown version \"{}\" (2000, 2004, 2007, 2010, 2013 or 2018)", name.chars().take(40).collect::<String>())),
+                },
+                None => Ok(json!({ "saveVersion": app.ui.save_version })),
+            }
+        }
         "ui.hidepalettes" => {
             app.ui.show_palettes = false;
             app.ui.show_toolsets = false;
@@ -212,7 +268,8 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
         }
         "ui.resetpalettes" => {
             let (menu, theme, interface_language, save_format) = (app.ui.in_window_menu, app.ui.theme, app.ui.interface_language, app.ui.save_format);
-            app.ui = crate::UiState { in_window_menu: menu, theme, interface_language, save_format, ..Default::default() };
+            let save_version = std::mem::take(&mut app.ui.save_version);
+            app.ui = crate::UiState { in_window_menu: menu, theme, interface_language, save_format, save_version, ..Default::default() };
             Ok(Value::Null)
         }
         "ui.start" => {
@@ -231,6 +288,10 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
                 app.ui.history_lines = n.min(crate::cmdline::MAX_LINES as u64) as usize;
             }
             Ok(json!({ "lines": app.ui.history_lines }))
+        }
+        "ui.cmdline.clear" => {
+            app.session.log.clear();
+            Ok(Value::Null)
         }
         "ui.dialog.language"
         | "ui.dialog.layers"
@@ -294,6 +355,16 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
         _ => return None,
     };
     Some(r)
+}
+
+/// SAVEAS parameters for a path picked in the Save dialog: a drawing that has no file yet is saved
+/// in the default save version; one opened from a file keeps that file's version.
+fn saveas_params(ui: &crate::UiState, session: &cadcraft_engine::Session, path: &str) -> Value {
+    let untitled = session.state().is_ok_and(|s| s.path.is_none());
+    match crate::SaveVersion::parse(&ui.save_version) {
+        Some(v) if untitled => json!({ "path": path, "version": v.year() }),
+        _ => json!({ "path": path }),
+    }
 }
 
 fn set_save_format(app: &mut CadApp, format: crate::SaveFormat) -> Value {
@@ -391,7 +462,7 @@ pub(crate) fn entry_ui(ui: &mut egui::Ui, e: &Entry, clicked: &mut Option<String
             }
         }
         Entry::Sub { label, children } => {
-            ui.menu_button(crate::i18n::t(label), |ui| {
+            ui.menu_button(crate::i18n::menu(label), |ui| {
                 for c in children {
                     entry_ui(ui, c, clicked);
                 }
@@ -409,7 +480,7 @@ pub fn menu_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 for (name, entries) in &tree {
-                    ui.menu_button(crate::i18n::t(name), |ui| {
+                    ui.menu_button(crate::i18n::menu(name), |ui| {
                         for e in entries {
                             entry_ui(ui, e, &mut clicked);
                         }
@@ -436,6 +507,7 @@ pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
     let cmd = Modifiers::COMMAND;
     let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
     let pairs: &[(KeyboardShortcut, &str)] = &[
+        (sc(cmd_shift, Key::A), "pickstyle"),
         (sc(cmd_shift, Key::Z), "redo"),
         (sc(cmd, Key::Z), "u"),
         (sc(cmd, Key::Y), "redo"),
@@ -456,6 +528,8 @@ pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
         (sc(Modifiers::NONE, Key::F1), "ui.dialog.commands"),
         (sc(Modifiers::NONE, Key::F2), "ui.toggle.history"),
         (sc(Modifiers::NONE, Key::F3), "osnap"),
+        (sc(Modifiers::NONE, Key::F5), "isoplane"),
+        (sc(cmd, Key::E), "isoplane"),
         (sc(Modifiers::NONE, Key::F7), "grid"),
         (sc(Modifiers::NONE, Key::F8), "ortho"),
         (sc(Modifiers::NONE, Key::F9), "snap"),
@@ -477,8 +551,15 @@ pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
         }
     });
     for id in fire {
+        // ISOPLANE (F5, Ctrl+E) switches the plane without cancelling the active command.
+        if id == "isoplane" {
+            if let Some(m) = app.session.execute(id, &json!({})).ok().and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string)) {
+                app.session.echo(m);
+            }
+            continue;
+        }
         // Toggles run transparently (they don't cancel the active command).
-        let transparent = ["osnap", "grid", "ortho", "snap", "polar", "otrack", "dynmode"].contains(&id);
+        let transparent = ["osnap", "grid", "ortho", "snap", "polar", "otrack", "dynmode", "pickstyle"].contains(&id);
         if transparent || id.starts_with("ui.") {
             match app.session.execute(id, &json!({})) {
                 Ok(v) => {
@@ -526,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn print_asks_where_to_save_the_pdf() {
+    fn plot_and_print_open_the_plot_dialog_and_exportpdf_asks_for_a_file() {
         set_io(IoHooks { read: |_, _| Err("no reader in tests".into()), write: |_, _| Err("no writer in tests".into()), plot: Some(fake_plot) });
         if io().and_then(|h| h.plot).is_none() {
             return; // another test installed hooks without a plotter first
@@ -536,29 +617,33 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let (mut app, asked) = app_with_picker(Some(ps.clone()));
 
-        // Toolbar, menu and Cmd+P all start the command by name.
+        // Toolbar, menu, Cmd+P and typed PRINT open the Plot dialog; its OK asks for the file.
         app.start("plot");
+        assert_eq!(app.ui.dialog.as_deref(), Some("plot"));
+        app.ui.dialog = None;
+        app.cmdline("print");
+        assert_eq!(app.ui.dialog.as_deref(), Some("plot"));
+        assert!(asked.borrow().is_empty());
+
+        // EXPORTPDF asks where to save straight away.
+        app.start("exportpdf");
         assert_eq!(*asked.borrow(), vec!["Drawing1.pdf".to_string()]);
         assert!(std::fs::read(&path).unwrap().starts_with(b"%PDF"));
         assert!(app.session.log.iter().any(|l| l.contains(&ps)));
         let _ = std::fs::remove_file(&path);
 
-        app.cmdline("print");
-        app.start("exportpdf");
-        assert_eq!(asked.borrow().len(), 3);
-        assert!(path.exists());
-        let _ = std::fs::remove_file(&path);
-
         // Programmatic calls never open a dialog.
+        app.ui.dialog = None;
         let r = app.run("plot", json!({})).unwrap();
         assert!(r["data"].is_string());
-        assert_eq!(asked.borrow().len(), 3);
+        assert_eq!(asked.borrow().len(), 1);
+        assert!(app.ui.dialog.is_none());
     }
 
     #[test]
-    fn cancelled_print_writes_nothing() {
+    fn cancelled_export_writes_nothing() {
         let (mut app, asked) = app_with_picker(None);
-        app.start("plot");
+        app.start("exportpdf");
         assert_eq!(asked.borrow().len(), 1);
         assert!(app.session.running.is_none());
     }

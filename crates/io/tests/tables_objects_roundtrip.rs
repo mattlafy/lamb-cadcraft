@@ -62,11 +62,22 @@ fn linetype_text_and_shape_elements_round_trip() {
 fn multileader_styles_and_current_style_round_trip() {
     let mut d = Drawing::new_imperial();
     d.text_styles.push(TextStyle { name: "Slanted".into(), oblique: 0.2, ..TextStyle::default() });
-    let callout =
-        MLeaderStyle { name: "Callout".into(), arrow_size: 2.0, text_height: 3.0, landing_gap: 1.0, dogleg: 5.0, text_style: "Slanted".into() };
+    let callout = MLeaderStyle {
+        name: "Callout".into(),
+        arrow_size: 2.0,
+        text_height: 3.0,
+        landing_gap: 1.0,
+        dogleg: 5.0,
+        text_style: "Slanted".into(),
+        annotative: false,
+    };
     d.mleader_styles.push(callout);
     d.header.set_str("CMLEADERSTYLE", "Callout");
-    let r = round_trip(&d);
+    let text = write_dxf(&d);
+    let tags = cadcraft_dxf::parse(text.as_bytes()).expect("parse written DXF");
+    let header = cadcraft_dxf::sections(&tags).into_iter().find(|s| s.name == "HEADER").expect("HEADER");
+    assert!(header.tags.iter().all(|t| t.code != 9 || t.str() != "$CMLEADERSTYLE"));
+    let r = read_dxf(text.as_bytes()).expect("reopen");
     assert_eq!(r.mleader_styles, d.mleader_styles);
     assert_eq!(r.header.str("CMLEADERSTYLE", ""), "Callout");
 }
@@ -99,7 +110,14 @@ fn layout_page_setup_and_paper_view_round_trip() {
 fn named_views_ucss_and_groups_round_trip() {
     let mut d = Drawing::new_imperial();
     let line = d.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(10.0, 0.0, 0.0) })).expect("line");
-    d.views.push(NamedView { name: "Front".into(), center: Vec2::new(5.0, 5.0), height: 20.0, width: 30.0, layer_state: Some("Plan".into()) });
+    d.views.push(NamedView {
+        name: "Front".into(),
+        center: Vec2::new(5.0, 5.0),
+        height: 20.0,
+        width: 30.0,
+        layer_state: Some("Plan".into()),
+        ..Default::default()
+    });
     d.ucss.push(Ucs { name: "Tilted".into(), origin: Vec3::new(1.0, 2.0, 0.0), x_axis: Vec3::new(0.6, 0.8, 0.0), y_axis: Vec3::new(-0.8, 0.6, 0.0) });
     d.groups.push(Group { name: "G1".into(), description: "grp".into(), selectable: false, members: vec![line] });
     // A member that no longer exists is not written.

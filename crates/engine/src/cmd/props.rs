@@ -1,6 +1,9 @@
 //! Properties: per-object property edits, current properties, MATCHPROP, linetypes, units, RENAME.
 
+mod matchprop;
 mod rename;
+
+pub use matchprop::MatchProps;
 
 use cadcraft_color::Color;
 use cadcraft_doc::{EntityKind, Lineweight, Transparency};
@@ -14,9 +17,18 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec::new("properties", "Properties", run_get).menu(&["Modify", "Properties"]).alias(&["pr", "props", "ch"]).params("{handles?} → properties of the selection").noundo(),
         CommandSpec::new("properties.set", "Set Properties", run_set).params("{handles?, layer?, color?, linetype?, lineweight?, ltscale?, transparency?: \"ByLayer\" | \"ByBlock\" | 0..90, visible?, <geometry fields: radius, center, start, end, text, height, rotation…>}"),
-        CommandSpec::new("matchprop", "Match Properties", run_matchprop).menu(&["Modify", "Match Properties"]).alias(&["ma", "painter"]).params("{source, targets: [hex]}"),
+        CommandSpec::new("matchprop", "Match Properties", matchprop::run_matchprop)
+            .menu(&["Modify", "Match Properties"])
+            .alias(&["ma", "painter"])
+            .params("{source, targets?: [hex] (default: selection), properties?: [name] | {name: bool} (default: all; names: color, layer, linetype, ltscale, lineweight, transparency, thickness, plotStyle, dimension, text, hatch, polyline, viewport, table, multileader)} → {changed}")
+            .interactive(|_| Ok(Box::new(matchprop::MatchPropM::new()))),
         CommandSpec::new("color", "Color...", run_color).menu(&["Format", "Color..."]).alias(&["col", "colour"]).params("{color: \"ByLayer\" | \"red\" | 1..255 | \"r,g,b\"}"),
-        CommandSpec::new("linetype", "Linetype...", run_linetype).menu(&["Format", "Linetype..."]).alias(&["lt", "ltype"]).params("{current?: name, load?: name | \"*\"}"),
+        CommandSpec::new("linetype", "Linetype...", run_linetype).menu(&["Format", "Linetype..."]).alias(&["lt", "ltype"]).params("{current?: name, load?: name | \"*\" (with a file: comma-separated names, wildcards), file?: path to a .lin file | text?: its contents, reload?: bool}"),
+        CommandSpec::new("hatch.patterns", "Hatch Patterns", super::hatch::run_patterns)
+            .params("{file?: path to a .pat file | text?: its contents, clear?: bool} → {standard, user, added, warnings} (HATCH also takes patternFile | patternText)")
+            .enabled(always)
+            .noundo(),
+        CommandSpec::new("-linetype", "Linetype", run_linetype).params("{current?, load?, file? | text?, reload?} (as LINETYPE)").interactive(|_| Ok(Box::new(linfile::DashLinetype::new()))),
         CommandSpec::new("lweight", "Lineweight...", run_lweight).menu(&["Format", "Lineweight..."]).alias(&["lw", "lineweight"]).params("{lineweight: mm | ByLayer}"),
         CommandSpec::new("ltscale", "Linetype Scale", run_ltscale).alias(&["lts"]).params("{scale}"),
         CommandSpec::new("units", "Units...", run_units).menu(&["Format", "Units..."]).alias(&["un"]).params("{lunits?: 1..5, luprec?: 0..8, aunits?: 0..4, auprec?: 0..8, insunits?}"),
@@ -43,12 +55,15 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("tablestyle", "Table Style...", run_tablestyle)
             .menu(&["Format", "Table Style..."])
             .alias(&["ts"])
-            .params("{name, textHeight?, margin?, title?, header?, current?} → styles"),
+            .params("{name, textHeight?, margin?, title?, header?, current?, cellStyle?: {name, …} (see tablestyle.cellstyle)} → styles"),
         CommandSpec::new("mleaderstyle", "Multileader Style...", run_mleaderstyle)
             .menu(&["Format", "Multileader Style..."])
             .alias(&["mls"])
-            .params("{name, arrowSize?, textHeight?, landingGap?, dogleg?, textStyle?, current?} → styles"),
-        CommandSpec::new("ddptype", "Point Style...", run_ptype).menu(&["Format", "Point Style..."]).params("{pdmode, pdsize}"),
+            .params("{name, arrowSize?, textHeight?, landingGap?, dogleg?, textStyle?, annotative?, current?} → styles"),
+        CommandSpec::new("ddptype", "Point Style...", run_ptype)
+            .menu(&["Format", "Point Style..."])
+            .alias(&["ptype"])
+            .params("{pdmode, pdsize}"),
         CommandSpec::new("rename", "Rename...", run_rename)
             .menu(&["Format", "Rename..."])
             .alias(&["ren", "-rename"])
@@ -69,6 +84,12 @@ pub(super) fn entity_props(d: &cadcraft_doc::Drawing, e: &cadcraft_doc::Entity) 
         "transparency": transparency_value(e.common.transparency),
         "visible": e.common.visible,
     });
+    if cadcraft_doc::can_be_annotative(&e.kind)
+        && let Some(o) = v.as_object_mut()
+    {
+        o.insert("annotative".into(), json!(cadcraft_doc::is_annotative(e)));
+        o.insert("annotativeScales".into(), json!(e.common.anno_scales.iter().map(|s| s.name.clone()).collect::<Vec<_>>()));
+    }
     let geo = serde_json::to_value(&e.kind).unwrap_or(Value::Null);
     if let (Some(o), Some(g)) = (v.as_object_mut(), geo.as_object()) {
         o.insert("geometry".into(), Value::Object(g.clone()));
@@ -164,33 +185,39 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
         .get("transparency")
         .map(|v| parse_transparency(v).ok_or_else(|| bad("properties.set", "transparency must be ByLayer, ByBlock or a percentage from 0 to 90")))
         .transpose()?;
-    let lw = p.get("lineweight").map(|v| match v.as_str().map(str::to_ascii_lowercase).as_deref() {
-        Some("bylayer") => Lineweight::ByLayer,
-        Some("byblock") => Lineweight::ByBlock,
-        Some("default") => Lineweight::Default,
-        _ => Lineweight::Mm100(
-            (v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim_end_matches("mm").trim().parse().ok())).unwrap_or(0.25) * 100.0)
-                .round()
-                .clamp(0.0, 211.0) as u16,
-        ),
-    });
+    let lw = p.get("lineweight").map(|v| super::layer::parse_lw(v).ok_or_else(|| bad("properties.set", "bad lineweight"))).transpose()?;
     let d = s.doc_mut()?;
+    // An explicit object linetype must be ByLayer, ByBlock or a loaded definition (as `linetype current` requires).
+    let linetype = str_param(p, "linetype")
+        .map(|n| {
+            if n.eq_ignore_ascii_case("ByLayer") || n.eq_ignore_ascii_case("ByBlock") {
+                Ok(n.to_string())
+            } else {
+                d.linetype(n).map(|t| t.name.clone()).ok_or_else(|| bad("properties.set", format!("linetype `{n}` is not loaded")))
+            }
+        })
+        .transpose()?;
     if let Some(l) = str_param(p, "layer") {
         d.ensure_layer(l);
     }
     let dim_style = str_param(p, "dimStyle")
         .map(|n| d.dim_style(n).map(|st| st.name.clone()).ok_or_else(|| bad("properties.set", format!("dimension style `{n}` not found"))))
         .transpose()?;
+    let anno_scale = d.current_anno_scale();
     for h in &hs {
         d.modify_entity(*h, |e| {
+            // Annotative: Yes supports the current annotation scale; No drops every scale.
+            if let Some(a) = p.get("annotative").and_then(Value::as_bool) {
+                cadcraft_doc::set_annotative(e, a, &anno_scale);
+            }
             if let Some(l) = str_param(p, "layer") {
                 e.common.layer = l.to_string();
             }
             if let Some(c) = color {
                 e.common.color = c;
             }
-            if let Some(lt) = str_param(p, "linetype") {
-                e.common.linetype = lt.to_string();
+            if let Some(lt) = &linetype {
+                e.common.linetype.clone_from(lt);
             }
             if let Some(w) = lw {
                 e.common.lineweight = w;
@@ -302,9 +329,32 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 EntityKind::Insert(i) => {
                     if let Some(x) = num("rotation") {
+                        let turn = x.to_radians() - i.rotation;
                         i.rotation = x.to_radians();
+                        // The attached text turns with the reference, around its insertion point (as ROTATE does).
+                        let base = i.insert.xy();
+                        for a in &mut i.attribs {
+                            let t = &mut a.text;
+                            for q in std::iter::once(&mut t.insert).chain(t.align_pt.as_mut()) {
+                                let r = q.xy().rotate_about(base, turn);
+                                q.x = r.x;
+                                q.y = r.y;
+                            }
+                            t.rotation = cadcraft_geom::norm_angle(t.rotation + turn);
+                        }
                     }
                     if let Some(x) = num("scale").filter(|x| *x != 0.0) {
+                        // A new positive scale carries the attached attribute text with it, like SCALE about the insertion point.
+                        if x > 0.0 && i.scale.x > 0.0 {
+                            let m = cadcraft_geom::Mat3::scale_about(i.insert.xy(), x / i.scale.x);
+                            for a in &mut i.attribs {
+                                let mut k = EntityKind::Text(a.text.clone());
+                                k.transform(&m);
+                                if let EntityKind::Text(t) = k {
+                                    a.text = t;
+                                }
+                            }
+                        }
                         i.scale = Vec3::new(x, x, x);
                     }
                 }
@@ -320,7 +370,12 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 EntityKind::Hatch(h) => {
                     if let Some(v) = str_param(p, "pattern") {
+                        if !h.pattern.eq_ignore_ascii_case(v) {
+                            h.pattern_lines = super::hatch::lines_for(v);
+                        }
                         h.pattern = v.to_ascii_uppercase();
+                        // The old pattern's definition lines no longer apply.
+                        h.pattern_lines.clear();
                         h.solid = h.pattern == "SOLID";
                         if !h.solid {
                             // A named pattern replaces the gradient fill; the renderer draws the gradient first when it is set.
@@ -341,29 +396,6 @@ fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "changed": hs.len() }))
 }
 
-fn run_matchprop(s: &mut Session, p: &Value) -> Result<Value> {
-    let src =
-        p.get("source").and_then(Value::as_str).and_then(cadcraft_doc::Handle::parse_hex).ok_or_else(|| bad("matchprop", "`source` is required"))?;
-    let tg: Vec<cadcraft_doc::Handle> = p
-        .get("targets")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().and_then(cadcraft_doc::Handle::parse_hex)).collect())
-        .unwrap_or_default();
-    let d = s.doc_mut()?;
-    let c = d.entity(src).map(|e| e.common.clone()).ok_or_else(|| bad("matchprop", "no such source"))?;
-    for h in &tg {
-        d.modify_entity(*h, |e| {
-            e.common.layer = c.layer.clone();
-            e.common.color = c.color;
-            e.common.linetype = c.linetype.clone();
-            e.common.lineweight = c.lineweight;
-            e.common.ltscale = c.ltscale;
-            e.common.transparency = c.transparency;
-        })?;
-    }
-    Ok(json!({ "changed": tg.len() }))
-}
-
 fn run_color(s: &mut Session, p: &Value) -> Result<Value> {
     let c = p.get("color").and_then(parse_color).ok_or_else(|| bad("color", "`color` is required"))?;
     let d = s.doc_mut()?;
@@ -380,7 +412,12 @@ fn run_color(s: &mut Session, p: &Value) -> Result<Value> {
     ok()
 }
 
+mod linfile;
+
 fn run_linetype(s: &mut Session, p: &Value) -> Result<Value> {
+    if linfile::has_file(p) {
+        return linfile::run(s, p);
+    }
     let d = s.doc_mut()?;
     if let Some(load) = str_param(p, "load") {
         let lib = cadcraft_doc::library::standard_linetypes_for(d);
@@ -573,26 +610,34 @@ fn run_style_rename(s: &mut Session, p: &Value) -> Result<Value> {
     }
     d.dim_styles.iter_mut().for_each(|x| fix(&mut x.text_style));
     d.mleader_styles.iter_mut().for_each(|x| fix(&mut x.text_style));
-    for space in
-        std::iter::once(cadcraft_doc::Space::Model).chain(d.layouts.iter().map(|l| cadcraft_doc::Space::Paper(l.name.clone())).collect::<Vec<_>>())
-    {
-        let hs: Vec<cadcraft_doc::Handle> = d.space(&space).map(|st| st.handles()).unwrap_or_default();
-        for h in hs {
-            let uses = d.entity(h).is_some_and(|e| match &e.kind {
-                EntityKind::Text(t) => t.style.eq_ignore_ascii_case(&from),
-                EntityKind::MText(t) => t.style.eq_ignore_ascii_case(&from),
-                EntityKind::AttDef(a) => a.text.style.eq_ignore_ascii_case(&from),
-                EntityKind::Insert(i) => i.attribs.iter().any(|a| a.text.style.eq_ignore_ascii_case(&from)),
-                _ => false,
-            });
-            if uses {
-                d.modify_entity(h, |e| match &mut e.kind {
-                    EntityKind::Text(t) => fix(&mut t.style),
-                    EntityKind::MText(t) => fix(&mut t.style),
-                    EntityKind::AttDef(a) => fix(&mut a.text.style),
-                    EntityKind::Insert(i) => i.attribs.iter_mut().for_each(|a| fix(&mut a.text.style)),
-                    _ => {}
-                })?;
+    let uses = |k: &EntityKind| match k {
+        EntityKind::Text(t) => t.style.eq_ignore_ascii_case(&from),
+        EntityKind::MText(t) => t.style.eq_ignore_ascii_case(&from),
+        EntityKind::AttDef(a) => a.text.style.eq_ignore_ascii_case(&from),
+        EntityKind::Insert(i) => i.attribs.iter().any(|a| a.text.style.eq_ignore_ascii_case(&from)),
+        EntityKind::MLeader(m) => m.text.iter().any(|t| t.style.eq_ignore_ascii_case(&from)),
+        _ => false,
+    };
+    let repoint = |k: &mut EntityKind| match k {
+        EntityKind::Text(t) => fix(&mut t.style),
+        EntityKind::MText(t) => fix(&mut t.style),
+        EntityKind::AttDef(a) => fix(&mut a.text.style),
+        EntityKind::Insert(i) => i.attribs.iter_mut().for_each(|a| fix(&mut a.text.style)),
+        EntityKind::MLeader(m) => m.text.iter_mut().for_each(|t| fix(&mut t.style)),
+        _ => {}
+    };
+    let mut hs: Vec<cadcraft_doc::Handle> = d.model.iter().filter(|e| uses(&e.kind)).map(|e| e.handle).collect();
+    hs.extend(d.layouts.iter().flat_map(|l| l.entities.iter().filter(|e| uses(&e.kind)).map(|e| e.handle)));
+    for h in hs {
+        d.modify_entity(h, |e| repoint(&mut e.kind))?;
+    }
+    // Block definitions too, so their text keeps resolving to the renamed style.
+    for block in d.blocks.values_mut() {
+        let hs: Vec<cadcraft_doc::Handle> = block.entities.iter().filter(|e| uses(&e.kind)).map(|e| e.handle).collect();
+        if !hs.is_empty() {
+            let b = std::sync::Arc::make_mut(block);
+            for h in hs {
+                b.entities.modify(h, |e| repoint(&mut e.kind));
             }
         }
     }
@@ -693,11 +738,31 @@ fn dims_using(d: &cadcraft_doc::Drawing, name: &str) -> Vec<(cadcraft_doc::Space
                 let uses = match &e.kind {
                     EntityKind::Dimension(dm) => dm.style.eq_ignore_ascii_case(name),
                     EntityKind::Leader(l) => l.style.eq_ignore_ascii_case(name),
+                    EntityKind::Tolerance(t) => t.style.eq_ignore_ascii_case(name),
                     _ => false,
                 };
                 if uses {
                     out.push((space.clone(), e.handle));
                 }
+            }
+        }
+    }
+    out
+}
+
+/// Dimensions and leaders inside block definitions that use the style (block name, entity handle).
+fn block_dims_using(d: &cadcraft_doc::Drawing, name: &str) -> Vec<(String, cadcraft_doc::Handle)> {
+    let mut out = Vec::new();
+    for (bname, b) in &d.blocks {
+        for e in b.entities.iter() {
+            let uses = match &e.kind {
+                EntityKind::Dimension(dm) => dm.style.eq_ignore_ascii_case(name),
+                EntityKind::Leader(l) => l.style.eq_ignore_ascii_case(name),
+                EntityKind::Tolerance(t) => t.style.eq_ignore_ascii_case(name),
+                _ => false,
+            };
+            if uses {
+                out.push((bname.clone(), e.handle));
             }
         }
     }
@@ -723,8 +788,18 @@ fn run_dimstyle_rename(s: &mut Session, p: &Value) -> Result<Value> {
         d.modify_entity(h, |e| match &mut e.kind {
             EntityKind::Dimension(dm) => dm.style = to.clone(),
             EntityKind::Leader(l) => l.style = to.clone(),
+            EntityKind::Tolerance(t) => t.style = to.clone(),
             _ => {}
         })?;
+    }
+    for (bname, h) in block_dims_using(d, &from) {
+        if let Some(b) = d.blocks.get_mut(&bname) {
+            std::sync::Arc::make_mut(b).entities.modify(h, |e| match &mut e.kind {
+                EntityKind::Dimension(dm) => dm.style = to.clone(),
+                EntityKind::Leader(l) => l.style = to.clone(),
+                _ => {}
+            });
+        }
     }
     Ok(dimstyles_json(d))
 }
@@ -738,7 +813,7 @@ fn run_dimstyle_delete(s: &mut Session, p: &Value) -> Result<Value> {
     if d.header.str("DIMSTYLE", "Standard").eq_ignore_ascii_case(&name) {
         return Err(bad("dimstyle.delete", "the current dimension style cannot be deleted"));
     }
-    if !dims_using(d, &name).is_empty() {
+    if !dims_using(d, &name).is_empty() || !block_dims_using(d, &name).is_empty() {
         return Err(bad("dimstyle.delete", format!("dimension style `{name}` is in use")));
     }
     let before = d.dim_styles.len();
@@ -811,6 +886,7 @@ fn run_tablestyle(s: &mut Session, p: &Value) -> Result<Value> {
                 st.header = b;
             }
         }
+        super::table::tablestyle_cell_style(d, name, p)?;
         if bool_or(p, "current", true) {
             d.header.set_str("CTABLESTYLE", name);
         }
@@ -844,6 +920,9 @@ fn run_mleaderstyle(s: &mut Session, p: &Value) -> Result<Value> {
             }
             if let Some(t) = str_param(p, "textStyle") {
                 st.text_style = t.to_string();
+            }
+            if let Some(a) = p.get("annotative").and_then(Value::as_bool) {
+                st.annotative = a;
             }
         }
         if bool_or(p, "current", true) {
@@ -931,4 +1010,27 @@ fn run_rename(s: &mut Session, p: &Value) -> Result<Value> {
         _ => return Err(bad("rename", "unsupported table")),
     }
     ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn properties_set_rejects_unloaded_linetype() {
+        let mut s = Session::new();
+        s.execute("linetype", &json!({ "load": "DASHED" })).unwrap();
+        s.execute("line", &json!({ "points": [[0, 0], [50, 0]] })).unwrap();
+        let h = s.doc().unwrap().model.last().unwrap().handle.hex();
+        s.execute("properties.set", &json!({ "handles": [h], "linetype": "DASHED" })).unwrap();
+        assert!(s.execute("properties.set", &json!({ "handles": [h], "linetype": "NOPE" })).is_err());
+        let lt = |s: &Session| s.doc().unwrap().model.last().unwrap().common.linetype.clone();
+        assert_eq!(lt(&s), "DASHED");
+        for ok in ["ByBlock", "ByLayer"] {
+            s.execute("properties.set", &json!({ "handles": [h], "linetype": ok })).unwrap();
+            assert_eq!(lt(&s), ok);
+        }
+    }
 }

@@ -2,7 +2,7 @@ use cadcraft_doc::{AssocSnap, DimKind, Dimension, EntityKind, Handle};
 use cadcraft_geom::Vec2;
 use serde_json::{Value, json};
 
-use crate::Session;
+use crate::{Input, Session};
 
 fn h(v: &Value) -> Handle {
     Handle::parse_hex(v["handle"].as_str().unwrap()).unwrap()
@@ -241,6 +241,23 @@ fn dimstyle_commands() {
 }
 
 #[test]
+fn dimstyle_rename_updates_block_dimensions() {
+    let mut s = Session::new();
+    s.execute("dimstyle", &json!({ "name": "DS", "DIMTXT": 2 })).unwrap();
+    s.execute("dimlinear", &json!({ "p1": [0, 0], "p2": [10, 0], "at": [5, 3] })).unwrap();
+    s.execute("selectall", &json!({})).unwrap();
+    s.execute("block", &json!({ "name": "BD", "base": [0, 0], "keep": "convert" })).unwrap();
+    let in_block = |s: &Session| {
+        let b = s.doc().unwrap().block("BD").unwrap().clone();
+        b.entities.iter().find_map(|e| if let EntityKind::Dimension(d) = &e.kind { Some(d.style.clone()) } else { None }).unwrap()
+    };
+    assert_eq!(in_block(&s), "DS");
+    assert!(s.execute("dimstyle.delete", &json!({ "name": "DS" })).is_err());
+    s.execute("dimstyle.rename", &json!({ "from": "DS", "to": "DS2" })).unwrap();
+    assert_eq!(in_block(&s), "DS2");
+}
+
+#[test]
 fn dimension_overrides() {
     let mut s = Session::new();
     let d = h(&s.execute("dimlinear", &json!({ "p1": [0, 0], "p2": [10, 0], "at": [5, 2] })).unwrap());
@@ -297,6 +314,54 @@ fn dimtedit_and_dimspace() {
     assert!(dim(&s, a).overrides.is_empty() && dim(&s, a).text_rotation == 0.0);
     s.execute("dimspace", &json!({ "base": a.hex(), "handles": [b.hex()], "spacing": 0.5 })).unwrap();
     assert!((dim(&s, b).defpt.y - 1.5).abs() < 1e-9, "{:?}", dim(&s, b).defpt);
+}
+
+#[test]
+fn text_style_rename_follows_block_definition_text() {
+    let mut s = Session::new();
+    s.execute("style", &json!({ "name": "SRC", "height": 1, "backwards": true })).unwrap();
+    let t = h(&s.execute("text", &json!({ "at": [0, 0], "text": "abc" })).unwrap());
+    let m = h(&s.execute("mtext", &json!({ "at": [0, 2], "text": "def", "style": "SRC" })).unwrap());
+    let a = h(&s.execute("attdef", &json!({ "tag": "TAG", "at": [0, 4] })).unwrap());
+    let hs = [t.hex(), m.hex(), a.hex()];
+    s.execute("block", &json!({ "name": "Label", "base": [0, 0], "handles": hs, "keep": "delete" })).unwrap();
+    s.execute("style.current", &json!({ "name": "Standard" })).unwrap();
+    s.execute("style.rename", &json!({ "from": "SRC", "to": "DST" })).unwrap();
+    let d = s.doc().unwrap();
+    let mut styles: Vec<String> = d
+        .block("Label")
+        .unwrap()
+        .entities
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntityKind::Text(t) => Some(format!("text {}", t.style)),
+            EntityKind::MText(t) => Some(format!("mtext {}", t.style)),
+            EntityKind::AttDef(a) => Some(format!("attdef {}", a.text.style)),
+            _ => None,
+        })
+        .collect();
+    styles.sort();
+    assert_eq!(styles, ["attdef DST", "mtext DST", "text DST"]);
+    assert!(d.text_style("DST").is_some_and(|st| st.backwards));
+}
+
+#[test]
+fn dimspace_prompts_for_its_inputs() {
+    let mut s = Session::new();
+    let a = h(&s.execute("dimlinear", &json!({ "p1": [0, 0], "p2": [10, 0], "at": [0, 5] })).unwrap());
+    let b = h(&s.execute("dimlinear", &json!({ "p1": [0, 0], "p2": [20, 0], "at": [0, 9] })).unwrap());
+    // The menu / typed start used to fail with "`base` dimension is required".
+    s.start("dimspace").unwrap();
+    assert!(s.prompt_text().contains("Select base dimension"), "{}", s.prompt_text());
+    s.input(Input::Pick(vec![a])).unwrap();
+    assert!(s.prompt_text().contains("Select dimensions to space"), "{}", s.prompt_text());
+    s.input(Input::Pick(vec![b])).unwrap();
+    s.input(Input::Enter).unwrap();
+    assert!(s.prompt_text().contains("Enter value"), "{}", s.prompt_text());
+    s.input(Input::Text("2".into())).unwrap();
+    assert!(s.running.is_none());
+    assert!((dim(&s, a).defpt.y - 5.0).abs() < 1e-9, "{:?}", dim(&s, a).defpt);
+    assert!((dim(&s, b).defpt.y - 7.0).abs() < 1e-9, "{:?}", dim(&s, b).defpt);
 }
 
 #[test]

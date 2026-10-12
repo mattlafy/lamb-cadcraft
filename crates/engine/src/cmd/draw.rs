@@ -46,7 +46,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("ellipse", "Ellipse", run_ellipse)
             .menu(&["Draw", "Ellipse", "Center"])
             .alias(&["el"])
-            .params("{center, major: [dx,dy], ratio, start?, end? (degrees)}")
+            .params("{center, major: [dx,dy], ratio, start?, end? (degrees)} | {isocircle: {center, radius | diameter, plane?}}")
             .interactive(|_| Ok(Box::new(EllipseM::default()))),
         CommandSpec::new("point", "Point", run_point)
             .menu(&["Draw", "Point", "Single Point"])
@@ -84,7 +84,11 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("mtext", "Multiline Text", run_mtext)
             .menu(&["Draw", "Text", "Multiline Text..."])
             .alias(&["t", "mt"])
-            .params("{at, text, height?, width?, attach?: 1..9 | justify?: TL..BR, rotation?, style?, lineSpacing?, lineSpacingExact?}")
+            .params(
+                "{at, text, height?, width?, attach?: 1..9 | justify?: TL..BR, rotation?, style?, lineSpacing?, lineSpacingExact?, \
+                 list?: bullet|number|lower|upper, indent?, firstIndent?, rightIndent?, tabs?: [..], align?: left|center|right|justify|distributed, \
+                 columns?: {type: static|dynamic, count?, gutter?, height, heights?, reversed?}} (indents and tabs in text heights; width = one column)",
+            )
             .interactive(|_| Ok(Box::new(MTextM::default()))),
     ]
 }
@@ -221,6 +225,9 @@ fn run_polygon(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn run_ellipse(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("isocircle").is_some() {
+        return super::settings::iso::run_isocircle(s, p);
+    }
     let c = point_req("ellipse", p, "center")?;
     let m = point_req("ellipse", p, "major")?;
     let ratio = f64_req("ellipse", p, "ratio")?;
@@ -363,16 +370,18 @@ fn run_mtext(s: &mut Session, p: &Value) -> Result<Value> {
         Some(j) => super::mtext_opts::attach_code(j).ok_or_else(|| bad("mtext", "`justify` must be TL, TC, TR, ML, MC, MR, BL, BC or BR"))?,
         None => p.get("attach").and_then(Value::as_u64).unwrap_or(1).clamp(1, 9) as u8,
     };
+    let width = f64_or(p, "width", 0.0).max(0.0);
     let k = EntityKind::MText(MText {
         insert: v3(at),
         height,
-        width: f64_or(p, "width", 0.0).max(0.0),
+        width,
         attach,
         rotation: f64_or(p, "rotation", 0.0).to_radians(),
         style,
-        contents: text.replace('\n', "\\P"),
+        contents: super::mtext_opts::json_paragraphs(p, text.replace('\n', "\\P"))?,
         line_spacing: f64_or(p, "lineSpacing", 1.0),
         line_spacing_exact: bool_or(p, "lineSpacingExact", false),
+        columns: super::mtext_opts::json_columns(p, height, width)?,
     });
     added(s.add_entity(k)?)
 }
@@ -949,6 +958,8 @@ struct EllipseM {
     /// The `Parameter` option: arc start/end values are ellipse parameters, not true angles.
     param: bool,
     start: Option<f64>,
+    /// The Isocircle option (isometric snap style) in progress.
+    iso: Option<super::settings::iso::IsoCircle>,
 }
 
 impl EllipseM {
@@ -999,7 +1010,7 @@ impl Interactive for EllipseM {
     fn name(&self) -> &'static str {
         "ELLIPSE"
     }
-    fn prompt(&self, _s: &Session) -> Prompt {
+    fn prompt(&self, s: &Session) -> Prompt {
         if let Some(e) = &self.ellipse {
             let msg = match (self.start.is_none(), self.param) {
                 (true, false) => "Specify start angle",
@@ -1009,7 +1020,11 @@ impl Interactive for EllipseM {
             };
             return Prompt::new(msg, Accept::POINT_OR_NUMBER).kw(if self.param { &["Angle"] } else { &["Parameter"] }).base(e.center);
         }
+        if let Some(iso) = &self.iso {
+            return iso.prompt();
+        }
         match (self.center_mode, self.pts.len()) {
+            (false, 0) if s.settings.isodraft => Prompt::new("Specify axis endpoint of ellipse", Accept::POINT).kw(&["Arc", "Center", "Isocircle"]),
             (false, 0) => Prompt::new("Specify axis endpoint of ellipse", Accept::POINT).kw(&["Arc", "Center"]),
             (false, 1) => Prompt::new("Specify other endpoint of axis", Accept::POINT).base_opt(self.pts.first().copied()),
             (true, 0) => Prompt::new("Specify center of ellipse", Accept::POINT),
@@ -1061,7 +1076,14 @@ impl Interactive for EllipseM {
                 }
             }
         }
+        if let Some(iso) = &mut self.iso {
+            return match iso.input(s, i)? {
+                Some(e) => self.place(s, e),
+                None => Ok(Step::Continue),
+            };
+        }
         match i {
+            Input::Keyword(k) if k == "Isocircle" && self.pts.is_empty() => self.iso = Some(Default::default()),
             Input::Keyword(k) if k == "Center" => self.center_mode = true,
             Input::Keyword(k) if k == "Arc" => self.arc_mode = true,
             Input::Keyword(k) if k == "Rotation" && self.pts.len() == 2 => self.rotation = true,
@@ -1097,7 +1119,10 @@ impl Interactive for EllipseM {
         }
         Ok(Step::Continue)
     }
-    fn preview(&self, _s: &Session, c: Vec2) -> Vec<EntityKind> {
+    fn preview(&self, s: &Session, c: Vec2) -> Vec<EntityKind> {
+        if let Some(iso) = &self.iso {
+            return iso.preview(s, c).map(|e| super::settings::iso::ellipse_entity(&e)).into_iter().collect();
+        }
         if self.pts.len() < 2 {
             return self.pts.first().map(|a| vec![line(*a, c)]).unwrap_or_default();
         }
@@ -1414,11 +1439,10 @@ impl Interactive for TextM {
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
         let d = s.doc()?;
-        let msg = format!(
-            "Current text style:  \"{}\"  Text height:  {:.4}  Annotative:  No  Justify:  Left",
-            d.header.str("TEXTSTYLE", "Standard"),
-            d.header.f64("TEXTSIZE", 0.2)
-        );
+        let style = d.header.str("TEXTSTYLE", "Standard");
+        let anno = if d.text_style(&style).is_some_and(|st| st.annotative) { "Yes" } else { "No" };
+        let msg =
+            format!("Current text style:  \"{style}\"  Text height:  {:.4}  Annotative:  {anno}  Justify:  Left", d.header.f64("TEXTSIZE", 0.2));
         s.echo(msg);
         Ok(Step::Continue)
     }
@@ -1487,7 +1511,13 @@ impl Interactive for MTextM {
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
         self.opts = super::mtext_opts::MTextOpts::new(s);
-        s.echo(format!("Current text style:  \"{}\"  Text height:  {:.4}  Annotative:  No", self.opts.style, self.opts.height));
+        let anno = s.doc()?.text_style(&self.opts.style).is_some_and(|st| st.annotative);
+        s.echo(format!(
+            "Current text style:  \"{}\"  Text height:  {:.4}  Annotative:  {}",
+            self.opts.style,
+            self.opts.height,
+            if anno { "Yes" } else { "No" }
+        ));
         Ok(Step::Continue)
     }
     fn prompt(&self, _s: &Session) -> Prompt {

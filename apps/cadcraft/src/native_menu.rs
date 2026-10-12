@@ -43,7 +43,9 @@ impl NativeMenu {
             ("Show All", PredefinedMenuItem::show_all(Some(i18n::tr(language, "Show All")))),
             ("Quit CADCraft", PredefinedMenuItem::quit(Some(i18n::tr(language, "Quit CADCraft")))),
         ];
-        let _ = app_menu.append_items(&[&about, &discord, &PredefinedMenuItem::separator()]);
+        // The Mac place for preferences: CADCraft ▸ Settings… (⌘,) opens the Options dialog.
+        let settings = MenuItem::with_id("cc-settings", i18n::tr(language, "Settings..."), true, accel("Cmd+Comma"));
+        let _ = app_menu.append_items(&[&about, &discord, &PredefinedMenuItem::separator(), &settings, &PredefinedMenuItem::separator()]);
         for (label, item) in &predefined {
             let _ = app_menu.append(item);
             if ["Services", "Show All"].contains(label) {
@@ -52,9 +54,10 @@ impl NativeMenu {
         }
         items.insert("cc-about".into(), ("ui.dialog.about".into(), "About CADCraft".into(), about));
         items.insert("cc-discord".into(), ("ui.discord".into(), "Join the ArtCraft Discord…".into(), discord));
+        items.insert("cc-settings".into(), ("options".into(), "Settings...".into(), settings));
         let _ = menu.append(&app_menu);
         for (title, entries) in menus::tree(app) {
-            let sub = Submenu::new(i18n::tr(language, &title), true);
+            let sub = Submenu::new(i18n::tr_menu(language, &title), true);
             build(&sub, &entries, &mut items, &mut submenus, &mut counter, language);
             let _ = menu.append(&sub);
             submenus.push((title, sub));
@@ -84,7 +87,7 @@ impl NativeMenu {
                 item.set_text(i18n::tr(language, label));
             }
             for (label, submenu) in &self.submenus {
-                submenu.set_text(i18n::tr(language, label));
+                submenu.set_text(i18n::tr_menu(language, label));
             }
         }
         let now = cadcraft_ui_egui::now_ms();
@@ -110,7 +113,7 @@ fn build(
     for e in entries {
         match e {
             Entry::Sub { label, children } => {
-                let sub = Submenu::new(i18n::tr(language, label), true);
+                let sub = Submenu::new(i18n::tr_menu(language, label), true);
                 build(&sub, children, items, submenus, counter, language);
                 let _ = parent.append(&sub);
                 submenus.push((label.clone(), sub));

@@ -1,6 +1,6 @@
 # Localization parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (Ukrainian catalog landed, #36: first string catalog) · **Target:** Autodesk AutoCAD 2027 for Mac (26.0)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-11 · **Change:** minor (Czech catalog added: reference/literal coverage, Czech plurals and menu headings) · **Target:** Autodesk AutoCAD 2027 for Mac (26.0)
 
 How far CADCraft's interface and drawing text are from AutoCAD's languages. Summarised in
 [ROADMAP.md](../ROADMAP.md#languages); work items in [gaps.md](gaps.md#localization).
@@ -23,7 +23,8 @@ shaping and right-to-left text through TrueType, vertical SHX text styles.
 - **A display-time string catalog** (`crates/ui-egui/src/i18n/`, landed with #36): a TSV per
   language (context, English source, translation, `@plural` rows), Edit → Interface Language with
   Auto (system language), live switching, a saved choice, and tests for coverage, placeholders
-  and plurals ([localization.md](localization.md)). The Ukrainian catalog has **936 rows**,
+  and plurals ([localization.md](localization.md)). The Ukrainian and German catalogs have
+  **989 rows** each,
   covering menus, command labels, tool groups and tooltips, the Start page, tabs, status
   controls, object snaps, drafting prompts, property labels and dialogs. Engine diagnostics,
   CLI/MCP responses and command history stay English, and uncatalogued text falls back to
@@ -31,9 +32,11 @@ shaping and right-to-left text through TrueType, vertical SHX text styles.
   and `crates/ui-egui` (grep, 2026-10-10).
 - **Drawing text:** TrueType/OpenType/`.ttc` through `skrifa` with per-character font fallback
   and FONTALT, so CJK characters render (#173). DXF text is written with `\U+` escapes so
-  non-ASCII survives in R2000 files (#169). Glyphs are placed one per code point: there is **no
-  shaping** (Arabic joining, Devanagari conjuncts), **no bidi** (right-to-left order) and **no
-  vertical text**. SHX fonts are not read; our stroke font stands in.
+  non-ASCII survives in R2000 files (#169). Lines with right-to-left text get the Unicode
+  Bidirectional Algorithm and OpenType shaping with `harfrust` (Arabic, Persian and Urdu joining,
+  lam-alef, ZWNJ, marks; Hebrew), in TEXT and MTEXT including wrapping (#287). Left-to-right lines
+  are still placed one glyph per code point: **no shaping** for Devanagari and other Indic
+  scripts, and **no vertical text**. SHX fonts are not read; our stroke font stands in.
 - **Text input:** egui/winit IME. Several upstream IME fixes are queued as PRs (#110–#119:
   macOS Korean, emoji picker, Windows caret placement, X11 and Wayland), so CJK input is not yet
   reliable on every platform.
@@ -42,7 +45,7 @@ shaping and right-to-left text through TrueType, vertical SHX text styles.
 
 Order and columns from craftrules' progress-docs standard. Every UI percentage is **measured**
 from the catalogs (0 rows for every language without a catalog file). Hours are **estimated**:
-about 3–5 h per language for an Opus 5.5 agent to translate the ~940 catalog rows and fix layout,
+about 3–5 h per language for an Opus 5.5 agent to translate the ~990 catalog rows and fix layout,
 plus native review by a human; extending the catalog to the remaining English-only strings
 (engine diagnostics, uncatalogued text) is about 4–6 h, counted once in the first row.
 
@@ -52,27 +55,33 @@ plus native review by a human; extending the catalog to the remaining English-on
 | Simplified Chinese | zh-Hans | 0 (0%) | 0% | CJK glyphs render via fallback; IME fixes pending (#110–#119); no vertical text | no | none | 8–12 h (includes extending the catalog, 4–6 h) |
 | Spanish | es | 0 (0%) | 0% | Latin: yes | no | none | 3–5 h |
 | Hindi | hi | 0 (0%) | 0% | Devanagari: no shaping | no | none | 3–5 h + 15–25 h shaping (shared with Arabic) |
-| Arabic | ar | 0 (0%) | 0% | No shaping, no RTL layout or bidi text | no | none | 3–5 h + shaping + 15–25 h RTL UI |
-| French | fr | 0 (0%) | 0% | Latin: yes | no | none | 3–5 h |
+| Arabic | ar | 0 (0%) | 0% | Drawing text shaped and laid out right to left (#287); the UI is not mirrored | no | none | 3–5 h + 15–25 h RTL UI |
+| French | fr | ≈ 900 catalog rows (gaps reported, English fallback) | partial | Latin: yes | contributed by @pechnikov2026-star (#624); no native review yet | partial | 2–4 h |
+| Russian | ru | ≈ 900 catalog rows (gaps reported, English fallback) | partial | Cyrillic: yes (bundled egui fonts) | contributed by @pechnikov2026-star (#624); no native review yet | partial | 2–4 h |
 | Portuguese | pt | 0 (0%) | 0% | Latin: yes | no | none | 3–5 h |
 | Indonesian | id | 0 (0%) | 0% | Latin: yes | no | none | 3–5 h |
 | Japanese | ja | 0 (0%) | 0% | CJK glyphs render; IME pending; no vertical text | no | none | 4–6 h |
-| German | de | 0 (0%) | 0% | Latin: yes (long strings will need layout checks) | no | none | 3–5 h |
+| German | de | 989 catalog rows (≈ 100% of the catalog; ≈ 80% of all UI strings, estimated: engine diagnostics and uncatalogued text stay English) | dialogs and tooltips yes; command reference searchable in German | Latin: yes (bundled egui fonts cover ä ö ü Ä Ö Ü ß; long strings will need layout checks) | no native review | partial | 1–2 h |
 | Korean | ko | 0 (0%) | 0% | Hangul renders; macOS Korean IME fixes pending (#118, #119) | no | none | 4–6 h |
 | Vietnamese | vi | 0 (0%) | 0% | Latin with stacked diacritics: renders per code point, untested | no | none | 3–5 h |
-| Ukrainian | uk | 936 catalog rows (≈ 100% of the catalog; ≈ 80% of all UI strings, estimated: engine diagnostics and uncatalogued text stay English) | dialogs and tooltips yes; command reference searchable in Ukrainian | Cyrillic: yes (bundled egui fonts) | translated by a contributor; no second review | partial | 2–4 h |
+| Ukrainian | uk | 989 catalog rows (≈ 100% of the catalog; ≈ 80% of all UI strings, estimated: engine diagnostics and uncatalogued text stay English) | dialogs and tooltips yes; command reference searchable in Ukrainian | Cyrillic: yes (bundled egui fonts) | translated by a contributor; no second review | partial | 2–4 h |
+| Czech | cs | 1,202 catalog rows; reference catalog and marked UI literals covered | dialogs and tooltips yes; contextual menu headings; command reference searchable in Czech | Latin: yes (bundled egui proportional and monospace fonts; Czech letters and quotes tested) | AI-assisted by @Losminek; independent review pass; not yet proofread by a native speaker | complete current catalog; English-only interface gaps remain | native review + shared English-only UI work |
 
-Other languages shipped: Ukrainian (partial). AutoCAD for Mac ships 7 non-English languages
-(zh-Hans, es, fr, ja, de, ko, it); CADCraft ships none of those, and Ukrainian, which AutoCAD
-for Mac doesn't ship.
+Other languages shipped: Ukrainian, Brazilian Portuguese, German, Czech, Russian and French. Czech covers the
+reference catalog and marked UI literals; engine diagnostics and uncatalogued text remain English. AutoCAD for Mac ships 7
+non-English languages (zh-Hans, es, fr, ja, de, ko, it); of those, CADCraft now ships German,
+and additionally Ukrainian, which AutoCAD for Mac doesn't ship.
 
-**Total to put all twelve at `full`:** about 60–100 Opus 5.5 hours (catalog extension 4–6 h,
-eleven translations 35–55 h, complex-script shaping and RTL 30–45 h), plus native-speaker review for
+**Total to put all twelve at `full`:** about 55–95 Opus 5.5 hours (catalog extension 4–6 h,
+ten translations 30–50 h, complex-script shaping and RTL 30–45 h), plus native-speaker review for
 each language, which needs humans. Translations parallelise fully once the catalog exists.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-11 | minor | Czech added: 1,202 rows, one/few/other plurals, locale/preferences/menu/font/render tests; independent review pass; native proofreading pending |
+| 2026-10-11 | minor | German catalog landed: `de` preference and catalog, per-language plural rules; non-English languages 1 → 2; total hours 60–100 → 55–95 |
+| 2026-10-10 | minor | Right-to-left drawing text: bidi and Arabic-script shaping in TEXT and MTEXT (#287) |
 | 2026-10-10 | minor | Ukrainian catalog landed on main (#36): catalog infrastructure exists, Ukrainian partial; total hours 70–110 → 60–100 |
 | 2026-10-10 | major | First localization measurement against AutoCAD 2027 for Mac's bundle localizations |

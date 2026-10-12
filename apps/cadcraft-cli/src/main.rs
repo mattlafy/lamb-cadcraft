@@ -7,9 +7,24 @@
 //! cadcraft-cli commands [FILTER]                   command catalog (JSON)
 //! cadcraft-cli mcp [--connect HOST:PORT]           MCP server on stdio (headless or bridged to the app)
 //! cadcraft-cli perf [N]                            timing table on a synthetic N-entity drawing
+//! cadcraft-cli perf FILE                           canvas display-list build of a drawing, zoomed in step by step
 //! cadcraft-cli sample (bracket|floorplan) OUT       write a built-in sample drawing
 //! ```
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+/// `println!` that doesn't panic when stdout is closed (`cadcraft-cli commands | head`) with
+/// "failed printing to stdout: Broken pipe (os error 32)". Once stdout has failed, later output is
+/// dropped and the work goes on: see `stdout_failed`.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        if !$crate::stdout_gone() {
+            if let Err(e) = writeln!(std::io::stdout(), $($arg)*) {
+                $crate::stdout_failed(e);
+            }
+        }
+    }};
+}
 
 use std::process::ExitCode;
 
@@ -17,6 +32,28 @@ use cadcraft_engine::doc::Space;
 use cadcraft_engine::geom::{Bounds2, Vec2};
 use cadcraft_engine::{Session, View};
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set once a write to stdout has failed; later output is dropped.
+static STDOUT_GONE: AtomicBool = AtomicBool::new(false);
+/// Set when stdout failed for a reason other than a closed reader: the exit status becomes 1.
+static STDOUT_ERROR: AtomicBool = AtomicBool::new(false);
+
+fn stdout_gone() -> bool {
+    STDOUT_GONE.load(Ordering::Relaxed)
+}
+
+/// stdout went away. The program doesn't stop there: the rest of `run` (later `--cmd` results,
+/// `--save`, `--export`) still happens, so `cadcraft-cli run … --save out.dxf | head` keeps the
+/// drawing. A reader that stopped early (a closed pipe) is not an error, as in ripgrep; any other
+/// write error is reported and makes the exit status 1.
+fn stdout_failed(e: std::io::Error) {
+    if STDOUT_GONE.swap(true, Ordering::Relaxed) || e.kind() == std::io::ErrorKind::BrokenPipe {
+        return;
+    }
+    eprintln!("cadcraft-cli: can't write to stdout: {e}");
+    STDOUT_ERROR.store(true, Ordering::Relaxed);
+}
 
 const USAGE: &str = "usage:
   cadcraft-cli info FILE.dxf
@@ -24,7 +61,7 @@ const USAGE: &str = "usage:
   cadcraft-cli run [FILE | --sample | --metric] [--script TEXT] [--script-file F.scr] [--cmd 'id {json}']... [--save OUT.dxf] [--export OUT.(png|svg|pdf)] [FRAMING]
   cadcraft-cli commands [FILTER]
   cadcraft-cli mcp [--connect HOST:PORT]
-  cadcraft-cli perf [N]
+  cadcraft-cli perf [N | FILE]
   cadcraft-cli sample (bracket|floorplan) OUT.(dxf|dwg|svg|png)
   cadcraft-cli --version
 
@@ -130,7 +167,10 @@ fn install_io() {
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
-        plot: Some(|d, space, opts| cadcraft_io::plot(d, space, opts).map_err(|e| e.to_string())),
+        plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+    });
+    cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
+        cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
     });
 }
 
@@ -169,7 +209,7 @@ fn info(path: &str) -> Result<(), String> {
     let mut s = Session::empty();
     open(&mut s, path)?;
     let v = s.execute("drawing.inspect", &json!({ "entities": false })).map_err(|e| e.to_string())?;
-    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    outln!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     Ok(())
 }
 
@@ -182,7 +222,7 @@ fn export_framed(s: &Session, out: &str, window: Option<Bounds2>) -> Result<(), 
     let bytes = cadcraft_io::write_framed(d, out, window).map_err(|e| e.to_string())?;
     std::fs::write(out, &bytes).map_err(|e| format!("{out}: {e}"))?;
     eprintln!("wrote {out} ({} bytes)", bytes.len());
-    if !cadcraft_io::is_image(out) {
+    if cadcraft_engine::cmd::file::drops_unknown(out) {
         let lost = cadcraft_engine::cmd::file::not_saved(d);
         if let Some(m) = cadcraft_engine::cmd::file::not_saved_message(&lost) {
             eprintln!("{m}");
@@ -274,7 +314,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 let params: Value = serde_json::from_str(json).map_err(|e| format!("--cmd {id}: {e}"))?;
                 let r = s.execute(id, &params).map_err(|e| e.to_string())?;
                 if !r.is_null() {
-                    println!("{r}");
+                    outln!("{r}");
                 }
             }
         }
@@ -354,11 +394,55 @@ fn synthetic(n: usize, side: f64) -> Result<cadcraft_engine::doc::Drawing, Strin
     Ok(dr)
 }
 
+/// `perf FILE`: the display list built as the canvas builds it (a 1600 x 1000 px view at the
+/// drawing's centre: tolerance, dash level of detail and view window from the zoom band), at
+/// zoom extents and zoomed in 4x at a time, next to the full-detail build plots use.
+fn perf_file(path: &str) -> Result<(), String> {
+    use cadcraft_engine::geom::{Bounds2, Vec2};
+    use cadcraft_engine::render::{Options, build};
+    use std::time::Instant;
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+    let mut s = Session::empty();
+    let t = Instant::now();
+    open(&mut s, path)?;
+    let open_ms = ms(t);
+    let st = s.state().map_err(|e| e.to_string())?;
+    let (d, space) = (&st.doc, &st.space);
+    let ext = d.extents(space);
+    let size = ext.width().max(ext.height());
+    if ext.is_empty() || !(size.is_finite() && size > 0.0) {
+        return Err("perf: the drawing is empty".into());
+    }
+    outln!("open {open_ms:.0} ms, {} entities, extents {:.1} x {:.1}", d.entity_count(), ext.width(), ext.height());
+    outln!("{:>8} {:>10} {:>10}", "zoom", "build ms", "prims");
+    let mut finest = Options::default();
+    for k in 0..5 {
+        let zoom = 4f64.powi(k);
+        let h = size / zoom;
+        let pixel = 2f64.powi((h / 1000.0).max(1e-300).log2().floor() as i32);
+        let half = Vec2::new(h * 0.8, h * 0.5);
+        let visible = Bounds2::new(ext.center() - half, ext.center() + half);
+        let screen = Options { tolerance: pixel * 0.5, min_dash: pixel * 2.0, view: Some(visible.expand(h * 0.8)), ..Default::default() };
+        let t = Instant::now();
+        let n = build(d, space, &screen).prims.len();
+        outln!("{:>7}x {:>10.1} {n:>10}", zoom, ms(t));
+        finest = screen;
+    }
+    // Plots: every pattern line, everywhere (last, so its large list doesn't weigh on the above).
+    let t = Instant::now();
+    let n = build(d, space, &Options { min_dash: 0.0, view: None, ..finest }).prims.len();
+    outln!("{:>8} {:>10.1} {n:>10}", "full", ms(t));
+    Ok(())
+}
+
 fn perf(args: &[String]) -> Result<(), String> {
     use cadcraft_engine::doc::Space;
     use cadcraft_engine::geom::{Bounds2, Vec2};
     use cadcraft_engine::{select, snap};
     use std::time::Instant;
+    if let Some(path) = args.first().filter(|a| a.parse::<usize>().is_err()) {
+        return perf_file(path);
+    }
     let n: usize = match args.first() {
         Some(a) => a.parse().map_err(|_| format!("perf: bad entity count {a}"))?,
         None => 200_000,
@@ -427,10 +511,10 @@ fn perf(args: &[String]) -> Result<(), String> {
     let back = cadcraft_io::read(&bytes, "perf.dxf").map_err(|e| e.to_string())?;
     rows.push(("DXF read".into(), ms(t), format!("{} entities", back.entity_count())));
 
-    println!("{:<40} {:>12}  notes", "operation", "ms");
-    println!("{}", "-".repeat(80));
+    outln!("{:<40} {:>12}  notes", "operation", "ms");
+    outln!("{}", "-".repeat(80));
     for (name, t, note) in rows {
-        println!("{name:<40} {t:>12.2}  {note}");
+        outln!("{name:<40} {t:>12.2}  {note}");
     }
     Ok(())
 }
@@ -518,6 +602,11 @@ mod mcp_args_tests {
 }
 
 fn main() -> ExitCode {
+    let code = cli();
+    if STDOUT_ERROR.load(Ordering::Relaxed) { ExitCode::FAILURE } else { code }
+}
+
+fn cli() -> ExitCode {
     install_io();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rest: Vec<String> = args.iter().skip(1).cloned().collect();
@@ -535,11 +624,11 @@ fn main() -> ExitCode {
                 .filter(|c| f.as_ref().is_none_or(|f| c.id.contains(f.as_str()) || c.label.to_ascii_lowercase().contains(f.as_str())))
                 .map(|c| serde_json::to_value(c.info(&s)).unwrap_or_default())
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            outln!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }),
         Some("mcp") => mcp(&rest),
         Some("--version" | "-V") => {
-            println!("cadcraft-cli {}", env!("CARGO_PKG_VERSION"));
+            outln!("cadcraft-cli {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => Err(USAGE.into()),

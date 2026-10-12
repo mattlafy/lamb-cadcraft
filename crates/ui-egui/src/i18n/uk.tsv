@@ -4,6 +4,29 @@
 # UTF-8: context<TAB>English source<TAB>Ukrainian translation.
 # Empty context = ordinary label; @plural = one|few|many forms with {n}.
 # Keep command IDs, keywords, technology/product names and user data unchanged.
+# External References palette (#525).
+	Apply	Застосувати
+	Attach DWG...	Приєднати DWG...
+	Bind	Вбудувати
+	Detach	Від'єднати
+	Loaded	Завантажено
+	Make it a block of this drawing, keeping its layer names	Зробити блоком цього креслення зі збереженням назв шарів
+	Make it a block of this drawing; its layers become NAME$0$LAYER	Зробити блоком цього креслення; його шари стануть NAME$0$LAYER
+	No external references are attached.	Зовнішні посилання не приєднано.
+	Not Found	Не знайдено
+	Not loaded	Не завантажено
+	Open	Відкрити
+	Overlay	Накладення
+	Reference Manager	Диспетчер посилань
+	Reference Name	Ім'я посилання
+	References: {n}	Посилань: {n}
+	Reload	Оновити
+	Reload All	Оновити всі
+	Saved Path	Збережений шлях
+	Unload	Вивантажити
+	Unloaded	Вивантажено
+	Unreferenced	Без посилань
+	Unresolved	Не розв'язано
 	  Cancel  	Скасувати
 	  OK  	Гаразд
 	 or [	 або [
@@ -27,14 +50,17 @@
 	<> Not Equal	<> Не дорівнює
 	= Equals	= Дорівнює
 	> Greater than	> Більше ніж
+	A variable name starts with a letter and has only letters, digits and _	Ім'я змінної починається з літери й містить лише літери, цифри та _
 	About	Про програму
 	About CADCraft	Про CADCraft
 	Absolute	Абсолютні
 	Add Leader	Додати виноску
+	Additional angles	Додаткові кути
 	Align	Вирівняти
 	Align Text	Вирівняти текст
 	Aligned	Паралельний
 	All	Усі
+	All Annotation Objects	Усі об'єкти анотацій
 	All Used Layers	Усі використані шари
 	All files	Усі файли
 	Angle	Кут
@@ -64,6 +90,7 @@
 	Batch Publish	Пакетне публікування
 	Binary assets added	Додані двійкові ресурси
 	Binary assets removed	Видалені двійкові ресурси
+	Bind...	Вбудувати...
 	Blend	Плавне з'єднання
 	Block	Блок
 	Block Attribute Manager...	Диспетчер атрибутів блоків...
@@ -79,7 +106,10 @@
 	Box	Паралелепіпед
 	Break	Розірвати
 	Break At Point	Розірвати в точці
+	Bring Above Objects	Над об'єктами
+	Bring Annotations to Front	Анотації на передній план
 	Bring to Front	На передній план
+	Bulleted list	Маркований список
 	ByBlock	За блоком
 	ByColor	За кольором
 	ByLayer	За шаром
@@ -100,14 +130,21 @@
 	Chamfer	Фаска
 	Change Space	Змінити простір
 	Change to Current Layer	Перенести на поточний шар
+	Changed: {n}	Змінено: {n}
 	Circle	Коло
 	Circumference	Довжина кола
+	Clear History	Очистити журнал
 	Clear	Очистити
+	Clip	Обрізати
+	Clip Viewport	Обрізати видовий екран
 	Clipboard	Буфер обміну
 	Close	Закрити
 	Close All	Закрити всі
+	Close All Other Drawings	Закрити всі інші креслення
 	Closed	Замкнений
+	Close Comparison	Закрити порівняння
 	Coincident	Збіг
+	Collapse Palettes	Згорнути палітри
 	Collapse Tool Sets	Згорнути набори інструментів
 	Collinear	Колінеарність
 	Color	Колір
@@ -115,12 +152,15 @@
 	Color 9	Колір 9
 	Color Index	Індекс кольору
 	Color...	Колір...
+	Command Aliases	Псевдоніми команд
 	Command History	Історія команд
+	Clear Command History	Очистити історію команд
 	Command Line	Командний рядок
 	Command Line History Lines	Рядки історії командного рядка
 	Command Reference	Довідник команд
 	Commits	Коміти
 	Company	Компанія
+	Compare Drawings...	Порівняти креслення...
 	Computer-aided design and drafting: an open-source, clean-room CAD application written in pure Rust.	Автоматизоване проєктування та креслення: CAD-програма з відкритим кодом, незалежно розроблена мовою Rust.
 	Concentric	Концентричність
 	Cone	Конус
@@ -131,12 +171,17 @@
 	Continue	Продовжити
 	Contributors	Учасники
 	Control Vertices	Керувальні вершини
+	Convert	Перетворити
 	Copy	Копіювати
+	Copy Full File Path	Копіювати повний шлях до файлу
+	Copy History	Копіювати історію
 	Copy Layout	Копіювати аркуш
 	Copy Nested Objects	Копіювати вкладені об'єкти
 	Copy Selection	Копіювати вибране
 	Copy with Base Point	Копіювати з базовою точкою
 	Count	Кількість
+	Count List	Список підрахунку
+	Count Table	Таблиця підрахунку
 	Create Block	Створити блок
 	Creates a user parameter	Створює параметр користувача
 	Ctrl+Enter to finish	Ctrl+Enter для завершення
@@ -147,14 +192,20 @@
 	Cyan	Блакитний
 	Cylinder	Циліндр
 	DWG	DWG
+	DWG Reference...	Посилання на DWG...
 	DXF	DXF
 	Dark	Темна
+	Data Extraction...	Вилучення даних...
 	Default	Типово
+	Data Link...	Зв’язок із даними...
 	Default Save Format	Типовий формат збереження
+	Default Save Version	Типова версія збереження
 	Define Attributes	Визначити атрибути
 	Define Attributes...	Визначити атрибути...
 	Defined width	Задана ширина
 	Degree	Градус
+	Degrees of Freedom	Ступені вільності
+	Degrees of freedom: {n}	Ступені вільності: {n}
 	Delete	Видалити
 	Delete Column	Видалити стовпець
 	Delete Constraints	Видалити обмеження
@@ -171,7 +222,10 @@
 	Deselect All	Скасувати вибір
 	Diameter	Діаметр
 	Dim style	Розмірний стиль
+	Dimension Break	Розрив розміру
+	Dimension Edit	Редагувати розмір
 	Dimension	Розміри
+	Dimension Objects Only	Лише розміри
 	Dimension Space	Відстань між розмірами
 	Dimension Style Override	Перевизначення розмірного стилю
 	Dimension Style...	Розмірний стиль...
@@ -196,23 +250,30 @@
 	Drawing (DWG)	Креслення (DWG)
 	Drawing (DXF)	Креслення (DXF)
 	Drawing Limits	Межі креслення
+	Drawing Template (DWT)	Шаблон креслення (DWT)
 	Drawing Utilities	Утиліти креслення
 	Drawings (DWG, DXF)	Креслення (DWG, DXF)
+	SVG drawings (SVG, SVGZ)	Креслення SVG (SVG, SVGZ)
+	Dynamic	Динамічно
 	Dynamic Dimensions	Динамічні розміри
 	Dynamic Input	Динамічне введення
 	Dynamic Input (F12)	Динамічне введення (F12)
 	E	Сх
 	Edit	Редагування
+	Edit Attributes...	Редагувати атрибути...
 	Edit Text...	Редагувати текст...
+	Edit Table Cell	Редагувати комірку таблиці
 	Elevation	Відмітка
 	Ellipse	Еліпс
 	Elliptical Arc	Еліптична дуга
 	Enable Dynamic Input (F12)	Увімкнути динамічне введення (F12)
+	End Object Isolation	Завершити ізоляцію об'єктів
 	End Width	Кінцева ширина
 	End X	Кінець X
 	End Y	Кінець Y
 	End angle	Кінцевий кут
 	Endpoint	Кінцева точка
+	Enter	Ввід
 	Enter Top, Zero or Bottom.	Введіть Top, Zero або Bottom.
 	Enter a fit data option	Введіть параметр апроксимації
 	Enter a pattern name	Введіть назву візерунка
@@ -259,14 +320,18 @@
 	Entire drawing	Усе креслення
 	Equal	Рівність
 	Erase	Стерти
+	Evaluate	Обчислити
 	Exclude from new selection set	Виключити з нового набору вибраних об'єктів
 	Explode	Розчленувати
 	Export	Експортувати
+	Export Table	Експортувати таблицю
 	Export to PDF...	Експортувати в PDF...
 	Expression	Вираз
 	Extend	Подовжити
 	Extension	Продовження
 	Extents	За межами об'єктів
+	External Reference	Зовнішнє посилання
+	External References	Зовнішні посилання
 	Extrude	Видавити
 	File	Файл
 	File Tab	Вкладка файлу
@@ -289,11 +354,13 @@
 	Freeze/Thaw in all viewports	Заморозити/розморозити в усіх видових екранах
 	Freeze/Thaw in the current viewport	Заморозити/розморозити в поточному видовому екрані
 	From	Від точки
+	From Template...	З шаблону...
 	General	Загальні
 	Geometric Center	Геометричний центр
 	Geometric Constraint	Геометричне обмеження
 	Geometric Constraints	Геометричні обмеження
 	Geometry	Геометрія
+	Get from the Drawing	Взяти з креслення
 	Get Variable	Отримати змінну
 	Get View	Отримати вид
 	Global	Глобально
@@ -305,15 +372,21 @@
 	Grid (F7)	Сітка (F7)
 	Grid Display	Відображення сітки
 	Grid On (F7)	Увімкнути сітку (F7)
+	Grid snap	Прив'язка до сітки
 	Grid spacing	Крок сітки
+	Grip Edit	Редагування ручками
 	Grip Mirror	Дзеркальне відображення ручками
+	Grip Option	Опція ручки
 	Grip Rotate	Поворот ручками
 	Grip Scale	Масштабування ручками
 	Grip Stretch	Розтягування ручками
 	Group	Згрупувати
 	Group Edit	Редагувати групу
+	Group Options	Параметри групи
+	Group Selection	Вибір груп
 	Hatch	Штрихування
 	Hatch Edit	Редагувати штрихування
+	Hatch Patterns	Зразки штрихування
 	Hatch...	Штрихування...
 	Height	Висота
 	Height: {height}	Висота: {height}
@@ -323,7 +396,9 @@
 	Hide All Constraint Bars	Приховати всі панелі обмежень
 	Hide All Dynamic Dimensions	Приховати всі динамічні розміри
 	Hide Layer List	Приховати список шарів
+	Hide Objects	Приховати об'єкти
 	Hide Palettes	Приховати палітри
+	History	Журнал
 	Home	Початковий вид
 	Horizontal	Горизонтальність
 	HorizontalDistance	Горизонтальна відстань
@@ -336,28 +411,37 @@
 	Increment angle	Крок кута
 	Index Color	Індексований колір
 	Index color: {index}	Індексований колір: {index}
+	Infer Constraints	Виведення обмежень
 	Inquiry	Вимірювання
 	Insert	Вставлення
 	Insert Block	Вставити блок
 	Insert Column	Вставити стовпець
 	Insert Row	Вставити рядок
+	Insert tab	Вставити табуляцію
 	Insert this block	Вставити цей блок
+	Insert Table Formula	Вставити формулу в таблицю
 	Insertion	Точка вставлення
 	Insertion X	Вставлення X
 	Insertion Y	Вставлення Y
 	Insertion Z	Вставлення Z
 	Inspect Constraints	Переглянути обмеження
 	Inspect Drawing	Переглянути креслення
+	Inspection	Контрольний розмір
 	Interface Language	Мова інтерфейсу
 	Interface Theme	Тема інтерфейсу
 	Intersect	Перетин
 	Intersection	Перетин
 	Isolate	Ізолювати
 	Isolate Layer	Ізолювати шар
+	Isolate Objects	Ізолювати об'єкти
 	Isometric Drafting	Ізометричне креслення
+	Jogged	Зі зламом
+	Jogged Linear	Лінійний зі зламом
 	Join	Об'єднати
 	Join the ArtCraft Discord…	Приєднатися до Discord ArtCraft…
 	Join us on Discord	Приєднуйтеся до нас у Discord
+	Isometric Plane	Ізометрична площина
+	Isometric snap	Ізометрична крокова прив'язка
 	Language	Мова
 	Last	Останній
 	Last commit	Останній коміт
@@ -376,10 +460,12 @@
 	Layer is empty (double-click to make current)	Шар порожній (двічі клацніть, щоб зробити поточним)
 	Layers	Шари
 	Layers Palette	Палітра шарів
+	Hide Palette	Сховати палітру
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Показано шарів: {shown} із {total}.   Поточний шар: {layer}
 	Layout	Аркуш
 	Layout list	Список аркушів
 	Leader	Виноска
+	Leaders Only	Лише виноски
 	Left	Ліворуч
 	Length	Довжина
 	Length X	Довжина X
@@ -392,6 +478,7 @@
 	Lines +/−	Рядки +/−
 	Lines added	Додані рядки
 	Lines deleted	Видалені рядки
+	Lines of Command History	Рядки історії команд
 	Linetype	Тип лінії
 	Linetype Scale	Масштаб типу лінії
 	Linetype scale	Масштаб типу лінії
@@ -412,6 +499,7 @@
 	Loaded linetypes	Завантажені типи ліній
 	Lock	Заблокувати
 	Lock Layer	Заблокувати шар
+	Lock viewport	Заблокувати видовий екран
 	Lock/Unlock	Заблокувати/розблокувати
 	Loft	Тіло за перерізами
 	MIT OR Apache-2.0. Not affiliated with Autodesk, Inc.	MIT OR Apache-2.0. Не пов'язано з Autodesk, Inc.
@@ -451,6 +539,7 @@
 	N	Пн
 	Name	Назва
 	Name (A–Z)	Назва (А–Я)
+	Named Views...	Іменовані види...
 	Nearest	Найближча точка
 	New	Створити
 	New (metric)	Створити (метричне)
@@ -461,8 +550,10 @@
 	New Layout	Новий аркуш
 	New VP Freeze	Заморозити в нових ВЕ
 	New Viewports...	Нові видові екрани...
+	New from Template...	Створити із шаблону...
 	New layout	Новий аркуш
 	New state name	Назва нового стану
+	Next Change	Наступна зміна
 	No	Ні
 	No blocks defined in this drawing.	У цьому кресленні немає визначених блоків.
 	No contributor data was built into this copy.	Ця збірка не містить даних про учасників.
@@ -473,6 +564,7 @@
 	None	Немає
 	Not available	Недоступно
 	Not available yet	Поки недоступно
+	Numbered list	Нумерований список
 	OK	Гаразд
 	Object	Об'єкт
 	Object Snap	Об'єктна прив'язка
@@ -480,15 +572,20 @@
 	Object Snap On (F3)	Увімкнути об'єктну прив'язку (F3)
 	Object Snap Tracking	Відстеження об'єктної прив'язки
 	Object Snap Tracking (F11)	Відстеження об'єктної прив'язки (F11)
+	Object Snap Tracking Settings	Параметри відстеження об'єктної прив'язки
 	Object type:	Тип об'єкта:
+	Oblique	Похилий
 	Off	Вимкнено
 	Offset	Зміщення
 	On	Увімкнено
 	On/Off	Увімкнути/вимкнути
 	One of the Crafting Apps by the ArtCraft team and community.	Одна з програм Crafting Apps від команди та спільноти ArtCraft.
+	Only in this drawing: {n}	Лише в цьому кресленні: {n}
+	Only in {name}: {n}	Лише в {name}: {n}
 	Open (⌘O)	Відкрити (⌘O)
 	Open Sample Drawing	Відкрити зразок креслення
 	Open sample drawing	Відкрити зразок креслення
+	Open Xref	Відкрити зовнішнє посилання
 	Open...	Відкрити...
 	Operator:	Оператор:
 	Orbit	Орбіта
@@ -498,6 +595,7 @@
 	Ortho Mode (F8)	Режим Орто (F8)
 	Osnap Settings...	Параметри об'єктної прив'язки...
 	Out	Віддалити
+	Over-constrained	Надмірно обмежено
 	Override	Перевизначити
 	PAPER	АРКУШ
 	Percent	Відсоток
@@ -516,6 +614,7 @@
 	Parametric	Параметризація
 	Paste	Вставити
 	Paste as Block	Вставити як блок
+	Paste to Command Line	Вставити в командний рядок
 	Paste to Original Coordinates	Вставити у вихідні координати
 	Path Array	Масив уздовж траєкторії
 	Pattern	Візерунок
@@ -530,10 +629,15 @@
 	Plot Style Manager	Диспетчер стилів друку
 	Plot Style Manager...	Диспетчер стилів друку...
 	Plot Styles...	Стилі друку...
+	Plotter Manager	Диспетчер плотерів
+	Plotter Manager...	Диспетчер плотерів...
 	New CTB	Нова CTB
 	New STB	Нова STB
 	New style	Новий стиль
 	Reset Panel Layout	Скинути розташування панелей
+	Send Hatches to Back	Штрихування на задній план
+	Send Under Objects	Під об'єкти
+	Text Objects Only	Лише текстові об'єкти
 	Use for this layout	Використати для цього аркуша
 	Display plot styles	Показувати стилі друку
 	No plot style tables.	Немає таблиць стилів друку.
@@ -558,14 +662,20 @@
 	Polar Tracking	Полярне відстеження
 	Polar Tracking (F10)	Полярне відстеження (F10)
 	Polar Tracking On (F10)	Увімкнути полярне відстеження (F10)
+	Polar angle measurement	Вимірювання полярного кута
+	Polar distance	Полярна відстань
 	Polar: {distance} < {angle}°	Полярне: {distance} < {angle}°
+	PolarSnap	Полярна прив'язка
 	Polygon	Правильний багатокутник
 	Polygonal	Багатокутний
+	Polygonal Viewport	Багатокутний видовий екран
 	Polyline	Полілінія
+	Polyline Edit	Редагувати полілінію
 	Position X	Позиція X
 	Position Y	Позиція Y
 	Position Z	Позиція Z
 	Previous	Попередній
+	Previous Change	Попередня зміна
 	Previous Layer	Попередній шар
 	Primitives	Примітиви
 	Print	Друк
@@ -585,6 +695,7 @@
 	Quick Select Properties	Властивості швидкого вибору
 	Quick Select...	Швидкий вибір...
 	QuickCalc	Калькулятор
+	QuickCalc Pick	Вибір для калькулятора
 	Quit CADCraft	Вийти з CADCraft
 	Radius	Радіус
 	Raster Image	Растрове зображення
@@ -594,9 +705,13 @@
 	Realtime	У реальному часі
 	Reassociate Dimensions	Відновити асоціативність розмірів
 	Recent	Нещодавні
+	Recent Commands	Нещодавні команди
+	Recent Input	Нещодавнє введення
 	Recover...	Відновити...
 	Rectangle	Прямокутник
+	Recalculate Table Formulas	Перерахувати формули таблиці
 	Rectangular	Прямокутний
+	Rectangular snap	Прямокутна крокова прив'язка
 	Rectangular Array	Прямокутний масив
 	Red	Червоний
 	Redo	Повторити
@@ -606,7 +721,9 @@
 	Regen All	Регенерувати все
 	Region	Область
 	Region/Mass Properties	Властивості області/маси
+	Reinitialize	Переініціалізувати
 	Relative	Відносні
+	Relative to last segment	Відносно останнього сегмента
 	Remove Leader	Видалити виноску
 	Remove the viewport override	Видалити перевизначення видового екрана
 	Rename Dimension Style	Перейменувати розмірний стиль
@@ -642,6 +759,7 @@
 	Select 2D polyline	Виберіть 2D-полілінію
 	Select All	Вибрати все
 	Select Objects	Вибрати об'єкти
+	Select Similar	Вибрати подібні
 	Select a 2D polyline.	Виберіть 2D-полілінію.
 	Select a block reference.	Виберіть посилання на блок.
 	Select a circle or arc.	Виберіть коло або дугу.
@@ -711,9 +829,11 @@
 	Set Current	Зробити поточним
 	Set Current Dimension Style	Зробити розмірний стиль поточним
 	Set Current Text Style	Зробити текстовий стиль поточним
+	Set Current Viewport	Зробити видовий екран поточним
 	Set Layer Properties	Задати властивості шару
 	Set Properties	Задати властивості
 	Set Table Cell	Задати комірку таблиці
+	Set Table Cell Style	Задати стиль комірки таблиці
 	Set Variable	Задати змінну
 	Set View	Задати вид
 	Share	Поділитися
@@ -721,6 +841,9 @@
 	Show All	Показати всі
 	Show All Constraint Bars	Показати всі панелі обмежень
 	Show All Dynamic Dimensions	Показати всі динамічні розміри
+	Show and hide the tools of this category	Показати й сховати інструменти цієї категорії
+	Show in Tool Sets	Показувати в наборах інструментів
+	Show command prompting near the crosshairs	Показувати запити команд біля перехрестя
 	Show Layer List	Показати список шарів
 	Show/Hide Lineweight	Показати/приховати товщину ліній
 	Show/Hide Transparency	Показати/приховати прозорість
@@ -732,8 +855,10 @@
 	Snap Mode	Режим крокової прив'язки
 	Snap Mode (F9)	Режим крокової прив'язки (F9)
 	Snap On (F9)	Увімкнути крокову прив'язку (F9)
+	Snap Overrides	Перевизначення прив'язок
 	Snap X spacing	Крок прив'язки X
 	Snap and Grid	Крокова прив'язка та сітка
+	Snap type	Тип крокової прив'язки
 	Solid	Тіло
 	Sort	Сортування
 	Specify a point	Укажіть точку
@@ -798,6 +923,42 @@
 	Specify included angle	Укажіть кут між сторонами
 	Specify insertion base point	Укажіть базову точку вставлення
 	Specify insertion point	Укажіть точку вставлення
+# Options dialog (OPTIONS).
+	A drawing opened from a file keeps that file's format.	Креслення, відкрите з файлу, зберігає формат цього файлу.
+	An array that would create more objects than this is refused.	Масив, що створив би більше об'єктів, буде відхилено.
+	CADCraft keeps these preferences, object snap modes and drafting toggles for your user account and restores them when it starts.	CADCraft зберігає ці параметри, режими об'єктної прив'язки та перемикачі креслення для вашого облікового запису й відновлює їх під час запуску.
+	Changes apply at once and are kept for next time.	Зміни застосовуються одразу й зберігаються на наступний раз.
+	Command line history	Історія командного рядка
+	Copy as JSON	Копіювати як JSON
+	Crosshair size	Розмір перехрестя
+	Display	Відображення
+	Grip size	Розмір ручок
+	Hold Shift to add to the selection	Утримувати Shift, щоб додати до вибору
+	Interface language	Мова інтерфейсу
+	Interface theme	Тема інтерфейсу
+	Keep the system cursor visible over the drawing area	Показувати системний курсор над областю креслення
+	Largest array	Найбільший масив
+	Layout paper	Папір аркуша
+	Model background	Тло простору моделі
+	Object snap aperture	Апертура об'єктної прив'язки
+	Object snap marker size	Розмір маркера об'єктної прив'язки
+	Open and Save	Відкриття та збереження
+	Options	Параметри
+	Options...	Параметри...
+	Pickbox size	Розмір прицілу вибору
+	Profiles	Профілі
+	Reset keeps the interface language.	Скидання не змінює мову інтерфейсу.
+	Reset to Defaults	Скинути до типових
+	Save new drawings as	Зберігати нові креслення як
+	Screen magnifiers, screen readers and recorders follow the system cursor.	Екранні лупи, програми читання з екрана та запису стежать за системним курсором.
+	Select objects first, then choose a command	Спочатку вибирати об'єкти, потім команду
+	Selection	Вибір
+	Settings...	Налаштування...
+	Show Quick Properties for selected objects	Показувати швидкі властивості вибраних об'єктів
+	Snap, grid, polar tracking and Dynamic Input:	Крок, сітка, полярне відстеження та динамічне введення:
+	The aperture is how near the cursor must come to a point for an object snap to find it.	Апертура — це наскільки близько курсор має підійти до точки, щоб об'єктна прив'язка її знайшла.
+	User Preferences	Налаштування користувача
+	objects	об'єктів
 	Specify inside diameter of donut	Укажіть внутрішній діаметр кільця
 	Specify leader arrowhead location	Укажіть розташування стрілки виноски
 	Specify leader endpoint	Укажіть кінцеву точку виноски
@@ -865,6 +1026,7 @@
 	Specify width for rectangles	Укажіть ширину прямокутників
 	Sphere	Сфера
 	Spline	Сплайн
+	Spline Edit	Редагувати сплайн
 	Stack (type 1/2 then select)	Дріб (введіть 1/2, потім виділіть)
 	Standard	Стандартний
 	Start	Початок
@@ -889,16 +1051,20 @@
 	Switch between model space in a viewport and paper space	Перемкнути між простором моделі у видовому екрані та простором аркуша
 	Symmetric	Симетрія
 	Synchronize Attributes	Синхронізувати атрибути
+	To	До
 	Toggle PICKADD (off: each pick replaces the selection)	Перемкнути PICKADD (вимкнено: кожен вибір замінює набір вибраних об'єктів)
 	Toggle PICKADD (on: picks add to the selection)	Перемкнути PICKADD (увімкнено: вибране додається до набору вибраних об'єктів)
 	TOP	ЗВЕРХУ
 	Table	Таблиця
+	Table Breaks	Розриви таблиці
+	Table Cell Style	Стиль комірок таблиці
 	Table Style...	Стиль таблиць...
 	Table style	Стиль таблиць
 	Table...	Таблиця...
 	Tan, Tan, Radius	Дотична, дотична, радіус
 	Tan, Tan, Tan	Дотична, дотична, дотична
 	Tangent	Дотичність
+	Temporary track point	Тимчасова точка відстеження
 	Text	Текст
 	Text Editor	Текстовий редактор
 	Text Height	Висота тексту
@@ -907,6 +1073,7 @@
 	Text override	Перевизначення тексту
 	Text style	Текстовий стиль
 	Thaw All Layers	Розморозити всі шари
+	Thaw Layer	Розморозити шар
 	There is nothing here yet.	Тут поки що нічого немає.
 	Thickness	Висота видавлювання
 	Time	Час
@@ -916,11 +1083,14 @@
 	Tools	Інструменти
 	Torus	Тор
 	Trace	Смуга
+	Track orthogonally only	Відстежувати лише ортогонально
+	Track using all polar angle settings	Відстежувати за всіма полярними кутами
 	Transparency	Прозорість
 	Trim	Обрізати
 	True Color	Колір RGB
 	Turn All Layers On	Увімкнути всі шари
 	Turn Off Layer	Вимкнути шар
+	Turn On Layer	Увімкнути шар
 	Turn Quick Properties off (QPMODE)	Вимкнути швидкі властивості (QPMODE)
 	Type	Тип
 	Type a command	Введіть команду
@@ -931,21 +1101,32 @@
 	Ungroup	Розгрупувати
 	Union	Об'єднання
 	Unisolate Layer	Скасувати ізоляцію шарів
+	Units Conversion	Перетворення одиниць
 	Units...	Одиниці...
 	Unlock Layer	Розблокувати шар
+	Unlock viewport	Розблокувати видовий екран
 	Unmerge Cells	Розділити комірки
 	Unsaved Layer State	Незбережений стан шарів
 	Up	Угору
+	Update Data Links	Оновити зв’язки з даними
 	Update	Оновити
 	Use System Setting	Як у системі
 	User	Користувач
 	User Parameters	Параметри користувача
 	Username	Ім'я користувача
+	Volume	Об'єм
 	VP Color	Колір ВЕ
 	VP Freeze	Заморожування ВЕ
 	Value	Значення
 	Value:	Значення:
+	Variables	Змінні
 	Version	Версія
+	Version 2000	Версія 2000
+	Version 2004	Версія 2004
+	Version 2007	Версія 2007
+	Version 2010	Версія 2010
+	Version 2013	Версія 2013
+	Version 2018	Версія 2018
 	Version {version}	Версія {version}
 	Vertical	Вертикальність
 	VerticalDistance	Вертикальна відстань
@@ -954,6 +1135,8 @@
 	Viewport	Видовий екран
 	Viewport Layer Freeze	Заморозити шар у видовому екрані
 	Viewport Properties	Властивості видового екрана
+	Viewport is locked	Видовий екран заблоковано
+	Viewport scale	Масштаб видового екрана
 	Viewport {id}	Видовий екран {id}
 	Viewports	Видові екрани
 	W	Зх
@@ -969,11 +1152,13 @@
 	Yes	Так
 	Zoom	Масштабування виду
 	Zoom All	Показати все
+	Zoom Dynamic	Динамічне масштабування
 	Zoom Extents	Показати межі об'єктів
 	Zoom In	Наблизити
 	Zoom Object	Показати об'єкт
 	Zoom Out	Віддалити
 	Zoom Previous	Попередній масштаб
+	Zoom Realtime	Масштабування в реальному часі
 	Zoom Window	Масштабувати рамкою
 	error	помилка
 	{contributors} · {commits}	{contributors} · {commits}
@@ -993,3 +1178,54 @@
 	Hide Others	Приховати інші
 	Accessibility	Спеціальні можливості
 	Show System Cursor	Показувати системний курсор
+	Import...	Імпорт...
+	Export...	Експорт...
+	Batch Publish...	Пакетна публікація...
+	Scale List...	Список масштабів...
+	Annotative Object Scale	Масштаб анотативних об'єктів
+	Add Current Scale	Додати поточний масштаб
+	Delete Current Scale	Видалити поточний масштаб
+	Add/Delete Scales...	Додати/видалити масштаби...
+	Synchronize Multiple-scale Positions	Синхронізувати положення для кількох масштабів
+	Annotative Update	Оновити анотативні об'єкти
+	Show Annotative Objects	Показувати анотативні об'єкти
+	Current Scale Only	Лише поточний масштаб
+	All Scales	Усі масштаби
+	Drawing Recovery Manager...	Диспетчер відновлення креслень...
+	Tolerance...	Допуск...
+	Add Vertex	Додати вершину
+	Remove Vertex	Видалити вершину
+	Convert to Arc	Перетворити на дугу
+	Convert to Line	Перетворити на відрізок
+	Stretch Vertex	Розтягнути вершину
+	Edit Array	Редагувати масив
+	Close Array Editing	Завершити редагування масиву
+	Multiline...	Мультилінія...
+	Multiline Style...	Стиль мультилінії...
+	Solid Editing	Редагування тіл
+	3D Mouse...	3D-миша...
+	3D Mouse	3D-миша
+	Calibrate 3D Mouse	Калібрувати 3D-мишу
+	3D Mouse Navigation	Навігація за допомогою 3D-миші
+	3D mouse input is unavailable on this platform	Введення з 3D-миші недоступне на цій платформі
+	No supported 3D mouse found	Сумісну 3D-мишу не знайдено
+	Release the 3D mouse to calibrate its resting position	Відпустіть 3D-мишу, щоб відкалібрувати її положення спокою
+	3D mouse connected	3D-мишу підключено
+	3D mouse busy, possibly 3DxWare or missing device permissions	3D-миша зайнята, можливо, через 3DxWare або недостатні права доступу до пристрою
+	3D mouse disconnected	3D-мишу відключено
+	3D mouse input could not be started	Не вдалося запустити введення з 3D-миші
+	Enable 3D mouse navigation	Увімкнути навігацію 3D-мишею
+	Pan sensitivity	Чутливість панорамування
+	Zoom sensitivity	Чутливість масштабування
+	Reverse zoom direction	Змінити напрямок масштабування
+	Calibrate	Калібрувати
+	Move sideways to pan; push/pull or twist to zoom.	Рухайте вбік для панорамування; натискайте, тягніть або обертайте для масштабування.
+	Left device button: zoom extents. Right device button: calibrate.	Ліва кнопка пристрою: масштабування до меж. Права кнопка: калібрування.
+	More toolbar commands	Інші команди панелі інструментів
+	Default save version	Типова версія збереження
+	Automatic save every	Автозбереження кожні
+	min	хв
+	Automatic save file location	Папка файлів автозбереження
+	Drawings with no file yet are saved in the default version. 0 minutes turns automatic save off.	Креслення, що ще не мають файлу, зберігаються в типовій версії. 0 хвилин вимикає автозбереження.
+	Time-sensitive right-click: a quick click is Enter, holding opens the menu	Клік правою кнопкою з урахуванням часу: швидкий клік — Enter, утримання відкриває меню
+	Turned off, a right-click while a command runs always opens the shortcut menu.	Якщо вимкнено, клік правою кнопкою під час команди завжди відкриває контекстне меню.

@@ -16,10 +16,21 @@ pub struct CmdLine {
     typed_since_selection: bool,
     pub history: Vec<String>,
     pub history_pos: Option<usize>,
+    /// What was typed at command prompts (not command names), oldest first: the in-command
+    /// shortcut menu's Recent Input.
+    pub recent_input: Vec<String>,
     /// The expanded history window is open (F2, the chevron, or a click on the history lines).
     pub expanded: bool,
     /// Dragging the history's top edge: (pointer y, line count) when the drag started.
     resize_from: Option<(f32, usize)>,
+    /// The Dynamic Input options menu at the cursor (Down Arrow at a prompt with keywords).
+    pub options: Option<crate::dyninput::OptionsMenu>,
+    /// The text whose second Dynamic Input value Tab locked; the lock holds while it is unchanged.
+    locked_second: Option<String>,
+    /// Where the options menu's rows were drawn last frame (screen), for clicks on them.
+    pub option_rows: Vec<(Rect, String)>,
+    /// Where the Dynamic Input tooltip stays while the options menu is open.
+    pub options_anchor: Option<Pos2>,
 }
 
 /// The most history lines the command line shows above its bar.
@@ -27,13 +38,13 @@ pub const MAX_LINES: usize = 12;
 const LINE_H: f32 = 16.0;
 
 /// The Dynamic Input frame for the prompt on screen, or `None` when the value boxes are not live
-/// (Dynamic Input off, no point prompt, a hot grip or a pending selection window).
+/// (Dynamic Input off, no point prompt or a pending selection window).
 pub fn dyn_frame(app: &CadApp) -> Option<crate::dyninput::Frame> {
     let st = &app.session.settings;
-    if !st.dynmode || app.canvas.hot_grip.is_some() || app.session.pending_window.is_some() {
+    if !st.dynmode || app.session.pending_window.is_some() {
         return None;
     }
-    let p = app.session.current_prompt().filter(|p| p.accept.point && !p.accept.select)?;
+    let p = app.session.current_prompt().filter(cadcraft_engine::pointmod::accepts)?;
     Some(crate::dyninput::Frame { base: p.base, cartesian: st.dynpi_cartesian, absolute: st.dynpi_absolute })
 }
 
@@ -63,6 +74,10 @@ pub fn capture_tab(ctx: &egui::Context, raw: &mut egui::RawInput) {
 /// Tab on the command line: cycle the object snaps under the cursor, type the Dynamic Input
 /// separator (`,` or `<`) after a value, or complete a command name.
 fn tab(app: &mut CadApp) {
+    // Grip dimensional input: Tab locks the typed value and moves to the next field.
+    if crate::grip_dyn::tab(app) {
+        return;
+    }
     // Over a snap marker with nothing typed, Tab cycles the candidate snaps.
     if app.cmd.buffer.is_empty() && app.canvas.snap.is_some() {
         app.canvas.snap_tab = true;
@@ -70,6 +85,11 @@ fn tab(app: &mut CadApp) {
         && let Some(sep) = crate::dyninput::tab_separator(&app.cmd.buffer, &f)
     {
         app.cmd.buffer.push(sep);
+    } else if let Some(f) = dyn_frame(app)
+        && crate::dyninput::can_lock_second(&app.cmd.buffer, &f)
+    {
+        // Both values typed: Tab locks the second one as well.
+        app.cmd.locked_second = Some(app.cmd.buffer.clone());
     } else if let Some((id, _)) = suggestions(&app.cmd.buffer).first() {
         app.cmd.buffer = id.clone();
     }
@@ -106,6 +126,53 @@ impl CmdLine {
             self.typed_since_selection = true;
         }
     }
+
+    /// Tab locked the second Dynamic Input value and nothing was typed since.
+    pub fn second_locked(&self) -> bool {
+        self.locked_second.as_deref() == Some(self.buffer.as_str())
+    }
+
+    /// The options menu row under `at` (screen), if the menu is open.
+    pub fn option_at(&self, at: Pos2) -> Option<String> {
+        self.options.as_ref()?;
+        self.option_rows.iter().find(|(r, _)| r.contains(at)).map(|(_, k)| k.clone())
+    }
+}
+
+/// Keep the options menu only while its prompt is on screen with Dynamic Input and DYNPROMPT on.
+fn options_still_fit(app: &mut CadApp) {
+    let st = &app.session.settings;
+    let on = st.dynmode && st.dynprompt && app.canvas.hot_grips.is_empty();
+    let kws = app.session.current_prompt().map(|p| p.keywords).unwrap_or_default();
+    if app.cmd.options.as_ref().is_some_and(|m| !on || !m.fits(&kws)) {
+        app.cmd.options = None;
+    }
+}
+
+/// Down Arrow at a prompt with keywords (Dynamic Input on, DYNPROMPT on, not browsing the
+/// history): open the options menu at the cursor, or move its highlight. `false` when the key is
+/// left for the history.
+fn options_key(app: &mut CadApp, step: isize) -> bool {
+    if let Some(m) = app.cmd.options.as_mut() {
+        m.step(step);
+        return true;
+    }
+    let st = &app.session.settings;
+    if step < 0 || !st.dynmode || !st.dynprompt || app.cmd.history_pos.is_some() || !app.canvas.hot_grips.is_empty() {
+        return false;
+    }
+    let kws = app.session.current_prompt().map(|p| p.keywords).unwrap_or_default();
+    app.cmd.options = crate::dyninput::OptionsMenu::open(&kws);
+    app.cmd.options.is_some()
+}
+
+/// Send a keyword picked from the options menu, as a click on it at the command line does.
+pub fn pick_option(app: &mut CadApp, keyword: String) {
+    app.cmd.options = None;
+    app.cmd.buffer.clear();
+    if let Err(e) = app.session.input(Input::Keyword(keyword)) {
+        app.session.echo(e.to_string());
+    }
 }
 
 /// Whether Backspace should erase the selection instead of editing the command line. The key
@@ -136,42 +203,40 @@ pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
     let selection = app.session.selection();
     app.cmd.watch_selection(&selection);
     let mac = ctx.os() == egui::os::OperatingSystem::Mac;
-    // A hot grip takes Space/Enter (cycle mode, or apply a typed point) and Escape.
-    if app.canvas.hot_grip.is_some() {
-        for ev in &events {
-            match ev {
-                egui::Event::Text(t) if t != " " && t != "\t" => app.cmd.buffer.push_str(t),
-                egui::Event::Key { key: Key::Backspace, pressed: true, .. } => {
-                    app.cmd.buffer.pop();
+    let text_prompt = app.session.current_prompt().is_some_and(|p| p.accept.text && !p.accept.point && !p.accept.number);
+    options_still_fit(app);
+    for ev in events {
+        // The options menu takes the arrows, Enter and Escape; typing closes it.
+        if app.cmd.options.is_some() {
+            let space = matches!(&ev, egui::Event::Text(t) if t == " ") && !text_prompt;
+            match &ev {
+                _ if space => {
+                    if let Some(k) = app.cmd.options.as_ref().and_then(|m| m.current()).map(str::to_owned) {
+                        pick_option(app, k);
+                    }
+                    continue;
+                }
+                egui::Event::Key { key: Key::Enter, pressed: true, .. } => {
+                    if let Some(k) = app.cmd.options.as_ref().and_then(|m| m.current()).map(str::to_owned) {
+                        pick_option(app, k);
+                    }
+                    continue;
                 }
                 egui::Event::Key { key: Key::Escape, pressed: true, .. } => {
-                    app.canvas.hot_grip = None;
-                    app.cmd.buffer.clear();
-                    app.session.echo("*Cancel*");
+                    app.cmd.options = None;
+                    continue;
                 }
-                egui::Event::Key { key: Key::Enter | Key::Space, pressed: true, .. } => {
-                    let typed = std::mem::take(&mut app.cmd.buffer);
-                    if typed.trim().is_empty() {
-                        if let Some(g) = app.canvas.hot_grip.as_mut() {
-                            g.next_mode();
-                            let l = g.label();
-                            app.session.echo(l);
-                        }
-                    } else {
-                        let base = app.canvas.hot_grip.map(|g| g.base).unwrap_or_default();
-                        match cadcraft_engine::prompt::parse_point_with(&typed, base, &app.session.angle_settings()) {
-                            Some(p) => crate::canvas::apply_hot_grip(app, p),
-                            None => app.session.echo("Requires a point (x,y, @dx,dy or @d<a)."),
-                        }
-                    }
+                egui::Event::Key { key: Key::ArrowUp, pressed: true, modifiers, .. } if !modifiers.any() => {
+                    options_key(app, -1);
+                    continue;
                 }
+                egui::Event::Key { key: Key::ArrowDown | Key::ArrowUp, pressed: true, .. } => {}
+                // Space arrives as a key and as text; the text picks.
+                egui::Event::Key { key: Key::Space, .. } => {}
+                egui::Event::Text(_) | egui::Event::Key { pressed: true, .. } => app.cmd.options = None,
                 _ => {}
             }
         }
-        return;
-    }
-    let text_prompt = app.session.current_prompt().is_some_and(|p| p.accept.text && !p.accept.point && !p.accept.number);
-    for ev in events {
         match ev {
             egui::Event::Text(t) => {
                 if t == "\t" {
@@ -213,7 +278,9 @@ pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
                     }
                 }
                 Key::ArrowDown if !modifiers.any() => {
-                    if let Some(p) = app.cmd.history_pos {
+                    if !options_key(app, 1)
+                        && let Some(p) = app.cmd.history_pos
+                    {
                         let np = p + 1;
                         if np >= app.cmd.history.len() {
                             app.cmd.history_pos = None;
@@ -237,6 +304,10 @@ pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
 }
 
 pub fn submit(app: &mut CadApp) {
+    // Grip dimensional input: the typed lengths and angles place the grip.
+    if crate::grip_dyn::submit(app) {
+        return;
+    }
     // Dynamic Input: a split entry (`40,30`, `40<90`, `40,`) is completed from the cursor and
     // measured from the last point.
     if let Some(f) = dyn_frame(app) {
@@ -248,6 +319,7 @@ pub fn submit(app: &mut CadApp) {
         }
     }
     let text = std::mem::take(&mut app.cmd.buffer);
+    app.cmd.locked_second = None;
     app.cmd.history_pos = None;
     if !text.trim().is_empty() && app.session.running.is_none() {
         app.cmd.history.push(text.clone());
@@ -255,6 +327,7 @@ pub fn submit(app: &mut CadApp) {
             app.cmd.history.remove(0);
         }
     }
+    crate::context_menu::note_input(app, &text);
     if text.is_empty() {
         if let Err(e) = app.session.input(Input::Enter) {
             app.session.echo(e.to_string());
@@ -271,7 +344,6 @@ fn visible_lines(app: &CadApp, canvas: Rect, bar: Rect) -> usize {
 
 pub fn show(app: &mut CadApp, ui: &mut egui::Ui, canvas: Rect) {
     let t = Tokens::get();
-    keyboard(app, ui.ctx());
     let w = (canvas.width() * 0.48).clamp(360.0, 760.0).min((canvas.width() - 8.0).max(0.0));
     let h = 24.0;
     let bar = Rect::from_min_size(pos2(canvas.center().x - w / 2.0, canvas.bottom() - h - 10.0), vec2(w, h));
@@ -295,75 +367,69 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, canvas: Rect) {
     let mut x = bar.left() + 30.0;
     let prompt = app.session.current_prompt();
     let font = crate::theme::body();
-    if let Some(g) = app.canvas.hot_grip {
-        let gl = p.layout_no_wrap(crate::i18n::t(g.label()).to_string(), font.clone(), t.text);
-        let gw = gl.size().x;
-        p.galley(pos2(x, bar.center().y - gl.size().y / 2.0), gl, t.text);
-        x += gw + 6.0;
-    } else {
-        match &prompt {
-            Some(pr) => {
-                let name = app.session.running.as_ref().map(|r| r.id.to_ascii_uppercase()).unwrap_or_default();
-                let g = p.layout_no_wrap(format!("{name} "), font.clone(), t.text_faint);
-                let gw = g.size().x;
-                p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text_faint);
-                x += gw;
-                let g = p.layout_no_wrap(crate::i18n::t(&pr.message).to_string(), font.clone(), t.text);
+    match &prompt {
+        Some(pr) => {
+            // The grip modes name themselves ("** STRETCH **…").
+            let name = app.session.running.as_ref().filter(|r| r.id != "grip").map(|r| r.id.to_ascii_uppercase() + " ").unwrap_or_default();
+            let g = p.layout_no_wrap(name, font.clone(), t.text_faint);
+            let gw = g.size().x;
+            p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text_faint);
+            x += gw;
+            let g = p.layout_no_wrap(crate::i18n::t(&pr.message).to_string(), font.clone(), t.text);
+            let gw = g.size().x;
+            p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text);
+            x += gw;
+            if !pr.keywords.is_empty() {
+                let g = p.layout_no_wrap(if pr.message.is_empty() { " [".into() } else { crate::tl!(" or [").into() }, font.clone(), t.text);
                 let gw = g.size().x;
                 p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text);
                 x += gw;
-                if !pr.keywords.is_empty() {
-                    let g = p.layout_no_wrap(if pr.message.is_empty() { " [".into() } else { crate::tl!(" or [").into() }, font.clone(), t.text);
-                    let gw = g.size().x;
-                    p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text);
-                    x += gw;
-                    let kws = pr.keywords.clone();
-                    for (i, k) in kws.iter().enumerate() {
-                        let g = p.layout_no_wrap(k.clone(), font.clone(), t.cmd_keyword);
-                        let r = Rect::from_min_size(pos2(x, bar.top() + 3.0), vec2(g.size().x, h - 6.0));
-                        let resp = ui.interact(r, ui.id().with(("kw", i)), Sense::click());
-                        if resp.hovered() {
-                            p.rect_filled(r, 2.0, t.cmd_keyword_hover);
-                        }
-                        let gw = g.size().x;
-                        p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.cmd_keyword);
-                        x += gw;
-                        if resp.clicked() {
-                            let _ = app.session.input(Input::Keyword(k.clone()));
-                        }
-                        if i + 1 < kws.len() {
-                            let g = p.layout_no_wrap("/".into(), font.clone(), t.text);
-                            let gw = g.size().x;
-                            p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text);
-                            x += gw;
-                        }
+                let kws = pr.keywords.clone();
+                for (i, k) in kws.iter().enumerate() {
+                    let g = p.layout_no_wrap(k.clone(), font.clone(), t.cmd_keyword);
+                    let r = Rect::from_min_size(pos2(x, bar.top() + 3.0), vec2(g.size().x, h - 6.0));
+                    let resp = ui.interact(r, ui.id().with(("kw", i)), Sense::click());
+                    if resp.hovered() {
+                        p.rect_filled(r, 2.0, t.cmd_keyword_hover);
                     }
-                    let g = p.layout_no_wrap("]".into(), font.clone(), t.text);
                     let gw = g.size().x;
-                    p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text);
+                    p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.cmd_keyword);
                     x += gw;
+                    if resp.clicked() {
+                        let _ = app.session.input(Input::Keyword(k.clone()));
+                    }
+                    if i + 1 < kws.len() {
+                        let g = p.layout_no_wrap("/".into(), font.clone(), t.text);
+                        let gw = g.size().x;
+                        p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text);
+                        x += gw;
+                    }
                 }
-                if let Some(d) = &pr.default {
-                    let g = p.layout_no_wrap(format!(" <{d}>"), font.clone(), t.text);
-                    let gw = g.size().x;
-                    p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text);
-                    x += gw;
-                }
-                let g = p.layout_no_wrap(": ".into(), font.clone(), t.text);
+                let g = p.layout_no_wrap("]".into(), font.clone(), t.text);
                 let gw = g.size().x;
                 p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text);
                 x += gw;
             }
-            None => {
-                if app.cmd.buffer.is_empty() {
-                    p.text(
-                        pos2(x, bar.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        crate::tl!("Type a command"),
-                        egui::FontId::proportional(12.5),
-                        t.text_faint,
-                    );
-                }
+            if let Some(d) = &pr.default {
+                let g = p.layout_no_wrap(format!(" <{d}>"), font.clone(), t.text);
+                let gw = g.size().x;
+                p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text);
+                x += gw;
+            }
+            let g = p.layout_no_wrap(": ".into(), font.clone(), t.text);
+            let gw = g.size().x;
+            p.galley(pos2(x, bar.center().y - g.size().y / 2.0), g, t.text);
+            x += gw;
+        }
+        None => {
+            if app.cmd.buffer.is_empty() {
+                p.text(
+                    pos2(x, bar.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    crate::tl!("Type a command"),
+                    egui::FontId::proportional(12.5),
+                    t.text_faint,
+                );
             }
         }
     }
@@ -489,6 +555,7 @@ fn history(app: &mut CadApp, ui: &mut egui::Ui, canvas: Rect, bar: Rect) {
     if resp.clicked() && resp.interact_pointer_pos().is_some_and(on_toggle) {
         let _ = app.run("ui.toggle.history", serde_json::json!({}));
     }
+    crate::shortcut_menus::attach(app, &resp, crate::shortcut_menus::command_line_entries);
     if let Some(r) = zones(app, canvas, bar).window {
         history_window(app, ui, r);
     }

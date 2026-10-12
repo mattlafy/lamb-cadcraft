@@ -1,9 +1,10 @@
 //! Hit testing and window/crossing selection.
 
 use cadcraft_doc::{Drawing, Entity, EntityKind, Handle, Prim, Space, entity_bounds};
-use cadcraft_geom::{Bounds2, Line, Vec2};
+use cadcraft_geom::{Bounds2, Line, Vec2, point_in_polygon};
 
 use crate::spatial::{self, SpatialIndex};
+use crate::{Accept, Prompt};
 
 /// Polylines approximating an entity for hit testing, tessellated at `tol`.
 pub fn hit_polylines(d: &Drawing, e: &Entity, tol: f64) -> Vec<Vec<Vec2>> {
@@ -14,6 +15,7 @@ pub fn hit_polylines(d: &Drawing, e: &Entity, tol: f64) -> Vec<Vec<Vec2>> {
         | EntityKind::Dimension(_)
         | EntityKind::AttDef(_)
         | EntityKind::Table(_)
+        | EntityKind::Tolerance(_)
         | EntityKind::MLeader(_)
         | EntityKind::Image(_) => {
             // Text-like objects are hit inside their box.
@@ -57,6 +59,19 @@ pub fn hit_polylines(d: &Drawing, e: &Entity, tol: f64) -> Vec<Vec<Vec2>> {
                 }
                 out.push(pts);
             }
+            // A pattern hatch is also picked on its drawn pattern strokes, not only its boundary.
+            if let EntityKind::Hatch(h) = kind
+                && !h.solid
+                && h.gradient.is_none()
+                && !h.pattern.eq_ignore_ascii_case("SOLID")
+            {
+                let list = cadcraft_render::build_entities(
+                    d,
+                    std::iter::once(e),
+                    &cadcraft_render::Options { tolerance: tol, text: false, fill: false, ..Default::default() },
+                );
+                out.extend(list.prims.iter().map(|p| list.points(p).to_vec()));
+            }
             out
         }
     }
@@ -74,6 +89,7 @@ pub fn entity_distance(d: &Drawing, e: &Entity, p: Vec2, tol: f64) -> f64 {
     let polys = hit_polylines(d, e, tol);
     let mut best = polys.iter().map(|pl| dist_to_polyline(pl, p)).fold(f64::INFINITY, f64::min);
     let filled = matches!(e.kind, EntityKind::Text(_) | EntityKind::MText(_) | EntityKind::AttDef(_) | EntityKind::Solid(_) | EntityKind::Table(_))
+        || matches!(e.kind, EntityKind::Tolerance(_))
         || matches!(&e.kind, EntityKind::Hatch(h) if h.solid);
     if filled && entity_bounds(d, e, 0).contains(p) {
         best = 0.0;
@@ -242,6 +258,138 @@ pub(crate) fn select_fence_with(d: &Drawing, space: &Space, ix: &Option<std::syn
     out
 }
 
+/// Window polygon selection (entities entirely inside `poly`) or crossing polygon selection
+/// (inside or crossing its edges). The polygon closes back to its first point.
+pub fn select_polygon(d: &Drawing, space: &Space, poly: &[Vec2], crossing: bool) -> Vec<Handle> {
+    let (Some(first), true) = (poly.first(), poly.len() >= 3) else { return Vec::new() };
+    let ix = spatial::index(d, space);
+    let pb = Bounds2::from_points(poly.iter().copied());
+    let tol = (pb.width() + pb.height()).max(1e-9) / 2000.0;
+    let Some(cands) = candidates(d, space, &ix, &pb, crossing, false) else { return Vec::new() };
+    let edges: Vec<Line> =
+        poly.windows(2).filter_map(|w| Some(Line::new(*w.first()?, *w.get(1)?))).chain(poly.last().map(|l| Line::new(*l, *first))).collect();
+    let mut out = Vec::new();
+    for (e, known) in cands {
+        let infinite = is_infinite(e);
+        if !selectable(d, e) || (infinite && !crossing) {
+            continue;
+        }
+        let eb = bounds_of(d, e, known);
+        if !infinite && if crossing { !eb.intersects(&pb) } else { !pb.contains_box(&eb) } {
+            continue;
+        }
+        let polys = hit_polylines(d, e, tol);
+        let crosses = polys.iter().any(|pl| {
+            pl.windows(2).any(|w| {
+                w.first().zip(w.get(1)).is_some_and(|(p, q)| edges.iter().any(|f| cadcraft_geom::line_line(f, &Line::new(*p, *q)).is_some()))
+            })
+        });
+        let mut pts = polys.iter().flatten();
+        let hit = if crossing {
+            crosses || pts.any(|p| point_in_polygon(poly, *p))
+        } else {
+            !crosses && !polys.is_empty() && pts.all(|p| point_in_polygon(poly, *p))
+        };
+        if hit {
+            out.push(e.handle);
+        }
+    }
+    out
+}
+
+/// The visible objects in `space` of the group called `name` (any case), or `None` when the
+/// drawing has no such group.
+pub fn select_group(d: &Drawing, space: &Space, name: &str) -> Option<Vec<Handle>> {
+    let g = d.groups.iter().find(|g| g.name.eq_ignore_ascii_case(name.trim()))?;
+    let store = d.space(space)?;
+    Some(g.members.iter().copied().filter(|h| store.get(*h).is_some_and(|e| d.is_visible(e))).collect())
+}
+
+/// A selection mode typed at "Select objects", collecting its points before it selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectKind {
+    /// `W`: objects entirely inside two corners, whichever order they come in.
+    Window,
+    /// `C`: objects inside or crossing two corners, whichever order they come in.
+    Crossing,
+    /// `F`: objects crossed by a series of points; Enter ends it.
+    Fence,
+    /// `WP`: objects entirely inside a polygon; Enter closes it.
+    WPolygon,
+    /// `CP`: objects inside or crossing a polygon; Enter closes it.
+    CPolygon,
+    /// `BOX`: two corners; left to right is a window, right to left a crossing.
+    Box,
+    /// `G`: the objects of a group, by name.
+    Group,
+}
+
+/// Most points a fence or polygon collects (typed input is hostile).
+const MAX_MODE_POINTS: usize = 10_000;
+
+/// A typed selection mode in progress and the points given so far.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectMode {
+    pub kind: SelectKind,
+    pub pts: Vec<Vec2>,
+}
+
+impl SelectMode {
+    /// The mode named by text typed at "Select objects" (`W`, `Window`, `C`, `F`, `WP`, `CP`…).
+    pub fn from_keyword(text: &str) -> Option<Self> {
+        let kind = match text.trim().to_ascii_lowercase().as_str() {
+            "w" | "window" => SelectKind::Window,
+            "c" | "crossing" => SelectKind::Crossing,
+            "f" | "fence" => SelectKind::Fence,
+            "wp" | "wpolygon" => SelectKind::WPolygon,
+            "cp" | "cpolygon" => SelectKind::CPolygon,
+            "box" => SelectKind::Box,
+            "g" | "group" => SelectKind::Group,
+            _ => return None,
+        };
+        Some(SelectMode { kind, pts: Vec::new() })
+    }
+    fn is_box(&self) -> bool {
+        matches!(self.kind, SelectKind::Window | SelectKind::Crossing | SelectKind::Box)
+    }
+    /// The prompt shown while the mode collects points.
+    pub fn prompt(&self) -> Prompt {
+        let last = self.pts.last().copied();
+        let (first, next) = match self.kind {
+            SelectKind::Group => return Prompt::new("Enter group name", Accept::TEXT),
+            SelectKind::Window | SelectKind::Crossing | SelectKind::Box => ("Specify first corner", "Specify opposite corner"),
+            SelectKind::Fence => ("Specify first fence point", "Specify next fence point"),
+            SelectKind::WPolygon | SelectKind::CPolygon => ("Specify first polygon point", "Specify endpoint of line"),
+        };
+        match last {
+            None => Prompt::new(first, Accept::POINT),
+            Some(p) if self.is_box() => Prompt::new(next, Accept::POINT).base(p),
+            Some(p) => Prompt::new(next, Accept::POINT).kw(&["Undo"]).base(p),
+        }
+    }
+    /// Add a point. Returns whether the mode is complete (the second corner of W/C).
+    pub fn push(&mut self, p: Vec2) -> bool {
+        if p.is_finite() && self.pts.len() < MAX_MODE_POINTS {
+            self.pts.push(p);
+        }
+        self.is_box() && self.pts.len() >= 2
+    }
+    /// The objects the mode selects, or `None` while it has too few points.
+    pub fn select(&self, d: &Drawing, space: &Space) -> Option<Vec<Handle>> {
+        match (self.kind, self.pts.as_slice()) {
+            (SelectKind::Window | SelectKind::Crossing, [a, b, ..]) => {
+                Some(select_window(d, space, Bounds2::new(*a, *b), self.kind == SelectKind::Crossing))
+            }
+            (SelectKind::Box, [a, b, ..]) => Some(select_window(d, space, Bounds2::new(*a, *b), b.x < a.x)),
+            (SelectKind::Fence, pts) if pts.len() >= 2 => Some(select_fence(d, space, pts)),
+            (SelectKind::WPolygon | SelectKind::CPolygon, pts) if pts.len() >= 3 => {
+                Some(select_polygon(d, space, pts, self.kind == SelectKind::CPolygon))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +452,55 @@ mod solid_interior_tests {
         assert!(!in_window(&d, &e, None, &empty, true, 0.01));
         let inside = Bounds2::new(Vec2::new(3.0, 3.0), Vec2::new(4.0, 4.0));
         assert!(in_window(&d, &e, None, &inside, true, 0.01));
+    }
+}
+
+#[cfg(test)]
+mod hatch_pattern_pick_tests {
+    use super::*;
+    use cadcraft_doc::{Common, Hatch, HatchLoop};
+    use cadcraft_geom::PolyVertex;
+
+    fn square(lo: f64, hi: f64, outer: bool) -> HatchLoop {
+        let vertices = [(lo, lo), (hi, lo), (hi, hi), (lo, hi)].iter().map(|&(x, y)| PolyVertex::new(Vec2::new(x, y))).collect();
+        HatchLoop { vertices, outer, sources: Vec::new() }
+    }
+
+    fn ansi31_hatch(loops: Vec<HatchLoop>) -> Drawing {
+        let mut d = Drawing::new_metric();
+        let hatch = Hatch {
+            pattern: "ANSI31".into(),
+            solid: false,
+            loops,
+            scale: 1.0,
+            angle: 0.0,
+            associative: false,
+            style: 0,
+            elevation: 0.0,
+            gradient: None,
+            origin: Vec2::ZERO,
+            background: None,
+            pattern_lines: Vec::new(),
+        };
+        d.add(&Space::Model, Common::default(), EntityKind::Hatch(hatch)).unwrap();
+        d
+    }
+
+    #[test]
+    fn pattern_hatch_is_picked_on_a_visible_stroke() {
+        let d = ansi31_hatch(vec![square(0.0, 10.0, true)]);
+        // The ANSI31 diagonal passes through the middle of the square.
+        assert!(pick(&d, &Space::Model, Vec2::new(5.0, 5.0), 0.05).is_some());
+        // The boundary is still pickable and a point outside is not.
+        assert!(pick(&d, &Space::Model, Vec2::new(5.0, 0.0), 0.05).is_some());
+        assert!(pick(&d, &Space::Model, Vec2::new(15.0, 5.0), 0.05).is_none());
+    }
+
+    #[test]
+    fn pattern_hatch_island_stays_empty() {
+        // The diagonal is clipped to [0,0]-[4,4] and [6,6]-[10,10] around the island.
+        let d = ansi31_hatch(vec![square(0.0, 10.0, true), square(4.0, 6.0, false)]);
+        assert!(pick(&d, &Space::Model, Vec2::new(1.0, 1.0), 0.05).is_some());
+        assert!(pick(&d, &Space::Model, Vec2::new(5.0, 5.0), 0.05).is_none());
     }
 }

@@ -22,7 +22,8 @@ use cadcraft_geom::Vec2;
 use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::raw::FileRef;
-use skrifa::{FontRef, MetadataProvider};
+use skrifa::raw::types::Tag;
+use skrifa::{FontRef, GlyphId, MetadataProvider};
 
 use crate::{Run, Shaped};
 
@@ -32,6 +33,13 @@ pub struct Face {
     pub bytes: Arc<Vec<u8>>,
     /// Face index inside a collection (0 for a plain font file).
     pub index: u32,
+}
+
+/// The same face of the same loaded file.
+impl PartialEq for Face {
+    fn eq(&self, other: &Face) -> bool {
+        Arc::ptr_eq(&self.bytes, &other.bytes) && self.index == other.index
+    }
 }
 
 impl std::fmt::Debug for Face {
@@ -46,8 +54,22 @@ impl Face {
         FontRef::from_index(&bytes, index).ok()?;
         Some(Face { bytes, index })
     }
-    fn font(&self) -> Option<FontRef<'_>> {
+    pub(crate) fn font(&self) -> Option<FontRef<'_>> {
         FontRef::from_index(&self.bytes, self.index).ok()
+    }
+    /// Whether two handles are the same face of the same loaded file.
+    pub(crate) fn same(&self, other: &Face) -> bool {
+        Arc::ptr_eq(&self.bytes, &other.bytes) && self.index == other.index
+    }
+    /// Whether the face has OpenType Arabic joining features (`init` / `medi` / `fina`). Faces
+    /// without them get Unicode presentation forms instead ([`crate::bidi::presentation_forms`]).
+    pub(crate) fn has_joining_features(&self) -> bool {
+        use skrifa::raw::TableProvider;
+        let tags = [Tag::new(b"init"), Tag::new(b"medi"), Tag::new(b"fina")];
+        self.font()
+            .and_then(|f| f.gsub().ok())
+            .and_then(|g| g.feature_list().ok())
+            .is_some_and(|l| l.feature_records().iter().any(|r| tags.contains(&r.feature_tag())))
     }
     /// Whether the face maps `c` to a glyph.
     pub fn has_glyph(&self, c: char) -> bool {
@@ -110,13 +132,44 @@ const PREFERRED_FALLBACK: &[&str] = &[
     "segoeui",
     "arial",
 ];
+/// Fonts known to cover a right-to-left script, tried before the general search for its
+/// characters (the general search loads a bounded number of files, and wide-coverage CJK fonts
+/// come first in it). Matched as substrings of the normalised file stem.
+const ARABIC_FALLBACK: &[&str] = &[
+    "vazirmatn",
+    "vazir",
+    "notonaskharabic",
+    "notosansarabic",
+    "notokufiarabic",
+    "amiri",
+    "sahel",
+    "samim",
+    "geezapro",
+    "segoeui",
+    "tahoma",
+    "arial",
+    "dejavusans",
+];
+const HEBREW_FALLBACK: &[&str] = &["notosanshebrew", "notoserifhebrew", "arial", "tahoma", "segoeui", "dejavusans"];
+/// Script-specific fallback files loaded per character, at most.
+const MAX_SCRIPT_FILES: usize = 4;
+
+/// Script-specific fallback font names for `c`, if any.
+fn script_fallback(c: char) -> &'static [&'static str] {
+    match c {
+        '\u{0600}'..='\u{08FF}' | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}' => ARABIC_FALLBACK,
+        '\u{0590}'..='\u{05FF}' | '\u{FB1D}'..='\u{FB4F}' => HEBREW_FALLBACK,
+        _ => &[],
+    }
+}
+
 const WEIGHT_WORDS: &[&str] = &["thin", "light", "medium", "semibold", "bold", "black", "heavy", "italic", "oblique", "mono", "condensed"];
 
 #[derive(Default)]
 struct Db {
     scanned: bool,
-    /// Font files found by the scan, by lower-case file stem.
-    paths: HashMap<String, PathBuf>,
+    /// Font files found by the scan and fonts compiled into the binary, by lower-case file stem.
+    paths: HashMap<String, Source>,
     /// Loaded or registered font file bytes, by lower-case file stem.
     files: HashMap<String, Arc<Vec<u8>>>,
     /// Name lookups already answered, found or not.
@@ -141,12 +194,24 @@ struct Fallback {
     by_char: HashMap<char, Option<usize>>,
 }
 
+/// Where a font file's bytes come from.
+enum Source {
+    /// An installed font file, read on first use.
+    File(PathBuf),
+    /// A font compiled into the binary ([`crate::CRAFT_FONTS`]), copied on first use.
+    Static(&'static [u8]),
+}
+
 fn lock() -> MutexGuard<'static, Db> {
     static DB: OnceLock<Mutex<Db>> = OnceLock::new();
     let mut g = DB.get_or_init(|| Mutex::new(Db::default())).lock().unwrap_or_else(PoisonError::into_inner);
     if !g.scanned {
         g.scanned = true;
-        g.paths = scan();
+        g.paths = scan().into_iter().map(|(stem, p)| (stem, Source::File(p))).collect();
+        // Embedded craft-fonts fonts take the place of an installed file with the same stem.
+        for f in crate::CRAFT_FONTS {
+            g.paths.insert(f.stem(), Source::Static(f.bytes));
+        }
     }
     g
 }
@@ -227,7 +292,10 @@ impl Db {
         if self.loaded_bytes >= MAX_LOADED_BYTES {
             return None;
         }
-        let bytes = Arc::new(read_file(self.paths.get(stem)?)?);
+        let bytes = Arc::new(match self.paths.get(stem)? {
+            Source::File(path) => read_file(path)?,
+            Source::Static(bytes) => bytes.to_vec(),
+        });
         self.loaded_bytes = self.loaded_bytes.saturating_add(bytes.len());
         self.files.insert(stem.to_string(), bytes.clone());
         Some(bytes)
@@ -290,14 +358,47 @@ impl Db {
         }
     }
 
+    /// Index in `fallback.faces` of a face of a font known to cover `c`'s script (loaded and
+    /// added on demand), if one is installed and has `c`.
+    fn search_script_fallback(&mut self, c: char) -> Option<usize> {
+        let names = script_fallback(c);
+        if names.is_empty() {
+            return None;
+        }
+        let mut stems: Vec<(usize, usize, String)> = self
+            .paths
+            .keys()
+            .chain(self.files.keys())
+            .filter_map(|s| {
+                let n = norm(s);
+                names.iter().position(|p| n.contains(p)).map(|pref| (weight_penalty(s, ""), pref, s.clone()))
+            })
+            .collect();
+        stems.sort();
+        stems.dedup_by(|a, b| a.2 == b.2);
+        for (_, _, stem) in stems.into_iter().take(MAX_SCRIPT_FILES) {
+            let Some(bytes) = self.file(&stem) else { continue };
+            let Some(face) = faces(&bytes).into_iter().find(|f| f.has_glyph(c)) else { continue };
+            if let Some(i) = self.fallback.faces.iter().position(|f| f.same(&face)) {
+                return Some(i);
+            }
+            if self.fallback.faces.len() >= MAX_FALLBACK_FACES {
+                return None;
+            }
+            self.fallback.faces.push(face);
+            return Some(self.fallback.faces.len() - 1);
+        }
+        None
+    }
+
     /// Index in `fallback.faces` of the first face that has `c`.
     fn search_fallback(&mut self, c: char) -> Option<usize> {
         if let Some(r) = self.fallback.by_char.get(&c) {
             return *r;
         }
-        let mut found = None;
+        let mut found = self.search_script_fallback(c);
         let mut i = 0;
-        while i < MAX_FALLBACK_FACES {
+        while found.is_none() && i < MAX_FALLBACK_FACES {
             if i >= self.fallback.faces.len() && !self.load_next_fallback() {
                 break;
             }
@@ -333,11 +434,15 @@ fn weight_penalty(stem: &str, want: &str) -> usize {
 /// Order font file stems for the missing-glyph search: known wide-coverage (CJK) fonts first,
 /// regular weights before bold, light and the like, then by name.
 pub(crate) fn rank_fallback(stems: &[String]) -> Vec<String> {
+    let embedded_rank = PREFERRED_FALLBACK.iter().position(|p| *p == "notosans").unwrap_or(PREFERRED_FALLBACK.len());
     let mut v: Vec<(usize, usize, String)> = stems
         .iter()
         .map(|s| {
             let n = norm(s);
             let pref = PREFERRED_FALLBACK.iter().position(|p| n.contains(p)).unwrap_or(PREFERRED_FALLBACK.len());
+            // Embedded craft-fonts fonts come right after the installed wide-coverage (CJK) fonts,
+            // before the general-purpose ones, so the bounded search always reaches them.
+            let pref = if crate::craft_fonts::is_embedded(s) { pref.min(embedded_rank) } else { pref };
             (pref, weight_penalty(s, ""), s.clone())
         })
         .collect();
@@ -350,6 +455,18 @@ pub(crate) fn rank_fallback(stems: &[String]) -> Vec<String> {
 pub fn register(name: &str, bytes: Vec<u8>) {
     let mut g = lock();
     g.files.insert(key(name), Arc::new(bytes));
+    g.resolved.clear();
+    g.fallback = Fallback::default();
+}
+
+/// Register font bytes that live for the whole process under a name; they are copied only when
+/// the font is first used, the way the embedded craft-fonts fonts are listed.
+#[cfg(test)]
+pub(crate) fn register_static(name: &str, bytes: &'static [u8]) {
+    let mut g = lock();
+    let k = key(name);
+    g.files.remove(&k);
+    g.paths.insert(k, Source::Static(bytes));
     g.resolved.clear();
     g.fallback = Fallback::default();
 }
@@ -463,16 +580,26 @@ pub fn fallback_for(c: char) -> Option<Face> {
 /// font's cap height.
 #[derive(Default)]
 pub(crate) struct GlyphOutline {
-    pub(crate) contours: Vec<Vec<Vec2>>,
+    pub(crate) contours: Arc<[Vec<Vec2>]>,
     pub(crate) advance: f64,
     pub(crate) cap: f64,
     /// The font maps the character (false: the missing-glyph shape).
     mapped: bool,
+    /// Its glyph id and face, for output that keeps text as text ([`crate::TextGlyph`]).
+    gid: u32,
+    face: Option<Face>,
 }
 
-/// Cached glyph outlines keyed by (font bytes address, length, face, char). Fonts live for the
+/// A glyph by character (through the face's character map) or by glyph id (shaper output).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum GlyphKey {
+    Char(char),
+    Id(u32),
+}
+
+/// Cached glyph outlines keyed by (font bytes address, length, face, glyph). Fonts live for the
 /// whole process in the font table, so the address identifies them.
-type GlyphCache = HashMap<(usize, usize, u32, char), Arc<GlyphOutline>>;
+type GlyphCache = HashMap<(usize, usize, u32, GlyphKey), Arc<GlyphOutline>>;
 
 fn glyph_cache() -> &'static Mutex<GlyphCache> {
     static C: OnceLock<Mutex<GlyphCache>> = OnceLock::new();
@@ -555,12 +682,31 @@ fn cap_height(f: &FontRef) -> f64 {
 /// The outline of `c` in `face` (its missing-glyph shape when unmapped; empty when the face
 /// doesn't parse).
 pub(crate) fn glyph(face: &Face, c: char) -> Arc<GlyphOutline> {
-    let key = (face.bytes.as_ptr() as usize, face.bytes.len(), face.index, c);
+    outline(face, GlyphKey::Char(c))
+}
+
+/// The outline of glyph `gid` of `face` (as a shaper returns it); its advance is the font's
+/// nominal one.
+pub(crate) fn glyph_by_id(face: &Face, gid: u32) -> Arc<GlyphOutline> {
+    outline(face, GlyphKey::Id(gid))
+}
+
+/// Closed, flattened contours of a glyph at 1000 font units per em. Shared with the outline
+/// cache so renderers can tessellate once before applying each occurrence's affine placement.
+pub fn glyph_contours(face: &Face, gid: u16) -> Arc<[Vec<Vec2>]> {
+    glyph_by_id(face, u32::from(gid)).contours.clone()
+}
+
+fn outline(face: &Face, k: GlyphKey) -> Arc<GlyphOutline> {
+    let key = (face.bytes.as_ptr() as usize, face.bytes.len(), face.index, k);
     if let Some(g) = glyph_cache().lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
         return g.clone();
     }
     let Some(f) = face.font() else { return Arc::new(GlyphOutline { cap: 1.0, ..Default::default() }) };
-    let mapped = f.charmap().map(c);
+    let mapped = match k {
+        GlyphKey::Char(c) => f.charmap().map(c),
+        GlyphKey::Id(id) => Some(GlyphId::new(id)),
+    };
     let gid = mapped.unwrap_or_default();
     let mut pen = Pen { contours: Vec::new(), cur: Vec::new() };
     if let Some(g) = f.outline_glyphs().get(gid) {
@@ -568,7 +714,8 @@ pub(crate) fn glyph(face: &Face, c: char) -> Arc<GlyphOutline> {
         pen.flush();
     }
     let advance = f64::from(f.glyph_metrics(Size::new(UPEM), LocationRef::default()).advance_width(gid).unwrap_or(UPEM * 0.5));
-    let g = Arc::new(GlyphOutline { contours: pen.contours, advance, cap: cap_height(&f), mapped: mapped.is_some() });
+    let (cap, mapped, gid) = (cap_height(&f), mapped.is_some(), gid.to_u32());
+    let g = Arc::new(GlyphOutline { contours: pen.contours.into(), advance, cap, mapped, gid, face: Some(face.clone()) });
     let mut cache = glyph_cache().lock().unwrap_or_else(PoisonError::into_inner);
     if cache.len() > MAX_CACHED_GLYPHS {
         cache.clear();
@@ -592,6 +739,24 @@ fn glyph_or_fallback(face: &Face, c: char) -> Arc<GlyphOutline> {
     fallback_glyph(c).unwrap_or(g)
 }
 
+/// The [`crate::TextGlyph`] of a glyph placed like [`place_glyph`] does (its outline index is
+/// set when it is added). `None` for the missing-glyph shape.
+pub(crate) fn text_glyph(g: &GlyphOutline, c: char, x: f64, h: f64, wf: f64, shear: f64) -> Option<crate::TextGlyph> {
+    let gid = u16::try_from(g.gid).ok().filter(|_| g.mapped)?;
+    let face = g.face.clone()?;
+    // Font units at 1000 per em scale by h / cap.
+    let em = 1000.0 * h / g.cap;
+    (em.is_finite() && em > 0.0).then(|| crate::TextGlyph {
+        face,
+        gid,
+        ch: c,
+        outline: 0,
+        origin: Vec2::new(x, 0.0),
+        x: Vec2::new(em * wf, 0.0),
+        y: Vec2::new(em * shear, em),
+    })
+}
+
 /// Contours of a glyph scaled so its font's cap height is `h`, at pen position `x`.
 pub(crate) fn place_glyph(g: &GlyphOutline, x: f64, h: f64, wf: f64, shear: f64) -> Vec<Vec<Vec2>> {
     let scale = h / g.cap;
@@ -613,6 +778,11 @@ pub(crate) fn place_glyph(g: &GlyphOutline, x: f64, h: f64, wf: f64, shear: f64)
 /// Characters the face lacks come from a fallback font, scaled to its own cap height.
 pub fn shape(face: &Face, s: &str, height: f64, width_factor: f64, oblique: f64) -> Option<Shaped> {
     face.font()?;
+    if crate::bidi::has_rtl(s)
+        && let Some(sh) = crate::complex::shape(Some(face), s, height, width_factor, oblique)
+    {
+        return Some(sh);
+    }
     let h = if height.is_finite() && height > 0.0 { height } else { 1.0 };
     let wf = if width_factor.is_finite() && width_factor.abs() > 1e-6 { width_factor } else { 1.0 };
     let shear = oblique.tan().clamp(-10.0, 10.0);
@@ -620,11 +790,14 @@ pub fn shape(face: &Face, s: &str, height: f64, width_factor: f64, oblique: f64)
     let mut spans = Vec::new();
     let mut x = 0.0;
     for (c, under, over) in crate::decode_controls(s) {
+        if crate::bidi::is_format_control(c) {
+            continue;
+        }
         let g = glyph_or_fallback(face, c);
         if !c.is_whitespace() {
             let contours = place_glyph(&g, x, h, wf, shear);
             if !contours.is_empty() {
-                out.glyphs.push(contours);
+                out.push_glyph(contours, text_glyph(&g, c, x, h, wf, shear));
             }
         }
         let adv = g.advance * h / g.cap * wf;
@@ -639,10 +812,16 @@ pub fn shape(face: &Face, s: &str, height: f64, width_factor: f64, oblique: f64)
 /// Width of one line set in a TrueType face.
 pub fn width(face: &Face, s: &str, height: f64, width_factor: f64) -> Option<f64> {
     face.font()?;
+    if crate::bidi::has_rtl(s)
+        && let Some(sh) = crate::complex::shape(Some(face), s, height, width_factor, 0.0)
+    {
+        return Some(sh.width);
+    }
     let wf = if width_factor.is_finite() && width_factor.abs() > 1e-6 { width_factor } else { 1.0 };
     Some(
         crate::decode_controls(s)
             .iter()
+            .filter(|(c, _, _)| !crate::bidi::is_format_control(*c))
             .map(|(c, _, _)| {
                 let g = glyph_or_fallback(face, *c);
                 g.advance * height / g.cap * wf

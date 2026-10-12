@@ -4,6 +4,8 @@ use cadcraft_geom::{Bounds2, Vec2};
 
 use crate::{Shaped, TextFont, shape_line, text_width};
 
+pub(crate) mod para;
+
 /// Strip MTEXT formatting codes to plain text with `\n` paragraph breaks.
 /// Stacked fractions `\S1/2;` become `1/2`; `\~` is a space; braces are dropped.
 pub fn plain_mtext(s: &str) -> String {
@@ -99,6 +101,8 @@ pub struct MTextParams {
     pub font: TextFont,
     pub width_factor: f64,
     pub oblique: f64,
+    /// Columns the text flows through (each `width` wide); `None`: one column.
+    pub columns: Option<para::MTextColumnSpec>,
 }
 
 impl MTextParams {
@@ -113,6 +117,7 @@ impl MTextParams {
             font: TextFont::Stroke,
             width_factor: 1.0,
             oblique: 0.0,
+            columns: None,
         }
     }
 }
@@ -145,6 +150,8 @@ struct Fmt {
     over: bool,
     wf: f64,
     oblique: f64,
+    /// `\A`: vertical alignment of tolerance stacks (`^`) on the line: 0 bottom, 1 centre, 2 top.
+    valign: u8,
 }
 
 /// One shaped unit of a word.
@@ -247,6 +254,7 @@ fn parse(contents: &str, base: Fmt) -> (Vec<Atom>, Vec<Fmt>) {
             over: false,
             wf: 1.0,
             oblique: 0.0,
+            valign: 1,
         });
         f(&mut n);
         if fmts.len() < 100_000 {
@@ -348,8 +356,15 @@ fn parse(contents: &str, base: Fmt) -> (Vec<Atom>, Vec<Fmt>) {
                             derive(&mut fmts, &mut cur, &|f| f.color = Some(MTextColor::Rgb(v & 0xFF_FFFF)));
                         }
                     }
+                    'A' => {
+                        let (a, n) = arg(&chars, i);
+                        i = n;
+                        if let Ok(v @ 0..=2) = a.trim().parse::<u8>() {
+                            derive(&mut fmts, &mut cur, &|f| f.valign = v);
+                        }
+                    }
                     _ => {
-                        // \A, \T, \p and unknown codes: argument up to ';'.
+                        // \T, \p and unknown codes: argument up to ';'.
                         let (_, n) = arg(&chars, i);
                         i = n;
                     }
@@ -431,8 +446,15 @@ fn seg_shape(seg: &Seg, f: &Fmt, x: f64) -> Shaped {
                     out.strokes.push(vec![Vec2::new(sx, -h * 0.1), Vec2::new(sx + h * 0.3, h * 1.1)]);
                 }
                 '^' => {
-                    out.extend(put(top, hs, Vec2::new(x, h * 0.55)));
-                    out.extend(put(bottom, hs, Vec2::new(x, h * 0.45 - hs)));
+                    // Tolerances: centred on the line, or the lower value on the baseline (\A0) or
+                    // the upper value level with the text (\A2).
+                    let (yt, yb) = match f.valign {
+                        0 => (hs + h * 0.1, 0.0),
+                        2 => (0.0, -hs - h * 0.1),
+                        _ => (h * 0.55, h * 0.45 - hs),
+                    };
+                    out.extend(put(top, hs, Vec2::new(x, yt)));
+                    out.extend(put(bottom, hs, Vec2::new(x, yb)));
                 }
                 _ => {
                     let bar = h * 0.45;
@@ -459,12 +481,48 @@ fn seg_plain(seg: &Seg) -> String {
     }
 }
 
+/// One laid-out piece of a line: a segment (`None`: the space between two words), its format,
+/// x offset, width and the character offset of its text in [`Line::text`].
+struct Item {
+    seg: Option<Seg>,
+    fmt: usize,
+    x: f64,
+    w: f64,
+    at: usize,
+}
+
 #[derive(Default)]
 struct Line {
-    items: Vec<(Seg, usize, f64)>,
+    items: Vec<Item>,
     width: f64,
     max_h: f64,
     text: String,
+    /// Index of the paragraph the line belongs to.
+    para: usize,
+}
+
+impl Line {
+    /// Put the items in display order for right-to-left text: the Unicode Bidirectional
+    /// Algorithm over the line's text (paragraph direction `base`), pieces reordered by the level
+    /// of their first character, x offsets recomputed. Lines without right-to-left text are
+    /// left as they are.
+    fn reorder_bidi(&mut self, base: Option<bool>) {
+        if !crate::bidi::has_rtl(&self.text) {
+            return;
+        }
+        let levels = crate::bidi::char_levels(&self.text, base);
+        let item_levels: Vec<u8> = self.items.iter().map(|it| levels.get(it.at).copied().unwrap_or(0)).collect();
+        let order = crate::bidi::reorder(&item_levels);
+        let mut items: Vec<Option<Item>> = std::mem::take(&mut self.items).into_iter().map(Some).collect();
+        let mut x = 0.0;
+        for i in order {
+            if let Some(mut it) = items.get_mut(i).and_then(Option::take) {
+                it.x = x;
+                x += it.w;
+                self.items.push(it);
+            }
+        }
+    }
 }
 
 /// Lay out MTEXT with the stroke font. `attach` 1..=9 (TL, TC, TR, ML, MC, MR, BL, BC, BR).
@@ -479,17 +537,22 @@ pub fn layout_mtext_with(contents: &str, p: &MTextParams) -> MTextLayout {
     let wf = if p.width_factor.is_finite() && p.width_factor > 0.0 { p.width_factor } else { 1.0 };
     let width = if p.width.is_finite() && p.width > 0.0 { p.width } else { 0.0 };
     let rotation = if p.rotation.is_finite() { p.rotation } else { 0.0 };
-    let base = Fmt { font: p.font.clone(), height: h, color: None, under: false, over: false, wf, oblique: p.oblique };
+    let base = Fmt { font: p.font.clone(), height: h, color: None, under: false, over: false, wf, oblique: p.oblique, valign: 1 };
     let (atoms, fmts) = parse(contents, base.clone());
+    if para::needed(contents, p) {
+        return para::layout(contents, p, &base);
+    }
     let fmt = |i: usize| fmts.get(i).unwrap_or(&base);
     let mut lines: Vec<Line> = Vec::new();
     let mut line = Line::default();
     let mut pending_space: Option<usize> = None;
     let mut last_fmt = 0usize;
-    let finish = |lines: &mut Vec<Line>, line: &mut Line, f: &Fmt| {
+    let mut para = 0usize;
+    let finish = |lines: &mut Vec<Line>, line: &mut Line, f: &Fmt, para: usize| {
         if line.items.is_empty() {
             line.max_h = f.height;
         }
+        line.para = para;
         lines.push(std::mem::take(line));
     };
     for a in &atoms {
@@ -502,33 +565,53 @@ pub fn layout_mtext_with(contents: &str, p: &MTextParams) -> MTextLayout {
             }
             Atom::Para(f) => {
                 pending_space = None;
-                finish(&mut lines, &mut line, fmt(*f));
+                finish(&mut lines, &mut line, fmt(*f), para);
+                para += 1;
                 last_fmt = *f;
             }
             Atom::Word(segs) => {
                 let ww: f64 = segs.iter().map(|(sg, f)| seg_width(sg, fmt(*f))).sum();
-                let sw = pending_space.map(|f| text_width(&fmt(f).font, " ", fmt(f).height, fmt(f).wf)).unwrap_or(0.0);
+                let sw = pending_space.map(|f| crate::space_width(&fmt(f).font, fmt(f).height, fmt(f).wf)).unwrap_or(0.0);
                 if width > 0.0 && !line.items.is_empty() && line.width + sw + ww > width + 1e-9 {
-                    finish(&mut lines, &mut line, fmt(last_fmt));
+                    finish(&mut lines, &mut line, fmt(last_fmt), para);
                 } else if !line.items.is_empty() || pending_space.is_some() {
-                    line.width += sw;
-                    if pending_space.is_some() {
+                    if let Some(f) = pending_space {
+                        let at = line.text.chars().count();
+                        line.items.push(Item { seg: None, fmt: f, x: line.width, w: sw, at });
                         line.text.push(' ');
                     }
+                    line.width += sw;
                 }
                 pending_space = None;
                 for (sg, f) in segs {
                     let fw = seg_width(sg, fmt(*f));
                     line.max_h = line.max_h.max(fmt(*f).height);
+                    let at = line.text.chars().count();
                     line.text.push_str(&seg_plain(sg));
-                    line.items.push((sg.clone(), *f, line.width));
+                    line.items.push(Item { seg: Some(sg.clone()), fmt: *f, x: line.width, w: fw, at });
                     line.width += fw;
                     last_fmt = *f;
                 }
             }
         }
     }
-    finish(&mut lines, &mut line, fmt(last_fmt));
+    finish(&mut lines, &mut line, fmt(last_fmt), para);
+    // Right-to-left text: each line in display order, its paragraph's direction from the
+    // paragraph's first strong character.
+    let mut bases: Vec<Option<bool>> = Vec::new();
+    for l in &lines {
+        if bases.len() <= l.para {
+            bases.resize(l.para + 1, None);
+        }
+        if let Some(b) = bases.get_mut(l.para)
+            && b.is_none()
+        {
+            *b = crate::bidi::base_rtl(&l.text);
+        }
+    }
+    for l in &mut lines {
+        l.reorder_bidi(bases.get(l.para).copied().flatten());
+    }
     let ls = if p.line_spacing > 0.0 && p.line_spacing.is_finite() { p.line_spacing } else { 1.0 };
     // Baselines below the top of the first line.
     let mut baselines = Vec::with_capacity(lines.len());
@@ -556,9 +639,10 @@ pub fn layout_mtext_with(contents: &str, p: &MTextParams) -> MTextLayout {
             1 => -l.width / 2.0,
             _ => -l.width,
         };
-        for (sg, f, x) in &l.items {
-            let fm = fmt(*f);
-            let mut sh = seg_shape(sg, fm, *x);
+        for it in &l.items {
+            let Some(sg) = &it.seg else { continue };
+            let fm = fmt(it.fmt);
+            let mut sh = seg_shape(sg, fm, it.x);
             let off = Vec2::new(x0, top + base_y);
             sh.map(|q| xf(q + off));
             match out.pieces.last_mut() {
@@ -607,6 +691,12 @@ mod tests {
         let l = layout_mtext("AB", Vec2::new(5.0, 5.0), 1.0, 0.0, 5, 0.0, 1.0);
         let c = l.bounds.center();
         assert!((c.x - 5.0).abs() < 1e-9 && (c.y - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stroke_word_space_matches_text() {
+        let l = layout_mtext("A B", Vec2::ZERO, 1.0, 0.0, 1, 0.0, 1.0);
+        assert!((l.bounds.width() - crate::line_width("A B", 1.0, 1.0)).abs() < 1e-9);
     }
 
     fn lay(s: &str, width: f64) -> MTextLayout {
@@ -683,9 +773,62 @@ mod tests {
         assert!(l.pieces.iter().all(|p| p.shaped.glyphs.is_empty()));
     }
 
+    /// Stroke-font geometry that isn't a missing-glyph box (Latin letters here).
+    fn latin_points(l: &MTextLayout) -> Vec<Vec2> {
+        l.pieces.iter().flat_map(|p| p.shaped.strokes.iter()).filter(|s| !(s.len() == 5 && s.first() == s.last())).flatten().copied().collect()
+    }
+
+    #[test]
+    fn rtl_paragraph_lays_words_out_right_to_left() {
+        // A Persian paragraph: the first word is rightmost, the Latin word at the end of the
+        // sentence is leftmost (without any installed font the Persian letters are boxes).
+        let l = lay("سلام دنیا abc", 0.0);
+        let xs = latin_points(&l);
+        assert!(!xs.is_empty());
+        let w = l.bounds.width();
+        assert!(xs.iter().all(|p| p.x < w / 2.0), "abc on the left of a right-to-left line");
+        assert_eq!(l.lines, vec!["سلام دنیا abc"], "plain text stays in logical order");
+        // The same words in a left-to-right paragraph keep abc first.
+        let l = lay("abc سلام دنیا", 0.0);
+        assert!(latin_points(&l).iter().all(|p| p.x < l.bounds.width() / 2.0));
+        assert!((l.bounds.width() - w).abs() < 1e-9, "same width either way");
+    }
+
+    #[test]
+    fn rtl_wrapping_keeps_the_column_and_attachment() {
+        // Top-right attachment, wrapped to a 6-unit column: every line ends at the insertion
+        // point's x and nothing leaves the column.
+        let text = "قیمت 25 تومان و abc def";
+        let l = layout_mtext(text, Vec2::ZERO, 1.0, 6.0, 3, 0.0, 1.0);
+        assert!(l.lines.len() >= 2, "{:?}", l.lines);
+        assert!(l.bounds.max.x.abs() < 1e-9 && (l.bounds.width() - 6.0).abs() < 1e-9);
+        let pts: Vec<Vec2> = l.strokes.iter().flatten().copied().collect();
+        // Allow an installed font's overhang (a tenth of the height), so this holds on any machine.
+        assert!(pts.iter().all(|p| p.x <= 0.1 && p.x >= -6.0 - 0.1), "inside the column");
+        // Centred: the line box is centred on the insertion point.
+        let c = layout_mtext(text, Vec2::ZERO, 1.0, 0.0, 2, 0.0, 1.0);
+        assert!(c.bounds.center().x.abs() < 1e-9);
+    }
+
     #[test]
     fn hostile_contents_do_not_panic() {
-        for s in ["\\", "\\S", "\\S/;", "{{{{", "}}}}", "\\H;", "\\H-1;x", "\\Hx;", "\\C999;a", "\\f;", "\\W0;a", "\\Q90;a", "\\P\\P\\P"] {
+        for s in [
+            "\u{202E}{\\C1;سل}ام\\P\u{2067}",
+            "\\S\u{05D0}/ب;",
+            "\\",
+            "\\S",
+            "\\S/;",
+            "{{{{",
+            "}}}}",
+            "\\H;",
+            "\\H-1;x",
+            "\\Hx;",
+            "\\C999;a",
+            "\\f;",
+            "\\W0;a",
+            "\\Q90;a",
+            "\\P\\P\\P",
+        ] {
             let _ = lay(s, 1.0);
         }
         let long = "word ".repeat(5000);

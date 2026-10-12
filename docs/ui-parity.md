@@ -88,9 +88,9 @@ ignored; there are no context menus. Remaining: **≈ 110–170 Opus 5.5 hours**
 | Additional polar angles, relative to last segment | yes | additional angles yes (POLARADDANG with POLARMODE 4); **relative to the last segment no** |
 | Polar distance snap (PolarSnap) | yes | **no** |
 | **Object snap tracking** (acquire points, alignment paths, intersections of paths) | yes, F11 | yes (#379): resting on a snap point acquires it (`+`), resting again releases it, seven at most; horizontal/vertical paths, or every polar angle with POLARMODE 2; Shift to acquire with POLARMODE 8; crossings of two paths, a path and an object, and a path and a polar path snap; tooltip names each path; a typed distance (direct distance entry) runs along the path the cursor is on, measured from the point the path comes from. Engine: `Session::snap_cursor`, `snap/tracking.rs`; AUTOSNAP bits 8 and 16 |
-| Grid (rectangular, major lines, adaptive, limits) | yes | rectangular, major lines, adaptive display |
-| Snap (rectangular, isometric, polar snap) | yes | rectangular from 0,0 only (`snap.rs:531`) |
-| Isometric drafting (ISODRAFT, isoplanes F5) | yes | **status-bar toggle with no effect** |
+| Grid (rectangular, major lines, adaptive, limits) | yes | rectangular and isometric (30°, 90° and 150° lines), major lines, adaptive display |
+| Snap (rectangular, isometric, polar snap) | yes | rectangular and isometric (SNAPSTYL 1: the snap Y spacing along the isometric axes), from SNAPBASE turned by SNAPANG |
+| Isometric drafting (ISODRAFT, isoplanes F5) | yes | yes (#556): ISODRAFT and the status-bar toggle set SNAPSTYL and the plane; ISOPLANE / F5 / Ctrl+E cycle Left, Top, Right (SNAPISOPAIR); ortho, direct distance entry and the crosshair follow the plane's axes; ELLIPSE Isocircle (radius or Diameter, also for elliptical arcs); Drafting Settings snap style radio. Engine: `snap/iso.rs`, `cmd/settings/iso.rs` |
 | Drafting Settings dialog | yes | yes (`dialogs.rs:36-80`) |
 
 ## Dynamic input (≈ 45%)
@@ -125,14 +125,14 @@ down-arrow options menu (DYNPROMPT), and DYNDIM.
 | Feature | AutoCAD | CADCraft |
 |---|---|---|
 | Pick, implied window (left→right) and crossing (right→left) | yes | yes, coloured and dashed rectangles (`lib.rs:576-589`, `canvas.rs:823-836`) |
-| Keywords W, C, WP, CP, F, BOX, AU, SI, M, G (group), CL (class) | yes | **All, Last, Previous, Add, Remove only** (`lib.rs:595-599`, `machines.rs:77-80`); fence only as a JSON parameter |
+| Keywords W, C, WP, CP, F, BOX, AU, SI, M, G (group), CL (class) | yes | yes except CLass: W, C, F, WP, CP (#226); BOX, AUto, SIngle, Multiple, Group, Add, Remove, Undo (#428); ALL, Last, Previous |
 | Press-drag selection windows (PICKDRAG) | yes | yes (#63, PICKDRAG = 2) |
 | Lasso | yes | **no** |
 | Selection cycling (SELECTIONCYCLING) | yes | toggle nothing reads |
 | Selection preview, hover highlight | yes | hover highlight |
 | PICKADD, PICKFIRST, PICKAUTO | yes | PICKADD (Shift), PICKFIRST |
-| QSELECT, SELECTSIMILAR, FILTER | yes | QSELECT dialog; no SELECTSIMILAR or FILTER |
-| Object isolate/hide (ISOLATEOBJECTS, HIDEOBJECTS) | yes | **no** (only layer isolate) |
+| QSELECT, SELECTSIMILAR, FILTER | yes | QSELECT dialog; SELECTSIMILAR with SELECTSIMILARMODE (#428, SEttings asks for the bit code; no dialog); no FILTER |
+| Object isolate/hide (ISOLATEOBJECTS, HIDEOBJECTS) | yes | yes, temporary (OBJECTISOLATIONMODE 0; #428): Tools > Isolate, UNISOLATEOBJECTS; no status-bar button |
 | Groups selectable as one (PICKSTYLE) | yes | no |
 
 ## Command line (≈ 60%)
@@ -184,19 +184,24 @@ down-arrow options menu (DYNPROMPT), and DYNDIM.
 
 ## Keyboard and context menus (≈ 25%)
 
-- Shortcut table: 25 entries (Cmd shortcuts, F1, F2, F3, F7–F12) plus 21 command `.key()`
-  shortcuts. AutoCAD for Mac's defaults are similar in number; F4 (3D osnap), F5 (isoplane), F6
-  (dynamic UCS) are missing.
+- Shortcut table: 28 entries (Cmd shortcuts, F1, F2, F3, F5, F7–F12) plus 23 command `.key()`
+  shortcuts. AutoCAD for Mac's defaults are similar in number; F4 (3D osnap) and F6 (dynamic UCS)
+  are missing.
 - Delete erases the selection on macOS (#64); Escape cancels.
-- Right-click on the canvas is Enter while a command runs; otherwise it opens a shortcut menu
-  (Repeat, Clipboard ▸ Cut/Copy/Copy with Base Point/Paste/Paste as Block/Paste to Original
-  Coordinates, the selection's editing commands, Undo/Redo, Pan/Zoom; #325). Still missing:
-  AutoCAD's per-command menus and the menus of the command line, palettes and tabs.
+- Right-click on the canvas is Enter while a command runs; holding it (250 ms, AutoCAD's
+  time-sensitive right-click) opens the command menu: Enter, Cancel, Recent Input, the prompt's
+  options, Snap Overrides, Pan/Zoom. Otherwise it opens a shortcut menu (Repeat, Recent Commands,
+  Clipboard ▸, Isolate ▸, the selection's editing commands, Draw Order ▸, Group, the selected
+  object type's edit commands, Select Similar, Deselect All, Undo/Redo, Pan/Zoom; #325, #512).
+  The command line, drawing tabs, layout tabs, Layers palette rows and the Properties palette
+  have menus too (#512). Still missing: in-place layout tab rename, Move or Copy, Select All
+  Layouts.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-11 | minor | Isometric drafting (#556): isometric snap and grid, ISODRAFT, ISOPLANE (F5), ortho along isoplane axes, ELLIPSE Isocircle |
 | 2026-10-11 | minor | Object snap tracking, Extension, Parallel, Apparent Intersection, additional polar angles (#379): tracking 30% → 70%, object snaps 40% → 45%; total 43% → 48% |
 | 2026-10-10 | minor | Dynamic input 15% → 45% (pointer boxes, #60); press-drag windows (#63); total 40% → 43% |
 | 2026-10-10 | major | First UI-parity audit: point entry, snaps, tracking, dynamic input, grips, selection, command line, chrome, navigation, keys |
