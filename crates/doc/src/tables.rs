@@ -7,7 +7,7 @@ use cadcraft_color::Color;
 use cadcraft_geom::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::{EntityStore, Lineweight};
+use crate::{EntityStore, Extension, Lineweight};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -27,6 +27,9 @@ pub struct Layer {
     pub plot_style: String,
     /// Frozen in viewports created from now on (New VP Freeze; DXF layer flag 2).
     pub vp_freeze_new: bool,
+    /// Per-layer extension data, keyed by application name.
+    #[serde(default, skip_serializing_if = "Extension::is_empty")]
+    pub ext: Extension,
 }
 
 impl Default for Layer {
@@ -44,6 +47,7 @@ impl Default for Layer {
             description: String::new(),
             plot_style: "Normal".into(),
             vp_freeze_new: false,
+            ext: Extension::new(),
         }
     }
 }

@@ -1251,6 +1251,9 @@ impl Session {
 }
 
 #[cfg(test)]
+#[path = "ext_tests.rs"]
+mod ext_tests;
+#[cfg(test)]
 #[path = "observer_tests.rs"]
 mod observer_tests;
 #[cfg(test)]

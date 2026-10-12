@@ -6,6 +6,8 @@ use cadcraft_geom::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::Extension;
+
 /// A database handle (DXF group 5), unique per drawing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Handle(pub u64);
@@ -97,6 +99,9 @@ pub struct Common {
     /// Named plot style: `ByLayer`, `ByBlock` or a style of the layout's named (`.stb`) plot
     /// style table.
     pub plot_style: String,
+    /// Per-entity extension data, keyed by application name. Cloned with the entity.
+    #[serde(default, skip_serializing_if = "Extension::is_empty")]
+    pub ext: Extension,
 }
 
 impl Default for Common {
@@ -112,6 +117,7 @@ impl Default for Common {
             thickness: 0.0,
             extrusion: Vec3::Z,
             plot_style: "ByLayer".into(),
+            ext: Extension::new(),
         }
     }
 }
