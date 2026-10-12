@@ -2069,7 +2069,10 @@ dependencies = [
 name = "lamb-cadcraft"
 version = "0.5.0"
 dependencies = [
+ "cadcraft-doc",
  "cadcraft-engine",
+ "cadcraft-geom",
+ "lamb-core",
  "serde_json",
 ]
 
