@@ -13,6 +13,5 @@ cadcraft-doc = { workspace = true }
 cadcraft-engine = { workspace = true }
 cadcraft-geom = { workspace = true }
 lamb-core = { workspace = true }
-
-[dev-dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
