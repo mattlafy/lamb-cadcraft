@@ -2072,6 +2072,7 @@ dependencies = [
  "cadcraft-doc",
  "cadcraft-engine",
  "cadcraft-geom",
+ "cadcraft-io",
  "lamb-core",
  "serde",
  "serde_json",
