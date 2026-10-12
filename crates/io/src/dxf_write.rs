@@ -18,6 +18,8 @@ struct W {
     next: u64,
     /// Upper-case plot style name → its `ACDBPLACEHOLDER` handle (group 390 of layers and objects).
     pstyles: HashMap<String, String>,
+    /// Upper-case layer name → its LAYER table record handle (group 341 of viewports).
+    layers: HashMap<String, String>,
 }
 
 impl W {
@@ -171,7 +173,7 @@ fn annotative_xdata(w: &mut W) {
 
 /// Override (`ACAD` DSTYLE) and associativity (`CADCRAFT` ASSOC) xdata of a dimension.
 fn dim_xdata(w: &mut W, dm: &Dimension, cx: &Ctx) {
-    let mut ov = W { t: Vec::new(), next: 0, pstyles: HashMap::new() };
+    let mut ov = W { t: Vec::new(), next: 0, pstyles: HashMap::new(), layers: HashMap::new() };
     let mut sah = false;
     for (k, v) in &dm.overrides {
         let Some(field) = DimStyle::field_name(k) else { continue };
@@ -993,6 +995,13 @@ fn entity_body(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx:
             if let Some(h) = clip {
                 w.s(340, h.hex());
             }
+            // AutoCAD's frozen-layer list: one soft pointer per layer, to its LAYER record. Other
+            // programs read only this; CADCraft prefers its own xdata below when present.
+            for name in &v.frozen_layers {
+                if let Some(h) = w.layers.get(&name.to_ascii_uppercase()).cloned() {
+                    w.s(341, h);
+                }
+            }
             // One CADCraft xdata group holds both lists: readers stop at the first group of an app.
             if !v.frozen_layers.is_empty() || !v.layer_colors.is_empty() {
                 w.s(1001, dxf_ext::APP);
@@ -1483,7 +1492,7 @@ pub(crate) fn dwg_bridge(d: &Drawing, dwg: Version) -> String {
 /// file ends up in: `version`, or the DWG version the bridge writes) has.
 fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
     // Structural handles start above every entity handle.
-    let mut w = W { t: Vec::new(), next: d.handseed.max(0x100).saturating_add(0x1000), pstyles: HashMap::new() };
+    let mut w = W { t: Vec::new(), next: d.handseed.max(0x100).saturating_add(0x1000), pstyles: HashMap::new(), layers: HashMap::new() };
     // Pre-allocate handles for block records.
     let mut paper_layouts: Vec<&Layout> = d.layouts.iter().collect();
     paper_layouts.sort_by_key(|l| l.tab_order);
@@ -1781,7 +1790,8 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
     // LAYER
     let th = table_head(&mut w, "LAYER", d.layers.len());
     for l in &d.layers {
-        record_head(&mut w, "LAYER", &th, "AcDbLayerTableRecord");
+        let lh = record_head(&mut w, "LAYER", &th, "AcDbLayerTableRecord");
+        w.layers.insert(l.name.to_ascii_uppercase(), lh);
         w.s(2, &l.name);
         w.i(70, i64::from(l.frozen) | if l.vp_freeze_new { 2 } else { 0 } | if l.locked { 4 } else { 0 });
         let aci = match l.color {
@@ -1953,7 +1963,7 @@ fn tags_for(d: &Drawing, version: Version, target: Version) -> Vec<Tag> {
         w.i(70, 0);
         let v = serde_json::to_value(s).unwrap_or_default();
         let defaults = serde_json::to_value(DimStyle::default()).unwrap_or_default();
-        let mut newer = W { t: Vec::new(), next: 0, pstyles: HashMap::new() };
+        let mut newer = W { t: Vec::new(), next: 0, pstyles: HashMap::new(), layers: HashMap::new() };
         for (field, code, kind) in dxf_ext::DIM_CODES {
             let Some(enc) = v.get(*field).and_then(|x| cx.encode(*kind, x)) else { continue };
             if !dxf_ext::NEWER_CODES.contains(code) {
