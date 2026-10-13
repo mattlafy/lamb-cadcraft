@@ -14,7 +14,8 @@
 //! camera-lock centre ([`panes`]), and FILLET/CHAMFER on two adjacent polyline segments writing a
 //! virtual corner tag instead of baking an arc ([`fillet`]), drawn rounded on screen and in plots
 //! while the stored vertices stay sharp ([`rounding`]), and kept on their vertex when a CADCraft
-//! command rewrites the vertices ([`corners`]).
+//! command rewrites the vertices ([`corners`]), and the derived 3D scene as renderer-agnostic meshes
+//! that pick back to their source lines ([`scene`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
 //! the remaining overlay display lists (datums, repeat ghosts). Sits above
 //! `cadcraft-engine` and below the UI shells and MCP.
@@ -31,6 +32,7 @@ pub mod overlays;
 pub mod panes;
 pub mod project;
 pub mod rounding;
+pub mod scene;
 pub mod schema;
 pub mod sheets;
 pub mod views;
@@ -42,6 +44,7 @@ pub use import::{IdMap, ImportError, ImportReport, project_to_drawing};
 pub use maintain::{MaintenanceReport, install, link_observer, maintain_links};
 pub use overlays::{lamb_overlay, lamb_snaps, register_providers};
 pub use project::DrawingProject;
+pub use scene::{Scene, SceneError, SceneMesh, SceneMeshKind, ScenePath, ScenePick, pick, scene};
 pub use schema::{
     EXT_KEY, EntityData, LambDocument, LayerData, SchemaError, read_document, read_entity_data, set_entity_data, view_block_name, write_document,
 };
