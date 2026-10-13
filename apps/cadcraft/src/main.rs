@@ -228,6 +228,10 @@ fn control_flag(current: Option<u16>, value: Option<String>) -> Option<u16> {
 fn main() -> eframe::Result {
     // First, so every start-up record is captured; see `logging`.
     let logger = logging::install();
+    // LAMB (fork): its commands, overlays and snaps, before anything builds the command registry.
+    if let Err(e) = lamb_cadcraft::commands::install_app() {
+        log::warn!("LAMB not installed: {e}");
+    }
     // lossy, so a value that is not Unicode is reported like any other bad port instead of ignored
     let mut control_port =
         control_port_from("CADCRAFT_CONTROL_PORT", std::env::var_os("CADCRAFT_CONTROL_PORT").map(|p| p.to_string_lossy().into_owned()));
@@ -309,6 +313,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut app = CadApp::new(Session::empty(), services());
+            lamb_cadcraft::install(&mut app.session);
             let (workspace, restored, workspace_error) = workspace::Workspace::load();
             if let Some(ui) = restored {
                 app.ui = ui;

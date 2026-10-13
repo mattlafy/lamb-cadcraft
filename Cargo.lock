@@ -555,6 +555,7 @@ dependencies = [
  "eframe",
  "egui",
  "hidapi",
+ "lamb-cadcraft",
  "log",
  "muda",
  "objc2-app-kit 0.3.2",

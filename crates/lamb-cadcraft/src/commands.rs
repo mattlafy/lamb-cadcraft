@@ -10,12 +10,19 @@
 //!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
+//!
+//! Each command is also interactive (typed at the command line or picked from View > LAMB): the
+//! machines below prompt for what the JSON form takes and call the same `run` functions.
+//! [`install_app`] registers all of it for an app process.
 
-use cadcraft_doc::Space;
-use cadcraft_engine::{CommandSpec, EngineError, Result, Session};
+use std::sync::OnceLock;
+
+use cadcraft_doc::{EntityKind, Line, Space};
+use cadcraft_engine::{Accept, CommandSpec, EngineError, Input, Interactive, Prompt, Result, Session, Step, register_command_provider};
+use cadcraft_geom::Vec2;
 use lamb_core::geometry::polyline::line2;
 use lamb_core::geometry::{IDENTITY_TRANSFORM, Point2};
-use lamb_core::model::{AnyView, Id, Placement, PlanView, VerticalIntent, VerticalView};
+use lamb_core::model::{AnyView, Id, Placement, PlanView, VerticalIntent, VerticalView, is_plan_view};
 use serde_json::{Value, json};
 
 use crate::schema::{read_document, view_block_name};
@@ -115,17 +122,436 @@ fn newsheet(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "layout": name, "viewports": hex }))
 }
 
+// ---------------- interactive machines ----------------
+
+/// The `Plan N` default: one more than the views already of that kind.
+fn next_name(s: &Session, prefix: &str, kind: impl Fn(&AnyView) -> bool) -> String {
+    let n = s.doc().ok().and_then(|d| read_document(d).ok()).map_or(0, |doc| doc.views.iter().filter(|v| kind(v)).count());
+    format!("{prefix} {}", n + 1)
+}
+
+/// The LAMB view the session is editing (`Space::Block(view_block_name(id))`), if any.
+fn edited_view(s: &Session) -> Option<Id> {
+    let Space::Block(name) = &s.state().ok()?.space else { return None };
+    let id = Id(name.strip_prefix("LAMB_VIEW_")?.parse().ok()?);
+    let doc = read_document(s.doc().ok()?).ok()?;
+    (view_block_name(id) == *name && doc.views.iter().any(|v| v.id() == id)).then_some(id)
+}
+
+/// The answer to a name prompt: typed text, or the default on Enter.
+fn name_input(i: Input, default: &str) -> Option<String> {
+    match i {
+        Input::Enter => Some(default.to_owned()),
+        Input::Text(t) | Input::Keyword(t) => {
+            let t = t.trim();
+            Some(if t.is_empty() { default.to_owned() } else { t.to_owned() })
+        }
+        _ => None,
+    }
+}
+
+fn kind_word(v: &AnyView) -> &'static str {
+    match v {
+        AnyView::Plan(_) => "Plan",
+        AnyView::Vertical(v) if v.intent == VerticalIntent::Elevation => "Elevation",
+        AnyView::Vertical(_) => "Section",
+        _ => "Detail",
+    }
+}
+
+/// Echo `Plan "Ground" created (view 12).` for a creating command's result.
+fn echo_created(s: &mut Session, word: &str, name: &str, r: &Value) -> Option<Id> {
+    let id = r.get("viewId").and_then(Value::as_u64).map(Id)?;
+    s.echo(format!("{word} \"{name}\" created (view {}).", id.0));
+    Some(id)
+}
+
+fn enter_space(s: &mut Session, space: Space) -> Result<()> {
+    let st = s.state_mut()?;
+    st.space = space;
+    st.mspace = None;
+    s.touch();
+    Ok(())
+}
+
+/// NEWPLAN: `Enter plan name <Plan N>:`, then edit inside the new plan.
+struct NewPlan {
+    default: String,
+}
+
+impl Interactive for NewPlan {
+    fn name(&self) -> &'static str {
+        "newplan"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Enter plan name", Accept::TEXT).default(self.default.clone())
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let Some(name) = name_input(i, &self.default) else { return Ok(Step::Continue) };
+        match newplan(s, &json!({ "name": name })) {
+            Ok(r) => {
+                if let Some(id) = echo_created(s, "Plan", &name, &r) {
+                    enter_space(s, Space::Block(view_block_name(id)))?;
+                }
+            }
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+}
+
+fn newplan_machine(s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(NewPlan { default: next_name(s, "Plan", is_plan_view) }))
+}
+
+/// NEWSECTIONLINE / NEWELEVATIONLINE: two points of the cut line in the edited view, then a name.
+struct NewVertical {
+    intent: VerticalIntent,
+    host: Option<Id>,
+    first: Option<Vec2>,
+    second: Option<Vec2>,
+}
+
+impl NewVertical {
+    fn new(intent: VerticalIntent) -> Self {
+        NewVertical { intent, host: None, first: None, second: None }
+    }
+    fn word(&self) -> &'static str {
+        if self.intent == VerticalIntent::Elevation { "Elevation" } else { "Section" }
+    }
+    fn default_name(&self, s: &Session) -> String {
+        let intent = self.intent;
+        next_name(s, self.word(), move |v| matches!(v, AnyView::Vertical(v) if v.intent == intent))
+    }
+}
+
+impl Interactive for NewVertical {
+    fn name(&self) -> &'static str {
+        if self.intent == VerticalIntent::Elevation { "newelevationline" } else { "newsectionline" }
+    }
+    fn prompt(&self, s: &Session) -> Prompt {
+        match (self.first, self.second) {
+            (None, _) => Prompt::new("Specify first point of cut line", Accept::POINT),
+            (Some(a), None) => Prompt::new("Specify second point of cut line", Accept::POINT).base(a),
+            (Some(_), Some(_)) => Prompt::new(format!("Enter {} name", self.word().to_ascii_lowercase()), Accept::TEXT).default(self.default_name(s)),
+        }
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        self.host = edited_view(s);
+        if self.host.is_none() {
+            s.echo("Edit a plan or section first (EDITVIEW).");
+            return Ok(Step::Done);
+        }
+        Ok(Step::Continue)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let (Some(first), Some(second), Some(host)) = (self.first, self.second, self.host) else {
+            match i {
+                Input::Point(p) if self.first.is_none() => self.first = Some(p),
+                Input::Point(p) if self.first.is_some_and(|a| a.dist(p) > 1e-9) => self.second = Some(p),
+                Input::Point(_) => return Err(other("The cut line needs two different points")),
+                Input::Enter => return Ok(Step::Cancel),
+                _ => {}
+            }
+            return Ok(Step::Continue);
+        };
+        let default = self.default_name(s);
+        let Some(name) = name_input(i, &default) else { return Ok(Step::Continue) };
+        let params = json!({
+            "name": name,
+            "hostViewId": host.0,
+            "cutFrom": {"x": first.x, "y": first.y},
+            "cutTo": {"x": second.x, "y": second.y},
+        });
+        match new_vertical(s, &params, self.name(), self.intent) {
+            Ok(r) => {
+                echo_created(s, self.word(), &name, &r);
+            }
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+    fn preview(&self, _s: &Session, cursor: Vec2) -> Vec<EntityKind> {
+        match (self.first, self.second) {
+            (Some(a), None) => vec![EntityKind::Line(Line { a: a.to3(0.0), b: cursor.to3(0.0) })],
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn newsectionline_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(NewVertical::new(VerticalIntent::Section)))
+}
+
+fn newelevationline_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(NewVertical::new(VerticalIntent::Elevation)))
+}
+
+/// EDITVIEW: `Enter view name or [Model/?] <Model>:`.
+struct EditView;
+
+impl Interactive for EditView {
+    fn name(&self) -> &'static str {
+        "editview"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Enter view name", Accept::TEXT).kw(&["Model", "?"]).default("Model")
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        let text = match i {
+            Input::Cancel => return Ok(Step::Cancel),
+            Input::Enter => "Model".to_owned(),
+            Input::Text(t) | Input::Keyword(t) => t.trim().to_owned(),
+            _ => return Ok(Step::Continue),
+        };
+        if text.is_empty() || text.eq_ignore_ascii_case("model") {
+            enter_space(s, Space::Model)?;
+            return Ok(Step::Done);
+        }
+        let doc = read_document(s.doc()?).map_err(other)?;
+        if text == "?" {
+            for v in &doc.views {
+                s.echo(format!("{}  {}  {}", v.id().0, kind_word(v), v.name()));
+            }
+            return Ok(Step::Continue);
+        }
+        let by_name = doc.views.iter().find(|v| v.name().eq_ignore_ascii_case(&text));
+        let by_id = || text.parse::<u64>().ok().and_then(|n| doc.views.iter().find(|v| v.id() == Id(n)));
+        match by_name.or_else(by_id).map(AnyView::id) {
+            Some(id) => {
+                enter_space(s, Space::Block(view_block_name(id)))?;
+                Ok(Step::Done)
+            }
+            None => Err(other("No such view")),
+        }
+    }
+}
+
+fn editview_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(EditView))
+}
+
+/// NEWSHEET: `Enter sheet name <Sheet N>:`, one viewport per view.
+struct NewSheet {
+    default: String,
+}
+
+impl Interactive for NewSheet {
+    fn name(&self) -> &'static str {
+        "newsheet"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Enter sheet name", Accept::TEXT).default(self.default.clone())
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let Some(name) = name_input(i, &self.default) else { return Ok(Step::Continue) };
+        match newsheet(s, &json!({ "name": name })) {
+            Ok(r) => {
+                let n = r.get("viewports").and_then(Value::as_array).map_or(0, Vec::len);
+                s.echo(format!("Sheet \"{name}\" created ({n} viewports)."));
+            }
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+}
+
+fn newsheet_machine(s: &Session) -> Result<Box<dyn Interactive>> {
+    let taken = |n: &str| s.doc().is_ok_and(|d| d.layout(n).is_some());
+    let default = (1..).map(|n| format!("Sheet {n}")).find(|n| !taken(n)).unwrap_or_default();
+    Ok(Box::new(NewSheet { default }))
+}
+
+/// Register LAMB with an app process: its commands (a command provider) and its overlay and snap
+/// providers. Call before anything builds the command registry. Only the first call registers;
+/// later calls return its result.
+pub fn install_app() -> std::result::Result<(), &'static str> {
+    static DONE: OnceLock<std::result::Result<(), &'static str>> = OnceLock::new();
+    *DONE.get_or_init(|| {
+        register_command_provider(commands)?;
+        crate::overlays::register_providers()
+    })
+}
+
+/// View ▸ LAMB ▸ <the command's label>.
+const MENU: &[&str] = &["View", "LAMB", ""];
+
 /// The LAMB commands, for `register_command_provider`.
 pub fn commands() -> Vec<CommandSpec> {
     vec![
-        CommandSpec::new("newplan", "New Plan", newplan).alias(&["npl"]).params("{name}"),
+        CommandSpec::new("newplan", "New Plan", newplan).alias(&["npl"]).params("{name}").menu(MENU).interactive(newplan_machine),
         CommandSpec::new("newsectionline", "New Section Line", newsectionline)
             .alias(&["nsl"])
-            .params("{name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}"),
+            .params("{name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}")
+            .menu(MENU)
+            .interactive(newsectionline_machine),
         CommandSpec::new("newelevationline", "New Elevation Line", newelevationline)
             .alias(&["nel"])
-            .params("{name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}"),
-        CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?}"),
-        CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo(),
+            .params("{name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}")
+            .menu(MENU)
+            .interactive(newelevationline_machine),
+        CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?}").menu(MENU).interactive(newsheet_machine),
+        CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU).interactive(editview_machine),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    //! The interactive forms, driven like the command line. The command registry is process-global:
+    //! every test calls [`install_app`] first, which registers once.
+    use super::*;
+    use cadcraft_engine::command_specs;
+
+    type R = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    fn session() -> std::result::Result<Session, Box<dyn std::error::Error>> {
+        install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        Ok(s)
+    }
+
+    fn views(s: &Session) -> std::result::Result<Vec<AnyView>, Box<dyn std::error::Error>> {
+        Ok(read_document(s.doc()?)?.views)
+    }
+
+    fn space(s: &Session) -> std::result::Result<Space, Box<dyn std::error::Error>> {
+        Ok(s.state()?.space.clone())
+    }
+
+    fn text(s: &mut Session, t: &str) -> Result<()> {
+        s.input(Input::Text(t.into()))
+    }
+
+    #[test]
+    fn every_spec_has_a_menu_path_and_a_factory() -> R {
+        install_app()?;
+        let ids = ["newplan", "newsectionline", "newelevationline", "newsheet", "editview"];
+        for id in ids {
+            let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
+            assert_eq!(c.menu, MENU, "{id}");
+            assert!(c.interactive.is_some(), "{id}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn newplan_enter_takes_the_default_enters_it_and_undoes() -> R {
+        let mut s = session()?;
+        s.start("newplan")?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter plan name <Plan 1>:"));
+        s.input(Input::Enter)?;
+        let v = views(&s)?;
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name(), "Plan 1");
+        assert_eq!(space(&s)?, Space::Block(view_block_name(v[0].id())));
+        assert!(s.log.iter().any(|l| l == &format!("Plan \"Plan 1\" created (view {}).", v[0].id().0)), "{:?}", s.log);
+
+        s.undo()?;
+        assert!(views(&s)?.is_empty(), "undo removes the plan");
+        assert_eq!(space(&s)?, Space::Model, "undo leaves the removed view's block");
+        Ok(())
+    }
+
+    #[test]
+    fn newsectionline_refuses_in_model_and_cuts_the_edited_plan() -> R {
+        let mut s = session()?;
+        s.start("newsectionline")?;
+        assert!(s.running.is_none(), "refused at once");
+        assert!(s.log.iter().any(|l| l == "Edit a plan or section first (EDITVIEW)."), "{:?}", s.log);
+        assert!(views(&s)?.is_empty());
+
+        s.start("newplan")?;
+        text(&mut s, "Ground")?;
+        let plan = views(&s)?[0].id();
+        s.start("nsl")?;
+        assert_eq!(s.current_prompt().map(|p| p.message), Some("Specify first point of cut line".into()));
+        s.input(Input::Point(Vec2::new(0.0, 0.0)))?;
+        let p = s.current_prompt().ok_or("no prompt")?;
+        assert_eq!(p.base, Some(Vec2::new(0.0, 0.0)));
+        s.input(Input::Point(Vec2::new(5000.0, 1000.0)))?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter section name <Section 1>:"));
+        text(&mut s, "A-A")?;
+        let v = views(&s)?;
+        let AnyView::Vertical(sec) = v.iter().find(|v| v.name() == "A-A").ok_or("no section")? else { return Err("not vertical".into()) };
+        assert_eq!(sec.intent, VerticalIntent::Section);
+        let Some(Placement::Vertical { host_view_id, cut_line, .. }) = &sec.placement else { return Err("not placed".into()) };
+        assert_eq!(*host_view_id, plan);
+        assert_eq!(cut_line, &line2(Point2 { x: 0.0, y: 0.0 }, Point2 { x: 5000.0, y: 1000.0 }));
+        assert_eq!(space(&s)?, Space::Block(view_block_name(plan)), "stays in the host");
+        Ok(())
+    }
+
+    #[test]
+    fn newelevationline_preview_is_the_rubber_band() -> R {
+        let mut s = session()?;
+        s.start("newplan")?;
+        s.input(Input::Enter)?;
+        s.start("newelevationline")?;
+        s.input(Input::Point(Vec2::new(1.0, 2.0)))?;
+        let pv = s.running.as_ref().ok_or("not running")?.machine.preview(&s, Vec2::new(3.0, -4.0));
+        assert_eq!(pv, vec![EntityKind::Line(Line { a: Vec2::new(1.0, 2.0).to3(0.0), b: Vec2::new(3.0, -4.0).to3(0.0) })]);
+        s.input(Input::Point(Vec2::new(3.0, -4.0)))?;
+        s.input(Input::Enter)?;
+        assert!(views(&s)?.iter().any(|v| v.name() == "Elevation 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn editview_by_name_id_model_and_unknown() -> R {
+        let mut s = session()?;
+        s.start("newplan")?;
+        text(&mut s, "Ground")?;
+        s.start("newplan")?;
+        text(&mut s, "First")?;
+        let v = views(&s)?;
+        let (ground, first) = (v[0].id(), v[1].id());
+
+        s.start("editview")?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter view name or [Model/?] <Model>:"));
+        s.input(Input::Enter)?;
+        assert_eq!(space(&s)?, Space::Model);
+
+        s.start("editview")?;
+        text(&mut s, "ground")?;
+        assert_eq!(space(&s)?, Space::Block(view_block_name(ground)), "by name, any case");
+
+        s.start("editview")?;
+        text(&mut s, &first.0.to_string())?;
+        assert_eq!(space(&s)?, Space::Block(view_block_name(first)), "by id");
+
+        s.start("editview")?;
+        let n = s.log.len();
+        text(&mut s, "Nowhere")?;
+        assert!(s.log[n..].iter().any(|l| l.contains("No such view")), "{:?}", &s.log[n..]);
+        assert!(s.running.is_some(), "re-prompts");
+        s.input(Input::Keyword("?".into()))?;
+        assert!(s.log.iter().any(|l| l == &format!("{}  Plan  Ground", ground.0)), "{:?}", s.log);
+        s.input(Input::Keyword("Model".into()))?;
+        assert_eq!(space(&s)?, Space::Model);
+        assert!(s.running.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn newsheet_lays_out_every_view() -> R {
+        let mut s = session()?;
+        s.start("newplan")?;
+        s.input(Input::Enter)?;
+        s.start("newsheet")?;
+        assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("Sheet 1"));
+        s.input(Input::Enter)?;
+        assert!(s.doc()?.layout("Sheet 1").is_some());
+        assert!(s.log.iter().any(|l| l == "Sheet \"Sheet 1\" created (1 viewports)."), "{:?}", s.log);
+        Ok(())
+    }
 }
