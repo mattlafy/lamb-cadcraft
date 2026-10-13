@@ -1277,6 +1277,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             st.set_view_quiet(cadcraft_engine::View {
                 center: v.center - Vec2::new(f64::from(scroll.x) / scale, -f64::from(scroll.y) / scale),
                 height: v.height,
+                twist: v.twist,
             });
         }
     }
@@ -1314,6 +1315,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
                 st.set_view_quiet(cadcraft_engine::View {
                     center: v.center - Vec2::new(f64::from(d.x) / scale, -f64::from(d.y) / scale),
                     height: v.height,
+                    twist: v.twist,
                 });
             }
         }
