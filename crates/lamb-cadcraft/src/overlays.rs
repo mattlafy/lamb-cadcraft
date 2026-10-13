@@ -135,6 +135,7 @@ pub fn register_providers() -> Result<(), &'static str> {
         register_overlay_provider(lamb_overlay)?;
         register_snap_provider(lamb_snaps)?;
         crate::panes::register()?;
-        crate::fillet::register()
+        crate::fillet::register()?;
+        crate::rounding::register()
     })
 }

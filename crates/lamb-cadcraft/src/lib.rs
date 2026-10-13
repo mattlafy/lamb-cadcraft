@@ -12,7 +12,8 @@
 //! ([`sheets`], command `newsheet`), and the explicit link commands `link` / `unlink`
 //! ([`commands`]), and the relations between two panes' views — rotation, crosshair mapping,
 //! camera-lock centre ([`panes`]), and FILLET/CHAMFER on two adjacent polyline segments writing a
-//! virtual corner tag instead of baking an arc ([`fillet`]).
+//! virtual corner tag instead of baking an arc ([`fillet`]), drawn rounded on screen and in plots
+//! while the stored vertices stay sharp ([`rounding`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
 //! the remaining overlay display lists (datums, repeat ghosts). Sits above
 //! `cadcraft-engine` and below the UI shells and MCP.
@@ -27,6 +28,7 @@ pub mod maintain;
 pub mod overlays;
 pub mod panes;
 pub mod project;
+pub mod rounding;
 pub mod schema;
 pub mod sheets;
 pub mod views;

@@ -492,6 +492,17 @@ pub fn register_overlay_provider(p: OverlayProvider) -> Result<(), &'static str>
     Ok(())
 }
 
+/// A drawing source outside the renderer that may draw an entity as a different kind (LAMB fork:
+/// virtual corners drawn rounded while the stored vertices stay sharp). `None` draws it as stored.
+pub type DisplayKind = fn(&Drawing, &Entity) -> Option<EntityKind>;
+
+static DISPLAY_KIND: std::sync::OnceLock<DisplayKind> = std::sync::OnceLock::new();
+
+/// Register the process-global [`DisplayKind`] hook. Once per process; a second call is an error.
+pub fn register_display_kind(f: DisplayKind) -> Result<(), &'static str> {
+    DISPLAY_KIND.set(f).map_err(|_| "a display kind hook is already registered")
+}
+
 /// The registered overlay providers' display lists for a space, one per provider in
 /// registration order, empty lists left out. Separate from [`build`], which they never change.
 pub fn overlays(d: &Drawing, space: &Space, opts: &Options) -> Vec<DisplayList> {
@@ -1036,7 +1047,10 @@ fn entity(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     // draws (block contents set their own).
     let (saved, saved_transparency) = (b.named, b.transparency);
     b.named = b.styles.and_then(|s| s.named_index(ctx, &e.common));
-    entity_parts(b, ctx, e);
+    match DISPLAY_KIND.get().and_then(|f| f(ctx.d, e)) {
+        Some(kind) => entity_parts(b, ctx, &Entity { kind, ..e.clone() }),
+        None => entity_parts(b, ctx, e),
+    }
     b.named = saved;
     b.transparency = saved_transparency;
     if b.plotting && b.list.prim_layers.len() < b.list.prims.len() {
