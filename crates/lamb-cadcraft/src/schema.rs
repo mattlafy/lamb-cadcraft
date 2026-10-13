@@ -4,8 +4,8 @@
 //!
 //! - `Drawing.ext["LAMB"]` = [`LambDocument`]: name, defaults, levels, views (metadata only),
 //!   links, suppressed proposals.
-//! - `Common.ext["LAMB"]` = [`EntityData`]: an entity's line role and AI provenance, and on a
-//!   sheet's viewport the view it shows.
+//! - `Common.ext["LAMB"]` = [`EntityData`]: an entity's line role, AI provenance and virtual
+//!   (fillet/chamfer) corner tags, and on a sheet's viewport the view it shows.
 //! - `Layer.ext["LAMB"]` = [`LayerData`]: a layer's default role.
 //!
 //! A view's entities live in the block [`view_block_name`]`(id)`; an entity's id is its handle.
@@ -15,6 +15,7 @@
 use std::fmt;
 
 use cadcraft_doc::{Common, Drawing, Extension, Layer};
+use lamb_core::geometry::polyline::CornerEntry;
 use lamb_core::model::{AiOrigin, AnyView, Id, Level, LineRole, LinkRecord, ProjectDefaults, empty_project};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -108,7 +109,7 @@ fn cut() -> LineRole {
     LineRole::Cut
 }
 
-/// `Common.ext["LAMB"]`. Absent slot or field: `role` is `Bylayer`, no AI origin.
+/// `Common.ext["LAMB"]`. Absent slot or field: `role` is `Bylayer`, no AI origin, no corners.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EntityData {
@@ -119,11 +120,17 @@ pub struct EntityData {
     /// On a sheet's viewport: the LAMB view it shows ([`crate::sheets`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view_id: Option<Id>,
+    /// LAMB virtual corners (`PolySegment.corner_at_to`) as (vertex index, tag) pairs; the vertex
+    /// indices are the entity's `LwPolyline` vertex indices (closed: the wrap corner is vertex 0).
+    /// Re-applied by [`crate::convert::apply_corners`]; an index that is no longer a corner is
+    /// skipped there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub corners: Vec<CornerEntry>,
 }
 
 impl Default for EntityData {
     fn default() -> Self {
-        EntityData { role: LineRole::Bylayer, ai_origin: None, view_id: None }
+        EntityData { role: LineRole::Bylayer, ai_origin: None, view_id: None, corners: Vec::new() }
     }
 }
 

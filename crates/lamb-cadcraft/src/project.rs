@@ -4,8 +4,9 @@
 //! [`DrawingProject::new`] parses the LAMB slots once ([`crate::schema`]): the document, every
 //! layer's default role and every view-block entity's role / AI origin. Polylines are converted
 //! on the fly in [`ProjectRead::entities`]; an entity with no `Polyline2` form yields
-//! `polyline: None`, which derivation already treats as non-participating. Flatten warnings are
-//! dropped here.
+//! `polyline: None`, which derivation already treats as non-participating; a converted one gets its
+//! `EntityData.corners` virtual-corner tags back ([`apply_corners`]). Flatten warnings are dropped
+//! here.
 //!
 //! Layer `color` / `lineweight` are never read by derivation; they are filled as: colour = the
 //! layer colour resolved to RGB by CADCraft's own `Color::resolve` (ACI 7 for ByLayer/ByBlock),
@@ -20,7 +21,7 @@ use cadcraft_doc::{Drawing, Handle, Lineweight};
 use lamb_core::derivation::read::{EntityRef, ProjectRead, ViewRef, view_ref};
 use lamb_core::model::{DrawingLayer, Id, Level, LineRole, LinkRecord, ProjectDefaults};
 
-use crate::convert::to_polyline;
+use crate::convert::{apply_corners, to_polyline};
 use crate::schema::{EntityData, LambDocument, SchemaError, read_document, read_entity_data, read_layer_data, view_block_name};
 
 /// Logical lineweights (ByLayer, ByBlock, Default) read as this, in mm.
@@ -92,7 +93,13 @@ impl ProjectRead for DrawingProject<'_> {
                 view_id: view,
                 role: data.map_or(LineRole::Bylayer, |d| d.role),
                 layer_id: e.common.layer.as_str(),
-                polyline: to_polyline(e).ok().map(|c| Cow::Owned(c.polyline)),
+                polyline: to_polyline(e).ok().map(|c| {
+                    let mut p = c.polyline;
+                    if let Some(d) = data {
+                        apply_corners(&mut p, &d.corners);
+                    }
+                    Cow::Owned(p)
+                }),
                 ai_origin: data.and_then(|d| d.ai_origin.as_ref()),
             }
         })

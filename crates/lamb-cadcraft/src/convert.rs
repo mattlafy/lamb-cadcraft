@@ -13,7 +13,7 @@ use std::f64::consts::{PI, TAU};
 use cadcraft_doc::{Arc, Circle, Entity, EntityKind, Line, LwPolyline};
 use cadcraft_geom::{PolyVertex, Vec2, Vec3, arc_to_bulge};
 use lamb_core::geometry::circle_fit::{CircleFit, circle_as_polyline, polyline_as_circle};
-use lamb_core::geometry::polyline::arc_from_bulge;
+use lamb_core::geometry::polyline::{CornerEntry, arc_from_bulge, virtual_corner_segment_index};
 use lamb_core::geometry::tolerance::{TOLERANCE, deg_to_rad};
 use lamb_core::geometry::{Point2, PolySegment, Polyline2};
 
@@ -226,4 +226,20 @@ pub fn from_polyline(p: &Polyline2) -> (EntityKind, Vec<Flattened>) {
         vertices.pop();
     }
     (EntityKind::LwPolyline(LwPolyline { vertices, closed: p.closed, const_width: 0.0, elevation: 0.0, plinegen: false }), warnings)
+}
+
+/// Puts stored virtual-corner tags back on `p`: each entry's tag goes on the segment that owns
+/// vertex `corner_index` (`virtual_corner_segment_index`). An index that is not a corner of `p` —
+/// stale once a CADCraft command has edited the vertices — is skipped; returns how many were set.
+pub fn apply_corners(p: &mut Polyline2, corners: &[CornerEntry]) -> usize {
+    let mut set = 0;
+    for c in corners {
+        if let Some(i) = virtual_corner_segment_index(p, c.corner_index)
+            && let Some(s) = p.segments.get_mut(i)
+        {
+            s.corner_at_to = Some(c.entry);
+            set += 1;
+        }
+    }
+    set
 }

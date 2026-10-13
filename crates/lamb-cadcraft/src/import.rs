@@ -11,6 +11,9 @@
 //! name. Colour: the `#rrggbb` hex as a true colour; lineweight: the nearest of CADCraft's
 //! `Lineweight::STANDARD` values — the reverse of [`crate::project`]'s mapping.
 //!
+//! Virtual (fillet/chamfer) corner tags go into the entity's `EntityData.corners`, so they are not
+//! reported as flattened — unless the polyline became a Circle, which has no vertices to tag.
+//!
 //! Only polyline geometry is imported; text, hatch, dimension and anything else is skipped and
 //! listed in the [`ImportReport`], and a link to a skipped entity is dropped and listed.
 
@@ -18,7 +21,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use cadcraft_doc::color::{Color, Rgb};
-use cadcraft_doc::{Common, Drawing, Lineweight, Space};
+use cadcraft_doc::{Common, Drawing, EntityKind, Lineweight, Space};
+use lamb_core::geometry::polyline::virtual_corner_entries;
 use lamb_core::model::{AnyView, DrawingLayer, EntityGeometry, Id, Placement, Project};
 
 use crate::convert::{Flattened, from_polyline};
@@ -40,7 +44,8 @@ impl IdMap {
 pub struct ImportReport {
     /// Entities not imported (old id, geometry kind).
     pub skipped: Vec<(Id, &'static str)>,
-    /// Per imported entity (old id), each thing `from_polyline` dropped.
+    /// Per imported entity (old id), each thing the import dropped (virtual corners only when the
+    /// entity kind has no vertices to carry them).
     pub flattened: Vec<(Id, Flattened)>,
     /// Links (by id) dropped because an end's entity was not imported.
     pub dropped_links: Vec<Id>,
@@ -168,7 +173,13 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
                 report.skipped.push((e.id, geometry_kind(&e.geometry)));
                 continue;
             };
-            let (kind, warnings) = from_polyline(geometry);
+            let (kind, mut warnings) = from_polyline(geometry);
+            let corners = if matches!(kind, EntityKind::LwPolyline(_)) {
+                warnings.retain(|w| *w != Flattened::VirtualCorner);
+                virtual_corner_entries(geometry)
+            } else {
+                Vec::new()
+            };
             report.flattened.extend(warnings.into_iter().map(|w| (e.id, w)));
             let layer = match layer_names.get(e.layer_id.as_str()) {
                 Some(n) => (*n).to_owned(),
@@ -180,7 +191,7 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
                 }
             };
             let mut common = Common { layer, ..Common::default() };
-            let data = EntityData { role: e.role, ai_origin: e.ai_origin.clone(), view_id: None };
+            let data = EntityData { role: e.role, ai_origin: e.ai_origin.clone(), view_id: None, corners };
             let deferred = data.ai_origin.as_ref().is_some_and(|o| o.source_entity_id.is_some());
             if !deferred {
                 set_entity_data(&mut common, &data)?;

@@ -28,12 +28,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use cadcraft_doc::{Drawing, Handle};
+use cadcraft_doc::{Drawing, EntityKind, Handle};
 use cadcraft_engine::Session;
 use lamb_core::derivation::linking::{find_auto_links, link_still_coincides};
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::derivation::travel::travel_segment_move;
-use lamb_core::geometry::polyline::{ResolvedSegment, closest_point_on_segment, point_at_param, resolved_segments};
+use lamb_core::geometry::polyline::{ResolvedSegment, closest_point_on_segment, point_at_param, resolved_segments, virtual_corner_entries};
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::geometry::{Point2, Polyline2};
 use lamb_core::model::{Actor, AnyView, Id, LinkAnchor, LinkRecord};
@@ -41,7 +41,7 @@ use lamb_core::model::{Actor, AnyView, Id, LinkAnchor, LinkRecord};
 use crate::convert::from_polyline;
 
 use crate::project::DrawingProject;
-use crate::schema::{SchemaError, read_document, write_document};
+use crate::schema::{SchemaError, read_document, read_entity_data, set_entity_data, write_document};
 
 /// What [`maintain_links`] changed, as link ids.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -151,7 +151,23 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing) -> Result<Vec<Id>, S
     };
     for (id, geometry) in &writes {
         let (kind, _) = from_polyline(geometry);
-        after.modify_entity(Handle(id.0), |e| e.kind = kind).map_err(|e| derivation_error(e.to_string()))?;
+        // The corner tags go with the geometry, so `ext` never disagrees with what was written.
+        let corners = if matches!(kind, EntityKind::LwPolyline(_)) { virtual_corner_entries(geometry) } else { Vec::new() };
+        let mut err = None;
+        after
+            .modify_entity(Handle(id.0), |e| {
+                e.kind = kind;
+                err = read_entity_data(&e.common)
+                    .and_then(|mut data| {
+                        data.corners = corners;
+                        set_entity_data(&mut e.common, &data)
+                    })
+                    .err();
+            })
+            .map_err(|e| derivation_error(e.to_string()))?;
+        if let Some(e) = err {
+            return Err(e);
+        }
     }
     Ok(writes.into_iter().map(|(id, _)| id).collect())
 }

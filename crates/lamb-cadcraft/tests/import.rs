@@ -4,12 +4,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use cadcraft_doc::Drawing;
+use lamb_cadcraft::convert::apply_corners;
 use lamb_cadcraft::{DrawingProject, Flattened, IdMap, ImportReport, project_to_drawing};
 use lamb_core::derivation::issues::find_issues;
 use lamb_core::derivation::markers::{Marker, compute_markers_for_view};
 use lamb_core::derivation::read::ProjectRead;
-use lamb_core::geometry::Point2;
+use lamb_core::geometry::polyline::{CornerEntry, VirtualCornerEntry, virtual_corner_entries};
 use lamb_core::geometry::tolerance::TOLERANCE;
+use lamb_core::geometry::{Point2, PolySegment, Polyline2};
 use lamb_core::model::{AnyView, DrawingEntity, EntityGeometry, Id, LineRole, Placement, Project};
 use lamb_core::persistence::files_to_project;
 
@@ -50,17 +53,23 @@ fn near(a: Point2, b: Point2) -> bool {
 /// Every check in the brief's "Done when", for one project.
 fn check_agrees(name: &str, p: &Project) -> Result<(ImportReport, usize), Box<dyn std::error::Error>> {
     let (d, map, report) = project_to_drawing(p)?;
-    let dp = DrawingProject::new(&d)?;
+    let markers = check_drawing(name, p, &d, &map, &report)?;
+    Ok((report, markers))
+}
+
+/// `check_agrees` for a drawing already imported from `p` (or read back from its DXF).
+fn check_drawing(name: &str, p: &Project, d: &Drawing, map: &IdMap, report: &ImportReport) -> Result<usize, Box<dyn std::error::Error>> {
+    let dp = DrawingProject::new(d)?;
     let dviews = &dp.document().views;
 
     // Same views, names, kinds, intents, in order; hosts mapped.
     assert_eq!(dviews.len(), p.views.len(), "{name}: view count");
     for (pv, dv) in p.views.iter().zip(dviews) {
-        assert_eq!(dv.id(), mapped(&map, pv.id())?, "{name}: view id mapped");
+        assert_eq!(dv.id(), mapped(map, pv.id())?, "{name}: view id mapped");
         assert_eq!((pv.name(), kind(pv)), (dv.name(), kind(dv)), "{name}: view name/kind");
         if let Some(Placement::Vertical { host_view_id, .. }) = pv.placement() {
             match dv.placement() {
-                Some(Placement::Vertical { host_view_id: h, .. }) => assert_eq!(*h, mapped(&map, *host_view_id)?, "{name}: host"),
+                Some(Placement::Vertical { host_view_id: h, .. }) => assert_eq!(*h, mapped(map, *host_view_id)?, "{name}: host"),
                 other => panic!("{name}: placement lost: {other:?}"),
             }
         }
@@ -72,13 +81,13 @@ fn check_agrees(name: &str, p: &Project) -> Result<(ImportReport, usize), Box<dy
         let mut want: Vec<Marker> = compute_markers_for_view(p, pv.id())?
             .into_iter()
             .map(|mut m| -> Result<Marker, String> {
-                m.view_id = mapped(&map, m.view_id)?;
-                m.source_view_id = mapped(&map, m.source_view_id)?;
-                m.source_entity_id = mapped(&map, m.source_entity_id)?;
+                m.view_id = mapped(map, m.view_id)?;
+                m.source_view_id = mapped(map, m.source_view_id)?;
+                m.source_entity_id = mapped(map, m.source_entity_id)?;
                 Ok(m)
             })
             .collect::<Result<_, _>>()?;
-        let mut got = compute_markers_for_view(&dp, mapped(&map, pv.id())?)?;
+        let mut got = compute_markers_for_view(&dp, mapped(map, pv.id())?)?;
         want.sort_by_key(sort_key);
         got.sort_by_key(sort_key);
         assert_eq!(got.len(), want.len(), "{name}: marker count in {}", pv.name());
@@ -118,7 +127,7 @@ fn check_agrees(name: &str, p: &Project) -> Result<(ImportReport, usize), Box<dy
             assert!(found, "{name}: link end {} is not a polyline entity on the drawing", end.entity_id);
         }
     }
-    Ok((report, markers))
+    Ok(markers)
 }
 
 #[test]
@@ -135,8 +144,34 @@ fn every_fixture_derives_the_same_on_the_drawing() -> R {
     Ok(())
 }
 
+/// Every source polyline's `virtual_corner_entries`, keyed by its mapped (drawing) id.
+fn source_corners(p: &Project, map: &IdMap) -> Result<BTreeMap<Id, Vec<CornerEntry>>, String> {
+    let mut out = BTreeMap::new();
+    for v in &p.views {
+        for e in v.entities() {
+            if let EntityGeometry::Polyline { geometry } = &e.geometry {
+                out.insert(mapped(map, e.id)?, virtual_corner_entries(geometry));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every polyline entity's `virtual_corner_entries` as `DrawingProject` hands it to derivation.
+fn drawing_corners(dp: &DrawingProject) -> BTreeMap<Id, Vec<CornerEntry>> {
+    let mut out = BTreeMap::new();
+    for v in dp.views() {
+        for e in dp.entities(v.id) {
+            if let Some(poly) = &e.polyline {
+                out.insert(e.id, virtual_corner_entries(poly));
+            }
+        }
+    }
+    out
+}
+
 #[test]
-fn filleted_corners_reports_virtual_corners_per_polyline() -> R {
+fn filleted_corners_survive_import_and_are_not_flagged() -> R {
     let p = load("filleted-corners")?;
     let carriers: BTreeSet<Id> = p.views[0]
         .entities()
@@ -145,10 +180,36 @@ fn filleted_corners_reports_virtual_corners_per_polyline() -> R {
         .map(|e| e.id)
         .collect();
     assert_eq!(carriers.len(), 3);
-    let (_, _, report) = project_to_drawing(&p)?;
+    let (d, map, report) = project_to_drawing(&p)?;
     let flagged: BTreeSet<Id> = report.flattened.iter().filter(|(_, f)| *f == Flattened::VirtualCorner).map(|(id, _)| *id).collect();
-    assert_eq!(flagged, carriers);
+    assert!(flagged.is_empty(), "virtual corners still reported flattened: {flagged:?}");
+    let want = source_corners(&p, &map)?;
+    assert_eq!(want.values().filter(|c| !c.is_empty()).count(), 3);
+    assert_eq!(drawing_corners(&DrawingProject::new(&d)?), want);
     Ok(())
+}
+
+#[test]
+fn filleted_corners_survive_a_dxf_round_trip() -> R {
+    let p = load("filleted-corners")?;
+    let (d, map, report) = project_to_drawing(&p)?;
+    let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(&d).as_bytes())?;
+    assert_eq!(drawing_corners(&DrawingProject::new(&back)?), source_corners(&p, &map)?);
+
+    // Derivation over the read-back drawing agrees with derivation over the source project.
+    check_drawing("filleted-corners via DXF", &p, &back, &map, &report)?;
+    Ok(())
+}
+
+#[test]
+fn apply_corners_skips_an_index_that_is_not_a_corner() {
+    let pt = |x: f64, y: f64| Point2 { x, y };
+    let seg = |x: f64, y: f64| PolySegment { to: pt(x, y), bulge: 0.0, corner_at_to: None };
+    let mut p = Polyline2 { start: pt(0.0, 0.0), segments: vec![seg(10.0, 0.0), seg(10.0, 5.0)], closed: false };
+    let fillet = VirtualCornerEntry::Fillet { radius: 2.0 };
+    let n = apply_corners(&mut p, &[CornerEntry { corner_index: 1, entry: fillet }, CornerEntry { corner_index: 7, entry: fillet }]);
+    assert_eq!(n, 1);
+    assert_eq!(virtual_corner_entries(&p), vec![CornerEntry { corner_index: 1, entry: fillet }]);
 }
 
 #[test]
