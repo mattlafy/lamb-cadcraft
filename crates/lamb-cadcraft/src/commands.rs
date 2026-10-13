@@ -8,6 +8,11 @@
 //! - `newsheet {name, viewIds?}` (`nsh`): a paper layout with one viewport per view (default every
 //!   view), each freezing every other view's layer; returns `{layout, viewports: [hex handles]}`.
 //!
+//! - `link {a:{entityId, segmentIndex, segmentParam}, b:{…}}` (`lk`): an explicit link between two
+//!   segments in different views (the escape hatch from the same-layer auto-link rule); `entityId`
+//!   is a hex handle string or a JSON number. Returns `{"linkId": <id>}`.
+//! - `unlink {linkId}` (`ulk`): removes that link.
+//!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
 //!
@@ -17,15 +22,19 @@
 
 use std::sync::OnceLock;
 
-use cadcraft_doc::{EntityKind, Line, Space};
+use cadcraft_doc::{EntityKind, Handle, Line, Space};
 use cadcraft_engine::{Accept, CommandSpec, EngineError, Input, Interactive, Prompt, Result, Session, Step, register_command_provider};
 use cadcraft_geom::Vec2;
+use lamb_core::derivation::read::ProjectRead;
 use lamb_core::geometry::polyline::line2;
+use lamb_core::geometry::polyline::resolved_segments;
 use lamb_core::geometry::{IDENTITY_TRANSFORM, Point2};
-use lamb_core::model::{AnyView, Id, Placement, PlanView, VerticalIntent, VerticalView, is_plan_view};
+use lamb_core::model::{Actor, AnyView, Id, LinkAnchor, LinkOrigin, LinkRecord, Placement, PlanView, VerticalIntent, VerticalView, is_plan_view};
 use serde_json::{Value, json};
 
-use crate::schema::{read_document, view_block_name};
+use crate::maintain::now;
+use crate::project::DrawingProject;
+use crate::schema::{read_document, view_block_name, write_document};
 use crate::sheets::create_sheet;
 use crate::views::create_view;
 
@@ -120,6 +129,87 @@ fn newsheet(s: &mut Session, p: &Value) -> Result<Value> {
     let handles = create_sheet(s.doc_mut()?, &name, &ids).map_err(other)?;
     let hex: Vec<String> = handles.iter().map(|h| format!("{:X}", h.0)).collect();
     Ok(json!({ "layout": name, "viewports": hex }))
+}
+
+/// One end of a `link` call, as given: the entity id (hex handle string or JSON number), the
+/// segment index and param. Shapes are `BadParams`; ranges are checked in [`link`].
+struct RawAnchor {
+    entity: Id,
+    index: Value,
+    param: f64,
+}
+
+fn raw_anchor(p: &Value, end: &str) -> Result<RawAnchor> {
+    let q = p.get(end).filter(|q| q.is_object()).ok_or_else(|| bad("link", &format!("`{end}` must be {{entityId, segmentIndex, segmentParam}}")))?;
+    let entity = match q.get("entityId") {
+        Some(Value::String(h)) => Handle::parse_hex(h).map(|h| Id(h.0)),
+        Some(v) => v.as_u64().map(Id),
+        None => None,
+    }
+    .ok_or_else(|| bad("link", &format!("`{end}.entityId` must be a hex handle or a number")))?;
+    let index =
+        q.get("segmentIndex").filter(|v| v.is_number()).cloned().ok_or_else(|| bad("link", &format!("`{end}.segmentIndex` must be a number")))?;
+    let param = q.get("segmentParam").and_then(Value::as_f64).ok_or_else(|| bad("link", &format!("`{end}.segmentParam` must be a number")))?;
+    Ok(RawAnchor { entity, index, param })
+}
+
+/// TS T282's range check for one end: the param in 0..1, the index a whole number naming a real
+/// segment of the entity (left unchecked when the entity is missing — that refusal comes next).
+fn anchor_range(p: &DrawingProject<'_>, end: &str, a: &RawAnchor) -> Result<LinkAnchor> {
+    if !(0.0..=1.0).contains(&a.param) {
+        return Err(other(format!("Link end {end}: segmentParam {} is outside 0..1", a.param)));
+    }
+    let Some(index) = a.index.as_u64().and_then(|i| usize::try_from(i).ok()) else {
+        return Err(other(format!("Link end {end}: segmentIndex {} is not a whole number >= 0", a.index)));
+    };
+    if let Some(e) = p.entity(a.entity) {
+        let count = e.polyline.as_deref().map_or(1, |poly| resolved_segments(poly).len());
+        if index >= count {
+            let last = count.checked_sub(1).map_or_else(|| "-1".to_owned(), |n| n.to_string());
+            return Err(other(format!("Link end {end}: segmentIndex {index} is past the last segment ({last})")));
+        }
+    }
+    Ok(LinkAnchor { entity_id: a.entity, segment_index: index, segment_param: a.param })
+}
+
+fn link(s: &mut Session, p: &Value) -> Result<Value> {
+    let (ra, rb) = (raw_anchor(p, "a")?, raw_anchor(p, "b")?);
+    let (a, b) = {
+        let proj = DrawingProject::new(s.doc()?).map_err(other)?;
+        let (a, b) = (anchor_range(&proj, "a", &ra)?, anchor_range(&proj, "b", &rb)?);
+        let (va, vb) = (proj.entity_view_id(a.entity_id), proj.entity_view_id(b.entity_id));
+        let (Some(va), Some(vb)) = (va, vb) else { return Err(other("No such entity")) };
+        if va == vb {
+            return Err(other("Link ends must be in different views"));
+        }
+        (a, b)
+    };
+    let d = s.doc_mut()?;
+    let mut doc = read_document(d).map_err(other)?;
+    let id = Id(d.new_handle().0);
+    doc.links.push(LinkRecord {
+        id,
+        a,
+        b,
+        origin: LinkOrigin::Explicit,
+        created_at: now(),
+        created_by: Actor::User { user_id: "local".into() },
+        stale: None,
+    });
+    write_document(d, &doc).map_err(other)?;
+    Ok(json!({ "linkId": id.0 }))
+}
+
+fn unlink(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = p.get("linkId").and_then(id_value).ok_or_else(|| bad("unlink", "`linkId` is required"))?;
+    let mut doc = read_document(s.doc()?).map_err(other)?;
+    let n = doc.links.len();
+    doc.links.retain(|l| l.id != id);
+    if doc.links.len() == n {
+        return Err(other("No such link"));
+    }
+    write_document(s.doc_mut()?, &doc).map_err(other)?;
+    Ok(Value::Null)
 }
 
 // ---------------- interactive machines ----------------
@@ -401,6 +491,8 @@ pub fn commands() -> Vec<CommandSpec> {
             .interactive(newelevationline_machine),
         CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?}").menu(MENU).interactive(newsheet_machine),
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU).interactive(editview_machine),
+        CommandSpec::new("link", "Link", link).alias(&["lk"]).params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}"),
+        CommandSpec::new("unlink", "Unlink", unlink).alias(&["ulk"]).params("{linkId}"),
     ]
 }
 

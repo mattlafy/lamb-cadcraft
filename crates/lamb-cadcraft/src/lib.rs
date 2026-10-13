@@ -9,7 +9,8 @@
 //! keeps links true ([`maintain`]: erased ends drop, broken crossings go stale, new lines auto-link),
 //! the overlay and snap providers drawing an edited view's markers and cut lines ([`overlays`]), and
 //! sheets: a paper layout with one viewport per view, every other view's layer frozen there
-//! ([`sheets`], command `newsheet`).
+//! ([`sheets`], command `newsheet`), and the explicit link commands `link` / `unlink`
+//! ([`commands`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
 //! the remaining overlay display lists (datums, repeat ghosts). Sits above
 //! `cadcraft-engine` and below the UI shells and MCP.
