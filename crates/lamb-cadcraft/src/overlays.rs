@@ -28,13 +28,17 @@ const MARKER_ASSUMED_Z_COLOR: Rgb = Rgb(120, 140, 160);
 const CUT_LINE_COLOR: Rgb = Rgb(255, 170, 0);
 const SNAP_NAME: &str = "LAMB marker";
 
-/// The LAMB view a space edits: `Space::Block(view_block_name(id))` for a view in the document.
-fn view_of<'a>(d: &'a Drawing, space: &Space) -> Option<(DrawingProject<'a>, Id)> {
+/// The view id a space's block name stands for (`view_block_name(id)`), without checking the
+/// document holds that view.
+pub(crate) fn view_id(space: &Space) -> Option<Id> {
     let Space::Block(name) = space else { return None };
     let id = Id(name.strip_prefix("LAMB_VIEW_")?.parse().ok()?);
-    if view_block_name(id) != *name {
-        return None;
-    }
+    (view_block_name(id) == *name).then_some(id)
+}
+
+/// The LAMB view a space edits: `Space::Block(view_block_name(id))` for a view in the document.
+pub(crate) fn view_of<'a>(d: &'a Drawing, space: &Space) -> Option<(DrawingProject<'a>, Id)> {
+    let id = view_id(space)?;
     let dp = DrawingProject::new(d).ok()?;
     dp.document().views.iter().any(|v| v.id() == id).then_some((dp, id))
 }
@@ -122,12 +126,14 @@ pub fn lamb_snaps(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64) -> Ve
         .collect()
 }
 
-/// Register [`lamb_overlay`] and [`lamb_snaps`] with CADCraft's process-global registries. Only
-/// the first call registers; later calls return its result.
+/// Register [`lamb_overlay`], [`lamb_snaps`] and the pane relations ([`crate::panes`]) with
+/// CADCraft's process-global registries. Only the first call registers; later calls return its
+/// result.
 pub fn register_providers() -> Result<(), &'static str> {
     static DONE: OnceLock<Result<(), &'static str>> = OnceLock::new();
     *DONE.get_or_init(|| {
         register_overlay_provider(lamb_overlay)?;
-        register_snap_provider(lamb_snaps)
+        register_snap_provider(lamb_snaps)?;
+        crate::panes::register()
     })
 }

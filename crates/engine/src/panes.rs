@@ -5,8 +5,15 @@
 //! The current tile's space is always `DocState::space`; [`Panes::spaces`] only matters for the
 //! other tiles. It is session state, never saved with the drawing. When the tiling changes
 //! (VPORTS, or undo of it), every tile but the current one goes back to Model.
+//!
+//! Relations between two tiles' spaces — the rotation a tile takes to line up with another, where
+//! a point in one lands in another (the crosshair), where a locked tile re-centres — are geometry
+//! the engine doesn't know: an adapter registers them once ([`register_pane_relations`]) and the
+//! canvas reads them through [`Session::tile_rotations`] / [`Session::tile_crosshairs`].
 
-use cadcraft_doc::Space;
+use std::sync::OnceLock;
+
+use cadcraft_doc::{Drawing, Space};
 use cadcraft_geom::Vec2;
 
 use crate::{DocState, Session};
@@ -16,6 +23,40 @@ use crate::{DocState, Session};
 pub struct Panes {
     pub rects: Vec<(Vec2, Vec2)>,
     pub spaces: Vec<Space>,
+}
+
+/// Where a point in one tile's space lands in another's: a point, or (when the other space has an
+/// axis the first can't fix, e.g. a plan point in a section has no height) a line through `through`
+/// along unit `dir`, both in the other space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PaneMap {
+    Point(Vec2),
+    Line { through: Vec2, dir: Vec2 },
+}
+
+/// The relations between two spaces, filled by an adapter (LAMB's `lamb-cadcraft`).
+#[derive(Clone, Copy, Debug)]
+pub struct PaneRelations {
+    /// The rotation (radians) a tile showing the first space takes so the second reads aligned
+    /// with it; `None` when the two are unrelated.
+    pub rotation: fn(&Drawing, &Space, &Space) -> Option<f64>,
+    /// A point in the first space mapped into the second; `None` when unrelated.
+    pub map: fn(&Drawing, &Space, &Space, Vec2) -> Option<PaneMap>,
+    /// Camera lock: `(from, p, to, to_prev)` — the centre the `to` tile takes when the `from` tile
+    /// centres on `p`, given `to`'s previous centre; `None` when unrelated.
+    pub centre: fn(&Drawing, &Space, Vec2, &Space, Vec2) -> Option<Vec2>,
+}
+
+static RELATIONS: OnceLock<PaneRelations> = OnceLock::new();
+
+/// Register the pane relations. Once per process; a second call is an error.
+pub fn register_pane_relations(r: PaneRelations) -> Result<(), &'static str> {
+    RELATIONS.set(r).map_err(|_| "pane relations already registered")
+}
+
+/// The registered pane relations, if any.
+pub fn pane_relations() -> Option<&'static PaneRelations> {
+    RELATIONS.get()
 }
 
 /// The spaces a tiled model area can edit: Model, or a block (a view) shown in it.
@@ -66,6 +107,32 @@ impl Session {
                 }
             })
             .collect()
+    }
+
+    /// Each tile's rotation (radians), one per [`Session::model_tiles`] entry: aligned with the
+    /// current tile's space when they are related, else with the first related tile in tile
+    /// order, else 0. All 0 with no relations registered.
+    pub fn tile_rotations(&self) -> Vec<f64> {
+        let spaces = self.tile_spaces();
+        let (Some(rel), Ok(d)) = (pane_relations(), self.doc()) else { return vec![0.0; spaces.len()] };
+        let active = self.model_tiles().iter().position(|t| t.active);
+        (0..spaces.len())
+            .map(|i| {
+                let first = active.filter(|&a| a != i).and_then(|a| (rel.rotation)(d, &spaces[i], &spaces[a]));
+                first.or_else(|| (0..spaces.len()).filter(|&j| j != i).find_map(|j| (rel.rotation)(d, &spaces[i], &spaces[j]))).unwrap_or(0.0)
+            })
+            .collect()
+    }
+
+    /// Where `p` (in the current tile's space) lands in each tile, one per
+    /// [`Session::model_tiles`] entry: `None` for the current tile itself and for any tile whose
+    /// space is unrelated. All `None` with no relations registered.
+    pub fn tile_crosshairs(&self, p: Vec2) -> Vec<Option<PaneMap>> {
+        let tiles = self.model_tiles();
+        let spaces = self.tile_spaces();
+        let (Some(rel), Ok(d)) = (pane_relations(), self.doc()) else { return vec![None; spaces.len()] };
+        let Some(a) = tiles.iter().position(|t| t.active) else { return vec![None; spaces.len()] };
+        (0..spaces.len()).map(|i| if i == a { None } else { (rel.map)(d, &spaces[a], &spaces[i], p) }).collect()
     }
 }
 
@@ -146,6 +213,16 @@ mod tests {
         assert_eq!(s.space(), b());
         assert!(s.model_tiles().is_empty());
         assert!(s.tile_spaces().is_empty());
+    }
+
+    #[test]
+    fn unregistered_relations_are_neutral() {
+        // The engine's own tests never register relations (only an adapter does).
+        let mut s = two_tiles_with_block();
+        enter(&mut s, b());
+        assert!(super::pane_relations().is_none());
+        assert_eq!(s.tile_rotations(), vec![0.0, 0.0]);
+        assert_eq!(s.tile_crosshairs(Vec2::new(1.0, 2.0)), vec![None, None]);
     }
 
     #[test]
