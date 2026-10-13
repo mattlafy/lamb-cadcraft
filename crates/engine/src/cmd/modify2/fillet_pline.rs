@@ -106,9 +106,28 @@ fn same_polyline(
     } else {
         return Err(other("The segments must be adjacent or separated by one segment."));
     };
+    // LAMB fork patch 10: an adapter may keep the shared vertex and tag it instead (crate::vcorner).
+    let hook = crate::vcorner::virtual_corner_hook().filter(|_| gap == 0 && trim);
+    let vertex = (i + 1) % n.max(1);
+    if let Some(f) = hook
+        && chamfer.is_none()
+        && f(s, h, vertex, crate::vcorner::CornerOp::Fillet { radius: r })?
+    {
+        return Ok(Some(h));
+    }
     let (Some(Segment::Line(si)), Some(Segment::Line(sj))) = (segs.get(i), segs.get(j)) else {
         return Err(other("Fillet and chamfer work on straight polyline segments."));
     };
+    if let Some(f) = hook
+        && let Some(ch) = chamfer
+    {
+        let (ui, uj) = ((si.a - si.b).normalized(), (sj.b - sj.a).normalized());
+        let (df, ds) = if in_order { ch(ui, uj)? } else { ch(uj, ui)? };
+        let (distance1, distance2) = if in_order { (df, ds) } else { (ds, df) };
+        if f(s, h, vertex, crate::vcorner::CornerOp::Chamfer { distance1, distance2 })? {
+            return Ok(Some(h));
+        }
+    }
     let x =
         if gap == 0 { si.b } else { line_line_infinite(si.a, si.b, sj.a, sj.b).map(|r| r.0).ok_or_else(|| other("The segments are parallel."))? };
     let side = |keep: Vec2| ((keep - x).normalized(), keep.dist(x));

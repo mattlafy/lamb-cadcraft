@@ -30,6 +30,7 @@ pub mod spatial;
 pub mod sysvars;
 pub mod undoctl;
 pub mod units;
+pub mod vcorner;
 
 use std::sync::Arc;
 

@@ -126,14 +126,15 @@ pub fn lamb_snaps(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64) -> Ve
         .collect()
 }
 
-/// Register [`lamb_overlay`], [`lamb_snaps`] and the pane relations ([`crate::panes`]) with
-/// CADCraft's process-global registries. Only the first call registers; later calls return its
+/// Register [`lamb_overlay`], [`lamb_snaps`], the pane relations ([`crate::panes`]) and the
+/// virtual corner hook ([`crate::fillet`]) with CADCraft's process-global registries. Only the first call registers; later calls return its
 /// result.
 pub fn register_providers() -> Result<(), &'static str> {
     static DONE: OnceLock<Result<(), &'static str>> = OnceLock::new();
     *DONE.get_or_init(|| {
         register_overlay_provider(lamb_overlay)?;
         register_snap_provider(lamb_snaps)?;
-        crate::panes::register()
+        crate::panes::register()?;
+        crate::fillet::register()
     })
 }
