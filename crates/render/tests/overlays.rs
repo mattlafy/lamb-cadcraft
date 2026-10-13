@@ -7,7 +7,7 @@ use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use cadcraft_render::{DPrim, DisplayList, Kind, Options, build, overlays, register_overlay_provider};
 
 fn marker(at: Vec2, handle: u64) -> DisplayList {
-    let prim = DPrim { handle: Handle(handle), color: Rgb(255, 0, 0), aci7: false, lw: 0.0, kind: Kind::Point, start: 0, len: 1 };
+    let prim = DPrim { handle: Handle(handle), color: Rgb(255, 0, 0), aci7: false, lw: 0.0, transparency: 0, kind: Kind::Point, start: 0, len: 1 };
     DisplayList { prims: vec![prim], verts: vec![at], bounds: Bounds2::from_points([at]), ..Default::default() }
 }
 

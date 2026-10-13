@@ -78,12 +78,23 @@ fn entities_with_child_records_keep_ext_and_children() {
             constant: false,
             prompt: String::new(),
             props: Default::default(),
+            multiline: None,
+            modes: Default::default(),
         }),
     ));
     d.blocks.insert("Tag".into(), std::sync::Arc::new(b));
     d.bump_handseed(Handle(0x710));
     let ie = lamb("door-tag");
-    let attrib = Attrib { tag: "NUM".into(), text: text("D1"), invisible: false, constant: false, prompt: String::new(), props: Default::default() };
+    let attrib = Attrib {
+        tag: "NUM".into(),
+        text: text("D1"),
+        invisible: false,
+        constant: false,
+        prompt: String::new(),
+        props: Default::default(),
+        multiline: None,
+        modes: Default::default(),
+    };
     d.add(
         &Space::Model,
         with_ext(&ie),

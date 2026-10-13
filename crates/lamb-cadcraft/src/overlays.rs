@@ -67,7 +67,7 @@ fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kind, pts: &[V
     let buf = if into_tris { &mut list.tris } else { &mut list.verts };
     let start = buf.len() as u32;
     buf.extend_from_slice(pts);
-    list.prims.push(DPrim { handle, color, aci7: false, lw: 0.0, kind, start, len: pts.len() as u32 });
+    list.prims.push(DPrim { handle, color, aci7: false, lw: 0.0, transparency: 0, kind, start, len: pts.len() as u32 });
 }
 
 /// The overlay provider: the edited view's markers and cut lines, in its block's coordinates.
