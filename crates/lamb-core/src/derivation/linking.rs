@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use super::markers::{Marker, compute_markers_for_view};
 use super::read::{EntityRef, ProjectRead};
-use crate::geometry::polyline::{closest_point_on_segment, resolved_segments};
+use crate::geometry::polyline::{closest_point_on_segment, point_at_param, resolved_segments};
 use crate::geometry::tolerance::TOLERANCE;
 use crate::model::{Actor, Id, LinkAnchor, LinkOrigin, LinkRecord};
 
@@ -72,4 +72,24 @@ pub fn find_link_for_marker<'a>(doc: &'a impl ProjectRead, marker: &Marker, view
             false
         }
     })
+}
+
+/// Whether `link` still holds: either end's current point lies within the auto-link tolerance of
+/// a marker sourced from the other end's segment (TS `move.ts` `linkStillCoincides`). The same
+/// test [`find_auto_links`] uses to create a link, run against the live geometry.
+pub fn link_still_coincides(doc: &impl ProjectRead, link: &LinkRecord) -> Result<bool, String> {
+    Ok(coincides_one_way(doc, &link.a, &link.b)? || coincides_one_way(doc, &link.b, &link.a)?)
+}
+
+fn coincides_one_way(doc: &impl ProjectRead, drawn: &LinkAnchor, source: &LinkAnchor) -> Result<bool, String> {
+    let Some(entity) = doc.entity(drawn.entity_id) else { return Ok(false) };
+    let Some(poly) = entity.polyline.as_deref() else { return Ok(false) };
+    let Some(seg) = resolved_segments(poly).into_iter().find(|s| s.index == drawn.segment_index) else { return Ok(false) };
+    let point = point_at_param(&seg, drawn.segment_param);
+    let markers = compute_markers_for_view(doc, entity.view_id)?;
+    let Some(marker) = markers.iter().find(|m| m.source_entity_id == source.entity_id && m.source_segment_index == source.segment_index) else {
+        return Ok(false);
+    };
+    let tolerance_mm = TOLERANCE.coincidence_mm + 2.0;
+    Ok((marker.position.x - point.x).hypot(marker.position.y - point.y) <= tolerance_mm)
 }
