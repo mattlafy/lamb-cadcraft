@@ -51,7 +51,7 @@ fn vports_factory(s: &Session) -> Result<Box<dyn Interactive>> {
 /// The tile machine for the Model tab (`count`: View > Viewports > n), else `None` (the caller
 /// runs its layout form).
 pub(in crate::cmd) fn model_vports(s: &Session, count: Option<usize>) -> Option<Box<dyn Interactive>> {
-    if s.layout_space() != Space::Model {
+    if !crate::panes::tiles_space(&s.layout_space()) {
         return None;
     }
     Some(Box::new(VportsM { count, ..Default::default() }))
@@ -106,7 +106,8 @@ fn active_config(d: &Drawing) -> Option<&VportConfig> {
 /// The tiles on show with their views as they are now (the current one's is the model view), and
 /// the current tile. One full tile when there is no tiling.
 fn live(st: &DocState, px: (f64, f64)) -> (Vec<VportTile>, usize) {
-    let now = st.views.iter().find(|(sp, _)| *sp == Space::Model).map(|(_, v)| *v).unwrap_or_default();
+    let edit = if matches!(st.space, Space::Block(_)) { st.space.clone() } else { Space::Model };
+    let now = st.views.iter().find(|(sp, _)| *sp == edit).map(|(_, v)| *v).unwrap_or_default();
     let Some(cfg) = active_config(&st.doc) else {
         let aspect = px.0 / px.1.max(1.0);
         return (vec![VportTile { min: Vec2::ZERO, max: Vec2::new(1.0, 1.0), center: now.center, height: now.height, aspect }], 0);
@@ -151,7 +152,7 @@ fn apply(s: &mut Session, mut tiles: Vec<VportTile>, current: usize) -> Result<(
     } else {
         st.tiles = ModelTiles::default();
     }
-    if st.space == Space::Model && st.mspace.is_none() {
+    if crate::panes::tiles_space(&st.space) && st.mspace.is_none() {
         st.set_view_quiet(view_of(&cur));
     }
     s.touch();
@@ -210,7 +211,7 @@ fn valid_name(n: &str) -> bool {
 }
 
 fn model_only(s: &Session) -> Result<()> {
-    if s.layout_space() == Space::Model {
+    if crate::panes::tiles_space(&s.layout_space()) {
         Ok(())
     } else {
         Err(EngineError::Other("Tiled viewports are for the Model tab; use MVIEW in a layout.".into()))
@@ -252,7 +253,7 @@ fn run_vports(s: &mut Session, p: &Value) -> Result<Value> {
         _ => None,
     };
     if let Some(count) = count
-        && (s.layout_space() != Space::Model || p.get("layout").is_some())
+        && (!crate::panes::tiles_space(&s.layout_space()) || p.get("layout").is_some())
     {
         // In a layout, -VPORTS makes layout viewports: MVIEW.
         let mview = find_command("mview").ok_or_else(|| EngineError::UnknownCommand("mview".into()))?;
@@ -391,7 +392,7 @@ impl Session {
     /// The model space tiles to draw (empty: one view, or not in the Model tab).
     pub fn model_tiles(&self) -> Vec<ModelTile> {
         let Ok(st) = self.state() else { return Vec::new() };
-        if st.space != Space::Model || active_config(&st.doc).is_none() {
+        if !crate::panes::tiles_space(&st.space) || active_config(&st.doc).is_none() {
             return Vec::new();
         }
         let (tiles, active) = live(st, self.viewport_px);
@@ -410,6 +411,7 @@ impl Session {
         }
         let st = self.state_mut()?;
         st.tiles = ModelTiles { rects: tiles.iter().map(rect).collect(), views: tiles.iter().map(view_of).collect(), active: index };
+        crate::panes::on_activate(st, active, index);
         if let Some(t) = tiles.get(index) {
             st.set_view_quiet(view_of(t));
         }
