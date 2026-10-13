@@ -4,7 +4,8 @@
 //!
 //! - `Drawing.ext["LAMB"]` = [`LambDocument`]: name, defaults, levels, views (metadata only),
 //!   links, suppressed proposals.
-//! - `Common.ext["LAMB"]` = [`EntityData`]: an entity's line role and AI provenance.
+//! - `Common.ext["LAMB"]` = [`EntityData`]: an entity's line role and AI provenance, and on a
+//!   sheet's viewport the view it shows.
 //! - `Layer.ext["LAMB"]` = [`LayerData`]: a layer's default role.
 //!
 //! A view's entities live in the block [`view_block_name`]`(id)`; an entity's id is its handle.
@@ -115,11 +116,14 @@ pub struct EntityData {
     pub role: LineRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_origin: Option<AiOrigin>,
+    /// On a sheet's viewport: the LAMB view it shows ([`crate::sheets`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<Id>,
 }
 
 impl Default for EntityData {
     fn default() -> Self {
-        EntityData { role: LineRole::Bylayer, ai_origin: None }
+        EntityData { role: LineRole::Bylayer, ai_origin: None, view_id: None }
     }
 }
 

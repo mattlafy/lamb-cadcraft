@@ -5,6 +5,8 @@
 //! - `newsectionline` / `newelevationline {name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}` (`nsl`,
 //!   `nel`): a vertical view placed on a straight cut line in the host view.
 //! - `editview {viewId?}`: edit inside the view's block; no `viewId` returns to Model.
+//! - `newsheet {name, viewIds?}` (`nsh`): a paper layout with one viewport per view (default every
+//!   view), each freezing every other view's layer; returns `{layout, viewports: [hex handles]}`.
 //!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
@@ -17,6 +19,7 @@ use lamb_core::model::{AnyView, Id, Placement, PlanView, VerticalIntent, Vertica
 use serde_json::{Value, json};
 
 use crate::schema::{read_document, view_block_name};
+use crate::sheets::create_sheet;
 use crate::views::create_view;
 
 fn other(e: impl std::fmt::Display) -> EngineError {
@@ -98,6 +101,20 @@ fn editview(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+fn newsheet(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = str_param("newsheet", p, "name")?.to_owned();
+    let ids = match p.get("viewIds").filter(|v| !v.is_null()) {
+        None => Vec::new(),
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| bad("newsheet", "`viewIds` must be an array"))?;
+            arr.iter().map(|x| id_value(x).ok_or_else(|| other("No such view"))).collect::<Result<Vec<Id>>>()?
+        }
+    };
+    let handles = create_sheet(s.doc_mut()?, &name, &ids).map_err(other)?;
+    let hex: Vec<String> = handles.iter().map(|h| format!("{:X}", h.0)).collect();
+    Ok(json!({ "layout": name, "viewports": hex }))
+}
+
 /// The LAMB commands, for `register_command_provider`.
 pub fn commands() -> Vec<CommandSpec> {
     vec![
@@ -108,6 +125,7 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("newelevationline", "New Elevation Line", newelevationline)
             .alias(&["nel"])
             .params("{name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}"),
+        CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?}"),
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo(),
     ]
 }
