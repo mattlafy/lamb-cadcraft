@@ -98,7 +98,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .alias(&["dv"])
             .params("{twist: degrees counterclockwise} (the Model tab's view twist, as DVIEW TWist; 2D only: the 3D options are not available)")
             .noundo()
-            .interactive(|_| Ok(Box::new(DviewM::default()))),
+            .interactive(|s| {
+                // Refused as it starts in a layout, as BricsCAD does.
+                twist_view(s)?;
+                Ok(Box::new(DviewM::default()))
+            }),
         CommandSpec::new("view.set", "Set View", run_view_set).params("{center: [x,y], height, twist?: degrees (default: keep the current twist)}").noundo(),
         CommandSpec::new("view.get", "Get View", |s, _| {
             let v = s.state()?.view();
@@ -280,6 +284,10 @@ fn run_view_set(s: &mut Session, p: &Value) -> Result<Value> {
         Some(t) => t.as_f64().filter(|t| t.is_finite()).ok_or_else(|| bad("view.set", "twist must be a number of degrees"))?.to_radians(),
         None => s.state()?.view().twist,
     };
+    // Only the Model tab's view turns.
+    if twist != 0.0 && twist_view(s).is_err() {
+        return Err(EngineError::Other(PAPER_SPACE.into()));
+    }
     if !s.state_mut()?.set_view(View { center: c, height: h, twist }) {
         return Err(bad("view.set", "the view is too large to show. Nothing was changed"));
     }
@@ -292,12 +300,14 @@ fn run_view_set(s: &mut Session, p: &Value) -> Result<Value> {
 const DVIEW_3D: &[&str] =
     &["camera", "ca", "target", "ta", "distance", "d", "points", "po", "pan", "pa", "zoom", "z", "clip", "cl", "hide", "h", "off", "o", "undo", "u"];
 const DVIEW_2D_ONLY: &str = "Only the view twist is available: CADCraft views are 2D.";
+/// What DVIEW (and a view twist asked for anywhere) says in a layout, as BricsCAD does.
+const PAPER_SPACE: &str = "This command is not available in Paper space.";
 
 /// The view twist DVIEW changes: the Model tab's (outside a layout viewport).
 fn twist_view(s: &Session) -> Result<View> {
     let st = s.state()?;
     if st.space != Space::Model || st.mspace.is_some() {
-        return Err(EngineError::Other("DVIEW twists the Model tab's view; layout views have no twist yet.".into()));
+        return Err(EngineError::Other(PAPER_SPACE.into()));
     }
     Ok(st.view())
 }

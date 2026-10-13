@@ -61,6 +61,57 @@ fn dview_twist_sets_viewtwist_and_zoom_previous_turns_it_back() {
     assert!(s.execute("dview", &json!({ "twist": 10 })).is_err());
 }
 
+const PAPER: &str = "This command is not available in Paper space.";
+
+#[test]
+fn dview_in_paper_space_says_it_is_not_available() {
+    let mut s = session();
+    let layout = s.doc().unwrap().layouts.first().map(|l| l.name.clone()).unwrap();
+    s.execute("layout.set", &json!({ "name": layout })).unwrap();
+    let e = s.execute("dview", &json!({ "twist": 10 })).unwrap_err();
+    assert_eq!(e.to_string(), PAPER);
+    // Typed, it is refused as it starts: no prompt is left open.
+    let e = s.cmdline("dview").unwrap_err();
+    assert_eq!(e.to_string(), PAPER);
+    assert!(s.current_prompt().is_none());
+    // view.set can't turn a layout's view either (an untwisted one is fine).
+    let e = s.execute("view.set", &json!({ "center": [0, 0], "height": 5, "twist": 15 })).unwrap_err();
+    assert_eq!(e.to_string(), PAPER);
+    s.execute("view.set", &json!({ "center": [0, 0], "height": 5 })).unwrap();
+    assert_eq!(view(&s).twist, 0.0);
+}
+
+#[test]
+fn a_single_untiled_view_keeps_its_twist_through_a_dxf_round_trip() {
+    let mut s = session();
+    s.execute("dview", &json!({ "twist": 30 })).unwrap();
+    assert!(s.model_tiles().len() <= 1, "untiled");
+    let dxf = cadcraft_io::write_dxf(s.doc().unwrap());
+    let lines: Vec<&str> = dxf.lines().map(str::trim).collect();
+    let written = lines.windows(2).any(|w| w[0] == "51" && w[1].parse::<f64>().is_ok_and(|a| near(a, 30.0)));
+    assert!(written, "the lone *ACTIVE VPORT carries group 51");
+    let back = cadcraft_io::read_dxf(dxf.as_bytes()).unwrap();
+    let mut o = Session::new();
+    o.viewport_px = (1200.0, 800.0);
+    o.open_drawing(back.clone(), "single", None);
+    assert!(near(twist_deg(&o), 30.0), "twist {}", twist_deg(&o));
+    assert!(o.model_tiles().len() <= 1, "still untiled");
+    // And again: saved from the reopened session, it is still turned.
+    let again = cadcraft_io::read_dxf(cadcraft_io::write_dxf(o.doc().unwrap()).as_bytes()).unwrap();
+    let mut o2 = Session::new();
+    o2.viewport_px = (1200.0, 800.0);
+    o2.open_drawing(again, "again", None);
+    assert!(near(twist_deg(&o2), 30.0));
+    // Turned back (ZOOM Previous here), the drawing keeps no twist.
+    s.execute("zoom", &json!({ "mode": "previous" })).unwrap();
+    assert_eq!(view(&s).twist, 0.0);
+    let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc().unwrap()).as_bytes()).unwrap();
+    let mut o3 = Session::new();
+    o3.viewport_px = (1200.0, 800.0);
+    o3.open_drawing(back, "plain", None);
+    assert_eq!(view(&o3).twist, 0.0);
+}
+
 #[test]
 fn zoom_extents_fits_in_the_twisted_frame() {
     let mut s = session();

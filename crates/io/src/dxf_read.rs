@@ -1573,8 +1573,9 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
             _ => {}
         }
     }
-    // One *Active viewport is no tiling: the view is the editor's (it zooms to the extents).
-    d.vports.retain(|c| c.tiles.len() > usize::from(c.is_active()));
+    // One *Active viewport is no tiling: the view is the editor's (it zooms to the extents),
+    // kept only for its view twist (see `cadcraft_engine::DocState`).
+    d.vports.retain(|c| c.tiles.len() > usize::from(c.is_active()) || c.tiles.first().is_some_and(|t| t.twist != 0.0));
 }
 
 /// Most tiles a viewport configuration keeps.

@@ -291,6 +291,29 @@ impl DocState {
             Some((_, slot)) => *slot = v,
             None => self.views.push((self.space.clone(), v)),
         }
+        if self.space == Space::Model {
+            self.keep_untiled_twist(v);
+        }
+    }
+    /// An untiled Model tab keeps its view twist in the drawing as a lone `*Active` VPORT tile
+    /// (written as that record's group 51 and read back), so it survives save and reopen. Only a
+    /// change of twist touches the drawing; an untwisted view keeps no record.
+    fn keep_untiled_twist(&mut self, v: View) {
+        use cadcraft_doc::{VportConfig, VportTile};
+        let twist = if v.twist.is_finite() { v.twist.rem_euclid(std::f64::consts::TAU) } else { 0.0 };
+        let active = self.doc.vports.iter().find(|c| c.is_active());
+        if active.is_some_and(|c| c.tiles.len() > 1) {
+            return;
+        }
+        if active.and_then(|c| c.tiles.first()).map_or(0.0, |t| t.twist) == twist {
+            return;
+        }
+        let d = Arc::make_mut(&mut self.doc);
+        d.vports.retain(|c| !c.is_active());
+        if twist != 0.0 {
+            let tile = VportTile { min: Vec2::ZERO, max: Vec2::new(1.0, 1.0), center: v.center, height: v.height, aspect: 1.0, twist };
+            d.vports.insert(0, VportConfig { name: VportConfig::ACTIVE.into(), tiles: vec![tile] });
+        }
     }
     /// Set the view, recording view history. Returns false, changing nothing, when the view (or,
     /// in MSPACE, the viewport view it maps to) isn't finite with a positive height.
@@ -751,17 +774,13 @@ impl Session {
     pub fn open_drawing(&mut self, d: Drawing, title: &str, path: Option<String>) -> usize {
         let mut st = DocState::new(d, title, path);
         let ext = st.doc.extents(&Space::Model);
-        if !ext.is_empty() {
-            // Tiled: the current tile (the first) keeps its saved twist.
-            let twist = st
-                .doc
-                .vports
-                .iter()
-                .find(|c| c.is_active() && c.tiles.len() > 1)
-                .and_then(|c| c.tiles.first())
-                .map_or(0.0, |t| t.twist)
-                .rem_euclid(std::f64::consts::TAU);
-            let twist = if twist.is_finite() { twist } else { 0.0 };
+        // The current tile (the first), or the lone untiled view, keeps its saved twist.
+        let twist =
+            st.doc.vports.iter().find(|c| c.is_active()).and_then(|c| c.tiles.first()).map_or(0.0, |t| t.twist).rem_euclid(std::f64::consts::TAU);
+        let twist = if twist.is_finite() { twist } else { 0.0 };
+        if ext.is_empty() {
+            st.set_view_quiet(View { twist, ..st.view() });
+        } else {
             let (center, w, h) = View::twisted_box(ext, twist);
             st.set_view_quiet(View { center, height: (h.max(w * self.viewport_px.1 / self.viewport_px.0.max(1.0)) * 1.1).max(1e-6), twist });
         }

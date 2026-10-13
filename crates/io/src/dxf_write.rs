@@ -1492,7 +1492,8 @@ fn vport_table(w: &mut W, d: &Drawing, ext: Bounds2) {
         center: if ext.is_empty() { Vec2::new(6.0, 4.5) } else { ext.center() },
         height: if ext.is_empty() { 9.0 } else { (ext.height() * 1.1).max(1e-6) },
         aspect: 1.6,
-        twist: 0.0,
+        // An untiled view's twist: the lone `*Active` tile the editor keeps for it.
+        twist: d.vports.iter().find(|c| c.is_active() && c.tiles.len() == 1).and_then(|c| c.tiles.first()).map_or(0.0, |t| t.twist),
     };
     let tiled = d.vports.iter().find(|c| c.is_active() && c.tiles.len() > 1);
     let mut records: Vec<(&str, &VportTile)> = match tiled {
