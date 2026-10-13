@@ -524,6 +524,7 @@
 	Plot	Plotten
 	Plot (click: do not plot)	Plotten (Klick: nicht plotten)
 	Plot Preview	Plotvorschau
+	Plot Window	Plotfenster
 	Plot style	Plotstil
 	Plot style attached to	Plotstil zugeordnet zu
 	Plot style table	Plotstiltabelle
@@ -1012,3 +1013,5 @@
 	Calibrate	Kalibrieren
 	Move sideways to pan; push/pull or twist to zoom.	Seitlich bewegen zum Verschieben; drücken, ziehen oder drehen zum Zoomen.
 	Left device button: zoom extents. Right device button: calibrate.	Linke Gerätetaste: auf Grenzen zoomen. Rechte Gerätetaste: kalibrieren.
+	Hatch Pattern	Schraffurmuster
+	Search for pattern	Muster suchen

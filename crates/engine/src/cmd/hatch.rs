@@ -1,6 +1,7 @@
 //! HATCH, GRADIENT, BOUNDARY, REGION: boundaries from pick points or selected closed objects.
 
 mod patfile;
+pub use patfile::{PatternChoice, pattern_choices};
 pub(super) use patfile::{lines_for, run_patterns};
 
 use cadcraft_color::Color;
@@ -10,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::helpers::lwpoly;
 use super::*;
-use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
+use crate::{Accept, EngineError, Input, Interactive, Picker, Prompt, Result, Session, Step};
 
 mod assoc;
 mod edit;
@@ -355,9 +356,63 @@ fn make(s: &mut Session, p: &Value, gradient: bool) -> Result<Value> {
     Ok(json!({ "handle": hex.first(), "handles": hex }))
 }
 
+/// True when two loops have the same vertex sequence (ignoring cyclic shift and winding order).
+fn same_loop(a: &HatchLoop, b: &HatchLoop) -> bool {
+    if a.vertices.len() != b.vertices.len() {
+        return false;
+    }
+    let n = a.vertices.len();
+    if n == 0 {
+        return true;
+    }
+    let near = |v1: &PolyVertex, v2: &PolyVertex| v1.p.near(v2.p, 1e-6) && (v1.bulge - v2.bulge).abs() < 1e-6;
+    (0..n).any(|k| (0..n).all(|i| near(&a.vertices[i], &b.vertices[(i + k) % n])))
+        || (0..n).any(|k| {
+            (0..n).all(|i| {
+                let j = (k + n - (i % n)) % n;
+                let prev_j = (j + n - 1) % n;
+                a.vertices[i].p.near(b.vertices[j].p, 1e-6) && (a.vertices[i].bulge + b.vertices[prev_j].bulge).abs() < 1e-6
+            })
+        })
+}
+
+/// Deduplicate boundary loops that describe the same boundary.
+fn dedup_loops(loops: &mut Vec<HatchLoop>) {
+    let mut unique: Vec<HatchLoop> = Vec::with_capacity(loops.len());
+    for l in loops.drain(..) {
+        if let Some(existing) = unique.iter_mut().find(|u| same_loop(u, &l)) {
+            for s in l.sources {
+                if !existing.sources.contains(&s) {
+                    existing.sources.push(s);
+                }
+            }
+            existing.outer = existing.outer || l.outer;
+        } else {
+            unique.push(l);
+        }
+    }
+    *loops = unique;
+}
+
 /// Add the hatches for groups of loops: one per group when separate, otherwise one for all.
 fn add_hatches(s: &mut Session, st: &HatchSettings, groups: Vec<Vec<HatchLoop>>) -> Result<Vec<Handle>> {
-    let groups: Vec<Vec<HatchLoop>> = if st.separate { groups } else { vec![groups.into_iter().flatten().collect()] };
+    let groups: Vec<Vec<HatchLoop>> = if st.separate {
+        let mut unique_groups: Vec<Vec<HatchLoop>> = Vec::new();
+        for mut g in groups {
+            dedup_loops(&mut g);
+            if g.is_empty() {
+                continue;
+            }
+            if !unique_groups.iter().any(|u| u.len() == g.len() && u.iter().zip(&g).all(|(a, b)| same_loop(a, b))) {
+                unique_groups.push(g);
+            }
+        }
+        unique_groups
+    } else {
+        let mut all: Vec<HatchLoop> = groups.into_iter().flatten().collect();
+        dedup_loops(&mut all);
+        vec![all]
+    };
     let mut out = Vec::new();
     for loops in groups.into_iter().filter(|g| !g.is_empty()) {
         let h = s.add_entity(st.hatch(loops))?;
@@ -528,7 +583,11 @@ impl Interactive for HatchM {
     fn prompt(&self, s: &Session) -> Prompt {
         // The sub-prompts offer the current value: Enter keeps it.
         match self.asking {
-            Some(HatchAsk::Pattern) => return Prompt::new("Enter a pattern name", Accept::TEXT).default(self.settings.pattern.clone()),
+            Some(HatchAsk::Pattern) => {
+                return Prompt::new("Enter a pattern name", Accept::TEXT)
+                    .default(self.settings.pattern.clone())
+                    .picker(Picker::HatchPattern(self.settings.pattern.clone()));
+            }
             Some(HatchAsk::Scale) => {
                 return Prompt::new("Specify a scale for the hatch pattern", Accept::NUMBER).default(format!("{:.4}", self.settings.scale));
             }
@@ -542,8 +601,10 @@ impl Interactive for HatchM {
             Some(HatchAsk::Origin) => return Prompt::new("Specify the pattern origin", Accept::POINT).kw(&ORIGIN_KW).default("Use current"),
             None => {}
         }
+        // The pattern picker stays offered while boundaries are picked: a choice sets the pattern.
+        let picker = |p: Prompt| if self.gradient { p } else { p.picker(Picker::HatchPattern(self.settings.pattern.clone())) };
         if self.selecting {
-            return Prompt::new("Select objects", Accept::SELECT).kw(&[
+            return picker(Prompt::new("Select objects", Accept::SELECT).kw(&[
                 "picK internal point",
                 "Undo",
                 "seTtings",
@@ -551,9 +612,9 @@ impl Interactive for HatchM {
                 "Angle",
                 "Origin",
                 "sEparate",
-            ]);
+            ]));
         }
-        Prompt::new("Pick internal point", Accept::POINT).kw(&[
+        picker(Prompt::new("Pick internal point", Accept::POINT).kw(&[
             "Select objects",
             "Undo",
             "seTtings",
@@ -562,7 +623,7 @@ impl Interactive for HatchM {
             "Angle",
             "Origin",
             "sEparate",
-        ])
+        ]))
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         if let Some(a) = self.asking.take() {
@@ -614,6 +675,11 @@ impl Interactive for HatchM {
                     }
                     _ => {}
                 }
+                Ok(Step::Continue)
+            }
+            // A pattern chosen in the picker while boundaries are picked.
+            Input::Text(t) if !self.gradient => {
+                self.answer(s, HatchAsk::Pattern, &t)?;
                 Ok(Step::Continue)
             }
             // Enter ends boundary picking in either mode and creates the hatch.
@@ -682,5 +748,96 @@ mod tests {
         assert_eq!(hatch.pattern, "ANSI31");
         assert!(!hatch.solid);
         assert!(hatch.gradient.is_none());
+    }
+
+    #[test]
+    fn the_pattern_picker_is_offered_and_its_choice_sets_the_pattern() {
+        let mut s = Session::new();
+        s.execute("rectang", &json!({ "p1": [0, 0], "p2": [10, 10] })).unwrap();
+        s.start("hatch").unwrap();
+        let picker = s.current_prompt().and_then(|p| p.picker);
+        assert_eq!(picker, Some(Picker::HatchPattern(HatchSettings::from(&s, &Value::Null, false).pattern)));
+        // A choice made in the picker while boundaries are picked.
+        s.input(Input::Text("AR-CONC".into())).unwrap();
+        assert_eq!(s.current_prompt().and_then(|p| p.picker), Some(Picker::HatchPattern("AR-CONC".into())));
+        // And at the pattern prompt.
+        s.input(Input::Keyword("Pattern".into())).unwrap();
+        assert!(s.current_prompt().unwrap().picker.is_some());
+        s.input(Input::Text("BRICK".into())).unwrap();
+        s.input(Input::Point(Vec2::new(5.0, 5.0))).unwrap();
+        s.input(Input::Enter).unwrap();
+        assert_eq!(only_hatch(&s).1.pattern, "BRICK");
+        // An unknown name keeps the pattern.
+        s.start("hatch").unwrap();
+        s.input(Input::Text("NO-SUCH".into())).unwrap();
+        assert_eq!(s.current_prompt().and_then(|p| p.picker), Some(Picker::HatchPattern("BRICK".into())));
+        // GRADIENT offers no pattern picker.
+        s.cancel();
+        s.start("gradient").unwrap();
+        assert!(s.current_prompt().unwrap().picker.is_none());
+    }
+
+    #[test]
+    fn pattern_choices_list_the_library_with_its_lines() {
+        let all = pattern_choices();
+        assert_eq!(all.first().map(|c| c.name.as_str()), Some("SOLID"));
+        assert!(all[0].lines.is_empty());
+        let ansi31 = all.iter().find(|c| c.name == "ANSI31").unwrap();
+        assert_eq!(ansi31.lines.len(), 1);
+        assert!(!ansi31.description.is_empty());
+    }
+
+    #[test]
+    fn repeated_picks_and_handles_in_one_region_do_not_produce_duplicate_loops() {
+        // One internal point
+        let mut s = Session::new();
+        s.execute("rectang", &json!({ "p1": [0, 0], "p2": [10, 10] })).unwrap();
+        s.execute("hatch", &json!({ "points": [[5, 5]], "pattern": "SOLID" })).unwrap();
+        let (_, h1) = only_hatch(&s);
+        assert_eq!(h1.loops.len(), 1);
+
+        // Two different points in the same rectangle
+        let mut s = Session::new();
+        s.execute("rectang", &json!({ "p1": [0, 0], "p2": [10, 10] })).unwrap();
+        s.execute("hatch", &json!({ "points": [[2, 2], [8, 8]], "pattern": "SOLID" })).unwrap();
+        let (_, h2) = only_hatch(&s);
+        assert_eq!(h2.loops.len(), 1, "two points in same region must deduplicate loops");
+
+        // The same point twice
+        let mut s = Session::new();
+        s.execute("rectang", &json!({ "p1": [0, 0], "p2": [10, 10] })).unwrap();
+        s.execute("hatch", &json!({ "points": [[5, 5], [5, 5]], "pattern": "SOLID" })).unwrap();
+        let (_, h3) = only_hatch(&s);
+        assert_eq!(h3.loops.len(), 1, "identical points must deduplicate loops");
+
+        // Three points in the same rectangle
+        let mut s = Session::new();
+        s.execute("rectang", &json!({ "p1": [0, 0], "p2": [10, 10] })).unwrap();
+        s.execute("hatch", &json!({ "points": [[2, 2], [5, 5], [8, 8]], "pattern": "SOLID" })).unwrap();
+        let (_, h4) = only_hatch(&s);
+        assert_eq!(h4.loops.len(), 1);
+
+        // Same boundary handle twice
+        let mut s = Session::new();
+        let r = s.execute("rectang", &json!({ "p1": [0, 0], "p2": [10, 10] })).unwrap();
+        let handle = r["handle"].as_str().unwrap();
+        s.execute("hatch", &json!({ "handles": [handle, handle], "pattern": "SOLID" })).unwrap();
+        let (_, h5) = only_hatch(&s);
+        assert_eq!(h5.loops.len(), 1, "repeated boundary handle must deduplicate loops");
+
+        // Two points in disjoint rectangles: both regions preserved
+        let mut s = Session::new();
+        s.execute("rectang", &json!({ "p1": [0, 0], "p2": [10, 10] })).unwrap();
+        s.execute("rectang", &json!({ "p1": [20, 0], "p2": [30, 10] })).unwrap();
+        s.execute("hatch", &json!({ "points": [[5, 5], [25, 5]], "pattern": "SOLID" })).unwrap();
+        let (_, h6) = only_hatch(&s);
+        assert_eq!(h6.loops.len(), 2, "disjoint rectangles must both be kept");
+
+        // Gradient with duplicate points in the same rectangle
+        let mut s = Session::new();
+        s.execute("rectang", &json!({ "p1": [0, 0], "p2": [10, 10] })).unwrap();
+        s.execute("gradient", &json!({ "points": [[2, 2], [8, 8]], "color1": "1", "color2": "3" })).unwrap();
+        let (_, hg) = only_hatch(&s);
+        assert_eq!(hg.loops.len(), 1, "gradient with repeated picks in same region must deduplicate loops");
     }
 }

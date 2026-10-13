@@ -9,6 +9,8 @@ use crate::CadApp;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
+/// The hatch pattern picker.
+pub mod patterns;
 /// The QuickCalc palette.
 pub mod quickcalc;
 
@@ -1014,11 +1016,9 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
             EntityKind::Hatch(hh) => {
                 prop_row(ui, "Pattern", |ui| {
                     ui.menu_button(hh.pattern.clone(), |ui| {
-                        for pat in cadcraft_doc::library::standard_patterns() {
-                            if ui.button(pat.name).clicked() {
-                                set = Some(json!({ "handles": ids, "pattern": pat.name }));
-                                ui.close();
-                            }
+                        if let Some(name) = patterns::menu(ui, &hh.pattern) {
+                            set = Some(json!({ "handles": ids, "pattern": name }));
+                            ui.close();
                         }
                     });
                 });
@@ -1039,6 +1039,9 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
             }
             EntityKind::Insert(i) => {
                 prop_row(ui, "Name", |ui| read_only(ui, &i.block));
+                prop_row(ui, "Position X", |ui| read_only(ui, &format!("{:.4}", i.insert.x)));
+                prop_row(ui, "Position Y", |ui| read_only(ui, &format!("{:.4}", i.insert.y)));
+                prop_row(ui, "Position Z", |ui| read_only(ui, &format!("{:.4}", i.insert.z)));
                 num(ui, "Rotation", "rotation", i.rotation.to_degrees(), &mut set, &ids);
                 num(ui, "Scale", "scale", i.scale.x, &mut set, &ids);
             }
