@@ -218,3 +218,42 @@ fn a_slot_removed_after_reading_stays_removed() {
     let twice = write_dxf(&roundtrip(&d));
     assert_eq!(twice.matches("1001\r\nLAMB\r\n").count(), 1);
 }
+
+/// A layout's first viewport writes the implicit id-1 paper view ahead of itself; its ext must land
+/// on its own VIEWPORT record, not on that paper view (which the reader drops).
+#[test]
+fn first_viewport_of_a_layout_keeps_its_ext() {
+    let mut d = Drawing::new_metric();
+    let paper = Space::Paper("Layout1".into());
+    let vp = |id: u32| {
+        EntityKind::Viewport(Viewport {
+            center: Vec3::new(5.0, 4.0, 0.0),
+            width: 8.0,
+            height: 6.0,
+            view_center: cadcraft_geom::Vec2::new(5.0, 2.5),
+            view_height: 12.0,
+            id,
+            locked: false,
+            frozen_layers: Vec::new(),
+            layer_colors: Vec::new(),
+            clip: None,
+            on: true,
+        })
+    };
+    for id in [2, 3] {
+        d.add(&paper, with_ext(&ext(&[("LAMB", json!({"viewId": id}))])), vp(id)).unwrap();
+    }
+    let back = roundtrip(&d);
+    let got: Vec<(u32, Option<Value>)> = back
+        .layouts
+        .iter()
+        .flat_map(|l| l.entities.iter())
+        .filter_map(|e| match &e.kind {
+            EntityKind::Viewport(v) => Some((v.id, e.common.ext.get("LAMB").cloned())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got.contains(&(2, Some(json!({"viewId": 2})))), "{got:?}");
+    assert!(got.contains(&(3, Some(json!({"viewId": 3})))), "{got:?}");
+}

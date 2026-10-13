@@ -450,6 +450,11 @@ fn text_tags(w: &mut W, t: &Text, attrib_tag: Option<(&str, i64)>, attdef_prompt
 /// SEQEND…). A slot the record already carries (a part of a multileader written as several
 /// entities) is not written twice.
 fn entity(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx: &Ctx) {
+    // A layout's first viewport is preceded by the implicit paper view; write it before `start`
+    // so the ext slots below land on the viewport's own record.
+    if matches!(e.kind, EntityKind::Viewport(_)) {
+        paper_view(w, d, e, owner, cx);
+    }
     let start = w.t.len();
     entity_body(w, d, e, owner, paper, cx);
     if e.common.ext.is_empty() || w.t.len() == start {
@@ -976,7 +981,6 @@ fn entity_body(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx:
             hatch_xdata(w, h);
         }
         EntityKind::Viewport(v) => {
-            paper_view(w, d, e, owner, cx);
             w.s(0, "VIEWPORT");
             common(w, e, owner, paper, "AcDbViewport");
             w.p(10, v.center);
