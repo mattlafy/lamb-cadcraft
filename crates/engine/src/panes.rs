@@ -10,6 +10,10 @@
 //! a point in one lands in another (the crosshair), where a locked tile re-centres — are geometry
 //! the engine doesn't know: an adapter registers them once ([`register_pane_relations`]) and the
 //! canvas reads them through [`Session::tile_rotations`] / [`Session::tile_crosshairs`].
+//!
+//! Camera lock ([`Panes::locked`], off by default, toggled by LAMB's `panelock`): every view change
+//! of the current tile ([`after_view`], from `DocState::set_view`/`set_view_quiet`) re-centres each
+//! related tile through [`PaneRelations::centre`] at the same screen scale; unrelated tiles stay.
 
 use std::sync::OnceLock;
 
@@ -23,6 +27,9 @@ use crate::{DocState, Session};
 pub struct Panes {
     pub rects: Vec<(Vec2, Vec2)>,
     pub spaces: Vec<Space>,
+    /// Camera lock: the other tiles follow the current one's centre and scale. Kept across
+    /// re-tiling.
+    pub locked: bool,
 }
 
 /// Where a point in one tile's space lands in another's: a point, or (when the other space has an
@@ -76,7 +83,7 @@ fn existing(st: &DocState, sp: Option<&Space>) -> Space {
 /// view is set: tile `old` keeps the edit space, tile `new`'s space becomes it.
 pub fn on_activate(st: &mut DocState, old: usize, new: usize) {
     if st.panes.rects != st.tiles.rects {
-        st.panes = Panes { rects: st.tiles.rects.clone(), spaces: vec![Space::Model; st.tiles.rects.len()] };
+        st.panes = Panes { rects: st.tiles.rects.clone(), spaces: vec![Space::Model; st.tiles.rects.len()], locked: st.panes.locked };
     }
     let here = st.space.clone();
     if let Some(slot) = st.panes.spaces.get_mut(old) {
@@ -86,7 +93,61 @@ pub fn on_activate(st: &mut DocState, old: usize, new: usize) {
     st.mspace = None;
 }
 
+/// Hook in `DocState::set_view` / `set_view_quiet`, after the view is stored: with the camera
+/// lock on, each other tile related to the current one's space takes the centre
+/// [`PaneRelations::centre`] gives it and the current view's px per mm (heights scaled by the
+/// tiles' fraction heights). Unrelated tiles, and everything with no relations registered, stay.
+pub fn after_view(st: &mut DocState) {
+    if !st.panes.locked || st.mspace.is_some() || !tiles_space(&st.space) {
+        return;
+    }
+    let Some(rel) = pane_relations() else { return };
+    let (tiles, active) = crate::cmd::view::vports::live(st, (1.0, 1.0));
+    if tiles.len() < 2 {
+        return;
+    }
+    let rects: Vec<(Vec2, Vec2)> = tiles.iter().map(|t| (t.min, t.max)).collect();
+    if st.tiles.rects != rects || st.tiles.views.len() != tiles.len() {
+        st.tiles = crate::ModelTiles {
+            rects: rects.clone(),
+            views: tiles.iter().map(|t| crate::View { center: t.center, height: t.height }).collect(),
+            active,
+        };
+    }
+    let panes_synced = st.panes.rects == rects;
+    let now = st.view();
+    let here = st.space.clone();
+    let fh = |i: usize| (rects[i].1.y - rects[i].0.y).max(1e-12);
+    for i in (0..tiles.len()).filter(|&i| i != active) {
+        let sp = if panes_synced { existing(st, st.panes.spaces.get(i)) } else { Space::Model };
+        let prev = st.tiles.views[i];
+        if let Some(c) = (rel.centre)(&st.doc, &here, now.center, &sp, prev.center) {
+            let v = crate::View { center: c, height: now.height * fh(i) / fh(active) };
+            if v.center.is_finite() && v.height.is_finite() && v.height > 1e-12 {
+                st.tiles.views[i] = v;
+            }
+        }
+    }
+}
+
 impl Session {
+    /// Turn the camera lock on or off ([`Panes::locked`]); nothing without a drawing.
+    pub fn set_panes_locked(&mut self, on: bool) {
+        if let Ok(st) = self.state_mut() {
+            st.panes.locked = on;
+            if on {
+                let v = st.view();
+                st.set_view_quiet(v);
+            }
+        }
+        self.touch();
+    }
+
+    /// Whether the camera lock is on.
+    pub fn panes_locked(&self) -> bool {
+        self.state().is_ok_and(|st| st.panes.locked)
+    }
+
     /// Each tile's space, one per [`Session::model_tiles`] entry and in its order: the current
     /// tile's is the edit space, the others' what they showed when they were last current (Model
     /// after a re-tiling, or when their block is gone).
@@ -223,6 +284,19 @@ mod tests {
         assert!(super::pane_relations().is_none());
         assert_eq!(s.tile_rotations(), vec![0.0, 0.0]);
         assert_eq!(s.tile_crosshairs(Vec2::new(1.0, 2.0)), vec![None, None]);
+    }
+
+    #[test]
+    fn lock_without_relations_leaves_other_tiles() {
+        let mut s = two_tiles_with_block();
+        let before = s.model_tiles()[1].view;
+        assert!(!s.panes_locked(), "off by default");
+        s.set_panes_locked(true);
+        assert!(s.panes_locked());
+        assert!(s.state_mut().unwrap().set_view(View { center: Vec2::new(123.0, -45.0), height: 7.0 }));
+        s.state_mut().unwrap().set_view_quiet(View { center: Vec2::new(-9.0, 4.0), height: 2.0 });
+        assert_eq!(s.model_tiles()[1].view, before);
+        assert_eq!(s.model_tiles()[0].view.center, Vec2::new(-9.0, 4.0));
     }
 
     #[test]

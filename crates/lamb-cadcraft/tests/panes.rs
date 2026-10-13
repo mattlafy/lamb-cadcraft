@@ -1,6 +1,6 @@
 //! Pane relations (LAMB T323) on imported fixtures: the rotation a plan tile takes for a section in
 //! another tile, where the active tile's point lands in the others (the crosshair), and the
-//! camera-lock centre. Tiles come from `-vports`, each showing a view through EDITVIEW.
+//! camera-lock centre, and PANELOCK driving it. Tiles come from `-vports`, each showing a view through EDITVIEW.
 //!
 //! The command and relation registries are process-global, so registration goes through one `Once`.
 
@@ -10,7 +10,7 @@ use std::sync::Once;
 
 use cadcraft_doc::Space;
 use cadcraft_engine::panes::PaneMap;
-use cadcraft_engine::{Session, register_command_provider};
+use cadcraft_engine::{Session, View, register_command_provider};
 use cadcraft_geom::Vec2;
 use lamb_cadcraft::{DrawingProject, commands, panes, project_to_drawing, read_document, register_providers, view_block_name};
 use lamb_core::derivation::projection::{Uz, vertical_local_to_uz, vertical_uz_to_local};
@@ -176,5 +176,49 @@ fn crosshairs_and_centre_on_u_wall() -> R {
     // Plan <-> section are unrelated for rotation the other way round, and Model never rotates.
     assert_eq!(panes::rotation(d, &aspace, &pspace), None);
     assert_eq!(panes::rotation(d, &Space::Model, &aspace), None);
+    Ok(())
+}
+
+#[test]
+fn panelock_recentres_the_section_tile() -> R {
+    let mut f = open("u-wall-two-sections", 2)?;
+    let (sa, a0, a1) = f.secs[0];
+    let plan = f.plan;
+    show(&mut f.s, 0, plan)?;
+    show(&mut f.s, 1, sa)?;
+    f.s.activate_tile(0)?;
+    assert!(!f.s.panes_locked(), "off by default");
+    let r = f.s.execute("panelock", &json!({}))?;
+    assert_eq!(r["on"], json!(true));
+    assert_eq!(r["message"], json!("<Pane lock on>"));
+
+    let prev = f.s.model_tiles()[1].view;
+    let z_prev = uz_of(&f.s, sa, prev.center)?.z;
+    let pc = Vec2::new(4321.0, 1500.0);
+    assert!(f.s.state_mut()?.set_view(View { center: pc, height: 3000.0 }));
+    let tiles = f.s.model_tiles();
+    let got = tiles[1].view;
+    let uz = uz_of(&f.s, sa, got.center)?;
+    let len = (a1.x - a0.x).hypot(a1.y - a0.y);
+    let u = ((pc.x - a0.x) * (a1.x - a0.x) + (pc.y - a0.y) * (a1.y - a0.y)) / len;
+    assert!((uz.u - u).abs() < EPS, "u from the plan centre: {} vs {u}", uz.u);
+    assert!((uz.z - z_prev).abs() < EPS, "z kept: {} vs {z_prev}", uz.z);
+    let fh = |i: usize| tiles[i].max.y - tiles[i].min.y;
+    assert!((got.height - 3000.0 * fh(1) / fh(0)).abs() < EPS, "scaled height {}", got.height);
+
+    // Off: tile 1 no longer follows.
+    let r = f.s.execute("panelock", &json!({}))?;
+    assert_eq!(r["on"], json!(false));
+    assert_eq!(r["message"], json!("<Pane lock off>"));
+    f.s.state_mut()?.set_view(View { center: Vec2::new(100.0, 200.0), height: 500.0 });
+    assert_eq!(f.s.model_tiles()[1].view, got);
+
+    // Re-tiling keeps the lock.
+    f.s.execute("panelock", &json!({"on": true}))?;
+    f.s.execute("-vports", &json!({"option": "3", "applyTo": "display"}))?;
+    assert_eq!(f.s.model_tiles().len(), 3);
+    assert!(f.s.panes_locked(), "re-tiling keeps the lock");
+    f.s.activate_tile(1)?;
+    assert!(f.s.panes_locked());
     Ok(())
 }

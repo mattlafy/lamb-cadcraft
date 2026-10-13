@@ -306,6 +306,7 @@ impl DocState {
         if !self.store_view(v) {
             return false;
         }
+        crate::panes::after_view(self);
         if old != v {
             self.view_history.push(old);
             if self.view_history.len() > 50 {
@@ -349,7 +350,9 @@ impl DocState {
         if !(v.center.is_finite() && v.height.is_finite() && v.height > 1e-12) {
             return;
         }
-        self.store_view(v);
+        if self.store_view(v) {
+            crate::panes::after_view(self);
+        }
     }
 }
 

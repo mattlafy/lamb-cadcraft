@@ -12,6 +12,9 @@
 //!   segments in different views (the escape hatch from the same-layer auto-link rule); `entityId`
 //!   is a hex handle string or a JSON number. Returns `{"linkId": <id>}`.
 //! - `unlink {linkId}` (`ulk`): removes that link.
+//! - `panelock {on?}`: camera lock for VPORTS panes (absent `on` toggles; off by default) — panning
+//!   or zooming the current tile re-centres every related tile at the same scale. Returns
+//!   `{on, message}` (`<Pane lock on>` / `<Pane lock off>`); not an undo step.
 //!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
@@ -472,6 +475,13 @@ pub fn install_app() -> std::result::Result<(), &'static str> {
     })
 }
 
+/// PANELOCK: toggle (or set, with `on`) the panes' camera lock.
+fn panelock(s: &mut Session, p: &Value) -> Result<Value> {
+    let on = p.get("on").and_then(Value::as_bool).unwrap_or(!s.panes_locked());
+    s.set_panes_locked(on);
+    Ok(json!({ "on": on, "message": format!("<Pane lock {}>", if on { "on" } else { "off" }) }))
+}
+
 /// View ▸ LAMB ▸ <the command's label>.
 const MENU: &[&str] = &["View", "LAMB", ""];
 
@@ -493,6 +503,7 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU).interactive(editview_machine),
         CommandSpec::new("link", "Link", link).alias(&["lk"]).params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}"),
         CommandSpec::new("unlink", "Unlink", unlink).alias(&["ulk"]).params("{linkId}"),
+        CommandSpec::new("panelock", "Pane Lock", panelock).params("{on?: bool}").noundo().menu(MENU),
     ]
 }
 

@@ -105,7 +105,7 @@ fn active_config(d: &Drawing) -> Option<&VportConfig> {
 
 /// The tiles on show with their views as they are now (the current one's is the model view), and
 /// the current tile. One full tile when there is no tiling.
-fn live(st: &DocState, px: (f64, f64)) -> (Vec<VportTile>, usize) {
+pub(crate) fn live(st: &DocState, px: (f64, f64)) -> (Vec<VportTile>, usize) {
     let edit = if matches!(st.space, Space::Block(_)) { st.space.clone() } else { Space::Model };
     let now = st.views.iter().find(|(sp, _)| *sp == edit).map(|(_, v)| *v).unwrap_or_default();
     let Some(cfg) = active_config(&st.doc) else {
