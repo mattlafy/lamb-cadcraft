@@ -7,13 +7,20 @@
 //!    other view with it (`selection-and-link-editing.md` §4b ray-sliding, lamb-core
 //!    `travel_segment_move`), so the link stays live — §13 phase 3 "STRETCH a linked plan line → the
 //!    section follows in one undo step";
+//! 0b. re-anchors: a link end whose entity the command replaced (TRIM, BREAK erase the original
+//!    handle and add a new one per piece) moves onto the new piece in the same view whose segment
+//!    is a sub-span of the old one and still holds the anchor point — same link id, origin and
+//!    creation stamp (§13 phase 3 "TRIM a linked line → links maintained"). No such piece: the
+//!    anchor was cut away and step 1 drops the link (TS `break.ts` `remapAnchor` parity);
 //! 1. drops every link with an anchor whose entity is no longer in any view block (ERASE);
 //! 2. re-checks every link with an anchor on a touched entity (new, or a different polyline) or in
 //!    a touched view (its document entry, or its host's, changed) with lamb-core's
 //!    `link_still_coincides`: a broken crossing is flagged `stale: Some(true)`, a restored one is
 //!    cleared back to `None` — a moved line is flagged, never dropped, because a flag is visible and
 //!    reversible (`link-maintenance.md`: "visible flags beat silent resolution");
-//! 3. auto-links each entity new to a view block through its view's hollow markers.
+//! 3. auto-links each entity new to a view block through its view's hollow markers, skipping a
+//!    pair of segments some link already joins (a re-anchored piece crosses the marker its own link
+//!    fills).
 //!
 //! [`install`] registers [`link_observer`] on a `Session`, so all of this lands in the command's own
 //! undo step. Out of scope: travel cascading past the first partner, Tier 2 declarations.
@@ -26,10 +33,10 @@ use cadcraft_engine::Session;
 use lamb_core::derivation::linking::{find_auto_links, link_still_coincides};
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::derivation::travel::travel_segment_move;
-use lamb_core::geometry::polyline::resolved_segments;
+use lamb_core::geometry::polyline::{ResolvedSegment, closest_point_on_segment, point_at_param, resolved_segments};
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::geometry::{Point2, Polyline2};
-use lamb_core::model::{Actor, AnyView, Id, LinkRecord};
+use lamb_core::model::{Actor, AnyView, Id, LinkAnchor, LinkRecord};
 
 use crate::convert::from_polyline;
 
@@ -49,11 +56,18 @@ pub struct MaintenanceReport {
     pub created: Vec<Id>,
     /// Partner entities (not links) slid to follow a rigidly moved linked segment.
     pub travelled: Vec<Id>,
+    /// Links moved onto a new piece of an entity the command replaced (TRIM, BREAK).
+    pub reanchored: Vec<Id>,
 }
 
 impl MaintenanceReport {
     pub fn is_empty(&self) -> bool {
-        self.dropped.is_empty() && self.staled.is_empty() && self.cleared.is_empty() && self.created.is_empty() && self.travelled.is_empty()
+        self.dropped.is_empty()
+            && self.staled.is_empty()
+            && self.cleared.is_empty()
+            && self.created.is_empty()
+            && self.travelled.is_empty()
+            && self.reanchored.is_empty()
     }
 }
 
@@ -142,6 +156,91 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing) -> Result<Vec<Id>, S
     Ok(writes.into_iter().map(|(id, _)| id).collect())
 }
 
+/// `piece` lies along `old`: both its ends within coincidence of `old`, and the same curvature sign.
+fn is_sub_span(old: &ResolvedSegment, piece: &ResolvedSegment) -> bool {
+    let tol = TOLERANCE.coincidence_mm;
+    let sign = |b: f64| {
+        if b.abs() <= 1e-12 {
+            0
+        } else if b > 0.0 {
+            1
+        } else {
+            -1
+        }
+    };
+    sign(old.bulge) == sign(piece.bulge)
+        && closest_point_on_segment(old, piece.from).distance <= tol
+        && closest_point_on_segment(old, piece.to).distance <= tol
+}
+
+/// Step 0b, re-anchor. For each link end whose entity is gone from `after`, finds the first entity
+/// new in `after` (handle order) in the same view with a segment that is a sub-span of the old
+/// anchored segment and holds the old anchor point, and moves the end there. Ends with no such
+/// piece are left for step 1 to drop. Writes `after`'s document once, only when something moved.
+fn reanchor(before_entities: &EntityMap, after: &mut Drawing) -> Result<Vec<Id>, SchemaError> {
+    let tol = TOLERANCE.coincidence_mm;
+    let (links, moved) = {
+        let p = DrawingProject::new(after)?;
+        let after_entities = entity_map(&p);
+        let new: Vec<(Id, Id, Vec<ResolvedSegment>)> = after_entities
+            .iter()
+            .filter(|(id, _)| !before_entities.contains_key(id))
+            .filter_map(|(id, (view, poly))| poly.as_ref().map(|poly| (*id, *view, resolved_segments(poly))))
+            .collect();
+        let remap = |end: &LinkAnchor| -> Option<LinkAnchor> {
+            if after_entities.contains_key(&end.entity_id) {
+                return None;
+            }
+            let (view, Some(old_poly)) = before_entities.get(&end.entity_id)? else { return None };
+            let old = resolved_segments(old_poly).into_iter().nth(end.segment_index)?;
+            let at = point_at_param(&old, end.segment_param);
+            new.iter().filter(|(_, v, _)| v == view).find_map(|(id, _, segs)| {
+                segs.iter().filter(|s| is_sub_span(&old, s)).find_map(|s| {
+                    let c = closest_point_on_segment(s, at);
+                    (c.distance <= tol).then_some(LinkAnchor { entity_id: *id, segment_index: s.index, segment_param: c.t })
+                })
+            })
+        };
+        let mut moved = Vec::new();
+        let links: Vec<LinkRecord> = p
+            .document()
+            .links
+            .iter()
+            .map(|link| {
+                let (a, b) = (remap(&link.a), remap(&link.b));
+                if a.is_none() && b.is_none() {
+                    return link.clone();
+                }
+                let mut l = link.clone();
+                if let Some(a) = a {
+                    l.a = a;
+                }
+                if let Some(b) = b {
+                    l.b = b;
+                }
+                moved.push(l.id);
+                l
+            })
+            .collect();
+        (links, moved)
+    };
+    if !moved.is_empty() {
+        let mut doc = read_document(after)?;
+        doc.links = links;
+        write_document(after, &doc)?;
+    }
+    Ok(moved)
+}
+
+/// Some link already joins segment `a` to segment `b`, either way round.
+fn already_joined(links: &[LinkRecord], r: &LinkRecord) -> bool {
+    let key = |x: &LinkAnchor| (x.entity_id, x.segment_index);
+    links.iter().any(|l| {
+        let (la, lb, ra, rb) = (key(&l.a), key(&l.b), key(&r.a), key(&r.b));
+        (la == ra && lb == rb) || (la == rb && lb == ra)
+    })
+}
+
 /// Keeps `after`'s links true to its geometry, given the drawing `before` the command ran.
 /// Writes `after`'s LAMB document once per step that changed it; when nothing changes, `after` is
 /// left untouched.
@@ -154,6 +253,8 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str) -> Resul
 
     // 0: travel, before anything reads `after`.
     report.travelled = travel(&before_entities, after)?;
+    // 0b: re-anchor ends whose entity was replaced by pieces, before step 1 would drop them.
+    report.reanchored = reanchor(&before_entities, after)?;
 
     // 1 + 2: drop and re-check, against one read of `after`.
     let (new_entities, links) = {
@@ -209,7 +310,10 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str) -> Resul
                 placeholder += 1;
                 Id(placeholder)
             };
-            find_auto_links(&p, &entity, &actor, now, &mut mint).map_err(derivation_error)?
+            let existing = &p.document().links;
+            let mut found = find_auto_links(&p, &entity, &actor, now, &mut mint).map_err(derivation_error)?;
+            found.retain(|r| !already_joined(existing, r));
+            found
         };
         if records.is_empty() {
             continue;

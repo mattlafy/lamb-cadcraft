@@ -313,3 +313,115 @@ fn rigid_move_travels_partner() -> R {
     assert_eq!(poly(&after, sec_e)?, poly(&d, sec_e)?);
     Ok(())
 }
+
+fn block_handles(d: &Drawing, view: Id) -> Vec<Handle> {
+    d.block(&view_block_name(view)).map(|b| b.entities.iter().map(|e| e.handle).collect()).unwrap_or_default()
+}
+
+/// Draws a cutting line on layer `0` in `view` (so it never auto-links) and returns its handle.
+fn draw_edge(s: &mut Session, view: Id, from: [f64; 2], to: [f64; 2]) -> Result<Handle, Box<dyn std::error::Error>> {
+    let before = block_handles(s.doc()?, view);
+    s.execute("editview", &json!({"viewId": view.0}))?;
+    s.execute("layer.current", &json!({"name": "0"}))?;
+    s.execute("line", &json!({"points": [from, to]}))?;
+    Ok(block_handles(s.doc()?, view).into_iter().find(|h| !before.contains(h)).ok_or("edge not drawn")?)
+}
+
+fn find_link(links: &[LinkRecord], id: Id) -> Result<LinkRecord, String> {
+    links.iter().find(|l| l.id == id).cloned().ok_or_else(|| format!("link {id} gone"))
+}
+
+fn joins(l: &LinkRecord, x: Id, y: Id) -> bool {
+    (l.a.entity_id == x && l.b.entity_id == y) || (l.a.entity_id == y && l.b.entity_id == x)
+}
+
+/// §13 phase 3 gate: TRIM a linked line → the link is maintained on the piece that still holds its
+/// anchor (same id), dropped when the anchor was cut away; BREAK the same; from either view.
+#[test]
+fn trim_reanchors_links() -> R {
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let original = read_document(&d)?.links;
+    // The crossbar link: plan wall segment 1 (0,0)-(10000,0) crossed at (5000,0) ↔ the section line
+    // (1000,0)-(1000,2700) anchored at (1000,1000).
+    let link = original.iter().find(|l| l.a.segment_index == 1 || l.b.segment_index == 1).ok_or("no seg-1 link")?.clone();
+    let (plan_e, sec_e) =
+        if is_plan(&d, view_of(&d, link.a.entity_id)?)? { (link.a.entity_id, link.b.entity_id) } else { (link.b.entity_id, link.a.entity_id) };
+    let (plan_view, sec_view) = (view_of(&d, plan_e)?, view_of(&d, sec_e)?);
+
+    let mut s = Session::new();
+    s.open_drawing(d.clone(), "u-wall", None);
+    install(&mut s);
+    // Two cutting edges across segment 1, away from the crossing.
+    let e1 = draw_edge(&mut s, plan_view, [7000.0, -500.0], [7000.0, 500.0])?;
+    let e2 = draw_edge(&mut s, plan_view, [8000.0, -500.0], [8000.0, 500.0])?;
+    assert_eq!(links(&s)?, original, "edges on layer 0 link nothing");
+    let base = s.doc()?.clone();
+    let edges = json!([e1.hex(), e2.hex()]);
+
+    // --- The gate: trim the far span.
+    let far = json!({"handle": hex(plan_e), "pick": [7500, 0], "edges": edges});
+    let (_, report) = raw_report(&base, plan_view, "trim", &far)?;
+    assert!(report.reanchored.contains(&link.id), "{report:?}");
+    assert!(report.dropped.is_empty() && report.created.is_empty(), "{report:?}");
+    let ext_before = s.doc()?.ext.get(lamb_cadcraft::EXT_KEY).cloned();
+    let plan_ent = s.doc()?.entity(Handle(plan_e.0)).cloned();
+    let handles_before = block_handles(s.doc()?, plan_view);
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    s.execute("trim", &far)?;
+    let now = links(&s)?;
+    assert_eq!(now.len(), original.len(), "link count unchanged: {now:?}");
+    let l = find_link(&now, link.id)?;
+    assert_eq!((l.origin, &l.created_at, &l.created_by, l.stale), (link.origin, &link.created_at, &link.created_by, None));
+    let new_plan = if l.a.entity_id == sec_e { l.b.entity_id } else { l.a.entity_id };
+    assert!(!handles_before.contains(&Handle(new_plan.0)) && s.doc()?.entity(Handle(new_plan.0)).is_some(), "plan end on a new piece");
+    assert_eq!(now.iter().filter(|x| joins(x, new_plan, sec_e)).count(), 1, "exactly one link joins the pair");
+    {
+        let p = DrawingProject::new(s.doc()?)?;
+        for x in &now {
+            assert!(link_still_coincides(&p, x)?, "link {} holds after the trim", x.id);
+        }
+    }
+    s.undo()?;
+    assert_eq!(s.doc()?.entity(Handle(plan_e.0)).cloned(), plan_ent, "one undo restores the plan entity");
+    assert_eq!(s.doc()?.ext.get(lamb_cadcraft::EXT_KEY).cloned(), ext_before, "and the LAMB slot, byte-identical");
+
+    // --- Trimming the span holding the crossing drops that link; it is not re-formed.
+    let e3 = draw_edge(&mut s, plan_view, [4000.0, -500.0], [4000.0, 500.0])?;
+    let e4 = draw_edge(&mut s, plan_view, [6000.0, -500.0], [6000.0, 500.0])?;
+    let base2 = s.doc()?.clone();
+    let near = json!({"handle": hex(plan_e), "pick": [5000, 0], "edges": [e3.hex(), e4.hex()]});
+    let (after, report) = raw_report(&base2, plan_view, "trim", &near)?;
+    assert_eq!(report.dropped, vec![link.id], "{report:?}");
+    assert!(report.created.is_empty(), "{report:?}");
+    let after_links = read_document(&after)?.links;
+    assert_eq!(after_links.len(), original.len() - 1);
+    assert!(!after_links.iter().any(|x| on(x, sec_e)), "nothing re-formed on the section line");
+
+    // --- BREAK across the line on one side of the crossing: the link lands on the piece holding it.
+    let brk = json!({"handle": hex(plan_e), "p1": [7000, 0], "p2": [8000, 0]});
+    let (after, report) = raw_report(&base, plan_view, "break", &brk)?;
+    assert!(report.reanchored.contains(&link.id) && report.dropped.is_empty(), "{report:?}");
+    let l = find_link(&read_document(&after)?.links, link.id)?;
+    let piece = if l.a.entity_id == sec_e { l.b.entity_id } else { l.a.entity_id };
+    assert!(after.entity(Handle(plan_e.0)).is_none() && after.entity(Handle(piece.0)).is_some());
+    let at = anchor_point(&after, &l, piece)?;
+    assert!(close(at.x, 5000.0) && close(at.y, 0.0), "anchor still at the crossing: {at:?}");
+    assert!(link_still_coincides(&DrawingProject::new(&after)?, &l)?);
+
+    // --- Section side: cut the section line above its anchor at z = 1000, trim the top away.
+    let e5 = draw_edge(&mut s, sec_view, [500.0, 2000.0], [1500.0, 2000.0])?;
+    let base3 = s.doc()?.clone();
+    let top = json!({"handle": hex(sec_e), "pick": [1000, 2500], "edges": [e5.hex()]});
+    let (after, report) = raw_report(&base3, sec_view, "trim", &top)?;
+    assert_eq!(report.reanchored, vec![link.id], "{report:?}");
+    assert!(report.dropped.is_empty() && report.created.is_empty(), "{report:?}");
+    let l = find_link(&read_document(&after)?.links, link.id)?;
+    assert!(!on(&l, sec_e) && on(&l, plan_e) && l.stale.is_none());
+    assert!(link_still_coincides(&DrawingProject::new(&after)?, &l)?);
+    // Trimming the bottom (holding the anchor) away drops it instead.
+    let bottom = json!({"handle": hex(sec_e), "pick": [1000, 500], "edges": [e5.hex()]});
+    let (_, report) = raw_report(&base3, sec_view, "trim", &bottom)?;
+    assert_eq!(report.dropped, vec![link.id], "{report:?}");
+    Ok(())
+}
