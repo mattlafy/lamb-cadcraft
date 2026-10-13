@@ -2070,10 +2070,12 @@ dependencies = [
 name = "lamb-cadcraft"
 version = "0.6.2"
 dependencies = [
+ "cadcraft-color",
  "cadcraft-doc",
  "cadcraft-engine",
  "cadcraft-geom",
  "cadcraft-io",
+ "cadcraft-render",
  "lamb-core",
  "serde",
  "serde_json",
