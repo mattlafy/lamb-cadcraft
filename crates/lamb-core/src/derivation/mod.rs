@@ -16,6 +16,7 @@ pub mod synthesis;
 pub mod tilt;
 pub mod travel;
 pub mod underlay;
+pub mod walls;
 pub mod write;
 
 /// JS `Number.prototype.toFixed(digits)`: rounds the exact binary value half away from zero (a bare
