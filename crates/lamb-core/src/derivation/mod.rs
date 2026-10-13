@@ -18,6 +18,7 @@ pub mod travel;
 pub mod underlay;
 pub mod wall_junctions;
 pub mod wall_openings;
+pub mod wall_spaces;
 pub mod walls;
 pub mod write;
 
