@@ -362,11 +362,14 @@ pub fn link_observer(s: &mut Session, before: &Arc<Drawing>) {
     }
 }
 
-/// Registers [`link_observer`] on `s` (once).
+/// Registers [`crate::corners::corner_observer`] then [`link_observer`] on `s` (each once), so
+/// link travel reads corner tags already re-seated by the same command.
 pub fn install(s: &mut Session) {
-    let f: cadcraft_engine::AfterCommand = link_observer;
-    if !s.observers.iter().any(|o| std::ptr::fn_addr_eq(*o, f)) {
-        s.observers.push(f);
+    let fs: [cadcraft_engine::AfterCommand; 2] = [crate::corners::corner_observer, link_observer];
+    for f in fs {
+        if !s.observers.iter().any(|o| std::ptr::fn_addr_eq(*o, f)) {
+            s.observers.push(f);
+        }
     }
 }
 

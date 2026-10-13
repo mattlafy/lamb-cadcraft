@@ -13,7 +13,8 @@
 //! ([`commands`]), and the relations between two panes' views — rotation, crosshair mapping,
 //! camera-lock centre ([`panes`]), and FILLET/CHAMFER on two adjacent polyline segments writing a
 //! virtual corner tag instead of baking an arc ([`fillet`]), drawn rounded on screen and in plots
-//! while the stored vertices stay sharp ([`rounding`]).
+//! while the stored vertices stay sharp ([`rounding`]), and kept on their vertex when a CADCraft
+//! command rewrites the vertices ([`corners`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
 //! the remaining overlay display lists (datums, repeat ghosts). Sits above
 //! `cadcraft-engine` and below the UI shells and MCP.
@@ -22,6 +23,7 @@
 
 pub mod commands;
 pub mod convert;
+pub mod corners;
 pub mod fillet;
 pub mod import;
 pub mod maintain;
@@ -35,6 +37,7 @@ pub mod views;
 
 pub use commands::commands;
 pub use convert::{Converted, Flattened, Unsupported, UnsupportedReason, from_polyline, to_polyline};
+pub use corners::{corner_observer, maintain_corners};
 pub use import::{IdMap, ImportError, ImportReport, project_to_drawing};
 pub use maintain::{MaintenanceReport, install, link_observer, maintain_links};
 pub use overlays::{lamb_overlay, lamb_snaps, register_providers};

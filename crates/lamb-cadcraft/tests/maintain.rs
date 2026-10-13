@@ -2,16 +2,15 @@
 //! drops exactly the erased entity's links, a non-rigid STRETCH off a crossing flags stale and back
 //! clears, a line drawn through a hollow marker auto-links, an unlinked MOVE leaves links alone, and
 //! a rigidly moved linked segment carries its partner across views (travel) — each in the command's
-//! own undo step.
+//! own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`).
 //!
 //! The command registry is process-global, so registration goes through one `Once`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Once;
 
 use cadcraft_doc::{Drawing, Handle};
-use cadcraft_engine::{Session, register_command_provider};
+use cadcraft_engine::Session;
 use lamb_cadcraft::{DrawingProject, commands, install, maintain_links, project_to_drawing, read_document, view_block_name};
 use lamb_core::derivation::issues::{IssueKind, find_issues};
 use lamb_core::derivation::linking::link_still_coincides;
@@ -58,10 +57,9 @@ fn stale_issue_count(s: &Session) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(find_issues(&p)?.iter().filter(|i| i.kind == IssueKind::StaleLink).count())
 }
 
-static REGISTER: Once = Once::new();
-
+/// The LAMB commands plus the process-global hooks (FILLET's virtual corners, rounded drawing).
 fn register() {
-    REGISTER.call_once(|| register_command_provider(commands).expect("register LAMB commands"));
+    commands::install_app().expect("register LAMB");
 }
 
 fn poly(d: &Drawing, e: Id) -> Result<Polyline2, Box<dyn std::error::Error>> {
@@ -89,7 +87,7 @@ fn link_observer_maintains_links() -> R {
     s.open_drawing(d, "u-wall", None);
     install(&mut s);
     install(&mut s);
-    assert_eq!(s.observers.len(), 1, "install is idempotent");
+    assert_eq!(s.observers.len(), 2, "install is idempotent: corner then link observer");
 
     // --- ERASE a linked plan entity: exactly its links go; one undo restores both.
     let plan_end = {
@@ -423,5 +421,43 @@ fn trim_reanchors_links() -> R {
     let bottom = json!({"handle": hex(sec_e), "pick": [1000, 500], "edges": [e5.hex()]});
     let (_, report) = raw_report(&base3, sec_view, "trim", &bottom)?;
     assert_eq!(report.dropped, vec![link.id], "{report:?}");
+    Ok(())
+}
+
+/// T332: through `install`, a PEDIT vertex insert before a filleted vertex moves its tag with it,
+/// the drawn arc stays at the same corner, and undo puts the old index back.
+#[test]
+fn corner_tag_follows_a_vertex_insert() -> R {
+    use cadcraft_doc::{EntityKind, Space};
+    use cadcraft_render::{Options, build};
+    use lamb_cadcraft::read_entity_data;
+
+    register();
+    let mut s = Session::new();
+    s.new_drawing(true);
+    install(&mut s);
+    let r = s.execute("pline", &json!({"vertices": [[0, 0], [100, 0], [100, 80]]}))?;
+    let hx = r["handle"].as_str().ok_or("no handle")?.to_owned();
+    let h = Handle::parse_hex(&hx).ok_or("bad handle")?;
+    s.execute("fillet", &json!({"h1": hx, "p1": [50, 0], "h2": hx, "p2": [100, 40], "radius": 10}))?;
+    let index = |s: &Session| -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+        let e = s.doc()?.entity(h).ok_or("no entity")?;
+        Ok(read_entity_data(&e.common)?.corners.iter().map(|c| c.corner_index).collect())
+    };
+    assert_eq!(index(&s)?, vec![1]);
+
+    s.execute("pedit", &json!({"handle": hx, "option": "vertex", "action": "insert", "index": 0, "to": [50, 0]}))?;
+    assert_eq!(index(&s)?, vec![2]);
+    let d = s.doc()?;
+    let EntityKind::LwPolyline(pl) = &d.entity(h).ok_or("no entity")?.kind else { return Err("not a polyline".into()) };
+    let v = pl.vertices.get(2).ok_or("no vertex 2")?.p;
+    assert!((v.x - 100.0).abs() < 1e-9 && v.y.abs() < 1e-9, "vertex 2 is the tagged corner: {v:?}");
+    let list = build(d, &Space::Model, &Options::default());
+    let pts: Vec<_> = list.prims.iter().filter(|p| p.handle == h).flat_map(|p| list.points(p).to_vec()).collect();
+    let near = |x: f64, y: f64| pts.iter().any(|p| (p.x - x).abs() < 1e-6 && (p.y - y).abs() < 1e-6);
+    assert!(!near(100.0, 0.0) && near(90.0, 0.0) && near(100.0, 10.0), "the arc is drawn at (100, 0): {pts:?}");
+
+    s.undo()?;
+    assert_eq!(index(&s)?, vec![1]);
     Ok(())
 }
