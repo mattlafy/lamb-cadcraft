@@ -3,6 +3,10 @@
 //! maintained or stale").
 //!
 //! [`maintain_links`] compares the drawing before and after one command and, in order:
+//! 0. travels: a linked segment the command rigidly translated carries its unchanged partner in the
+//!    other view with it (`selection-and-link-editing.md` §4b ray-sliding, lamb-core
+//!    `travel_segment_move`), so the link stays live — §13 phase 3 "STRETCH a linked plan line → the
+//!    section follows in one undo step";
 //! 1. drops every link with an anchor whose entity is no longer in any view block (ERASE);
 //! 2. re-checks every link with an anchor on a touched entity (new, or a different polyline) or in
 //!    a touched view (its document entry, or its host's, changed) with lamb-core's
@@ -12,17 +16,22 @@
 //! 3. auto-links each entity new to a view block through its view's hollow markers.
 //!
 //! [`install`] registers [`link_observer`] on a `Session`, so all of this lands in the command's own
-//! undo step. Out of scope: carrying a moved partner across views (travel), Tier 2 declarations.
+//! undo step. Out of scope: travel cascading past the first partner, Tier 2 declarations.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use cadcraft_doc::Drawing;
+use cadcraft_doc::{Drawing, Handle};
 use cadcraft_engine::Session;
 use lamb_core::derivation::linking::{find_auto_links, link_still_coincides};
 use lamb_core::derivation::read::ProjectRead;
-use lamb_core::geometry::Polyline2;
+use lamb_core::derivation::travel::travel_segment_move;
+use lamb_core::geometry::polyline::resolved_segments;
+use lamb_core::geometry::tolerance::TOLERANCE;
+use lamb_core::geometry::{Point2, Polyline2};
 use lamb_core::model::{Actor, AnyView, Id, LinkRecord};
+
+use crate::convert::from_polyline;
 
 use crate::project::DrawingProject;
 use crate::schema::{SchemaError, read_document, write_document};
@@ -38,11 +47,13 @@ pub struct MaintenanceReport {
     pub cleared: Vec<Id>,
     /// Automatic links formed by newly drawn entities.
     pub created: Vec<Id>,
+    /// Partner entities (not links) slid to follow a rigidly moved linked segment.
+    pub travelled: Vec<Id>,
 }
 
 impl MaintenanceReport {
     pub fn is_empty(&self) -> bool {
-        self.dropped.is_empty() && self.staled.is_empty() && self.cleared.is_empty() && self.created.is_empty()
+        self.dropped.is_empty() && self.staled.is_empty() && self.cleared.is_empty() && self.created.is_empty() && self.travelled.is_empty()
     }
 }
 
@@ -75,6 +86,62 @@ fn touched_views(before: &[AnyView], after: &[AnyView]) -> BTreeSet<Id> {
     out
 }
 
+/// The delta that rigidly translated segment `index` from `before` to `after`: same segment count,
+/// both ends moved by the same delta, bulge unchanged, and the delta longer than coincidence.
+fn rigid_delta(before: &Polyline2, after: &Polyline2, index: usize) -> Option<Point2> {
+    let tol = TOLERANCE.coincidence_mm;
+    if before.segments.len() != after.segments.len() {
+        return None;
+    }
+    let b = resolved_segments(before).into_iter().nth(index)?;
+    let a = resolved_segments(after).into_iter().nth(index)?;
+    let d = Point2 { x: a.from.x - b.from.x, y: a.from.y - b.from.y };
+    let d_end = Point2 { x: a.to.x - b.to.x, y: a.to.y - b.to.y };
+    let rigid = (d.x - d_end.x).hypot(d.y - d_end.y) <= tol && (a.bulge - b.bulge).abs() <= 1e-9;
+    (rigid && d.x.hypot(d.y) > tol).then_some(d)
+}
+
+/// Step 0, travel. For each link with exactly one end's entity changed by the command (same view,
+/// different polyline) and the other unchanged, when the anchored segment was rigidly translated,
+/// slides the partner by `travel_segment_move` and writes its new geometry into `after` (keeping
+/// the entity's handle, layer and `ext`). Each partner travels at most once, first link in
+/// `doc.links` order; nothing cascades — the partner's other links are left to step 2's re-check.
+/// A partial slide (`unreachable`) is still applied; step 2 decides stale.
+///
+/// Known limitation, TS parity: an oblique segment slid along its own direction is a translation
+/// whose crossing does not move, yet travel shifts the partner by the delta's component along the
+/// cut; step 2 then flags that link stale.
+fn travel(before_entities: &EntityMap, after: &mut Drawing) -> Result<Vec<Id>, SchemaError> {
+    let writes: Vec<(Id, Polyline2)> = {
+        let p = DrawingProject::new(after)?;
+        let after_entities = entity_map(&p);
+        let pair = |id: &Id| match (before_entities.get(id), after_entities.get(id)) {
+            (Some((bv, Some(bp))), Some((av, Some(ap)))) if bv == av => Some((bp, ap)),
+            _ => None,
+        };
+        let mut writes: Vec<(Id, Polyline2)> = Vec::new();
+        for link in &p.document().links {
+            for (mine, other) in [(&link.a, &link.b), (&link.b, &link.a)] {
+                let (Some((bp, ap)), Some((op_before, op_after))) = (pair(&mine.entity_id), pair(&other.entity_id)) else { continue };
+                if bp == ap || op_before != op_after || writes.iter().any(|(id, _)| *id == other.entity_id) {
+                    continue;
+                }
+                let Some(d) = rigid_delta(bp, ap, mine.segment_index) else { continue };
+                let Some(t) = travel_segment_move(&p, link, mine, d).map_err(derivation_error)? else { continue };
+                if t.entity_id == other.entity_id && &t.geometry != op_after {
+                    writes.push((t.entity_id, t.geometry));
+                }
+            }
+        }
+        writes
+    };
+    for (id, geometry) in &writes {
+        let (kind, _) = from_polyline(geometry);
+        after.modify_entity(Handle(id.0), |e| e.kind = kind).map_err(|e| derivation_error(e.to_string()))?;
+    }
+    Ok(writes.into_iter().map(|(id, _)| id).collect())
+}
+
 /// Keeps `after`'s links true to its geometry, given the drawing `before` the command ran.
 /// Writes `after`'s LAMB document once per step that changed it; when nothing changes, `after` is
 /// left untouched.
@@ -84,6 +151,9 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str) -> Resul
     let before_entities = entity_map(&before_project);
     let before_views = before_project.document().views.clone();
     drop(before_project);
+
+    // 0: travel, before anything reads `after`.
+    report.travelled = travel(&before_entities, after)?;
 
     // 1 + 2: drop and re-check, against one read of `after`.
     let (new_entities, links) = {
