@@ -17,6 +17,7 @@ pub mod tilt;
 pub mod travel;
 pub mod underlay;
 pub mod wall_junctions;
+pub mod wall_openings;
 pub mod walls;
 pub mod write;
 

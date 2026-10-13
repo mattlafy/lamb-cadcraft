@@ -1,8 +1,9 @@
 //! The wall graph, first slice: **runs** (LAMB's `docs/07-architecture/cadcraft-integration.md` §8,
 //! phase 7). In one view, two parallel cut-role face lines on wall layers a plausible wall width
 //! apart, with overlapping extents, form a derived run: both face anchors, the width and the
-//! centreline. Computed on demand, never stored, never displayed. Junctions, opening bridging and
-//! the exterior side are later slices.
+//! centreline. Computed on demand, never stored, never displayed. Junctions
+//! ([`super::wall_junctions`]) and opening bridging ([`super::wall_openings`]) build on it; the
+//! exterior side is a later slice.
 //!
 //! Pairing is nearest-partner only: a pair is dropped when a third face of the same kind lies
 //! strictly between the two and overlaps the pair's interval. So a cavity wall drawn as three
@@ -26,15 +27,25 @@ pub struct WallRunParams {
     pub max_width_mm: f64,
     /// Minimum shared length (along the first face; on the centreline radius for arcs).
     pub min_overlap_mm: f64,
+    /// Layers whose geometry is a drawn window or door, for opening bridging
+    /// ([`super::wall_openings`]). Role is ignored.
+    pub opening_layer_ids: Vec<String>,
 }
 
 impl WallRunParams {
     /// Wall layers are those whose name starts with `WALL` (ASCII case-insensitive): `WALL-EXT`
     /// and `WALL-INT` in `default_layers`. Width 50–800 mm, overlap ≥ `TOLERANCE.grouping_mm`.
+    /// Opening layers are those whose name starts with `WINDOW` or `DOOR` (none in `default_layers`).
     pub fn defaults(layers: &[DrawingLayer]) -> Self {
-        let wall_layer_ids =
-            layers.iter().filter(|l| l.name.len() >= 4 && l.name.as_bytes()[..4].eq_ignore_ascii_case(b"WALL")).map(|l| l.id.clone()).collect();
-        WallRunParams { wall_layer_ids, min_width_mm: 50.0, max_width_mm: 800.0, min_overlap_mm: TOLERANCE.grouping_mm }
+        let starts = |name: &str, prefix: &[u8]| name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix);
+        let ids = |pred: &dyn Fn(&str) -> bool| layers.iter().filter(|l| pred(&l.name)).map(|l| l.id.clone()).collect::<Vec<_>>();
+        WallRunParams {
+            wall_layer_ids: ids(&|n| starts(n, b"WALL")),
+            min_width_mm: 50.0,
+            max_width_mm: 800.0,
+            min_overlap_mm: TOLERANCE.grouping_mm,
+            opening_layer_ids: ids(&|n| starts(n, b"WINDOW") || starts(n, b"DOOR")),
+        }
     }
 }
 

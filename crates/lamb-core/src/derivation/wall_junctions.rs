@@ -9,10 +9,17 @@
 //! candidate point; candidates cluster by single linkage. Then every run end joins the nearest node
 //! within that node's reach that is not behind it — which is how a T's two collinear through-runs,
 //! which never cross each other, join their stem's node.
+//!
+//! Two ends that simply continue each other — a straight wall bending tangentially into a curve, or
+//! one face drawn as two collinear lines — have antiparallel outward tangents within
+//! `TOLERANCE.angle_deg` and points within `TOLERANCE.grouping_mm`; their midpoint is a candidate
+//! too, giving an N = 2 node at 180°. A wider gap is never joined this way: an undrawn door stays
+//! two free ends, and only a drawn opening bridges it ([`super::wall_openings`]).
 
 use std::cmp::Ordering;
 
 use super::read::ProjectRead;
+use super::wall_openings::{OpeningBridge, opening_bridges};
 use super::walls::{RunCurve, WallRun, WallRunParams, wall_runs};
 use crate::geometry::Point2;
 use crate::geometry::intersect::infinite_line_intersect;
@@ -50,19 +57,22 @@ pub struct Junction {
 pub struct WallGraph {
     pub runs: Vec<WallRun>,
     pub junctions: Vec<Junction>,
+    /// Run ends that joined no junction and no opening bridge, sorted.
     pub free_ends: Vec<(usize, RunEnd)>,
+    /// Gaps closed by a drawn opening, sorted by `(a, b)`.
+    pub bridges: Vec<OpeningBridge>,
 }
 
 #[derive(Clone, Copy)]
-struct EndInfo {
-    key: (usize, RunEnd),
-    point: Point2,
+pub(crate) struct EndInfo {
+    pub(crate) key: (usize, RunEnd),
+    pub(crate) point: Point2,
     /// Unit tangent pointing out of the run.
-    outward: Point2,
-    width: f64,
+    pub(crate) outward: Point2,
+    pub(crate) width: f64,
 }
 
-fn run_ends(runs: &[WallRun]) -> Vec<EndInfo> {
+pub(crate) fn run_ends(runs: &[WallRun]) -> Vec<EndInfo> {
     let mut out = Vec::with_capacity(runs.len() * 2);
     for (i, r) in runs.iter().enumerate() {
         let (start, start_out, end, end_out) = match r.centreline {
@@ -95,7 +105,9 @@ fn candidate(a: &EndInfo, b: &EndInfo) -> Option<(Point2, f64)> {
         return None;
     }
     if cross2(a.outward, b.outward).abs() <= deg_to_rad(TOLERANCE.angle_deg).sin() {
-        return None;
+        // Tangent continuation: antiparallel ends that (nearly) touch.
+        let continues = dot2(a.outward, b.outward) < 0.0 && dist2(a.point, b.point) <= TOLERANCE.grouping_mm;
+        return continues.then(|| (scale2(add2(a.point, b.point), 0.5), reach));
     }
     let hit = infinite_line_intersect(a.point, add2(a.point, a.outward), b.point, add2(b.point, b.outward))?;
     let p = hit.point;
@@ -210,9 +222,12 @@ pub fn wall_junctions(runs: &[WallRun]) -> (Vec<Junction>, Vec<(usize, RunEnd)>)
     (junctions, free)
 }
 
-/// [`wall_runs`] in `view`, then [`wall_junctions`] over them.
+/// [`wall_runs`] in `view`, then [`wall_junctions`] over them, then [`opening_bridges`] over the
+/// free ends; bridged ends leave `free_ends`.
 pub fn wall_graph(p: &impl ProjectRead, view: Id, params: &WallRunParams) -> WallGraph {
     let runs = wall_runs(p, view, params);
-    let (junctions, free_ends) = wall_junctions(&runs);
-    WallGraph { runs, junctions, free_ends }
+    let (junctions, mut free_ends) = wall_junctions(&runs);
+    let bridges = opening_bridges(p, view, params, &runs, &free_ends);
+    free_ends.retain(|e| !bridges.iter().any(|b| b.a == *e || b.b == *e));
+    WallGraph { runs, junctions, free_ends, bridges }
 }

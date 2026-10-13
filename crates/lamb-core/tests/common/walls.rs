@@ -47,3 +47,24 @@ pub fn project(entities: Vec<DrawingEntity>) -> Project {
     p.views.push(AnyView::Plan(PlanView { id: VIEW, name: "plan".into(), entities, placement: None }));
     p
 }
+
+/// Adds a layer `name` (id `layer-<name lowercased>`, default role Cut) to `p` and returns its id —
+/// for opening layers such as `WINDOW` and `DOOR`, which `default_layers` does not hold.
+pub fn add_layer(p: &mut Project, name: &str) -> String {
+    let id = format!("layer-{}", name.to_ascii_lowercase());
+    p.layers.push(lamb_core::model::DrawingLayer {
+        id: id.clone(),
+        name: name.into(),
+        color: "#ffffff".into(),
+        lineweight: 0.25,
+        visible: true,
+        locked: false,
+        default_role: LineRole::Cut,
+    });
+    id
+}
+
+/// A polyline on `layer` (a layer id) with `bulges` as in [`poly`].
+pub fn on_layer(id: u64, layer: &str, pts: &[(f64, f64)], bulges: &[f64]) -> DrawingEntity {
+    ent(id, layer, LineRole::Bylayer, poly(pts, bulges))
+}
