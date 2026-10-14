@@ -180,6 +180,17 @@ pub struct DocState {
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl DocState {
+    /// Replace the idle-picked object; when it changed, tell the adapter's picked-object observer
+    /// (LAMB fork patch, [`idle_pick::register_picked_observer`]).
+    fn set_picked(&mut self, v: Option<(Space, String)>) {
+        if self.picked == v {
+            return;
+        }
+        self.picked = v;
+        if let Some(f) = idle_pick::picked_observer() {
+            f(self.picked.as_ref());
+        }
+    }
     pub fn new(doc: Drawing, title: &str, path: Option<String>) -> Self {
         let doc = Arc::new(doc);
         DocState {
@@ -889,7 +900,7 @@ impl Session {
         if let Ok(st) = self.state_mut() {
             let mut seen = std::collections::HashSet::new();
             st.selection = sel.into_iter().filter(|h| seen.insert(*h)).collect();
-            st.picked = None;
+            st.set_picked(None);
         }
     }
     /// The key of the object the idle-click hook picked ([`idle_pick`]), while it was picked in
@@ -1760,7 +1771,7 @@ impl Session {
         let space = self.space();
         let pickadd = self.settings.pickadd;
         if let Ok(st) = self.state_mut() {
-            st.picked = None;
+            st.set_picked(None);
         }
         if let Some(pw) = self.pending_window.take() {
             let crossing = p.x < pw.corner.x;
@@ -1797,7 +1808,7 @@ impl Session {
                 {
                     self.set_selection(vec![]);
                     if let Ok(st) = self.state_mut() {
-                        st.picked = Some((space, key));
+                        st.set_picked(Some((space, key)));
                     }
                     return Ok(());
                 }

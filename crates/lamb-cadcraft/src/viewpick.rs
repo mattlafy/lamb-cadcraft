@@ -4,6 +4,13 @@
 //! nearest cut line within the pick aperture wins, the entity selection is cleared, and the
 //! command line says `Selected <name>`. [`picked_view`] reads the pick back (the view Properties
 //! form, T365).
+//!
+//! The pick is drawn too (TS T91): the engine's picked-object observer mirrors it into
+//! [`highlighted`], which the overlay provider reads to stroke that view's cut lines in the
+//! selected colour. Accepted limitation: the mirror is process-global, so with two drawings open
+//! the other drawing's cut line with the same view id would also highlight.
+
+use std::sync::{Mutex, PoisonError};
 
 use cadcraft_doc::Space;
 use cadcraft_engine::Session;
@@ -47,9 +54,27 @@ pub fn picked_view(s: &Session) -> Option<Id> {
     view_of(d, &Space::Block(view_block_name(id))).map(|_| id)
 }
 
-/// Register [`pick_cut_line`] as the engine's idle-pick hook.
+/// The picked view, mirrored out of the engine for the overlay provider.
+static PICKED: Mutex<Option<Id>> = Mutex::new(None);
+
+/// The engine's picked-object observer: mirror the pick and redraw the overlays (the drawing's
+/// revision does not move).
+fn mirror_pick(v: Option<&(Space, String)>) {
+    let id = v.and_then(|(_, key)| view_id(&Space::Block(key.clone())));
+    *PICKED.lock().unwrap_or_else(PoisonError::into_inner) = id;
+    cadcraft_render::bump_overlays();
+}
+
+/// The view whose cut lines draw highlighted: the one an idle click last picked.
+pub(crate) fn highlighted() -> Option<Id> {
+    *PICKED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Register [`pick_cut_line`] as the engine's idle-pick hook and [`mirror_pick`] as its
+/// picked-object observer.
 pub(crate) fn register() -> Result<(), &'static str> {
-    cadcraft_engine::idle_pick::register_idle_pick(pick_cut_line)
+    cadcraft_engine::idle_pick::register_idle_pick(pick_cut_line)?;
+    cadcraft_engine::idle_pick::register_picked_observer(mirror_pick)
 }
 
 #[cfg(test)]

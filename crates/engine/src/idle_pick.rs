@@ -7,9 +7,13 @@
 //! stores `(edit space, key)` as the picked object (`DocState::picked`, session state, never
 //! saved) and opens no selection window. Any `set_selection` and every idle click clear it again;
 //! [`Session::picked`] reads it back.
+//!
+//! An adapter that draws the pick registers one observer ([`register_picked_observer`]); it is
+//! told the new value every time `DocState::picked` changes (and only then).
 
 use std::sync::OnceLock;
 
+use cadcraft_doc::Space;
 use cadcraft_geom::Vec2;
 
 use crate::Session;
@@ -29,12 +33,26 @@ pub fn idle_pick() -> Option<IdlePick> {
     HOOK.get().copied()
 }
 
+/// Told the new picked object (`(space, key)`, or `None` when cleared) whenever it changes.
+pub type PickedObserver = fn(Option<&(Space, String)>);
+
+static OBSERVER: OnceLock<PickedObserver> = OnceLock::new();
+
+/// Register the picked-object observer. Once per process; a second call is an error.
+pub fn register_picked_observer(f: PickedObserver) -> Result<(), &'static str> {
+    OBSERVER.set(f).map_err(|_| "picked observer already registered")
+}
+
+/// The registered observer, if any.
+pub fn picked_observer() -> Option<PickedObserver> {
+    OBSERVER.get().copied()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::cell::Cell;
 
-    use cadcraft_doc::Space;
     use serde_json::json;
 
     use super::*;
@@ -67,6 +85,29 @@ mod tests {
         st.space = space();
         st.mspace = None;
         s
+    }
+
+    thread_local! {
+        /// Picked-object changes the observer saw on this test's thread.
+        static TOLD: Cell<usize> = const { Cell::new(0) };
+    }
+    fn observer(v: Option<&(Space, String)>) {
+        if v.is_none_or(|(sp, _)| *sp == space()) {
+            TOLD.with(|t| t.set(t.get() + 1));
+        }
+    }
+
+    #[test]
+    fn the_observer_is_told_each_change_once() {
+        let _ = register_picked_observer(observer);
+        assert!(register_picked_observer(observer).is_err());
+        let mut s = session();
+        let t0 = TOLD.with(Cell::get);
+        s.idle_click(Vec2::new(5.0, 500.0), false).unwrap();
+        assert_eq!(TOLD.with(Cell::get), t0 + 1, "picked: told once, with Some");
+        s.set_selection(vec![]);
+        s.set_selection(vec![]);
+        assert_eq!(TOLD.with(Cell::get), t0 + 2, "cleared once; clearing again is no change");
     }
 
     #[test]

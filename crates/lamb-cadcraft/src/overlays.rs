@@ -29,6 +29,8 @@ const MARKER_SEGMENTS: usize = 32;
 const MARKER_COLOR: Rgb = Rgb(0, 190, 255);
 const MARKER_ASSUMED_Z_COLOR: Rgb = Rgb(120, 140, 160);
 const CUT_LINE_COLOR: Rgb = Rgb(255, 170, 0);
+/// A picked view's cut lines (TS `SELECTED_OVERLAY_COLOR`, `#4da3ff`).
+const SELECTED_OVERLAY_COLOR: Rgb = Rgb(0x4d, 0xa3, 0xff);
 const SNAP_NAME: &str = "LAMB marker";
 
 /// The view id a space's block name stands for (`view_block_name(id)`), without checking the
@@ -90,6 +92,8 @@ pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let Ok(cuts) = compute_cut_lines_for_view(&dp, id) else { return list };
     let plan_cuts = compute_plan_cut_lines_for_view(&dp, id);
 
+    let picked = crate::viewpick::highlighted();
+    let cut_color = |v: Id| if picked == Some(v) { SELECTED_OVERLAY_COLOR } else { CUT_LINE_COLOR };
     let r = marker_radius(opts);
     for m in &markers {
         let handle = Handle(m.source_entity_id.0);
@@ -112,12 +116,12 @@ pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
         let pts = [Vec2::new(c.from.x, c.from.y), Vec2::new(c.to.x, c.to.y)];
         list.bounds.add(pts[0]);
         list.bounds.add(pts[1]);
-        push(&mut list, Handle(c.source_view_id.0), CUT_LINE_COLOR, Kind::Polyline, &pts);
+        push(&mut list, Handle(c.source_view_id.0), cut_color(c.source_view_id), Kind::Polyline, &pts);
     }
     for c in &plan_cuts {
         let base = Vec2::new(0.0, c.local_y);
         list.bounds.add(base);
-        push(&mut list, Handle(c.source_view_id.0), CUT_LINE_COLOR, Kind::Infinite { ray: false }, &[base, Vec2::new(1.0, 0.0)]);
+        push(&mut list, Handle(c.source_view_id.0), cut_color(c.source_view_id), Kind::Infinite { ray: false }, &[base, Vec2::new(1.0, 0.0)]);
     }
     list
 }
