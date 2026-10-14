@@ -222,3 +222,90 @@ fn panelock_recentres_the_section_tile() -> R {
     assert!(f.s.panes_locked());
     Ok(())
 }
+
+/// Snap off everything but ORTHO, so `snap_cursor` answers with ortho alone.
+fn ortho_only(s: &mut Session) {
+    s.settings.orthomode = true;
+    s.settings.osmode = 0;
+    s.settings.polarmode = false;
+    s.settings.otrack = false;
+    s.settings.snapmode = false;
+}
+
+fn ortho_at(s: &mut Session, base: Vec2, raw: Vec2) -> Vec2 {
+    let q = cadcraft_engine::snap::tracking::CursorQuery {
+        base: Some(base),
+        deferred: false,
+        corner: false,
+        aperture: 1e-6,
+        tol: 1e-6,
+        now: 0.0,
+        shift: false,
+    };
+    s.snap_cursor(raw, &q).point
+}
+
+#[test]
+fn ortho_follows_the_rotated_plan_tile_and_ucsalign_turns_it_off() -> R {
+    let mut f = open("t76-rotated-section", 2)?;
+    let (sec, a, b) = f.secs[0];
+    show(&mut f.s, 1, sec)?;
+    show(&mut f.s, 0, f.plan)?;
+    let want = (b.y - a.y).atan2(b.x - a.x);
+    ortho_only(&mut f.s);
+    let base = Vec2::new(a.x, a.y);
+    let raw = base + Vec2::from_angle(want + 2f64.to_radians()) * 1000.0;
+    let on_cut = base + Vec2::from_angle(want) * (1000.0 * 2f64.to_radians().cos());
+    assert!((f.s.ortho_rotation() - want).abs() < EPS);
+    let p = ortho_at(&mut f.s, base, raw);
+    assert!((p - on_cut).len() < 1e-6, "{p:?} vs {on_cut:?}");
+    // UCSALIGN off: world X/Y.
+    let r = f.s.execute("ucsalign", &json!({"on": false}))?;
+    assert_eq!(r["message"], "<UCS align off>");
+    assert_eq!(f.s.ortho_rotation(), 0.0);
+    assert_eq!(ortho_at(&mut f.s, base, raw), cadcraft_engine::snap::ortho(base, raw));
+    // Toggled back on.
+    let r = f.s.execute("ucsalign", &json!({}))?;
+    assert_eq!(r["on"], true);
+    assert!((ortho_at(&mut f.s, base, raw) - on_cut).len() < 1e-6);
+    // The section tile current: rotation 0, world behaviour.
+    f.s.activate_tile(1)?;
+    assert_eq!(f.s.ortho_rotation(), 0.0);
+    assert_eq!(ortho_at(&mut f.s, base, raw), cadcraft_engine::snap::ortho(base, raw));
+    Ok(())
+}
+
+#[test]
+fn ortho_without_tiles_is_world() -> R {
+    register();
+    let mut s = Session::new();
+    s.execute("line", &json!({"points": [[0, 0], [10, 0]]}))?;
+    ortho_only(&mut s);
+    assert_eq!(s.ortho_rotation(), 0.0);
+    let (base, raw) = (Vec2::new(1.0, 2.0), Vec2::new(30.0, 9.0));
+    assert_eq!(ortho_at(&mut s, base, raw), Vec2::new(30.0, 2.0));
+    Ok(())
+}
+
+#[test]
+fn direct_distance_runs_along_the_rotated_cut() -> R {
+    let mut f = open("t76-rotated-section", 2)?;
+    let (sec, a, b) = f.secs[0];
+    show(&mut f.s, 1, sec)?;
+    show(&mut f.s, 0, f.plan)?;
+    let want = (b.y - a.y).atan2(b.x - a.x);
+    ortho_only(&mut f.s);
+    let space = Space::Block(view_block_name(f.plan));
+    let before: Vec<_> = f.s.doc()?.space(&space).ok_or("no block")?.iter().map(|e| e.handle).collect();
+    f.s.cmdline(&format!("line {},{}", a.x, a.y))?;
+    f.s.cursor = Vec2::new(a.x, a.y) + Vec2::from_angle(want + 2f64.to_radians()) * 500.0;
+    f.s.cmdline("1000")?;
+    f.s.cmdline("")?;
+    let d = f.s.doc()?;
+    let new: Vec<_> = d.space(&space).ok_or("no block")?.iter().filter(|e| !before.contains(&e.handle)).collect();
+    assert_eq!(new.len(), 1);
+    let g = new[0].kind.grips();
+    let end = Vec2::new(a.x, a.y) + Vec2::from_angle(want) * 1000.0;
+    assert!(g.iter().any(|p| (*p - end).len() < 1e-6), "{g:?} vs {end:?}");
+    Ok(())
+}

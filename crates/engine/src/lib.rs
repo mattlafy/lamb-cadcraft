@@ -508,6 +508,10 @@ pub struct Settings {
     pub polarsnap: bool,
     /// POLARDIST: the PolarSnap step; 0 uses the snap X spacing.
     pub polardist: f64,
+    /// The frame ortho constrains to (radians) when not drafting isometric: filled by
+    /// [`Session::drafting_settings`] from [`Session::ortho_rotation`]; 0 elsewhere.
+    #[serde(skip)]
+    pub ortho_rotation: f64,
 }
 
 impl Default for Settings {
@@ -566,6 +570,7 @@ impl Default for Settings {
             polaraddang: Vec::new(),
             polarsnap: false,
             polardist: 0.0,
+            ortho_rotation: 0.0,
         }
     }
 }
@@ -859,6 +864,7 @@ impl Session {
             settings.snapunit = d.header.snap_unit();
             settings.gridunit = d.header.grid_unit();
         }
+        settings.ortho_rotation = self.ortho_rotation();
         settings
     }
     /// The space commands act on (model space while working inside a layout viewport).

@@ -145,7 +145,16 @@ fn nearest_axis(plane: IsoPlane, d: Vec2) -> Vec2 {
 /// isometric plane (or to horizontal/vertical when isometric drafting is off).
 pub fn constrain(s: &Settings, base: Vec2, p: Vec2) -> Vec2 {
     if !s.isodraft {
-        return super::ortho(base, p);
+        let r = s.ortho_rotation;
+        if r == 0.0 || !r.is_finite() {
+            return super::ortho(base, p);
+        }
+        // In the rotated frame: keep the larger component of base→p, turned back.
+        let (u, v) = (Vec2::from_angle(r), Vec2::from_angle(r + std::f64::consts::FRAC_PI_2));
+        let d = p - base;
+        let (a, b) = (d.dot(u), d.dot(v));
+        let q = if a.abs() >= b.abs() { base + u * a } else { base + v * b };
+        return if q.is_finite() { q } else { p };
     }
     let dir = nearest_axis(s.isoplane, p - base);
     let r = base + dir * (p - base).dot(dir);
@@ -278,6 +287,34 @@ mod tests {
         let h = Vec2::new(0.0, 3.0);
         let s = lattice_snap(h, d, Vec2::ZERO, 0.0);
         assert!(s.near(Vec2::new(0.0, 2.0), 1e-9) || s.near(Vec2::new(0.0, 4.0), 1e-9));
+    }
+
+    #[test]
+    fn rotated_ortho_keeps_to_the_frame() {
+        let s = Settings { ortho_rotation: 30f64.to_radians(), ..Settings::default() };
+        let near = |a: Vec2, b: Vec2| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9;
+        let base = Vec2::ZERO;
+        let p = Vec2::from_angle(31f64.to_radians()) * 10.0;
+        let want = Vec2::from_angle(30f64.to_radians()) * (10.0 * 1f64.to_radians().cos());
+        assert!(near(constrain(&s, base, p), want), "{:?}", constrain(&s, base, p));
+        let p = Vec2::from_angle(118f64.to_radians()) * 10.0;
+        let want = Vec2::from_angle(120f64.to_radians()) * (10.0 * 2f64.to_radians().cos());
+        assert!(near(constrain(&s, base, p), want), "{:?}", constrain(&s, base, p));
+        // A non-zero base works the same way.
+        let b = Vec2::new(3.0, -7.0);
+        assert!(near(
+            constrain(&s, b, b + Vec2::from_angle(31f64.to_radians()) * 10.0),
+            b + Vec2::from_angle(30f64.to_radians()) * (10.0 * 1f64.to_radians().cos())
+        ));
+        // Rotation 0 is exactly world ortho.
+        let s0 = Settings::default();
+        for p in [Vec2::new(5.0, 1.0), Vec2::new(-1.0, 4.0), Vec2::new(2.0, -2.0)] {
+            assert_eq!(constrain(&s0, b, p), crate::snap::ortho(b, p));
+        }
+        // Isometric drafting ignores the rotation.
+        let iso = Settings { isodraft: true, ..s };
+        let iso0 = Settings { isodraft: true, ..Settings::default() };
+        assert_eq!(constrain(&iso, base, p), constrain(&iso0, base, p));
     }
 
     #[test]

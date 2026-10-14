@@ -18,6 +18,9 @@
 //! - `panelock {on?}`: camera lock for VPORTS panes (absent `on` toggles; off by default) — panning
 //!   or zooming the current tile re-centres every related tile at the same scale. Returns
 //!   `{on, message}` (`<Pane lock on>` / `<Pane lock off>`); not an undo step.
+//! - `ucsalign {on?}`: ORTHO and direct distance entry follow the current pane's rotation (on, the
+//!   default) or keep to world X/Y (off); absent `on` toggles. Transparent, session-only, not an
+//!   undo step; returns `{on, message}` (`<UCS align on>` / `<UCS align off>`).
 //!
 //! - `newoffsetplan` (`np`) and `newplanline` (`npln`): placed plans at a new level — see
 //!   [`crate::newviews`]. NEWSECTIONLINE in a placed section takes one click for a perpendicular cut.
@@ -611,6 +614,13 @@ fn panelock(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "on": on, "message": format!("<Pane lock {}>", if on { "on" } else { "off" }) }))
 }
 
+/// UCSALIGN: toggle (or set, with `on`) whether ORTHO follows the current pane's rotation.
+fn ucsalign(s: &mut Session, p: &Value) -> Result<Value> {
+    let on = p.get("on").and_then(Value::as_bool).unwrap_or(s.world_ortho());
+    s.set_world_ortho(!on);
+    Ok(json!({ "on": on, "message": format!("<UCS align {}>", if on { "on" } else { "off" }) }))
+}
+
 /// View ▸ LAMB ▸ <the command's label>.
 const MENU: &[&str] = &["View", "LAMB", ""];
 
@@ -647,6 +657,7 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("link.apply", "Link", link).params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}"),
         CommandSpec::new("unlink.apply", "Unlink", unlink).params("{linkId}"),
         CommandSpec::new("panelock", "Pane Lock", panelock).params("{on?: bool}").noundo().menu(MENU),
+        CommandSpec::new("ucsalign", "UCS Align", ucsalign).params("{on?: bool}").key("F6").noundo().transparent().menu(MENU),
         CommandSpec::new("lambproject", "Start Project", lambproject).menu(MENU),
         CommandSpec::new("refpane", "Reference Pane", crate::refpane::refpane)
             .params("{on?: bool, viewId?}")

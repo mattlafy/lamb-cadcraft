@@ -31,6 +31,10 @@ pub struct Panes {
     /// Camera lock: the other tiles follow the current one's centre and scale. Kept across
     /// re-tiling.
     pub locked: bool,
+    /// ORTHO and direct distance entry keep to world X/Y instead of the current tile's rotation
+    /// ([`Session::ortho_rotation`]; LAMB's `ucsalign`, off = follow the pane, by default). Kept
+    /// across re-tiling, never saved.
+    pub world_ortho: bool,
 }
 
 /// Where a point in one tile's space lands in another's: a point, or (when the other space has an
@@ -84,7 +88,12 @@ fn existing(st: &DocState, sp: Option<&Space>) -> Space {
 /// view is set: tile `old` keeps the edit space, tile `new`'s space becomes it.
 pub fn on_activate(st: &mut DocState, old: usize, new: usize) {
     if st.panes.rects != st.tiles.rects {
-        st.panes = Panes { rects: st.tiles.rects.clone(), spaces: vec![Space::Model; st.tiles.rects.len()], locked: st.panes.locked };
+        st.panes = Panes {
+            rects: st.tiles.rects.clone(),
+            spaces: vec![Space::Model; st.tiles.rects.len()],
+            locked: st.panes.locked,
+            world_ortho: st.panes.world_ortho,
+        };
     }
     let here = st.space.clone();
     if let Some(slot) = st.panes.spaces.get_mut(old) {
@@ -150,6 +159,31 @@ impl Session {
     /// Whether the camera lock is on.
     pub fn panes_locked(&self) -> bool {
         self.state().is_ok_and(|st| st.panes.locked)
+    }
+
+    /// ORTHO keeps to world X/Y ([`Panes::world_ortho`]) instead of the current tile's rotation;
+    /// nothing without a drawing.
+    pub fn set_world_ortho(&mut self, on: bool) {
+        if let Ok(st) = self.state_mut() {
+            st.panes.world_ortho = on;
+        }
+        self.touch();
+    }
+
+    /// Whether ORTHO keeps to world X/Y.
+    pub fn world_ortho(&self) -> bool {
+        self.state().is_ok_and(|st| st.panes.world_ortho)
+    }
+
+    /// The frame ORTHO and direct distance entry constrain to (radians): the current tile's
+    /// [`Session::tile_rotations`] entry, else 0 (no tiles, no relations, a layout, or
+    /// [`Panes::world_ortho`]).
+    pub fn ortho_rotation(&self) -> f64 {
+        if self.world_ortho() {
+            return 0.0;
+        }
+        let Some(a) = self.model_tiles().iter().position(|t| t.active) else { return 0.0 };
+        self.tile_rotations().get(a).copied().filter(|r| r.is_finite()).unwrap_or(0.0)
     }
 
     /// Each tile's space, one per [`Session::model_tiles`] entry and in its order: the current
@@ -348,6 +382,19 @@ mod tests {
         s.state_mut().unwrap().set_view_quiet(View { center: Vec2::new(-9.0, 4.0), height: 2.0, twist: 0.0 });
         assert_eq!(s.model_tiles()[1].view, before);
         assert_eq!(s.model_tiles()[0].view.center, Vec2::new(-9.0, 4.0));
+    }
+
+    #[test]
+    fn world_ortho_survives_retiling_and_rotation_is_zero_without_relations() {
+        let mut s = two_tiles_with_block();
+        assert!(!s.world_ortho(), "follows the pane by default");
+        assert_eq!(s.ortho_rotation(), 0.0);
+        assert_eq!(s.drafting_settings().ortho_rotation, 0.0);
+        s.set_world_ortho(true);
+        s.execute("-vports", &json!({"option": "3"})).unwrap();
+        s.activate_tile(1).unwrap();
+        assert!(s.world_ortho(), "kept across re-tiling");
+        assert_eq!(s.ortho_rotation(), 0.0);
     }
 
     #[test]

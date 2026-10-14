@@ -825,7 +825,9 @@ impl crate::Session {
             && s.orthomode
             && !q.corner
         {
-            p = super::iso::ortho(&self.settings, b, p);
+            // `s` has grid snap switched off by the isometric lattice; ortho's own snap steps read
+            // the session's, with the frame the drafting settings computed.
+            p = super::iso::ortho(&crate::Settings { ortho_rotation: s.ortho_rotation, ..self.settings.clone() }, b, p);
         }
         CursorSnap { point: p, snap: None, track: None, wait }
     }
