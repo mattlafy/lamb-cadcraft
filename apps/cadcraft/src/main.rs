@@ -225,12 +225,23 @@ fn control_flag(current: Option<u16>, value: Option<String>) -> Option<u16> {
     current
 }
 
+/// The Views palette's rows (fork, LAMB T343): LAMB's view browser as generic list rows.
+fn lamb_view_rows(d: &cadcraft_engine::doc::Drawing, edit: &cadcraft_engine::doc::Space) -> Vec<cadcraft_ui_egui::viewlist::Row> {
+    lamb_cadcraft::views::browser_rows(d, edit)
+        .into_iter()
+        .map(|r| cadcraft_ui_egui::viewlist::Row { label: r.label, active: r.active, heading: r.heading, command: r.command })
+        .collect()
+}
+
 fn main() -> eframe::Result {
     // First, so every start-up record is captured; see `logging`.
     let logger = logging::install();
     // LAMB (fork): its commands, overlays and snaps, before anything builds the command registry.
     if let Err(e) = lamb_cadcraft::commands::install_app() {
         log::warn!("LAMB not installed: {e}");
+    }
+    if let Err(e) = cadcraft_ui_egui::viewlist::register_row_source(lamb_view_rows) {
+        log::warn!("LAMB Views palette not installed: {e}");
     }
     // lossy, so a value that is not Unicode is reported like any other bad port instead of ignored
     let mut control_port =

@@ -49,7 +49,8 @@ fn real_panel_drag_float_close_reopen_and_full_workspace_reload() {
     let target = harness.get_by_role_and_label(egui::accesskit::Role::Tab, "Tool Sets").rect().center();
     drag(&mut harness, source, target);
     let location = harness.state().ui.docking.layout.location(&Panel::Layers).unwrap();
-    assert_eq!(location.anchor, Some(Panel::ToolSets));
+    // The left column is a stack (Views above Tool Sets): the drop joins it.
+    assert!(matches!(location.anchor, Some(Panel::Views | Panel::ToolSets)), "{location:?}");
     harness.get_by_role_and_label(egui::accesskit::Role::Tab, "Layers").click_button(PointerButton::Secondary);
     harness.run_steps(3);
     harness.get_by_label("Float panel").click();
@@ -112,7 +113,7 @@ fn docking_renders_default_float_and_redocked_at_normal_and_narrow_sizes() {
                 harness.run_steps(5);
                 harness.state().ui.docking.validate().unwrap();
                 let content = harness.state().ui.docking.layout.panels();
-                assert_eq!(content.len(), 4);
+                assert_eq!(content.len(), 5);
                 assert!(content.contains(&&Panel::Canvas));
                 if let Ok(directory) = std::env::var("CRAFT_UI_DOCKING_DIR") {
                     std::fs::create_dir_all(&directory).unwrap();
@@ -140,7 +141,7 @@ fn automation_reaches_split_stack_resize_and_tab_reorder_through_the_same_handle
     h.run_steps(4);
     let panels = h.state().ui.docking.layout.panels();
     assert!(panels.iter().position(|p| **p == Panel::Properties).unwrap() < panels.iter().position(|p| **p == Panel::Layers).unwrap());
-    assert_eq!(h.state().ui.docking.layout.location(&Panel::ToolSets).unwrap().size, Some(SplitSize::FixedFirst(280.0)));
+    assert!(matches!(h.state().ui.docking.layout.root, Some(craft_ui::docking::Node::Split { size: SplitSize::FixedFirst(280.0), .. })));
 }
 
 #[test]
@@ -149,16 +150,16 @@ fn stack_boundary_resizes_by_pointer_and_keyboard_without_changing_the_drawing()
     let drawing = h.state().session.doc().unwrap().clone();
     let center = h
         .get_all_by_role_and_label(egui::accesskit::Role::Splitter, "Resize panels")
-        .into_iter()
-        .find(|node| node.rect().width() > node.rect().height())
+        .filter(|node| node.rect().width() > node.rect().height())
+        .max_by(|a, b| a.rect().left().total_cmp(&b.rect().left())) // the Layers/Properties stack, right of Views/Tool Sets
         .unwrap()
         .rect()
         .center();
     drag(&mut h, center, center + vec2(0.0, -45.0));
     let height = h.state().ui.docking.layout.location(&Panel::Layers).unwrap().stack.unwrap().1.unwrap();
     h.get_all_by_role_and_label(egui::accesskit::Role::Splitter, "Resize panels")
-        .into_iter()
-        .find(|node| node.rect().width() > node.rect().height())
+        .filter(|node| node.rect().width() > node.rect().height())
+        .max_by(|a, b| a.rect().left().total_cmp(&b.rect().left())) // the Layers/Properties stack, right of Views/Tool Sets
         .unwrap()
         .focus();
     h.run_steps(2);
@@ -259,7 +260,7 @@ fn properties_typed_in_rendered_command_line_reopens_and_selects_actual_workspac
     assert_eq!(restored_tools.size, tools.size);
     assert_eq!(restored_tools.floating, tools.floating);
     assert_eq!(restored_tools.stack, tools.stack);
-    assert!(restored_tools.sibling.contains(&Panel::Properties));
+    assert_eq!(restored_tools.sibling, tools.sibling);
 
     h.state_mut().run("ui.dock", json!({"operation":"float","panel":"layers","rect":[400,250,300,350]})).unwrap();
     h.state_mut().run("ui.dock", json!({"operation":"move","panel":"properties","target":"layers","zone":"center"})).unwrap();
@@ -333,4 +334,30 @@ fn canvas_reset_during_splitter_drag_discards_old_resize_and_ends_gesture() {
     h.run_steps(3);
     assert_eq!(h.state().ui.docking.layout, expected.layout);
     assert_eq!(h.state().session.doc().unwrap(), &drawing);
+}
+
+#[test]
+fn views_palette_is_in_the_default_left_column_and_optional_in_saved_workspaces() {
+    let default = cadcraft_ui_egui::docking::Workspace::default();
+    default.validate().unwrap();
+    let views = default.layout.location(&Panel::Views).unwrap();
+    assert_eq!(views.stack, Some((true, Some(200.0))));
+    assert_eq!(views.anchor, Some(Panel::ToolSets), "Views sits above Tool Sets in one stack: {views:?}");
+    // A workspace saved before Views existed has no Views: it still validates, and the Window
+    // menu entry and Reset Panel Layout both bring it back.
+    let mut h = harness(None, 1280.0, 1.0);
+    h.state_mut().run("ui.dock", json!({"operation":"close","panel":"views"})).unwrap();
+    let mut saved = serde_json::to_value(&h.state().ui.docking).unwrap();
+    saved["hidden"] = json!([]);
+    let old: cadcraft_ui_egui::docking::Workspace = serde_json::from_value(saved).unwrap();
+    old.validate().unwrap();
+    assert!(!old.layout.contains(&Panel::Views));
+    h.state_mut().ui.docking = old;
+    h.state_mut().run("ui.panel.views", json!({})).unwrap();
+    assert!(h.state().ui.docking.layout.contains(&Panel::Views));
+    h.state_mut().run("ui.dock", json!({"operation":"close","panel":"views"})).unwrap();
+    h.state_mut().run("ui.dock.reset", json!({})).unwrap();
+    assert_eq!(h.state().ui.docking.layout, default.layout);
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::Tab, "Views");
 }

@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 #[serde(rename_all = "camelCase")]
 pub enum Panel {
     Canvas,
+    /// LAMB's Views palette (fork-only, [`crate::viewlist`]).
+    Views,
     ToolSets,
     QuickCalc,
     Layers,
@@ -19,10 +21,11 @@ pub enum Panel {
 }
 
 impl Panel {
-    pub const ALL: &[Self] = &[Self::Canvas, Self::ToolSets, Self::Layers, Self::Properties, Self::ExternalRefs];
+    pub const ALL: &[Self] = &[Self::Canvas, Self::Views, Self::ToolSets, Self::Layers, Self::Properties, Self::ExternalRefs];
     pub fn id(self) -> &'static str {
         match self {
             Self::Canvas => "canvas",
+            Self::Views => "views",
             Self::ToolSets => "toolSets",
             Self::QuickCalc => "quickCalc",
             Self::Layers => "layers",
@@ -33,6 +36,7 @@ impl Panel {
     fn label(self) -> &'static str {
         match self {
             Self::Canvas => "Drawing",
+            Self::Views => "Views",
             Self::ToolSets => "Tool Sets",
             Self::QuickCalc => "QuickCalc",
             Self::Layers => "Layers",
@@ -43,6 +47,7 @@ impl Panel {
     fn default_side(self) -> Zone {
         match self {
             Self::Canvas => Zone::Right,
+            Self::Views => Zone::Left,
             Self::ToolSets => Zone::Left,
             Self::QuickCalc => Zone::Right,
             Self::Layers => Zone::Right,
@@ -84,7 +89,12 @@ impl Default for Workspace {
                 root: Some(split(
                     SplitAxis::Horizontal,
                     SplitSize::FixedFirst(220.0),
-                    tabs(Panel::ToolSets),
+                    Node::Stack {
+                        entries: vec![
+                            craft_ui::docking::StackEntry { panel: Panel::Views, open: true, height: Some(200.0) },
+                            craft_ui::docking::StackEntry { panel: Panel::ToolSets, open: true, height: None },
+                        ],
+                    },
                     split(
                         SplitAxis::Horizontal,
                         SplitSize::FixedSecond(300.0),
@@ -348,6 +358,9 @@ pub fn show(app: &mut crate::CadApp, ui: &mut egui::Ui) {
                 ui.painter().rect_filled(ui.max_rect(), 0.0, t.canvas);
                 crate::canvas::show(app, ui);
             }
+            Panel::Views => {
+                egui::ScrollArea::vertical().id_salt("dock-views").auto_shrink([false, false]).show(ui, |ui| crate::viewlist::show(app, ui));
+            }
             Panel::ToolSets => crate::palettes::toolsets(app, ui),
             Panel::QuickCalc => crate::palettes::quickcalc::show(app, ui),
             Panel::Layers => {
@@ -393,7 +406,7 @@ fn panel_limits(panel: &Panel) -> PanelLimits {
         Panel::Canvas => (egui::vec2(300.0, 180.0), 1_000_000.0),
         Panel::QuickCalc => (egui::vec2(240.0, 160.0), 600.0),
         Panel::ToolSets => (egui::vec2(220.0, 150.0), 480.0),
-        Panel::Layers | Panel::Properties | Panel::ExternalRefs => (egui::vec2(220.0, 100.0), 720.0),
+        Panel::Views | Panel::Layers | Panel::Properties | Panel::ExternalRefs => (egui::vec2(220.0, 100.0), 720.0),
     };
     PanelLimits { min, max: egui::vec2(max_width, 1_000_000.0) }
 }

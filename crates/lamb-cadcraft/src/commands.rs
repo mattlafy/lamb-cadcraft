@@ -16,6 +16,9 @@
 //!   or zooming the current tile re-centres every related tile at the same scale. Returns
 //!   `{on, message}` (`<Pane lock on>` / `<Pane lock off>`); not an undo step.
 //!
+//! - `lambproject` (View ▸ LAMB ▸ Start Project): `Level 1` and a placed `Ground Floor` plan on
+//!   it, then edit the plan; refused ("Already a LAMB project") once the drawing has views.
+//!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
 //!
@@ -32,7 +35,9 @@ use lamb_core::derivation::read::ProjectRead;
 use lamb_core::geometry::polyline::line2;
 use lamb_core::geometry::polyline::resolved_segments;
 use lamb_core::geometry::{IDENTITY_TRANSFORM, Point2};
-use lamb_core::model::{Actor, AnyView, Id, LinkAnchor, LinkOrigin, LinkRecord, Placement, PlanView, VerticalIntent, VerticalView, is_plan_view};
+use lamb_core::model::{
+    Actor, AnyView, Id, Level, LinkAnchor, LinkOrigin, LinkRecord, Placement, PlanView, VerticalIntent, VerticalView, authored_field, is_plan_view,
+};
 use serde_json::{Value, json};
 
 use crate::maintain::now;
@@ -113,11 +118,30 @@ fn editview(s: &mut Session, p: &Value) -> Result<Value> {
             Space::Block(view_block_name(id))
         }
     };
-    let st = s.state_mut()?;
-    st.space = space;
-    st.mspace = None;
-    s.touch();
+    enter_space(s, space)?;
     Ok(Value::Null)
+}
+
+/// LAMBPROJECT: the TS app's starting state (`bootstrap.ts`) — `Level 1` at floor 0 and a placed
+/// plan `Ground Floor` on it at the default cut height, then edit inside the plan. Refused when the
+/// drawing already has views.
+fn lambproject(s: &mut Session, _p: &Value) -> Result<Value> {
+    // Read before `doc_mut`: touching the drawing on a refusal would still record an undo step.
+    let doc = read_document(s.doc()?).map_err(other)?;
+    if !doc.views.is_empty() {
+        return Err(other("Already a LAMB project"));
+    }
+    let d = s.doc_mut()?;
+    let level_id = Id(d.new_handle().0);
+    let placement = Placement::Plan { level_id, cut_elevation: doc.defaults.default_cut_height_mm, transform: IDENTITY_TRANSFORM };
+    let plan = AnyView::Plan(PlanView { id: Id(0), name: "Ground Floor".into(), entities: Vec::new(), placement: Some(placement) });
+    let plan_id = create_view(d, plan).map_err(other)?;
+    let mut doc = read_document(d).map_err(other)?;
+    let floor_elevation = authored_field(0.0, plan_id, Actor::User { user_id: "local".into() }, &now());
+    doc.levels.push(Level { id: level_id, name: "Level 1".into(), order: 0.0, floor_elevation });
+    write_document(d, &doc).map_err(other)?;
+    enter_space(s, Space::Block(view_block_name(plan_id)))?;
+    Ok(json!({ "viewId": plan_id.0, "levelId": level_id.0 }))
 }
 
 fn newsheet(s: &mut Session, p: &Value) -> Result<Value> {
@@ -243,7 +267,7 @@ fn name_input(i: Input, default: &str) -> Option<String> {
     }
 }
 
-fn kind_word(v: &AnyView) -> &'static str {
+pub(crate) fn kind_word(v: &AnyView) -> &'static str {
     match v {
         AnyView::Plan(_) => "Plan",
         AnyView::Vertical(v) if v.intent == VerticalIntent::Elevation => "Elevation",
@@ -259,10 +283,18 @@ fn echo_created(s: &mut Session, word: &str, name: &str, r: &Value) -> Option<Id
     Some(id)
 }
 
+/// Make `space` the edit space (EDITVIEW, NEWPLAN, LAMBPROJECT, a Views palette click). A space
+/// the session has never shown (no stored view for it) is fitted with zoom extents, so it doesn't
+/// open on whatever window the last space had.
 fn enter_space(s: &mut Session, space: Space) -> Result<()> {
     let st = s.state_mut()?;
+    let first_visit = !st.views.iter().any(|(sp, _)| *sp == space);
     st.space = space;
     st.mspace = None;
+    if first_visit {
+        // A failed fit (no viewport yet) still enters the space.
+        let _ = s.zoom_extents();
+    }
     s.touch();
     Ok(())
 }
@@ -504,6 +536,7 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("link", "Link", link).alias(&["lk"]).params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}"),
         CommandSpec::new("unlink", "Unlink", unlink).alias(&["ulk"]).params("{linkId}"),
         CommandSpec::new("panelock", "Pane Lock", panelock).params("{on?: bool}").noundo().menu(MENU),
+        CommandSpec::new("lambproject", "Start Project", lambproject).menu(MENU),
     ]
 }
 
@@ -655,6 +688,55 @@ mod tests {
         s.input(Input::Enter)?;
         assert!(s.doc()?.layout("Sheet 1").is_some());
         assert!(s.log.iter().any(|l| l == "Sheet \"Sheet 1\" created (1 viewports)."), "{:?}", s.log);
+        Ok(())
+    }
+
+    #[test]
+    fn lambproject_starts_one_level_and_a_placed_plan_undoes_and_refuses_twice() -> R {
+        let mut s = session()?;
+        let r = s.execute("lambproject", &json!({}))?;
+        let doc = read_document(s.doc()?)?;
+        assert_eq!(doc.levels.len(), 1);
+        let level = &doc.levels[0];
+        assert_eq!((level.name.as_str(), level.order, level.floor_elevation.value), ("Level 1", 0.0, 0.0));
+        assert_eq!(doc.views.len(), 1);
+        let AnyView::Plan(plan) = &doc.views[0] else { return Err("not a plan".into()) };
+        assert_eq!(plan.name, "Ground Floor");
+        assert_eq!(
+            plan.placement,
+            Some(Placement::Plan { level_id: level.id, cut_elevation: doc.defaults.default_cut_height_mm, transform: IDENTITY_TRANSFORM })
+        );
+        assert_eq!(r["viewId"], json!(plan.id.0));
+        assert_eq!(space(&s)?, Space::Block(view_block_name(plan.id)), "edits the new plan");
+
+        assert!(s.execute("lambproject", &json!({})).is_err_and(|e| e.to_string().contains("Already a LAMB project")));
+        assert_eq!(read_document(s.doc()?)?.views.len(), 1, "a refusal changes nothing");
+
+        s.undo()?;
+        let doc = read_document(s.doc()?)?;
+        assert!(doc.levels.is_empty() && doc.views.is_empty(), "one undo step removes both");
+        assert_eq!(space(&s)?, Space::Model);
+        Ok(())
+    }
+
+    #[test]
+    fn entering_a_never_visited_view_fits_it_and_a_revisit_keeps_its_window() -> R {
+        let mut s = session()?;
+        let id = s.execute("newplan", &json!({ "name": "Far" }))?["viewId"].as_u64().ok_or("no id")?;
+        s.execute("editview", &json!({ "viewId": id }))?;
+        s.execute("line", &json!({ "points": [[100000, 50000], [101000, 50000]] }))?;
+        s.execute("editview", &json!({}))?;
+        // As in a freshly opened drawing: no space has a stored view yet.
+        s.state_mut()?.views.clear();
+        s.execute("view.set", &json!({ "center": [0, 0], "height": 100 }))?;
+        s.execute("editview", &json!({ "viewId": id }))?;
+        let v = s.state()?.view();
+        assert!((v.center.x - 100500.0).abs() < 1.0 && (v.center.y - 50000.0).abs() < 1.0, "fitted to the line: {v:?}");
+        s.execute("view.set", &json!({ "center": [5, 5], "height": 7 }))?;
+        s.execute("editview", &json!({}))?;
+        assert_eq!(s.state()?.view().height, 100.0, "Model keeps its window");
+        s.execute("editview", &json!({ "viewId": id }))?;
+        assert_eq!(s.state()?.view().height, 7.0, "a revisit keeps the view it had");
         Ok(())
     }
 }
