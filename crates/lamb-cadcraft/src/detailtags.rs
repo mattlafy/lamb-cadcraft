@@ -96,7 +96,7 @@ fn attach_junction(graph: &WallGraph, tip: Point2) -> Option<usize> {
 }
 
 /// The view's wall graph and sides, with `WALL-EXT*` layers exterior.
-fn graph_and_sides(p: &DrawingProject<'_>, view: Id) -> (WallGraph, WallSides) {
+pub(crate) fn graph_and_sides(p: &DrawingProject<'_>, view: Id) -> (WallGraph, WallSides) {
     let graph = wall_graph(p, view, &WallRunParams::defaults(p.layers()));
     let exterior_layer_ids = p.layers().iter().filter(|l| starts_with_ci(&l.name, "WALL-EXT")).map(|l| l.id.clone()).collect();
     let sides = wall_sides(p, &graph, &SideParams { outside_points: Vec::new(), exterior_layer_ids });
