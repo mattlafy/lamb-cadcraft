@@ -331,3 +331,47 @@ fn erase_suppresses_the_slot() -> R {
     assert!(!read_document(s.doc()?)?.suppressed_proposals.contains(&origin.proposal_id), "and lift the suppression");
     Ok(())
 }
+
+/// The real face line the fixture's AI lines are implied from: a non-AI line in a vertical view
+/// other than `ai_view`, and that view.
+fn face_line(d: &Drawing, ai_view: Id) -> Result<(Id, Id), Box<dyn std::error::Error>> {
+    let p = DrawingProject::new(d)?;
+    let doc = read_document(d)?;
+    let vertical = |id: Id| doc.views.iter().any(|v| v.id() == id && matches!(v, lamb_core::model::AnyView::Vertical(_)));
+    for v in p.views().filter(|v| v.id != ai_view && vertical(v.id)) {
+        if let Some(e) = p.entities(v.id).find(|e| e.ai_origin.is_none() && e.polyline.is_some()) {
+            return Ok((e.id, v.id));
+        }
+    }
+    Err("no face line".into())
+}
+
+/// Raises the real face line 500 mm (a z move in its section: nothing travels to the plan), so
+/// the height every AI line is implied from changes. Returns whether `ai` moved.
+fn raise_face_line(s: &mut Session, ai: Id, ai_view: Id) -> Result<bool, Box<dyn std::error::Error>> {
+    let before = polyline_of(s.doc()?, ai)?;
+    let (face, view) = face_line(s.doc()?, ai_view)?;
+    s.execute("editview", &json!({"viewId": view.0}))?;
+    s.execute("move", &json!({"handles": [Handle(face.0).hex()], "delta": [0, 500]}))?;
+    Ok(polyline_of(s.doc()?, ai)? != before)
+}
+
+#[test]
+fn accepted_ai_line_no_longer_follows_the_sweep() -> R {
+    // Control: unaccepted, the sweep re-seats the AI line on the new height.
+    let mut s = session()?;
+    let lines = ai_lines(s.doc()?)?;
+    let (ai, ai_view, origin, _) = lines.iter().find(|l| !l.2.accepted && l.2.source_entity_id.is_some()).cloned().ok_or("no unaccepted AI line")?;
+    assert!(raise_face_line(&mut s, ai, ai_view)?, "control: an unaccepted AI line follows the height it is implied from");
+
+    // Accepted: the same edit leaves it where it was.
+    let mut s = session()?;
+    let r = s.execute("accept", &json!({"handles": [Handle(ai.0).hex()]}))?;
+    assert!(r["accepted"].as_u64().is_some_and(|n| n >= 1), "{r}");
+    let now = ai_lines(s.doc()?)?;
+    assert!(now.iter().find(|l| l.0 == ai).ok_or("the accepted line survived the accept's own sweep")?.2.accepted);
+    let source = origin.source_entity_id.ok_or("no source")?;
+    assert!(now.iter().filter(|l| l.2.source_entity_id == Some(source)).all(|l| l.2.accepted), "every AI line of that source is accepted");
+    assert!(!raise_face_line(&mut s, ai, ai_view)?, "an accepted AI line is the user's: the sweep leaves it alone");
+    Ok(())
+}

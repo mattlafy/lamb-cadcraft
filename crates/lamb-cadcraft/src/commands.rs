@@ -40,6 +40,10 @@
 //! - `viewprops {mode, viewId, …}` (View ▸ LAMB ▸ View Properties): rename a view, a placed plan's
 //!   cut elevation, a vertical view's intent or flip — see [`crate::viewprops`].
 //!
+//! - `accept {handles?}` (`acc`), `setrole {handles?, role}`, `layerrole {layer, role}` (View ▸
+//!   LAMB): take ownership of AI lines, an entity's role, a layer's default role — see
+//!   [`crate::entitycmds`].
+//!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
 //!
@@ -672,6 +676,19 @@ pub fn commands() -> Vec<CommandSpec> {
             .menu(MENU)
             .interactive(crate::detailtags::detailtag_machine),
         CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU),
+        CommandSpec::new("accept", "Accept AI Line", crate::entitycmds::accept)
+            .alias(&["acc"])
+            .params("{handles?}")
+            .menu(MENU)
+            .interactive(crate::entitycmds::accept_machine),
+        CommandSpec::new("setrole", "Set Role", crate::entitycmds::setrole)
+            .params("{handles?, role: cut|seen|datum|view_clip|annotation|reference|bylayer}")
+            .menu(MENU)
+            .interactive(crate::entitycmds::setrole_machine),
+        CommandSpec::new("layerrole", "Layer Default Role", crate::entitycmds::layerrole)
+            .params("{layer, role: cut|seen|datum|view_clip|annotation|reference}")
+            .menu(MENU)
+            .interactive(crate::entitycmds::layerrole_machine),
     ]
 }
 
@@ -719,6 +736,9 @@ mod tests {
             "viewprops",
             "newdetail",
             "detailtag",
+            "accept",
+            "setrole",
+            "layerrole",
         ];
         for id in ids {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
