@@ -1255,6 +1255,9 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // Tiled model viewports (VPORTS): the current tile is the drawing area below; `draw_tiles`
     // draws the others.
     let tiles = tile_rects(app, full);
+    // LAMB (fork): each tile's display-only rotation (canvas/panes.rs), read once per frame.
+    let rots = panes::rotations(app);
+    let turn = tiles.iter().position(|(_, tile)| tile.active).map_or(0.0, |i| panes::rotation(&rots, i));
     let rect = tiles.iter().find(|(_, tile)| tile.active).map_or(full, |(r, _)| *r);
     let resp = ui.interact(full, ui.id().with("canvas"), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -1267,7 +1270,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let Ok(st) = app.session.state() else { return };
     let view = st.view();
     let scale = f64::from(rect.height()) / view.height.max(1e-12);
-    let xf = Xf { rect, center: view.center, scale, twist: view.twist };
+    let xf = Xf { rect, center: view.center, scale, twist: view.twist + turn };
     app.canvas.xf = Some(xf);
 
     // ---------- input ----------
@@ -1363,7 +1366,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // Re-read the view after navigation.
     let view = app.session.state().map(|s| s.view()).unwrap_or(view);
     let scale = f64::from(rect.height()) / view.height.max(1e-12);
-    let xf = Xf { rect, center: view.center, scale, twist: view.twist };
+    let xf = Xf { rect, center: view.center, scale, twist: view.twist + turn };
     app.canvas.xf = Some(xf);
     // The paper (display) transform; equal to `xf` except inside an MSPACE viewport.
     let (xf_paper, active_vp) = match app.session.state() {
@@ -1616,8 +1619,8 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     painter.rect_filled(rect, 0.0, t.canvas);
     let t0 = crate::now_ms();
     let mut views = vec![(xf_paper.world_bounds(), 1.0 / xf_paper.scale)];
-    views.extend(tiles.iter().filter(|(r, tile)| !tile.active && r.width() >= 1.0 && r.height() >= 1.0).map(|(r, tile)| {
-        let xf = tile_xf(*r, tile);
+    views.extend(tiles.iter().enumerate().filter(|(_, (r, tile))| !tile.active && r.width() >= 1.0 && r.height() >= 1.0).map(|(i, (r, tile))| {
+        let xf = tile_xf(*r, tile, panes::rotation(&rots, i));
         (xf.world_bounds(), 1.0 / xf.scale)
     }));
     ensure_list(app, &xf_paper, &views, ui.ctx());
@@ -1846,8 +1849,8 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     if let (Some(hit), Some(_)) = (app.canvas.snap, app.canvas.cursor) {
         draw_snap_marker(&painter, xf.to_screen(hit.point), &hit);
     }
-    panes::prepare(app, &tiles);
-    draw_tiles(app, ui, &tiles);
+    panes::prepare(app, &tiles, &rots);
+    draw_tiles(app, ui, &tiles, &rots);
     // UCS icon, ViewCube and viewport label.
     if app.ui.show_ucs_icon {
         draw_ucs_icon(&painter, rect);
@@ -1912,19 +1915,20 @@ fn tile_rects(app: &CadApp, full: Rect) -> Vec<(Rect, cadcraft_engine::ModelTile
         .collect()
 }
 
-/// The world ↔ screen transform of a model tile drawn in `r`.
-fn tile_xf(r: Rect, tile: &cadcraft_engine::ModelTile) -> Xf {
-    Xf { rect: r, center: tile.view.center, scale: f64::from(r.height()) / tile.view.height.max(1e-12), twist: tile.view.twist }
+/// The world ↔ screen transform of a model tile drawn in `r`, turned a further `rotation`
+/// (LAMB's display-only pane rotation, canvas/panes.rs; 0 upstream).
+fn tile_xf(r: Rect, tile: &cadcraft_engine::ModelTile, rotation: f64) -> Xf {
+    Xf { rect: r, center: tile.view.center, scale: f64::from(r.height()) / tile.view.height.max(1e-12), twist: tile.view.twist + rotation }
 }
 
 /// The tiles other than the current one (each with its own view, clipped to it), then the
 /// tile borders: thin, and heavy around the current tile.
-fn draw_tiles(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, cadcraft_engine::ModelTile)]) {
+fn draw_tiles(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, cadcraft_engine::ModelTile)], rots: &[f64]) {
     let t = Tokens::get();
     let bg = Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b());
     for (i, (r, tile)) in tiles.iter().enumerate().filter(|(_, (r, tile))| !tile.active && r.width() >= 1.0 && r.height() >= 1.0) {
         let p = ui.painter_at(*r);
-        let xf = tile_xf(*r, tile);
+        let xf = tile_xf(*r, tile, panes::rotation(rots, i));
         p.rect_filled(*r, 0.0, t.canvas);
         draw_grid(app, &p, &xf);
         if let Some(list) = panes::list_for(app, i).or(app.canvas.list.as_ref()) {
@@ -2533,7 +2537,7 @@ pub(crate) mod tests {
             view: cadcraft_engine::View { center: Vec2::new(1.0, 2.0), height: 50.0, twist: 0.5 },
             active: false,
         };
-        let xf = tile_xf(Rect::from_min_size(Pos2::ZERO, vec2(100.0, 100.0)), &tile);
+        let xf = tile_xf(Rect::from_min_size(Pos2::ZERO, vec2(100.0, 100.0)), &tile, 0.0);
         assert_eq!((xf.twist, xf.center, xf.scale), (0.5, Vec2::new(1.0, 2.0), 2.0));
     }
 

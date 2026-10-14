@@ -4,6 +4,11 @@
 //! and cut lines) sized to that tile's view. A tile showing the edit space draws the canvas's
 //! own list, as upstream does. Input is unchanged: only the current tile takes the pointer, and
 //! a click in another makes it current (and its space the edit space).
+//!
+//! Each tile is also drawn turned by its display-only rotation (`Session::tile_rotations`, LAMB
+//! T320) — a plan beside a section turns so the section's cut line reads horizontal. The angle
+//! is added to the tile's `Xf` twist only; it is never written to the drawing, the tile's view or
+//! `View.twist`, and is never an undo step. Pointer input follows through `Xf::to_world`.
 
 use cadcraft_color::Rgb;
 use cadcraft_doc::Space;
@@ -38,8 +43,20 @@ pub struct Lists {
     builds: u64,
 }
 
-/// Bring each tile's lists up to date for this frame, before `draw_tiles`.
-pub(super) fn prepare(app: &mut CadApp, tiles: &[(Rect, ModelTile)]) {
+/// Each tile's display-only rotation (radians), one per `Session::model_tiles` entry; empty
+/// when untiled. Read once per frame and passed to [`rotation`].
+pub(super) fn rotations(app: &CadApp) -> Vec<f64> {
+    app.session.tile_rotations()
+}
+
+/// Tile `i`'s rotation from [`rotations`]: 0 when untiled, out of range or not finite.
+pub(super) fn rotation(rots: &[f64], i: usize) -> f64 {
+    rots.get(i).copied().filter(|a| a.is_finite()).unwrap_or(0.0)
+}
+
+/// Bring each tile's lists up to date for this frame, before `draw_tiles`; `rots` is
+/// [`rotations`].
+pub(super) fn prepare(app: &mut CadApp, tiles: &[(Rect, ModelTile)], rots: &[f64]) {
     let lists = &mut app.canvas.panes;
     let Ok(st) = app.session.state() else {
         lists.tiles.clear();
@@ -57,7 +74,7 @@ pub(super) fn prepare(app: &mut CadApp, tiles: &[(Rect, ModelTile)]) {
             continue;
         }
         let space = spaces.get(i).cloned().unwrap_or(Space::Model);
-        let xf = tile_xf(*r, tile);
+        let xf = tile_xf(*r, tile, rotation(rots, i));
         slot.overlays.ensure(st, &space, tile.view.height, xf.scale);
         if space == st.space {
             (slot.key, slot.window, slot.list) = (None, None, None);
@@ -145,7 +162,7 @@ mod tests {
     #[test]
     fn an_inactive_tile_on_another_space_gets_its_own_list() {
         let (mut app, tiles) = app();
-        prepare(&mut app, &tiles);
+        prepare(&mut app, &tiles, &[]);
         let list = list_for(&app, 0).expect("tile 0 shows B: a list of its own");
         assert!(!list.prims.is_empty());
         let bb = list.bounds;
@@ -154,18 +171,61 @@ mod tests {
         assert_eq!(app.canvas.panes.builds, 1);
 
         // Same revision, same view: nothing rebuilt.
-        prepare(&mut app, &tiles);
+        prepare(&mut app, &tiles, &[]);
         assert_eq!(app.canvas.panes.builds, 1);
 
         // A new revision rebuilds.
         app.session.execute("line", &json!({"points": [[0, 50], [10, 50]]})).unwrap();
-        prepare(&mut app, &tiles);
+        prepare(&mut app, &tiles, &[]);
         assert_eq!(app.canvas.panes.builds, 2);
 
         // Tiles that are gone drop their lists.
-        prepare(&mut app, &tiles[1..]);
+        prepare(&mut app, &tiles[1..], &[]);
         assert!(list_for(&app, 1).is_none());
         assert_eq!(app.canvas.panes.tiles.len(), 1);
+    }
+
+    /// A test relation: a tile on block `B` turns 0.5 rad to align with model space; nothing
+    /// else is related. Registered once per test process (a second registration is refused).
+    fn register() {
+        fn rotation(_: &cadcraft_doc::Drawing, a: &Space, b: &Space) -> Option<f64> {
+            (*a == Space::Block("B".into()) && *b == Space::Model).then_some(0.5)
+        }
+        let _ = cadcraft_engine::panes::register_pane_relations(cadcraft_engine::panes::PaneRelations {
+            rotation,
+            map: |_, _, _, _| None,
+            centre: |_, _, _, _, _| None,
+        });
+    }
+
+    #[test]
+    fn a_tile_draws_turned_by_its_rotation_and_nothing_is_written_back() {
+        register();
+        let (mut app, tiles) = app();
+        let rots = rotations(&app);
+        assert_eq!((rotation(&rots, 0), rotation(&rots, 1), rotation(&rots, 7)), (0.5, 0.0, 0.0));
+        assert_eq!(rotation(&[f64::NAN], 0), 0.0);
+
+        // Tile 0's transform is its own view's twist plus the rotation, and round-trips (to
+        // within the f32 screen position: a thousandth of a point).
+        let (r, tile) = &tiles[0];
+        let xf = tile_xf(*r, tile, rotation(&rots, 0));
+        assert_eq!(xf.twist, tile.view.twist + 0.5);
+        for p in [Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(-3.25, 7.5)] {
+            let q = xf.to_world(xf.to_screen(p));
+            assert!((q - p).len() < 1e-3 / xf.scale, "{p:?} -> {q:?}");
+        }
+
+        // One whole frame: the current tile (rotation 0) keeps its plain view; nothing about
+        // the rotation lands in the drawing, the tiles' views or the current view.
+        let before = (app.session.state().unwrap().view(), app.session.model_tiles());
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_max(pos2(0.0, 0.0), pos2(1600.0, 1000.0))), ..Default::default() };
+        ctx.run_ui(raw, |ui| super::super::show(&mut app, ui)).textures_delta.clear();
+        assert_eq!(app.canvas.xf.map(|x| x.twist), Some(before.0.twist));
+        assert_eq!((app.session.state().unwrap().view(), app.session.model_tiles()), before);
+        assert_eq!(app.session.state().unwrap().view().twist, 0.0);
+        assert!(app.session.model_tiles().iter().all(|t| t.view.twist == 0.0));
     }
 
     #[test]
@@ -177,7 +237,7 @@ mod tests {
         app.session.activate_tile(1).unwrap();
         assert_eq!(app.session.tile_spaces(), vec![Space::Model, Space::Model]);
         let tiles: Vec<_> = tiles.iter().enumerate().map(|(i, (r, t))| (*r, ModelTile { active: i == 1, ..*t })).collect();
-        prepare(&mut app, &tiles);
+        prepare(&mut app, &tiles, &[]);
         assert!(list_for(&app, 0).is_none());
         assert!(list_for(&app, 1).is_none());
         assert_eq!(app.canvas.panes.builds, 0);
