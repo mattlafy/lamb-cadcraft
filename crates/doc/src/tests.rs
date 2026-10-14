@@ -564,3 +564,57 @@ fn space_names_its_tab() {
     assert_eq!(p.layout(), Some("Sheet A"));
     assert_eq!(p.tab_name(), "Sheet A");
 }
+
+#[test]
+fn mirroring_a_rotated_dimension_reflects_its_direction() {
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+    let dim = |rotation: f64, oblique: Option<f64>| {
+        EntityKind::Dimension(Dimension {
+            kind: DimKind::Linear { rotation },
+            defpt: Vec3::new(-1.0, 1.0, 0.0),
+            text_mid: Vec3::new(2.5, 4.5, 0.0),
+            p13: Vec3::ZERO,
+            p14: Vec3::new(7.071, 7.071, 0.0),
+            p15: Vec3::ZERO,
+            p16: Vec3::ZERO,
+            text: String::new(),
+            style: "Standard".into(),
+            measurement: 10.0,
+            text_rotation: 0.0,
+            user_text_pos: false,
+            block: None,
+            overrides: Default::default(),
+            assoc: vec![],
+            marks: DimMarks { oblique, ..Default::default() },
+        })
+    };
+    let same = |a: f64, b: f64| (a - b).sin().abs() < 1e-9 && (a - b).cos() > 0.0;
+    let parts = |k: &EntityKind| match k {
+        EntityKind::Dimension(d) => match d.kind {
+            DimKind::Linear { rotation } => (rotation, d.marks.oblique, d.p13.xy(), d.p14.xy()),
+            _ => panic!(),
+        },
+        _ => panic!(),
+    };
+
+    // Across the X axis: the 45° dimension line becomes −45° and still measures the full length.
+    let mut k = dim(FRAC_PI_4, None);
+    k.transform(&Mat3::mirror(Vec2::ZERO, Vec2::X));
+    let (r, _, p13, p14) = parts(&k);
+    assert!(same(r, -FRAC_PI_4), "rotation {r}");
+    assert!(((p14 - p13).dot(Vec2::from_angle(r)) - 10.0).abs() < 1e-3);
+
+    // Across the 45° line: a 60° oblique becomes 30°.
+    let mut k = dim(0.0, Some(PI / 3.0));
+    k.transform(&Mat3::mirror(Vec2::ZERO, Vec2::new(1.0, 1.0)));
+    let (r, ob, _, _) = parts(&k);
+    assert!(same(r, FRAC_PI_2), "rotation {r}");
+    assert!(same(ob.unwrap(), PI / 6.0), "oblique {ob:?}");
+
+    // A plain rotation adds its angle to both.
+    let mut k = dim(FRAC_PI_4, Some(PI / 3.0));
+    k.transform(&Mat3::rotate(FRAC_PI_2));
+    let (r, ob, _, _) = parts(&k);
+    assert!(same(r, FRAC_PI_4 + FRAC_PI_2), "rotation {r}");
+    assert!(same(ob.unwrap(), PI / 3.0 + FRAC_PI_2), "oblique {ob:?}");
+}
