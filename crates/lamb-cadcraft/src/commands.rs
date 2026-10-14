@@ -24,6 +24,9 @@
 //!
 //! - `refpane {on?, viewId?}` (View ▸ LAMB ▸ Reference Pane): the reference pane — two tiles, the
 //!   edited view's reference in the other one, chosen for you and overridable; see [`crate::refpane`].
+//! - `underlay {viewId?}` (View ▸ LAMB ▸ Underlay): another placed view of the edited view's kind
+//!   drawn pale and snappable under it; the current one again, or none, turns it off — see
+//!   [`crate::overlays::underlay`].
 //!
 //! - `lambproject` (View ▸ LAMB ▸ Start Project): `Level 1` and a placed `Ground Floor` plan on
 //!   it, then edit the plan; refused ("Already a LAMB project") once the drawing has views.
@@ -635,6 +638,11 @@ pub fn commands() -> Vec<CommandSpec> {
             .noundo()
             .menu(MENU)
             .interactive(crate::refpane::refpane_machine),
+        CommandSpec::new("underlay", "Underlay", crate::overlays::underlay::underlay)
+            .params("{viewId?}")
+            .noundo()
+            .menu(MENU)
+            .interactive(crate::overlays::underlay::underlay_machine),
         CommandSpec::new("newoffsetplan", "New Offset Plan", newviews::newoffsetplan)
             .alias(&["np"])
             .params("{mode: \"offset\"|\"height\", fromViewId, floorToFloorMm | floorElevationMm, name?, cutHeightMm?}")

@@ -9,13 +9,15 @@ use std::sync::OnceLock;
 use cadcraft_color::Rgb;
 use cadcraft_doc::{Drawing, Handle, Space};
 use cadcraft_engine::snap::{SnapHit, register_snap_provider};
-use cadcraft_geom::{Bounds2, Vec2};
+use cadcraft_geom::Vec2;
 use cadcraft_render::{DPrim, DisplayList, Kind, Options, register_overlay_provider};
 use lamb_core::derivation::markers::{Marker, MarkerShape, compute_cut_lines_for_view, compute_markers_for_view, compute_plan_cut_lines_for_view};
 use lamb_core::model::Id;
 
 use crate::project::DrawingProject;
 use crate::schema::view_block_name;
+
+pub(crate) mod underlay;
 
 /// Marker radius as a fraction of the visible height: `view_height / MARKER_VIEW_FRACTION`.
 const MARKER_VIEW_FRACTION: f64 = 150.0;
@@ -74,9 +76,10 @@ fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kind, pts: &[V
     list.prims.push(DPrim { handle, color, aci7: false, lw: 0.0, transparency: 0, kind, start, len: pts.len() as u32 });
 }
 
-/// The overlay provider: the edited view's markers and cut lines, in its block's coordinates.
+/// The overlay provider: the edited view's underlay ([`underlay`], drawn first, pale), then its
+/// markers and cut lines, in its block's coordinates.
 pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
-    let mut list = DisplayList { bounds: Bounds2::EMPTY, ..DisplayList::default() };
+    let mut list = underlay::draw(d, space, opts);
     let Some((dp, id)) = view_of(d, space) else { return list };
     let Ok(markers) = compute_markers_for_view(&dp, id) else { return list };
     let Ok(cuts) = compute_cut_lines_for_view(&dp, id) else { return list };
@@ -114,16 +117,23 @@ pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     list
 }
 
-/// The snap provider: every marker centre of the edited view within `aperture` of the cursor.
+/// The snap provider: every marker centre of the edited view within `aperture` of the cursor,
+/// plus the underlay's snap ([`underlay`]). Nothing inside the underlay's own snap call.
 pub fn lamb_snaps(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64) -> Vec<SnapHit> {
-    let Some((dp, id)) = view_of(d, space) else { return Vec::new() };
-    let Ok(markers) = compute_markers_for_view(&dp, id) else { return Vec::new() };
-    markers
-        .iter()
-        .map(|m| Vec2::new(m.position.x, m.position.y))
-        .filter(|p| p.dist(cursor) <= aperture)
-        .map(|point| SnapHit { point, mode: 0, name: SNAP_NAME, viewport: None, deferred: None })
-        .collect()
+    if underlay::nested() {
+        return Vec::new();
+    }
+    let mut hits = underlay::snaps(d, space, cursor, aperture);
+    let Some((dp, id)) = view_of(d, space) else { return hits };
+    let Ok(markers) = compute_markers_for_view(&dp, id) else { return hits };
+    hits.extend(markers.iter().map(|m| Vec2::new(m.position.x, m.position.y)).filter(|p| p.dist(cursor) <= aperture).map(|point| SnapHit {
+        point,
+        mode: 0,
+        name: SNAP_NAME,
+        viewport: None,
+        deferred: None,
+    }));
+    hits
 }
 
 /// Register [`lamb_overlay`], [`lamb_snaps`], the pane relations ([`crate::panes`]) and the

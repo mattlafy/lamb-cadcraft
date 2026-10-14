@@ -97,7 +97,10 @@ fn row(label: String, active: bool, command: &str, params: serde_json::Value) ->
 /// `editview`; a drawing with no views offers `Start LAMB project` (LAMBPROJECT). When the edited
 /// view has eligible reference views: a `Reference pane` heading, `Show reference pane` (active
 /// while shown, toggling REFPANE) and one row per eligible view, active when the pane shows it,
-/// running `refpane {viewId}`. An unreadable LAMB slot gives just the Model row.
+/// running `refpane {viewId}`. When it has underlay candidates: an `Underlay` heading and one row
+/// per candidate (`" (mirrored)"` when it renders mirrored), active when it is the underlay,
+/// running `underlay {viewId}` (clicking the active one turns it off). An unreadable LAMB slot
+/// gives just the Model row.
 pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     let mut rows = vec![row("Model".into(), *edit == Space::Model, "editview", serde_json::json!({}))];
     let Ok(doc) = read_document(d) else { return rows };
@@ -115,6 +118,19 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
         rows.push(row("Show reference pane".into(), shown, "refpane", serde_json::json!({ "on": !shown })));
         for v in eligible.iter().filter_map(|id| doc.views.iter().find(|v| v.id() == *id)) {
             rows.push(row(view_label(v), shown && v.id() == pick, "refpane", serde_json::json!({ "viewId": v.id().0 })));
+        }
+    }
+    // The underlay (LAMB T350).
+    if let Some(e) = crate::overlays::view_id(edit) {
+        let candidates = crate::overlays::underlay::candidates(d, e);
+        if !candidates.is_empty() {
+            let current = crate::overlays::underlay::current(d, e);
+            rows.push(BrowserRow { label: "Underlay".into(), active: false, heading: true, command: None });
+            for c in &candidates {
+                let Some(v) = doc.views.iter().find(|v| v.id() == c.view_id) else { continue };
+                let label = if c.mirrored { format!("{} (mirrored)", view_label(v)) } else { view_label(v) };
+                rows.push(row(label, current == Some(c.view_id), "underlay", serde_json::json!({ "viewId": c.view_id.0 })));
+            }
         }
     }
     rows
@@ -186,7 +202,7 @@ mod tests {
 
     #[test]
     fn reference_rows_toggle_the_pane_and_pick_its_view() -> R {
-        let _g = crate::refpane::tests::lock();
+        let _g = crate::overlays::underlay::tests::lock();
         let (mut s, plan, a, b) = crate::refpane::tests::project()?;
         let r = rows(&s)?;
         let tail: Vec<_> = r[4..].iter().map(|r| (r.label.as_str(), r.active, r.heading)).collect();
@@ -212,11 +228,48 @@ mod tests {
         s.execute("editview", &json!({ "viewId": a.0 }))?;
         let r = rows(&s)?;
         let tail: Vec<_> = r[4..].iter().map(|r| (r.label.as_str(), r.active)).collect();
-        assert_eq!(tail, [("Reference pane", false), ("Show reference pane", true), ("Ground Floor — Plan", true), ("B-B — Section", false)]);
+        assert_eq!(
+            tail,
+            [
+                ("Reference pane", false),
+                ("Show reference pane", true),
+                ("Ground Floor — Plan", true),
+                ("B-B — Section", false),
+                ("Underlay", false),
+                ("B-B — Section", false)
+            ],
+            "a section's parallel sibling is also an underlay candidate"
+        );
         assert_eq!(r[6].command, Some(("refpane".into(), json!({ "viewId": plan.0 }))));
 
         s.execute("editview", &json!({}))?;
         assert_eq!(rows(&s)?.len(), 4, "Model has no reference rows");
+        Ok(())
+    }
+
+    #[test]
+    fn underlay_rows_mark_mirroring_and_toggle_it() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, plan, a, _b) = crate::refpane::tests::project()?;
+        assert!(!rows(&s)?.iter().any(|r| r.label == "Underlay"), "a lone plan has no underlay rows");
+        let c = s.execute(
+            "newsectionline",
+            &json!({ "name": "C-C", "hostViewId": plan.0, "cutFrom": {"x": 5000, "y": 3000}, "cutTo": {"x": 0, "y": 3000} }),
+        )?;
+        let c = c["viewId"].as_u64().ok_or("no C-C")?;
+        s.execute("editview", &json!({ "viewId": a.0 }))?;
+        let r = rows(&s)?;
+        let at = r.iter().position(|r| r.label == "Underlay" && r.heading).ok_or("no Underlay heading")?;
+        let under: Vec<_> = r[at + 1..].iter().map(|r| (r.label.as_str(), r.active)).collect();
+        assert_eq!(under, [("B-B — Section", false), ("C-C — Section (mirrored)", false)]);
+        assert_eq!(r[at + 2].command, Some(("underlay".into(), json!({ "viewId": c }))));
+
+        let (cmd, params) = r[at + 1].command.clone().ok_or("no command")?;
+        s.execute(&cmd, &params)?;
+        let r = rows(&s)?;
+        assert!(r[at + 1].active && !r[at + 2].active, "B-B is the underlay");
+        s.execute(&cmd, &params)?;
+        assert!(!rows(&s)?[at + 1].active, "clicking the active row turns it off");
         Ok(())
     }
 

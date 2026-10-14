@@ -503,6 +503,19 @@ pub fn register_display_kind(f: DisplayKind) -> Result<(), &'static str> {
     DISPLAY_KIND.set(f).map_err(|_| "a display kind hook is already registered")
 }
 
+static OVERLAYS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-global count of [`bump_overlays`] calls: caches of [`overlays`] key on it, since a
+/// provider's output can change without the drawing changing (LAMB fork: the underlay choice).
+pub fn overlays_generation() -> u64 {
+    OVERLAYS_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Say the overlay providers' output may have changed for an unchanged drawing.
+pub fn bump_overlays() {
+    OVERLAYS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The registered overlay providers' display lists for a space, one per provider in
 /// registration order, empty lists left out. Separate from [`build`], which they never change.
 pub fn overlays(d: &Drawing, space: &Space, opts: &Options) -> Vec<DisplayList> {

@@ -10,9 +10,10 @@ use cadcraft_render::DisplayList;
 use super::{Xf, draw_list};
 use crate::CadApp;
 
-/// What the lists were built from: drawing uid, revision, space and view height (the provider
-/// sizes markers from the view height, so a zoom rebuilds and a pan alone does not).
-type Key = (u64, u64, Space, u64);
+/// What the lists were built from: drawing uid, revision, space, view height (the provider
+/// sizes markers from the view height, so a zoom rebuilds and a pan alone does not) and
+/// `cadcraft_render::overlays_generation()` (a provider choice changed, e.g. LAMB's underlay).
+type Key = (u64, u64, Space, u64, u64);
 
 /// The overlay lists for the last key.
 #[derive(Default)]
@@ -40,7 +41,7 @@ impl Cache {
         // The tessellation tolerance `ensure_list` uses for this zoom band.
         let band = (1.0 / scale).max(1e-300).log2().floor() as i32;
         let opts = cadcraft_render::Options { view_height, tolerance: 2f64.powi(band) * 0.5, ..Default::default() };
-        let key = (st.uid, st.revision, space.clone(), view_height.to_bits());
+        let key = (st.uid, st.revision, space.clone(), view_height.to_bits(), cadcraft_render::overlays_generation());
         let doc = &st.doc;
         self.get(key, || cadcraft_render::overlays(doc, space, &opts))
     }
@@ -77,12 +78,13 @@ mod tests {
             });
             builds.get()
         };
-        let key = |rev: u64, h: f64| (7, rev, Space::Model, h.to_bits());
+        let key = |rev: u64, h: f64| (7, rev, Space::Model, h.to_bits(), 0);
         assert_eq!(get(key(1, 100.0)), 1);
         assert_eq!(get(key(1, 100.0)), 1, "same uid/revision/space/height reuses the lists");
         assert_eq!(get(key(1, 200.0)), 2, "a new view height rebuilds");
         assert_eq!(get(key(2, 200.0)), 3, "a new revision rebuilds");
-        assert_eq!(get((7, 2, Space::Block("LAMB_VIEW_1".into()), 200f64.to_bits())), 4, "a new space rebuilds");
-        assert_eq!(get((8, 2, Space::Block("LAMB_VIEW_1".into()), 200f64.to_bits())), 5, "another drawing rebuilds");
+        assert_eq!(get((7, 2, Space::Block("LAMB_VIEW_1".into()), 200f64.to_bits(), 0)), 4, "a new space rebuilds");
+        assert_eq!(get((8, 2, Space::Block("LAMB_VIEW_1".into()), 200f64.to_bits(), 0)), 5, "another drawing rebuilds");
+        assert_eq!(get((8, 2, Space::Block("LAMB_VIEW_1".into()), 200f64.to_bits(), 1)), 6, "a new overlay generation rebuilds");
     }
 }
