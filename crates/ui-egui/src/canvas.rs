@@ -78,6 +78,8 @@ pub struct CanvasState {
     hl_infinite: Vec<usize>,
     /// The selection and hover highlights inside the active MSPACE viewport (see [`VpHighlight`]).
     vp_sel: VpHighlight,
+    /// LAMB (fork-only): the overlay providers' lists for the edit space.
+    pub lamb_overlays: lamb_overlays::Cache,
     vp_hover: VpHighlight,
     /// Model space seen through the active MSPACE viewport (see [`VpContent`]).
     vp: VpContent,
@@ -1642,6 +1644,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     } else if let Some(list) = &app.canvas.list {
         draw_list(&painter, &xf_paper, list, bg, app.session.settings.lwdisplay);
     }
+    lamb_overlays::draw(app, &painter, &xf, bg);
     if let Some(vp) = &active_vp {
         // The active viewport: a heavy border, highlights in model units clipped to it.
         let r = Rect::from_two_pos(
@@ -2604,6 +2607,8 @@ pub(crate) mod tests {
 mod blockedit;
 /// The COMPARE overlay.
 mod compare;
+/// LAMB (fork-only): overlay providers' markers and cut lines over the drawing.
+mod lamb_overlays;
 
 /// Background rebuilds of the display list for a new view.
 mod rebuild;
