@@ -6,8 +6,10 @@
 //! a click in another makes it current (and its space the edit space).
 //!
 //! Each tile is also drawn turned by its display-only rotation (`Session::tile_rotations`, LAMB
-//! T320) — a plan beside a section turns so the section's cut line reads horizontal. The angle
-//! is added to the tile's `Xf` twist only; it is never written to the drawing, the tile's view or
+//! T320) — a plan beside a section turns so the section's cut line reads horizontal. The
+//! rotation is the angle of the direction that should read horizontal (the cut line's, in the
+//! tile's space), so the tile turns the other way: minus it is added to the tile's `Xf` twist
+//! only; it is never written to the drawing, the tile's view or
 //! `View.twist`, and is never an undo step. Pointer input follows through `Xf::to_world`.
 
 use cadcraft_color::Rgb;
@@ -49,9 +51,11 @@ pub(super) fn rotations(app: &CadApp) -> Vec<f64> {
     app.session.tile_rotations()
 }
 
-/// Tile `i`'s rotation from [`rotations`]: 0 when untiled, out of range or not finite.
+/// The twist tile `i` adds for its rotation from [`rotations`]: minus the rotation, which turns
+/// that direction onto the screen's horizontal (the TS reference pane's camera rotation draws
+/// `rotate(world, -rotation)` too). 0 when untiled, out of range or not finite.
 pub(super) fn rotation(rots: &[f64], i: usize) -> f64 {
-    rots.get(i).copied().filter(|a| a.is_finite()).unwrap_or(0.0)
+    rots.get(i).copied().filter(|a| a.is_finite()).map_or(0.0, |a| -a)
 }
 
 /// Bring each tile's lists up to date for this frame, before `draw_tiles`; `rots` is
@@ -203,14 +207,18 @@ mod tests {
         register();
         let (mut app, tiles) = app();
         let rots = rotations(&app);
-        assert_eq!((rotation(&rots, 0), rotation(&rots, 1), rotation(&rots, 7)), (0.5, 0.0, 0.0));
+        assert_eq!(rots, vec![0.5, 0.0]);
+        assert_eq!((rotation(&rots, 0), rotation(&rots, 1), rotation(&rots, 7)), (-0.5, 0.0, 0.0));
         assert_eq!(rotation(&[f64::NAN], 0), 0.0);
 
         // Tile 0's transform is its own view's twist plus the rotation, and round-trips (to
         // within the f32 screen position: a thousandth of a point).
         let (r, tile) = &tiles[0];
         let xf = tile_xf(*r, tile, rotation(&rots, 0));
-        assert_eq!(xf.twist, tile.view.twist + 0.5);
+        assert_eq!(xf.twist, tile.view.twist - 0.5);
+        // The direction at 0.5 rad (the cut line's) reads horizontal, pointing right.
+        let (a, b) = (xf.to_screen(tile.view.center), xf.to_screen(tile.view.center + Vec2::new(0.5f64.cos(), 0.5f64.sin()) * 5.0));
+        assert!((b.y - a.y).abs() < 1e-3 && b.x > a.x, "{a:?} -> {b:?}");
         for p in [Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(-3.25, 7.5)] {
             let q = xf.to_world(xf.to_screen(p));
             assert!((q - p).len() < 1e-3 / xf.scale, "{p:?} -> {q:?}");
