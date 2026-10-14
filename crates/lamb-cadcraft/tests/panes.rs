@@ -195,7 +195,7 @@ fn panelock_recentres_the_section_tile() -> R {
     let prev = f.s.model_tiles()[1].view;
     let z_prev = uz_of(&f.s, sa, prev.center)?.z;
     let pc = Vec2::new(4321.0, 1500.0);
-    assert!(f.s.state_mut()?.set_view(View { center: pc, height: 3000.0 }));
+    assert!(f.s.state_mut()?.set_view(View { center: pc, height: 3000.0, twist: 0.0 }));
     let tiles = f.s.model_tiles();
     let got = tiles[1].view;
     let uz = uz_of(&f.s, sa, got.center)?;
@@ -210,7 +210,7 @@ fn panelock_recentres_the_section_tile() -> R {
     let r = f.s.execute("panelock", &json!({}))?;
     assert_eq!(r["on"], json!(false));
     assert_eq!(r["message"], json!("<Pane lock off>"));
-    f.s.state_mut()?.set_view(View { center: Vec2::new(100.0, 200.0), height: 500.0 });
+    f.s.state_mut()?.set_view(View { center: Vec2::new(100.0, 200.0), height: 500.0, twist: 0.0 });
     assert_eq!(f.s.model_tiles()[1].view, got);
 
     // Re-tiling keeps the lock.

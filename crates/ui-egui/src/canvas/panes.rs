@@ -132,7 +132,7 @@ mod tests {
             let st = s.state_mut().unwrap();
             st.space = b();
             st.mspace = None;
-            st.set_view_quiet(View { center: Vec2::new(5.0, 0.0), height: 20.0 });
+            st.set_view_quiet(View { center: Vec2::new(5.0, 0.0), height: 20.0, twist: 0.0 });
         }
         s.activate_tile(1).unwrap();
         assert_eq!(s.tile_spaces(), vec![b(), Space::Model]);

@@ -80,21 +80,37 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 /// It must not call [`Session::execute`] (or otherwise run a command) — that would recurse.
 pub type AfterCommand = fn(&mut Session, &Arc<Drawing>);
 
-/// A 2D view of a space: world centre and visible height in drawing units.
+/// A 2D view of a space: world centre and visible height in drawing units, and the view twist
+/// (VIEWTWIST, DVIEW TWist): how far the view is turned on screen, in radians counterclockwise
+/// (the drawing appears turned by `twist`; 0 is the plain plan view).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct View {
     pub center: Vec2,
     pub height: f64,
+    #[serde(default)]
+    pub twist: f64,
 }
 
 impl Default for View {
     fn default() -> Self {
-        View { center: Vec2::new(6.0, 4.5), height: 10.0 }
+        View { center: Vec2::new(6.0, 4.5), height: 10.0, twist: 0.0 }
+    }
+}
+
+impl View {
+    /// Box `b` (world) as a view turned by `twist` shows it: the world centre of the box it
+    /// makes on screen, and that box's width and height (`b`'s own when there is no twist).
+    pub fn twisted_box(b: Bounds2, twist: f64) -> (Vec2, f64, f64) {
+        if twist == 0.0 || !twist.is_finite() {
+            return (b.center(), b.width(), b.height());
+        }
+        let r = Bounds2::from_points(b.corners().map(|p| p.rotate(twist)));
+        (r.center().rotate(-twist), r.width(), r.height())
     }
 }
 
 fn usable_view(v: &View) -> bool {
-    v.center.is_finite() && v.height.is_finite() && v.height > 1e-12
+    v.center.is_finite() && v.height.is_finite() && v.height > 1e-12 && v.twist.is_finite()
 }
 
 /// Tiled model viewports (VPORTS): the session side of the drawing's `*Active` configuration.
@@ -249,7 +265,8 @@ impl DocState {
         match self.active_viewport() {
             Some((_, vp)) => {
                 let k = vp.view_height / vp.height;
-                View { center: vp.view_center + (pv.center - vp.center.xy()) * k, height: pv.height * k }
+                // Layout viewports have no twist (yet): the model view inside one is untwisted.
+                View { center: vp.view_center + (pv.center - vp.center.xy()) * k, height: pv.height * k, twist: 0.0 }
             }
             None => pv,
         }
@@ -265,7 +282,7 @@ impl DocState {
                 // A locked viewport keeps its scale: pan/zoom the sheet instead.
                 let k0 = vp.view_height / vp.height;
                 let pc = vp.center.xy() + (v.center - vp.view_center) / k0;
-                let paper = View { center: pc, height: v.height / k0 };
+                let paper = View { center: pc, height: v.height / k0, twist: pv.twist };
                 if !usable_view(&paper) {
                     return false;
                 }
@@ -273,7 +290,7 @@ impl DocState {
             } else {
                 let center = v.center - (pv.center - vp.center.xy()) * k;
                 let height = vp.height * k;
-                if !usable_view(&View { center, height }) {
+                if !usable_view(&View { center, height, twist: 0.0 }) {
                     return false;
                 }
                 let doc = Arc::make_mut(&mut self.doc);
@@ -295,6 +312,29 @@ impl DocState {
         match self.views.iter_mut().find(|(s, _)| *s == self.space) {
             Some((_, slot)) => *slot = v,
             None => self.views.push((self.space.clone(), v)),
+        }
+        if self.space == Space::Model {
+            self.keep_untiled_twist(v);
+        }
+    }
+    /// An untiled Model tab keeps its view twist in the drawing as a lone `*Active` VPORT tile
+    /// (written as that record's group 51 and read back), so it survives save and reopen. Only a
+    /// change of twist touches the drawing; an untwisted view keeps no record.
+    fn keep_untiled_twist(&mut self, v: View) {
+        use cadcraft_doc::{VportConfig, VportTile};
+        let twist = if v.twist.is_finite() { v.twist.rem_euclid(std::f64::consts::TAU) } else { 0.0 };
+        let active = self.doc.vports.iter().find(|c| c.is_active());
+        if active.is_some_and(|c| c.tiles.len() > 1) {
+            return;
+        }
+        if active.and_then(|c| c.tiles.first()).map_or(0.0, |t| t.twist) == twist {
+            return;
+        }
+        let d = Arc::make_mut(&mut self.doc);
+        d.vports.retain(|c| !c.is_active());
+        if twist != 0.0 {
+            let tile = VportTile { min: Vec2::ZERO, max: Vec2::new(1.0, 1.0), center: v.center, height: v.height, aspect: 1.0, twist };
+            d.vports.insert(0, VportConfig { name: VportConfig::ACTIVE.into(), tiles: vec![tile] });
         }
     }
     /// Set the view, recording view history. Returns false, changing nothing, when the view (or,
@@ -325,7 +365,7 @@ impl DocState {
     /// The view ZOOM starts from: the model view of the active unlocked viewport, else [`Self::view`].
     pub fn zoom_frame(&self) -> View {
         match self.zoom_viewport() {
-            Some(v) => View { center: v.view_center, height: v.view_height },
+            Some(v) => View { center: v.view_center, height: v.view_height, twist: 0.0 },
             None => self.view(),
         }
     }
@@ -340,7 +380,7 @@ impl DocState {
             Some(vp) => {
                 let pv = self.paper_view();
                 let k = f.height / vp.height;
-                View { center: f.center + (pv.center - vp.center.xy()) * k, height: pv.height * k }
+                View { center: f.center + (pv.center - vp.center.xy()) * k, height: pv.height * k, twist: pv.twist }
             }
             None => f,
         };
@@ -348,7 +388,7 @@ impl DocState {
     }
     /// Set without recording view history (realtime pan/zoom frames).
     pub fn set_view_quiet(&mut self, v: View) {
-        if !(v.center.is_finite() && v.height.is_finite() && v.height > 1e-12) {
+        if !usable_view(&v) {
             return;
         }
         if self.store_view(v) {
@@ -753,7 +793,7 @@ impl Session {
         self.untitled_counter += 1;
         let d = if metric { Drawing::new_metric() } else { Drawing::new_imperial() };
         let mut st = DocState::new(d, &format!("Drawing{}", self.untitled_counter), None);
-        st.set_view_quiet(if metric { View { center: Vec2::new(210.0, 148.5), height: 297.0 } } else { View::default() });
+        st.set_view_quiet(if metric { View { center: Vec2::new(210.0, 148.5), height: 297.0, twist: 0.0 } } else { View::default() });
         self.end_running();
         self.docs.push(st);
         self.active = self.docs.len() - 1;
@@ -762,11 +802,15 @@ impl Session {
     pub fn open_drawing(&mut self, d: Drawing, title: &str, path: Option<String>) -> usize {
         let mut st = DocState::new(d, title, path);
         let ext = st.doc.extents(&Space::Model);
-        if !ext.is_empty() {
-            st.set_view_quiet(View {
-                center: ext.center(),
-                height: (ext.height().max(ext.width() * self.viewport_px.1 / self.viewport_px.0.max(1.0)) * 1.1).max(1e-6),
-            });
+        // The current tile (the first), or the lone untiled view, keeps its saved twist.
+        let twist =
+            st.doc.vports.iter().find(|c| c.is_active()).and_then(|c| c.tiles.first()).map_or(0.0, |t| t.twist).rem_euclid(std::f64::consts::TAU);
+        let twist = if twist.is_finite() { twist } else { 0.0 };
+        if ext.is_empty() {
+            st.set_view_quiet(View { twist, ..st.view() });
+        } else {
+            let (center, w, h) = View::twisted_box(ext, twist);
+            st.set_view_quiet(View { center, height: (h.max(w * self.viewport_px.1 / self.viewport_px.0.max(1.0)) * 1.1).max(1e-6), twist });
         }
         self.end_running();
         self.docs.push(st);
@@ -1748,8 +1792,10 @@ impl Session {
         let ext = if ext.is_empty() { self.zoom_limits()? } else { ext };
         let st = self.state_mut()?;
         let aspect = st.zoom_aspect(w / h.max(1.0));
-        let height = ext.height().max(ext.width() / aspect.max(1e-6)).max(1e-6) * 1.05;
-        st.set_zoom_frame(View { center: ext.center(), height });
+        let twist = st.zoom_frame().twist;
+        let (center, bw, bh) = View::twisted_box(ext, twist);
+        let height = bh.max(bw / aspect.max(1e-6)).max(1e-6) * 1.05;
+        st.set_zoom_frame(View { center, height, twist });
         Ok(())
     }
 
@@ -1763,7 +1809,7 @@ impl Session {
         let h = (v.height / factor).clamp(1e-9, 1e12);
         let k = h / v.height;
         let c = about + (v.center - about) * k;
-        st.set_view_quiet(View { center: c, height: h });
+        st.set_view_quiet(View { center: c, height: h, twist: v.twist });
         Ok(())
     }
 

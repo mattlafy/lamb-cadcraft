@@ -110,7 +110,10 @@ pub fn after_view(st: &mut DocState) {
     if st.tiles.rects != rects || st.tiles.views.len() != tiles.len() {
         st.tiles = crate::ModelTiles {
             rects: rects.clone(),
-            views: tiles.iter().map(|t| crate::View { center: t.center, height: t.height }).collect(),
+            views: tiles
+                .iter()
+                .map(|t| crate::View { center: t.center, height: t.height, twist: if t.twist.is_finite() { t.twist } else { 0.0 } })
+                .collect(),
             active,
         };
     }
@@ -122,7 +125,7 @@ pub fn after_view(st: &mut DocState) {
         let sp = if panes_synced { existing(st, st.panes.spaces.get(i)) } else { Space::Model };
         let prev = st.tiles.views[i];
         if let Some(c) = (rel.centre)(&st.doc, &here, now.center, &sp, prev.center) {
-            let v = crate::View { center: c, height: now.height * fh(i) / fh(active) };
+            let v = crate::View { center: c, height: now.height * fh(i) / fh(active), twist: prev.twist };
             if v.center.is_finite() && v.height.is_finite() && v.height > 1e-12 {
                 st.tiles.views[i] = v;
             }
@@ -234,7 +237,7 @@ mod tests {
         let mut s = two_tiles_with_block();
         assert_eq!(active(&s), 0);
         enter(&mut s, b());
-        let v0 = View { center: Vec2::new(5.0, 7.0), height: 3.0 };
+        let v0 = View { center: Vec2::new(5.0, 7.0), height: 3.0, twist: 0.0 };
         s.state_mut().unwrap().set_view_quiet(v0);
         assert_eq!(s.model_tiles().len(), 2, "tiles stay while editing a block");
         assert_eq!(s.tile_spaces(), vec![b(), Space::Model]);
@@ -293,8 +296,8 @@ mod tests {
         assert!(!s.panes_locked(), "off by default");
         s.set_panes_locked(true);
         assert!(s.panes_locked());
-        assert!(s.state_mut().unwrap().set_view(View { center: Vec2::new(123.0, -45.0), height: 7.0 }));
-        s.state_mut().unwrap().set_view_quiet(View { center: Vec2::new(-9.0, 4.0), height: 2.0 });
+        assert!(s.state_mut().unwrap().set_view(View { center: Vec2::new(123.0, -45.0), height: 7.0, twist: 0.0 }));
+        s.state_mut().unwrap().set_view_quiet(View { center: Vec2::new(-9.0, 4.0), height: 2.0, twist: 0.0 });
         assert_eq!(s.model_tiles()[1].view, before);
         assert_eq!(s.model_tiles()[0].view.center, Vec2::new(-9.0, 4.0));
     }
