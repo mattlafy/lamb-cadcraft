@@ -3,6 +3,7 @@
 //! over its own store. Design: LAMB's `docs/07-architecture/lamb-core-derivation-port.md`.
 
 pub mod alignment;
+pub mod detail_tags;
 pub mod issues;
 pub mod linking;
 pub mod markers;
