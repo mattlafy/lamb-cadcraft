@@ -31,6 +31,15 @@ fn register() {
     REGISTER.call_once(|| register_command_provider(commands).expect("register LAMB commands"));
 }
 
+/// The imported drawing after one AI / solid-cut sweep. A `.lamb` file's slot keys name the TS
+/// string ids the import migrates to handles, so the first sweep re-proposes its AI lines once;
+/// these tests start from the converged drawing that leaves.
+fn settled(mut d: Drawing) -> Result<Drawing, Box<dyn std::error::Error>> {
+    let before = d.clone();
+    lamb_cadcraft::run_sweeps(&before, &mut d, "2026-01-01T00:00:00.000Z")?;
+    Ok(d)
+}
+
 fn links(s: &Session) -> Result<Vec<LinkRecord>, Box<dyn std::error::Error>> {
     Ok(read_document(s.doc()?)?.links)
 }
@@ -70,7 +79,7 @@ fn refuses(s: &mut Session, cmd: &str, args: &Value, msg: &str) -> R {
 #[test]
 fn link_and_unlink() -> R {
     register();
-    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let d = settled(project_to_drawing(&load("u-wall-two-sections")?)?.0)?;
     let original = read_document(&d)?.links;
     assert_eq!(original.len(), 3, "fixture has 3 links");
     // A section line and its view, from an imported link's non-plan end; the plan view from the other.

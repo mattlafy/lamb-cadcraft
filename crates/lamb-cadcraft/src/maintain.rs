@@ -6,7 +6,8 @@
 //! 0. travels: a linked segment the command rigidly translated carries its unchanged partner in the
 //!    other view with it (`selection-and-link-editing.md` §4b ray-sliding, lamb-core
 //!    `travel_segment_move`), so the link stays live — §13 phase 3 "STRETCH a linked plan line → the
-//!    section follows in one undo step";
+//!    section follows in one undo step"; an unaccepted AI line never travels — the after-command
+//!    sweep ([`crate::sweeps`]) re-seats it on its slot instead;
 //! 0b. re-anchors: a link end whose entity the command replaced (TRIM, BREAK erase the original
 //!    handle and add a new one per piece) moves onto the new piece in the same view whose segment
 //!    is a sub-span of the old one and still holds the anchor point — same link id, origin and
@@ -138,6 +139,11 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing) -> Result<Vec<Id>, S
             for (mine, other) in [(&link.a, &link.b), (&link.b, &link.a)] {
                 let (Some((bp, ap)), Some((op_before, op_after))) = (pair(&mine.entity_id), pair(&other.entity_id)) else { continue };
                 if bp == ap || op_before != op_after || writes.iter().any(|(id, _)| *id == other.entity_id) {
+                    continue;
+                }
+                // An unaccepted AI line is the sweep's to move (`crate::sweeps`); travelling it
+                // would read as a user edit and accept it by divergence.
+                if p.entity(other.entity_id).and_then(|e| e.ai_origin).is_some_and(|o| !o.accepted) {
                     continue;
                 }
                 let Some(d) = rigid_delta(bp, ap, mine.segment_index) else { continue };
@@ -362,10 +368,11 @@ pub fn link_observer(s: &mut Session, before: &Arc<Drawing>) {
     }
 }
 
-/// Registers [`crate::corners::corner_observer`] then [`link_observer`] on `s` (each once), so
-/// link travel reads corner tags already re-seated by the same command.
+/// Registers [`crate::corners::corner_observer`], [`link_observer`] then
+/// [`crate::sweeps::sweep_observer`] on `s` (each once), so link travel reads corner tags already
+/// re-seated by the same command, and the AI / solid-cut sweeps see the links already maintained.
 pub fn install(s: &mut Session) {
-    let fs: [cadcraft_engine::AfterCommand; 2] = [crate::corners::corner_observer, link_observer];
+    let fs: [cadcraft_engine::AfterCommand; 3] = [crate::corners::corner_observer, link_observer, crate::sweeps::sweep_observer];
     for f in fs {
         if !s.observers.iter().any(|o| std::ptr::fn_addr_eq(*o, f)) {
             s.observers.push(f);

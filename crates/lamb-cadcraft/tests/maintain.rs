@@ -30,6 +30,13 @@ fn load(name: &str) -> Result<Project, Box<dyn std::error::Error>> {
     Ok(files_to_project(&files).map_err(|e| format!("{e:?}"))?)
 }
 
+/// [`install`], minus the AI / solid-cut sweep observer: these tests gate link maintenance alone
+/// (the sweeps' own session tests are in `tests/sweeps.rs`).
+fn install_link_maintenance(s: &mut Session) {
+    install(s);
+    s.observers.retain(|o| !std::ptr::fn_addr_eq(*o, lamb_cadcraft::sweep_observer as cadcraft_engine::AfterCommand));
+}
+
 fn links(s: &Session) -> Result<Vec<LinkRecord>, Box<dyn std::error::Error>> {
     Ok(read_document(s.doc()?)?.links)
 }
@@ -87,7 +94,8 @@ fn link_observer_maintains_links() -> R {
     s.open_drawing(d, "u-wall", None);
     install(&mut s);
     install(&mut s);
-    assert_eq!(s.observers.len(), 2, "install is idempotent: corner then link observer");
+    assert_eq!(s.observers.len(), 3, "install is idempotent: corner, link, then sweep observer");
+    install_link_maintenance(&mut s);
 
     // --- ERASE a linked plan entity: exactly its links go; one undo restores both.
     let plan_end = {
@@ -259,7 +267,7 @@ fn rigid_move_travels_partner() -> R {
     assert_eq!(report.travelled, vec![sec_e], "{report:?}");
     let mut s = Session::new();
     s.open_drawing(d.clone(), "u-wall", None);
-    install(&mut s);
+    install_link_maintenance(&mut s);
     let sec_before = anchor_point(s.doc()?, &link, sec_e)?;
     let ext_before = s.doc()?.ext.get(lamb_cadcraft::EXT_KEY).cloned();
     let (plan_ent, sec_ent) = (s.doc()?.entity(Handle(plan_e.0)).cloned(), s.doc()?.entity(Handle(sec_e.0)).cloned());
@@ -349,7 +357,7 @@ fn trim_reanchors_links() -> R {
 
     let mut s = Session::new();
     s.open_drawing(d.clone(), "u-wall", None);
-    install(&mut s);
+    install_link_maintenance(&mut s);
     // Two cutting edges across segment 1, away from the crossing.
     let e1 = draw_edge(&mut s, plan_view, [7000.0, -500.0], [7000.0, 500.0])?;
     let e2 = draw_edge(&mut s, plan_view, [8000.0, -500.0], [8000.0, 500.0])?;
@@ -435,7 +443,7 @@ fn corner_tag_follows_a_vertex_insert() -> R {
     register();
     let mut s = Session::new();
     s.new_drawing(true);
-    install(&mut s);
+    install_link_maintenance(&mut s);
     let r = s.execute("pline", &json!({"vertices": [[0, 0], [100, 0], [100, 80]]}))?;
     let hx = r["handle"].as_str().ok_or("no handle")?.to_owned();
     let h = Handle::parse_hex(&hx).ok_or("bad handle")?;

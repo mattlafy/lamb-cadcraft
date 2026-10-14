@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use cadcraft_doc::color::Color;
-use cadcraft_doc::{Drawing, Handle, Lineweight};
+use cadcraft_doc::{Drawing, Handle, Layer, Lineweight};
 use lamb_core::derivation::read::{EntityRef, ProjectRead, ViewRef, view_ref};
 use lamb_core::model::{DrawingLayer, Id, Level, LineRole, LinkRecord, ProjectDefaults};
 
@@ -35,36 +35,83 @@ pub struct DrawingProject<'a> {
     entity_data: HashMap<Handle, EntityData>,
 }
 
+/// The parsed LAMB slots of a drawing, shared by [`DrawingProject`] and
+/// [`crate::project_mut::DrawingProjectMut`].
+pub(crate) struct Parsed {
+    pub(crate) doc: LambDocument,
+    pub(crate) layers: Vec<DrawingLayer>,
+    pub(crate) entity_data: HashMap<Handle, EntityData>,
+}
+
+/// Parses every LAMB slot once; any malformed one, or a future `schemaVersion`, is an error.
+pub(crate) fn parse(drawing: &Drawing) -> Result<Parsed, SchemaError> {
+    let doc = read_document(drawing)?;
+    let mut layers = Vec::with_capacity(drawing.layers.len());
+    for l in &drawing.layers {
+        layers.push(layer_of(l)?);
+    }
+    let mut entity_data = HashMap::new();
+    for v in &doc.views {
+        let Some(block) = drawing.block(&view_block_name(v.id())) else { continue };
+        for e in block.entities.iter() {
+            let data = read_entity_data(&e.common)?;
+            if data != EntityData::default() {
+                entity_data.insert(e.handle, data);
+            }
+        }
+    }
+    Ok(Parsed { doc, layers, entity_data })
+}
+
+/// One CADCraft layer as lamb-core's `DrawingLayer` (see the module docs for colour/lineweight).
+pub(crate) fn layer_of(l: &Layer) -> Result<DrawingLayer, SchemaError> {
+    let data = read_layer_data(l)?;
+    Ok(DrawingLayer {
+        id: l.name.clone(),
+        name: l.name.clone(),
+        color: l.color.resolve(Color::WHITE, Color::WHITE).hex(),
+        lineweight: match l.lineweight {
+            Lineweight::Mm100(v) => f64::from(v) / 100.0,
+            _ => DEFAULT_LINEWEIGHT_MM,
+        },
+        visible: l.visible(),
+        locked: l.locked,
+        default_role: data.default_role,
+    })
+}
+
+/// `ProjectRead::entities` over a drawing and its parsed slots.
+pub(crate) fn entities<'s>(
+    drawing: &'s Drawing,
+    doc: &'s LambDocument,
+    entity_data: &'s HashMap<Handle, EntityData>,
+    view: Id,
+) -> impl Iterator<Item = EntityRef<'s>> + 's {
+    let known = doc.views.iter().any(|v| v.id() == view);
+    let block = if known { drawing.block(&view_block_name(view)) } else { None };
+    block.into_iter().flat_map(|b| b.entities.iter()).map(move |e| {
+        let data = entity_data.get(&e.handle);
+        EntityRef {
+            id: Id(e.handle.0),
+            view_id: view,
+            role: data.map_or(LineRole::Bylayer, |d| d.role),
+            layer_id: e.common.layer.as_str(),
+            polyline: to_polyline(e).ok().map(|c| {
+                let mut p = c.polyline;
+                if let Some(d) = data {
+                    apply_corners(&mut p, &d.corners);
+                }
+                Cow::Owned(p)
+            }),
+            ai_origin: data.and_then(|d| d.ai_origin.as_ref()),
+        }
+    })
+}
+
 impl<'a> DrawingProject<'a> {
     /// Parses every LAMB slot once; any malformed one, or a future `schemaVersion`, is an error.
     pub fn new(drawing: &'a Drawing) -> Result<Self, SchemaError> {
-        let doc = read_document(drawing)?;
-        let mut layers = Vec::with_capacity(drawing.layers.len());
-        for l in &drawing.layers {
-            let data = read_layer_data(l)?;
-            layers.push(DrawingLayer {
-                id: l.name.clone(),
-                name: l.name.clone(),
-                color: l.color.resolve(Color::WHITE, Color::WHITE).hex(),
-                lineweight: match l.lineweight {
-                    Lineweight::Mm100(v) => f64::from(v) / 100.0,
-                    _ => DEFAULT_LINEWEIGHT_MM,
-                },
-                visible: l.visible(),
-                locked: l.locked,
-                default_role: data.default_role,
-            });
-        }
-        let mut entity_data = HashMap::new();
-        for v in &doc.views {
-            let Some(block) = drawing.block(&view_block_name(v.id())) else { continue };
-            for e in block.entities.iter() {
-                let data = read_entity_data(&e.common)?;
-                if data != EntityData::default() {
-                    entity_data.insert(e.handle, data);
-                }
-            }
-        }
+        let Parsed { doc, layers, entity_data } = parse(drawing)?;
         Ok(DrawingProject { drawing, doc, layers, entity_data })
     }
 
@@ -84,25 +131,7 @@ impl ProjectRead for DrawingProject<'_> {
     }
 
     fn entities(&self, view: Id) -> impl Iterator<Item = EntityRef<'_>> {
-        let known = self.doc.views.iter().any(|v| v.id() == view);
-        let block = if known { self.drawing.block(&view_block_name(view)) } else { None };
-        block.into_iter().flat_map(|b| b.entities.iter()).map(move |e| {
-            let data = self.entity_data.get(&e.handle);
-            EntityRef {
-                id: Id(e.handle.0),
-                view_id: view,
-                role: data.map_or(LineRole::Bylayer, |d| d.role),
-                layer_id: e.common.layer.as_str(),
-                polyline: to_polyline(e).ok().map(|c| {
-                    let mut p = c.polyline;
-                    if let Some(d) = data {
-                        apply_corners(&mut p, &d.corners);
-                    }
-                    Cow::Owned(p)
-                }),
-                ai_origin: data.and_then(|d| d.ai_origin.as_ref()),
-            }
-        })
+        entities(self.drawing, &self.doc, &self.entity_data, view)
     }
 
     fn links(&self) -> impl Iterator<Item = &LinkRecord> {
