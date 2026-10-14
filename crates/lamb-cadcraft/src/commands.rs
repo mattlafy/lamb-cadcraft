@@ -46,6 +46,9 @@
 //!   [`crate::entitycmds`].
 //! - `showlinks {handle?}` (`sl`, View ▸ LAMB ▸ Show Links) and `query {…}` (parameter-only):
 //!   read-only — an edit's link blast radius, and the filter lookup; see [`crate::querycmds`].
+//! - `duplicateview {viewId?, name?}`, `placeview {viewId, kind, …}` (parameter-only),
+//!   `unplaceview {viewId?}` and `level {mode, …}` (View ▸ LAMB): a view's lifecycle and the level
+//!   cascade — see [`crate::viewlife`].
 //!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
@@ -705,6 +708,21 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("query", "Query", crate::querycmds::query)
             .params("{viewId?, layerName?, role?, kind?, closed?, near?: {entityIds?, layerName?, minMm?, maxMm?}, include?: \"geometry\", limit?}")
             .noundo(),
+        CommandSpec::new("duplicateview", "Duplicate View", crate::viewlife::duplicateview)
+            .params("{viewId?, name?}")
+            .menu(MENU)
+            .interactive(crate::viewlife::duplicateview_machine),
+        CommandSpec::new("placeview", "Place View", crate::viewlife::placeview).params(
+            "{viewId, kind: \"plan\", levelId, cutElevation, transform} | {viewId, kind: \"vertical\", cutLine, hostViewId, transform, intent?}",
+        ),
+        CommandSpec::new("unplaceview", "Unplace View", crate::viewlife::unplaceview)
+            .params("{viewId?}")
+            .menu(MENU)
+            .interactive(crate::viewlife::unplaceview_machine),
+        CommandSpec::new("level", "Level", crate::viewlife::level)
+            .params("{mode: \"create\", name, floorElevationMm, order?} | {mode: \"rename\", levelId, name} | {mode: \"elevation\", levelId, floorElevationMm}")
+            .menu(MENU)
+            .interactive(crate::viewlife::level_machine),
     ]
 }
 
