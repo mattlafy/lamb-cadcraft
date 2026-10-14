@@ -285,6 +285,9 @@ fn main() -> eframe::Result {
     if let Err(e) = cadcraft_ui_egui::palettes::layer_ext::register_layer_cell(lamb_layer_cell) {
         log::warn!("LAMB Layers role column not installed: {e}");
     }
+    if let Err(e) = cadcraft_ui_egui::canvas::scalebar::register_scale_bar(lamb_cadcraft::commands::scale_bar_wanted) {
+        log::warn!("LAMB scale bar not installed: {e}");
+    }
     // lossy, so a value that is not Unicode is reported like any other bad port instead of ignored
     let mut control_port =
         control_port_from("CADCRAFT_CONTROL_PORT", std::env::var_os("CADCRAFT_CONTROL_PORT").map(|p| p.to_string_lossy().into_owned()));

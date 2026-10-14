@@ -1850,8 +1850,13 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         draw_snap_marker(&painter, xf.to_screen(hit.point), &hit);
     }
     panes::prepare(app, &tiles, &rots);
-    draw_tiles(app, ui, &tiles, &rots);
+    // LAMB (fork, T363): the scale bar in model/block space only, decided once per frame.
+    let scale_bar = sheet.is_none() && active_vp.is_none() && scalebar::wanted(app);
+    draw_tiles(app, ui, &tiles, &rots, scale_bar);
     panes::draw_hover(app, ui, &tiles, &rots, hover_pos.filter(|_| resp.hovered())); // LAMB (fork): T321
+    if scale_bar {
+        scalebar::draw(&painter, rect, xf.scale, Tokens::get().crosshair); // LAMB (fork): T363
+    }
     // UCS icon, ViewCube and viewport label.
     if app.ui.show_ucs_icon {
         draw_ucs_icon(&painter, rect);
@@ -1924,7 +1929,7 @@ fn tile_xf(r: Rect, tile: &cadcraft_engine::ModelTile, rotation: f64) -> Xf {
 
 /// The tiles other than the current one (each with its own view, clipped to it), then the
 /// tile borders: thin, and heavy around the current tile.
-fn draw_tiles(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, cadcraft_engine::ModelTile)], rots: &[f64]) {
+fn draw_tiles(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, cadcraft_engine::ModelTile)], rots: &[f64], scale_bar: bool) {
     let t = Tokens::get();
     let bg = Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b());
     for (i, (r, tile)) in tiles.iter().enumerate().filter(|(_, (r, tile))| !tile.active && r.width() >= 1.0 && r.height() >= 1.0) {
@@ -1937,6 +1942,9 @@ fn draw_tiles(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, cadcraft_engine::Mode
         }
         panes::draw_overlays(app, &p, &xf, bg, i);
         viewport_label(&p, *r);
+        if scale_bar {
+            scalebar::draw(&p, *r, xf.scale, t.crosshair); // LAMB (fork): T363
+        }
     }
     let p = ui.painter();
     for (r, tile) in tiles {
@@ -2711,6 +2719,8 @@ mod compare;
 mod lamb_overlays;
 /// LAMB (fork-only): each model tile draws its own space.
 mod panes;
+/// LAMB (fork-only, T363): the scale bar HUD in each model/block-space tile.
+pub mod scalebar;
 
 /// Background rebuilds of the display list for a new view.
 mod rebuild;

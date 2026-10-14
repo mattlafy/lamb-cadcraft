@@ -653,6 +653,11 @@ pub fn status_toggles(s: &Session) -> Vec<StatusToggle> {
     ]
 }
 
+/// Whether the canvas shows its scale bar HUD (LAMB T363): only in a drawing with LAMB views.
+pub fn scale_bar_wanted(d: &cadcraft_doc::Drawing) -> bool {
+    DrawingProject::new(d).ok().is_some_and(|p| p.views().next().is_some())
+}
+
 /// View ▸ LAMB ▸ <the command's label>.
 const MENU: &[&str] = &["View", "LAMB", ""];
 
@@ -992,6 +997,20 @@ mod tests {
         assert_eq!(s.state()?.view().height, 100.0, "Model keeps its window");
         s.execute("editview", &json!({ "viewId": id }))?;
         assert_eq!(s.state()?.view().height, 7.0, "a revisit keeps the view it had");
+        Ok(())
+    }
+
+    #[test]
+    fn scale_bar_is_wanted_on_a_lamb_drawing_only() -> R {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+        let plain = session()?;
+        assert!(!scale_bar_wanted(plain.doc()?), "a plain drawing has no scale bar");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamb-core/tests/lamb/u-wall-two-sections.lamb.json");
+        let files: BTreeMap<String, String> = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let project = lamb_core::persistence::files_to_project(&files).map_err(|e| format!("{e:?}"))?;
+        let (d, _, _) = crate::import::project_to_drawing(&project)?;
+        assert!(scale_bar_wanted(&d), "a drawing with LAMB views shows the scale bar");
         Ok(())
     }
 
