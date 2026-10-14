@@ -2,20 +2,29 @@
 //! "Generation", steps 1, 2 and 4, straight runs only; LAMB T369): for each wall run whose edge
 //! detail resolves ([`resolve_view_details`]) to a detail with a face reference
 //! ([`detail_reference`]), that detail's continuous bands laid along the run on its matching face
-//! (lamb-core's [`detail_bands`] and [`lay_bands`]). Computed on demand and returned; nothing is
-//! written yet. Not the AI-line sweep in [`crate::sweeps`].
+//! (lamb-core's [`detail_bands`] and [`lay_bands`]). Computed on demand by [`assembly_lines`];
+//! `assemblyplan {viewId}` ([`write_assembly_block`], LAMB T371) writes them as LINEs into the
+//! block [`assembly_block_name`]`(plan)`, replacing its contents, in one undo step. Not the AI-line
+//! sweep in [`crate::sweeps`].
 
-use cadcraft_doc::Drawing;
+use std::sync::Arc;
+
+use cadcraft_doc::{Block, Common, Drawing, EntityKind, Line, Space};
+use cadcraft_engine::{Result as EngineResult, Session};
+use cadcraft_geom::Vec2;
 use lamb_core::derivation::assembly::{AssemblyLine, FaceRef, detail_bands, lay_bands};
 use lamb_core::derivation::detail_tags::RunDetail;
 use lamb_core::geometry::Point2;
+use lamb_core::model::AnyView;
 use lamb_core::model::Id;
+use serde_json::{Value, json};
 
+use crate::commands::{id_value, other};
 use crate::convert::to_polyline;
 use crate::detailref::{DetailRefKind, detail_reference};
 use crate::detailtags::{graph_and_sides, resolve_view_details};
 use crate::project::DrawingProject;
-use crate::schema::view_block_name;
+use crate::schema::{assembly_block_name, read_document, view_block_name};
 
 /// One wall run's assembly: the detail it resolved to (if any), the laid lines, and why it was
 /// skipped when `lines` is empty for a reason.
@@ -88,6 +97,45 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             }
         })
         .collect())
+}
+
+/// `Ok` when `plan` names a plan view.
+fn check_plan(d: &Drawing, plan: Id) -> Result<(), String> {
+    let doc = read_document(d).map_err(|e| e.to_string())?;
+    match doc.views.iter().find(|v| v.id() == plan) {
+        None => Err("No such view".into()),
+        Some(AnyView::Plan(_)) => Ok(()),
+        Some(_) => Err("Not a plan view".into()),
+    }
+}
+
+/// Replaces the block [`assembly_block_name`]`(plan)` with one LINE per laid assembly line (an
+/// empty block when every run is skipped). `plan` must be a plan view; nothing is touched on error.
+pub fn write_assembly_block(d: &mut Drawing, plan: Id) -> Result<Vec<RunAssembly>, String> {
+    check_plan(d, plan)?;
+    let runs = assembly_lines(d, plan)?;
+    let name = assembly_block_name(plan);
+    d.blocks.insert(name.clone(), Arc::new(Block::new(&name)));
+    let space = Space::Block(name);
+    for l in runs.iter().flat_map(|r| &r.lines) {
+        let common = Common { layer: l.layer.clone(), ..Common::default() };
+        let line = Line { a: Vec2::new(l.from.x, l.from.y).to3(0.0), b: Vec2::new(l.to.x, l.to.y).to3(0.0) };
+        d.add(&space, common, EntityKind::Line(line)).map_err(|e| e.to_string())?;
+    }
+    Ok(runs)
+}
+
+/// ASSEMBLYPLAN `{viewId}`: [`write_assembly_block`] for that plan. Returns
+/// `{block, lines, skipped: [{run, reason}]}`.
+pub fn assemblyplan(s: &mut Session, p: &Value) -> EngineResult<Value> {
+    let plan = p.get("viewId").and_then(id_value).ok_or_else(|| other("No such view"))?;
+    // Validate before `doc_mut`: touching the drawing on a refusal would still record an undo step.
+    check_plan(s.doc()?, plan).map_err(other)?;
+    let runs = write_assembly_block(s.doc_mut()?, plan).map_err(other)?;
+    let lines: usize = runs.iter().map(|r| r.lines.len()).sum();
+    let skipped: Vec<Value> = runs.iter().filter_map(|r| r.skipped.as_ref().map(|why| json!({ "run": r.run, "reason": why }))).collect();
+    s.echo(format!("{lines} assembly lines, {} runs skipped", skipped.len()));
+    Ok(json!({ "block": assembly_block_name(plan), "lines": lines, "skipped": skipped }))
 }
 
 #[cfg(test)]
@@ -192,6 +240,56 @@ mod tests {
         let runs = assembly_lines(s.doc()?, plan)?;
         assert_eq!(runs.len(), 4);
         assert!(runs.iter().all(|r| r.lines.is_empty() && r.detail.is_none() && r.skipped.as_deref() == Some("untyped")), "{runs:?}");
+        Ok(())
+    }
+
+    fn block_lines(s: &Session, name: &str) -> T<Option<Vec<(f64, f64, String)>>> {
+        let d = s.doc()?;
+        let Some(b) = d.block(name) else { return Ok(None) };
+        let mut v = Vec::new();
+        for e in b.entities.iter() {
+            let EntityKind::Line(l) = &e.kind else { return Err(format!("not a LINE: {:?}", e.kind).into()) };
+            v.push((l.a.y, l.b.y, e.common.layer.clone()));
+        }
+        Ok(Some(v))
+    }
+
+    #[test]
+    fn assemblyplan_writes_the_laid_lines_into_the_plans_assembly_block_replacing_it() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        let name = assembly_block_name(plan);
+        let r = s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(r, json!({ "block": name, "lines": 12, "skipped": [] }));
+        let lines = block_lines(&s, &name)?.ok_or("no block")?;
+        assert_eq!(lines.len(), 12);
+        assert!(lines.iter().all(|(_, _, l)| l == "CLAD" || l == "GYP"), "{lines:?}");
+        let mut bottom: Vec<f64> = lines.iter().filter(|(a, b, _)| a == b && *a < 1000.0).map(|(a, _, _)| (a * 1e6).round() / 1e6).collect();
+        bottom.sort_by(f64::total_cmp);
+        assert_eq!(bottom, [-20.0, 50.0, 200.0]);
+        let views_before = read_document(s.doc()?)?.views.len();
+
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(block_lines(&s, &name)?.ok_or("no block")?.len(), 12, "replaced, not appended");
+        assert_eq!(read_document(s.doc()?)?.views.len(), views_before, "not a view");
+
+        s.undo()?;
+        assert_eq!(block_lines(&s, &name)?.map(|v| v.len()), Some(12), "undo the second run");
+        s.undo()?;
+        assert_eq!(block_lines(&s, &name)?, None, "undo the first run");
+        Ok(())
+    }
+
+    #[test]
+    fn assemblyplan_refuses_a_detail_view_and_an_unknown_id_without_touching_the_drawing() -> R {
+        let (mut s, _plan) = room("exterior_face", true)?;
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        let blocks = s.doc()?.blocks.len();
+        let e = s.execute("assemblyplan", &json!({ "viewId": detail.0 })).err().ok_or("detail accepted")?;
+        assert!(e.to_string().contains("Not a plan view"), "{e}");
+        let e = s.execute("assemblyplan", &json!({ "viewId": 999_999 })).err().ok_or("unknown accepted")?;
+        assert!(e.to_string().contains("No such view"), "{e}");
+        assert_eq!(s.doc()?.blocks.len(), blocks);
+        assert!(s.doc()?.blocks.keys().all(|k| !k.starts_with("LAMB_ASSEMBLY_")));
         Ok(())
     }
 }
