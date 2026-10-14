@@ -105,7 +105,7 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
 }
 
 /// `Ok` when `plan` names a plan view.
-fn check_plan(d: &Drawing, plan: Id) -> Result<(), String> {
+pub(crate) fn check_plan(d: &Drawing, plan: Id) -> Result<(), String> {
     let doc = read_document(d).map_err(|e| e.to_string())?;
     match doc.views.iter().find(|v| v.id() == plan) {
         None => Err("No such view".into()),
@@ -160,7 +160,7 @@ pub fn wallconflicts(s: &mut Session, p: &Value) -> EngineResult<Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cadcraft_doc::Handle;
     use cadcraft_engine::Session;
@@ -190,7 +190,7 @@ mod tests {
     }
 
     /// [`room`] with the inner face `inner` mm inside the outer one (the wall `inner` thick).
-    fn room_with(kind: &str, tagged: bool, inner: f64) -> T<(Session, Id)> {
+    pub(crate) fn room_with(kind: &str, tagged: bool, inner: f64) -> T<(Session, Id)> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);
@@ -319,7 +319,7 @@ mod tests {
         Ok(())
     }
 
-    fn undo_len(s: &Session) -> T<usize> {
+    pub(crate) fn undo_len(s: &Session) -> T<usize> {
         Ok(s.state()?.undo.len())
     }
 

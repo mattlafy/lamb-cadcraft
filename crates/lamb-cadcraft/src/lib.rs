@@ -55,6 +55,7 @@ mod viewlife;
 pub mod viewpick;
 mod viewprops;
 pub mod views;
+pub mod wallfit;
 
 pub use commands::commands;
 pub use convert::{Converted, Flattened, Unsupported, UnsupportedReason, from_polyline, to_polyline};
