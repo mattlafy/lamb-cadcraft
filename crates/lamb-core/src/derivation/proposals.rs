@@ -55,6 +55,26 @@ pub fn ai_proposal_slot_key(source: Id, segment_index: usize, view: Id) -> Strin
     format!("{source}:{segment_index}:{view}")
 }
 
+/// Rewrites the id parts of a slot key — an AI key `"{source}:{segment_index}:{view}"` or a solid
+/// cut key `"solidcut:{id,id,…}:{view}"` — through `f`, for the migration points where ids change
+/// (a `.lamb` load, an import into a drawing; T355). The segment index is never mapped; a solid
+/// cut's list is re-sorted by the new strings, as [`super::solid_cut_lines::solid_cut_slot_key`]
+/// sorts by display. A token `f` returns `None` for is kept; a key of neither shape is unchanged.
+pub fn remap_slot_key(key: &str, f: impl Fn(&str) -> Option<String>) -> String {
+    let map = |s: &str| f(s).unwrap_or_else(|| s.to_owned());
+    if let Some(rest) = key.strip_prefix(super::markers::SOLID_CUT_PROPOSAL_PREFIX) {
+        let Some((list, view)) = rest.rsplit_once(':') else { return key.to_owned() };
+        let mut ids: Vec<String> = list.split(',').map(map).collect();
+        ids.sort();
+        return format!("{}{}:{}", super::markers::SOLID_CUT_PROPOSAL_PREFIX, ids.join(","), map(view));
+    }
+    let parts: Vec<&str> = key.split(':').collect();
+    match parts.as_slice() {
+        [source, index, view] if index.parse::<usize>().is_ok() => format!("{}:{index}:{}", map(source), map(view)),
+        _ => key.to_owned(),
+    }
+}
+
 fn extents_agree(a: &VerticalExtent, b: &VerticalExtent) -> bool {
     (a.top - b.top).abs() <= TOLERANCE.height_agreement_mm && (a.bottom - b.bottom).abs() <= TOLERANCE.height_agreement_mm
 }
@@ -404,5 +424,39 @@ pub fn invert_reconcile_ai_lines(doc: &mut impl ProjectWrite, result: &Reconcile
         let mut keys = doc.suppressed_proposals().to_vec();
         keys.extend(result.pruned_suppressions.iter().cloned());
         doc.set_suppressed_proposals(keys);
+    }
+}
+
+#[cfg(test)]
+mod remap_slot_key_tests {
+    use super::remap_slot_key;
+
+    fn table(s: &str) -> Option<String> {
+        match s {
+            "wall-a" => Some("7".to_owned()),
+            "sec-1" => Some("12".to_owned()),
+            "b" => Some("100".to_owned()),
+            "a" => Some("9".to_owned()),
+            "3" => Some("999".to_owned()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn ai_key_maps_source_and_view_but_never_the_segment_index() {
+        assert_eq!(remap_slot_key("wall-a:3:sec-1", table), "7:3:12");
+    }
+
+    #[test]
+    fn solid_cut_list_is_mapped_and_resorted_by_the_new_strings() {
+        // "a" < "b" before; "100" < "9" after, lexicographically, as display sorting is.
+        assert_eq!(remap_slot_key("solidcut:a,b:sec-1", table), "solidcut:100,9:12");
+    }
+
+    #[test]
+    fn unknown_tokens_and_foreign_shapes_are_kept() {
+        assert_eq!(remap_slot_key("ghost:0:sec-1", table), "ghost:0:12");
+        assert_eq!(remap_slot_key("not a key", table), "not a key");
+        assert_eq!(remap_slot_key("a:b:c:d", table), "a:b:c:d");
     }
 }

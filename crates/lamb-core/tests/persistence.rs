@@ -151,3 +151,30 @@ fn optional_files_default_empty() {
     let p = files_to_project(&files).unwrap();
     assert!(p.links.is_empty() && p.command_log.is_empty());
 }
+
+/// T355: AI lines' slot keys are rewritten from the TS string ids onto the loaded ids, so the
+/// first sweep of a freshly loaded, settled project finds every slot filled.
+#[test]
+fn ai_slot_keys_name_the_loaded_ids_and_the_first_sweep_is_a_no_op() {
+    use lamb_core::derivation::proposals::{ai_proposal_slot_key, reconcile_ai_lines};
+    use lamb_core::model::Id;
+    let mut p = load("u-wall-two-sections");
+    let views: HashSet<Id> = p.views.iter().map(|v| v.id()).collect();
+    let entities: HashSet<Id> = p.views.iter().flat_map(|v| v.entities().iter().map(|e| e.id)).collect();
+    let origins: Vec<_> = p.views.iter().flat_map(|v| v.entities().iter().filter_map(|e| e.ai_origin.clone())).collect();
+    assert!(!origins.is_empty(), "the fixture carries AI lines");
+    for o in &origins {
+        let parts: Vec<&str> = o.proposal_id.split(':').collect();
+        let [source, index, view] = parts.as_slice() else { panic!("not an AI slot key: {}", o.proposal_id) };
+        let (source, index, view) = (Id(source.parse().unwrap()), index.parse().unwrap(), Id(view.parse().unwrap()));
+        assert!(entities.contains(&source) && views.contains(&view), "{} names ids in the project", o.proposal_id);
+        assert_eq!(o.proposal_id, ai_proposal_slot_key(source, index, view));
+    }
+    let mut n = 1u64 << 50;
+    let r = reconcile_ai_lines(&mut p, "2026-01-01T00:00:00.000Z", &mut || {
+        n += 1;
+        Id(n)
+    })
+    .unwrap();
+    assert_eq!((r.created_entities.len(), r.removed_entities.len()), (0, 0), "the first sweep re-proposes nothing");
+}

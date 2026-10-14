@@ -7,16 +7,17 @@
 //! `views/<slug>--<id>.json` (listed in `project.json`'s `views[]`), and the optional
 //! `links/links.json` and `command-log.json`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
+use crate::derivation::proposals::remap_slot_key;
 use crate::geometry::Point2;
 use crate::geometry::circle_fit::{CircleFit, circle_as_polyline};
-use crate::model::{AnyView, CURRENT_SCHEMA_VERSION, LinkRecord, Project, default_project_defaults, with_string_ids};
+use crate::model::{AnyView, CURRENT_SCHEMA_VERSION, Id, LinkRecord, Project, default_project_defaults, with_string_ids};
 
 pub const MANIFEST_PATH: &str = "manifest.json";
 pub const PROJECT_PATH: &str = "project.json";
@@ -103,6 +104,27 @@ fn migrate_circles(views: &mut [Value]) {
     }
 }
 
+/// Inside the [`with_string_ids`] scope: rewrites every `ai_origin.proposal_id` from the TS string
+/// ids it was saved with onto the interned ids' decimals — what `Id`'s `Display` gives outside the
+/// scope, so lamb-core's sweeps find the saved slots (T355).
+fn rewrite_proposal_ids(views: &mut [AnyView]) {
+    let mut table: HashMap<String, Id> = HashMap::new();
+    for v in views.iter() {
+        table.insert(v.id().to_string(), v.id());
+        table.extend(v.entities().iter().map(|e| (e.id.to_string(), e.id)));
+    }
+    for v in views.iter_mut() {
+        let entities = match v {
+            AnyView::Plan(v) => &mut v.entities,
+            AnyView::Vertical(v) => &mut v.entities,
+            AnyView::Detail(v) => &mut v.entities,
+        };
+        for o in entities.iter_mut().filter_map(|e| e.ai_origin.as_mut()) {
+            o.proposal_id = remap_slot_key(&o.proposal_id, |s| table.get(s).map(|id| id.0.to_string()));
+        }
+    }
+}
+
 /// Reconstruct a [`Project`] from a `.lamb` directory's file contents, migrated up to
 /// [`CURRENT_SCHEMA_VERSION`]. String ids are interned once across every file, so link anchors
 /// resolve to the same [`crate::model::Id`]s as the views and entities they name.
@@ -155,13 +177,15 @@ pub fn files_to_project(files: &BTreeMap<String, String>) -> Result<Project, Loa
     };
 
     with_string_ids(|| {
+        let mut views = view_paths.iter().zip(views).map(|(path, v)| decode::<AnyView>(path, v)).collect::<Result<Vec<_>, _>>()?;
+        rewrite_proposal_ids(&mut views);
         Ok(Project {
             schema_version: CURRENT_SCHEMA_VERSION,
             name,
             defaults: decode(PROJECT_PATH, defaults)?,
             levels: decode(PROJECT_PATH, levels)?,
             layers: decode(PROJECT_PATH, layers)?,
-            views: view_paths.iter().zip(views).map(|(path, v)| decode::<AnyView>(path, v)).collect::<Result<_, _>>()?,
+            views,
             links: decode::<Vec<LinkRecord>>(LINKS_PATH, links)?,
             command_log: decode(COMMAND_LOG_PATH, command_log)?,
             patterns: decode(PROJECT_PATH, patterns)?,

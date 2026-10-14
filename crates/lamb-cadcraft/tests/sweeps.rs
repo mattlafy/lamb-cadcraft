@@ -245,18 +245,42 @@ fn load(name: &str) -> Result<Project, Box<dyn std::error::Error>> {
     Ok(files_to_project(&files).map_err(|e| format!("{e:?}"))?)
 }
 
-/// The imported `u-wall-two-sections` after one sweep (its slot keys name the TS string ids, so
-/// the first sweep re-proposes its AI lines under the imported handles), open in a session with
-/// every LAMB observer.
+/// The imported `u-wall-two-sections`, open in a session with every LAMB observer.
 fn session() -> Result<Session, Box<dyn std::error::Error>> {
     commands::install_app().map_err(|e| e.to_string())?;
-    let (mut d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
-    let before = d.clone();
-    run_sweeps(&before, &mut d, NOW)?;
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
     let mut s = Session::new();
     s.open_drawing(d, "u-wall", None);
     install(&mut s);
     Ok(s)
+}
+
+/// T355: an imported, settled project's first sweep creates and removes nothing — its AI lines'
+/// slot keys were rewritten onto the imported handles, so every slot is found filled.
+#[test]
+fn first_sweep_after_import_keeps_every_ai_line() -> R {
+    let (mut d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let before_lines = ai_lines(&d)?;
+    assert!(!before_lines.is_empty(), "the fixture carries AI lines");
+    let before = d.clone();
+    run_sweeps(&before, &mut d, NOW)?;
+    let ids = |l: &[(Id, Id, AiOrigin, Polyline2)]| l.iter().map(|x| (x.0, x.2.proposal_id.clone())).collect::<Vec<_>>();
+    assert_eq!(ids(&ai_lines(&d)?), ids(&before_lines), "no AI line created or removed; each keeps its handle");
+    Ok(())
+}
+
+/// T355: a suppressed slot key survives the import rewritten onto the new handles.
+#[test]
+fn suppressed_proposals_are_rewritten_onto_imported_handles() -> R {
+    let mut p = load("u-wall-two-sections")?;
+    let (source, view) = (p.views[0].entities()[0].id, p.views[1].id());
+    let ai_key = lamb_core::derivation::proposals::ai_proposal_slot_key(source, 2, view);
+    let cut_key = format!("solidcut:{}:{}", source.0, view.0);
+    p.suppressed_proposals = Some(vec![ai_key, cut_key, "foreign".to_owned()]);
+    let (d, map, _) = project_to_drawing(&p)?;
+    let (s, v) = (map.get(source).ok_or("source")?.0, map.get(view).ok_or("view")?.0);
+    assert_eq!(read_document(&d)?.suppressed_proposals, vec![format!("{s}:2:{v}"), format!("solidcut:{s}:{v}"), "foreign".to_owned()]);
+    Ok(())
 }
 
 /// (id, view, origin, polyline) of every AI line.

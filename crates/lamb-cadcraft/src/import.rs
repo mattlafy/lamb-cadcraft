@@ -22,6 +22,7 @@ use std::fmt;
 
 use cadcraft_doc::color::{Color, Rgb};
 use cadcraft_doc::{Common, Drawing, EntityKind, Lineweight, Space};
+use lamb_core::derivation::proposals::remap_slot_key;
 use lamb_core::geometry::polyline::virtual_corner_entries;
 use lamb_core::model::{AnyView, DrawingLayer, EntityGeometry, Id, Placement, Project};
 
@@ -140,6 +141,11 @@ fn remap_placement(p: &mut Option<Placement>, map: &IdMap) {
     }
 }
 
+/// One slot-key token — an old id's decimal — as its new handle's decimal, if `map` has it.
+fn remap_token(s: &str, map: &IdMap) -> Option<String> {
+    s.parse::<u64>().ok().and_then(|n| map.get(Id(n))).map(|id| id.0.to_string())
+}
+
 /// Imports `project` into a new metric drawing. See the module docs for what is mapped how.
 pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportReport), ImportError> {
     let mut d = Drawing::new_metric();
@@ -163,7 +169,8 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
         map.0.insert(v.id(), id);
     }
 
-    // Entities whose AI origin names a source entity, set once every entity has its handle.
+    // Entities with an AI origin, set once every entity has its handle: the origin's source entity
+    // and the ids inside its slot key are rewritten onto handles (T355).
     let mut pending_origin = Vec::new();
     for v in &project.views {
         let Some(view_id) = map.get(v.id()) else { continue };
@@ -192,7 +199,7 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
             };
             let mut common = Common { layer, ..Common::default() };
             let data = EntityData { role: e.role, ai_origin: e.ai_origin.clone(), view_id: None, corners, detail_tag: None, detail_ref: None };
-            let deferred = data.ai_origin.as_ref().is_some_and(|o| o.source_entity_id.is_some());
+            let deferred = data.ai_origin.is_some();
             if !deferred {
                 set_entity_data(&mut common, &data)?;
             }
@@ -204,11 +211,13 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
         }
     }
     for (h, mut data) in pending_origin {
-        if let Some(o) = data.ai_origin.as_mut()
-            && let Some(src) = o.source_entity_id
-            && let Some(new) = map.get(src)
-        {
-            o.source_entity_id = Some(new);
+        if let Some(o) = data.ai_origin.as_mut() {
+            if let Some(src) = o.source_entity_id
+                && let Some(new) = map.get(src)
+            {
+                o.source_entity_id = Some(new);
+            }
+            o.proposal_id = remap_slot_key(&o.proposal_id, |s| remap_token(s, &map));
         }
         let mut err = None;
         d.modify_entity(h, |e| err = set_entity_data(&mut e.common, &data).err())?;
@@ -218,6 +227,7 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
     }
 
     let mut doc = read_document(&d)?;
+    doc.suppressed_proposals = doc.suppressed_proposals.iter().map(|k| remap_slot_key(k, |s| remap_token(s, &map))).collect();
     for v in &mut doc.views {
         match v {
             AnyView::Plan(p) => remap_placement(&mut p.placement, &map),
