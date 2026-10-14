@@ -29,6 +29,8 @@ use lamb_core::derivation::assembly::{
     AssemblyLine, FaceRef, WidthConflict, detail_bands, detail_frame, junction_bisector, lay_bands, lay_repeat, mitre_end, width_conflict,
 };
 use lamb_core::derivation::detail_tags::RunDetail;
+use lamb_core::derivation::issues::{Issue, IssueKind};
+use lamb_core::derivation::walls::{RunCurve, WallRun};
 use lamb_core::geometry::Point2;
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::AnyView;
@@ -175,6 +177,80 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
         }
     }
     Ok(runs)
+}
+
+/// The midpoint of a run's centreline: a line's mean of ends, an arc's point at half its sweep.
+fn run_midpoint(run: &WallRun) -> Point2 {
+    match run.centreline {
+        RunCurve::Line { from, to } => Point2 { x: (from.x + to.x) / 2.0, y: (from.y + to.y) / 2.0 },
+        RunCurve::Arc { center, radius, start_angle, sweep } => {
+            let a = start_angle + sweep / 2.0;
+            Point2 { x: center.x + radius * a.cos(), y: center.y + radius * a.sin() }
+        }
+    }
+}
+
+/// The face entity ids of `runs`, deduped, sorted by display string.
+fn face_ids<'a>(runs: impl IntoIterator<Item = &'a WallRun>) -> Vec<Id> {
+    let mut ids: Vec<Id> = runs.into_iter().flat_map(|r| r.faces.iter().map(|f| f.from.entity_id)).collect();
+    ids.sort_by_cached_key(Id::to_string);
+    ids.dedup();
+    ids
+}
+
+/// The assembly plans' own gaps as RESOLVE issues (§10): for every plan view that has an assembly
+/// block, in document view order, each laid run's width conflict (by run), then each junction with
+/// no corner detail that has a laid arm (by junction). Locations are plan-local.
+pub(crate) fn wall_issues(d: &Drawing) -> Result<Vec<Issue>, String> {
+    let doc = read_document(d).map_err(|e| e.to_string())?;
+    let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_))) {
+        let plan = v.id();
+        if d.block(&assembly_block_name(plan)).is_none() {
+            continue;
+        }
+        let runs = assembly_lines(d, plan)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        let (_, corners) = resolve_view_details(d, plan)?;
+        let mitred = doc.mitre_plans.contains(&plan);
+        let issue = |kind: IssueKind, id: String, location: Point2, entity_ids: Vec<Id>, note: String| Issue {
+            id,
+            kind,
+            view_id: plan,
+            location,
+            entity_ids,
+            priority: kind.priority(),
+            note,
+        };
+        for r in runs.iter().filter(|r| r.skipped.is_none()) {
+            let (Some(c), Some(run)) = (r.conflict, graph.runs.get(r.run)) else { continue };
+            out.push(issue(
+                IssueKind::WidthConflict,
+                format!("width_conflict:{plan}:{}", r.run),
+                run_midpoint(run),
+                face_ids([run]),
+                format!("Wall run {}: {}", r.run, c.text()),
+            ));
+        }
+        for (j, (junction, corner)) in graph.junctions.iter().zip(&corners).enumerate() {
+            if !matches!(corner, RunDetail::Untyped | RunDetail::Conflict) {
+                continue;
+            }
+            if !junction.arms.iter().any(|a| runs.get(a.run).is_some_and(|r| r.skipped.is_none())) {
+                continue;
+            }
+            let suffix = if mitred { " (mitred)" } else { "" };
+            out.push(issue(
+                IssueKind::UndetailedCorner,
+                format!("undetailed_corner:{plan}:{j}"),
+                junction.point,
+                face_ids(junction.arms.iter().filter_map(|a| graph.runs.get(a.run))),
+                format!("Corner at ({:.0}, {:.0}) has no corner detail{suffix}", junction.point.x, junction.point.y),
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// `Ok` when `plan` names a plan view.
@@ -824,6 +900,44 @@ pub(crate) mod tests {
 
         let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
         assert_eq!(s.execute("wallconflicts", &json!({ "viewId": plan.0 }))?, json!({ "conflicts": [] }));
+        Ok(())
+    }
+
+    #[test]
+    fn wall_issues_list_each_plans_width_conflicts_then_undetailed_corners() -> R {
+        let (mut s, plan) = room_with("exterior_face", true, 210.0)?;
+        assert!(wall_issues(s.doc()?)?.is_empty(), "no assembly block, no issues");
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let list = wall_issues(s.doc()?)?;
+        assert_eq!(list.len(), 8, "{list:?}");
+        let p = DrawingProject::new(s.doc()?)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        for (i, w) in list[..4].iter().enumerate() {
+            assert_eq!(w.kind, IssueKind::WidthConflict);
+            assert_eq!(w.id, format!("width_conflict:{plan}:{i}"));
+            assert_eq!(w.view_id, plan);
+            assert_eq!(w.priority, 5);
+            assert!(w.note.starts_with(&format!("Wall run {i}: -10.0mm toward ")), "{}", w.note);
+            assert_eq!(w.entity_ids.len(), 2, "{w:?}");
+            assert_eq!(w.location, run_midpoint(&graph.runs[i]));
+        }
+        for (j, c) in list[4..].iter().enumerate() {
+            assert_eq!(c.kind, IssueKind::UndetailedCorner);
+            assert_eq!(c.id, format!("undetailed_corner:{plan}:{j}"));
+            assert_eq!(c.priority, 6);
+            assert_eq!(c.location, graph.junctions[j].point);
+            assert!(c.note.starts_with("Corner at (") && c.note.ends_with(") has no corner detail"), "{}", c.note);
+            assert!(!c.entity_ids.is_empty());
+        }
+        let v = serde_json::to_value(&list[0])?;
+        assert_eq!(v["kind"], "width_conflict");
+        assert_eq!(serde_json::to_value(&list[4])?["kind"], "undetailed_corner");
+
+        s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": true }))?;
+        let list = wall_issues(s.doc()?)?;
+        assert_eq!(list.len(), 8);
+        assert!(list[4..].iter().all(|c| c.note.ends_with(") has no corner detail (mitred)")), "{list:?}");
+        assert!(list[..4].iter().all(|w| !w.note.ends_with("(mitred)")));
         Ok(())
     }
 

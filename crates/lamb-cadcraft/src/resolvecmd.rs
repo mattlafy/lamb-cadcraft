@@ -1,5 +1,6 @@
 //! RESOLVE (LAMB T351, TS `resolveCommand.ts`, T158): step through lamb-core's [`find_issues`]
-//! list. Each step edits the issue's view, centres the camera on its location (block coordinates
+//! list followed by the assembly plans' own gaps ([`wall_issues`], LAMB T393: width conflicts and
+//! junctions with no corner detail, for plans that have an assembly block). Each step edits the issue's view, centres the camera on its location (block coordinates
 //! are the view's local coordinates, so no transform), names it on the command line and haloes its
 //! entities ([`crate::overlays::halo`]). The list is snapshotted when the command starts and never
 //! re-derived mid-command; `Next`/`Previous` (or a typed `>`/`<`) step, clamped at both ends;
@@ -14,17 +15,21 @@ use cadcraft_geom::Vec2;
 use lamb_core::derivation::issues::{Issue, find_issues};
 use serde_json::{Value, json};
 
+use crate::assembly::wall_issues;
 use crate::commands::{enter_space, other};
 use crate::overlays::halo::set_attention;
 use crate::project::DrawingProject;
 use crate::schema::view_block_name;
 
 fn issues(s: &Session) -> Result<Vec<Issue>> {
-    let dp = DrawingProject::new(s.doc()?).map_err(other)?;
-    find_issues(&dp).map_err(other)
+    let d = s.doc()?;
+    let dp = DrawingProject::new(d).map_err(other)?;
+    let mut list = find_issues(&dp).map_err(other)?;
+    list.extend(wall_issues(d).map_err(other)?);
+    Ok(list)
 }
 
-/// RESOLVE `{}`: the project's issues in `find_issues` order.
+/// RESOLVE `{}`: the project's issues in `find_issues` order, then [`wall_issues`].
 pub(crate) fn resolve(s: &mut Session, _p: &Value) -> Result<Value> {
     let list: Vec<Value> = issues(s)?
         .iter()
@@ -221,6 +226,36 @@ mod tests {
         s.input(Input::Enter)?;
         assert!(s.running.is_none(), "Enter ends it");
         assert_eq!(current_attention(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn wall_issues_follow_find_issues_and_step_to_the_run() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        set_attention(None);
+        let (mut s, plan) = crate::assembly::tests::room_with("exterior_face", true, 210.0)?;
+        let core = find_issues(&DrawingProject::new(s.doc()?)?)?.len();
+        assert_eq!(issues(&s)?.len(), core, "no assembly block yet");
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let r = s.execute("resolve", &json!({}))?;
+        let got = r["issues"].as_array().ok_or("no issues")?;
+        assert_eq!(got.len(), core + 8, "{r}");
+        let kinds: Vec<&str> = got[core..].iter().filter_map(|i| i["kind"].as_str()).collect();
+        assert_eq!(kinds, [["width_conflict"; 4], ["undetailed_corner"; 4]].concat());
+        assert_eq!(got[core]["id"], json!(format!("width_conflict:{}:0", plan)));
+
+        let found = issues(&s)?;
+        let first = &found[core];
+        s.start("resolve")?;
+        for _ in 0..core {
+            s.input(Input::Keyword("Next".into()))?;
+        }
+        assert!(at(&s, first)?, "the plan's view, centred on the run midpoint");
+        assert_eq!(first.entity_ids.len(), 2);
+        let (block, handles) = current_attention().ok_or("no halo")?;
+        assert_eq!(block, view_block_name(plan));
+        assert_eq!(handles, first.entity_ids.iter().map(|e| Handle(e.0)).collect::<Vec<_>>());
+        s.input(Input::Cancel)?;
         Ok(())
     }
 

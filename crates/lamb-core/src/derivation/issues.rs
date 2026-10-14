@@ -19,6 +19,12 @@ pub enum IssueKind {
     AmbiguousExtent,
     StaleLink,
     DefaultedExtent,
+    /// A laid wall run whose detail is wider or narrower than the drawn wall. Reported by the
+    /// CADCraft adapter's assembly plan, never by [`find_issues`].
+    WidthConflict,
+    /// A wall junction with no corner detail (mitred or ghosted). Adapter-only, like
+    /// [`IssueKind::WidthConflict`].
+    UndetailedCorner,
 }
 
 impl IssueKind {
@@ -31,6 +37,8 @@ impl IssueKind {
             IssueKind::AmbiguousExtent => 2,
             IssueKind::StaleLink => 3,
             IssueKind::DefaultedExtent => 4,
+            IssueKind::WidthConflict => 5,
+            IssueKind::UndetailedCorner => 6,
         }
     }
 }
