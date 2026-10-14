@@ -201,11 +201,15 @@ pub fn lay_bands(run: &WallRun, sides: &RunSides, face: FaceRef, bands: &[Band])
 }
 
 /// A repeat's `members` (straight segments in the detail's space, with their layers) arrayed along
-/// a straight `run`: copies shifted `k·|p|` along, `p` being `pitch`'s component along the
-/// reference, for every integer `k` whose copy's along-extent lies within `[0, run length]`
+/// a `run`: copies shifted `k·|p|` along, `p` being `pitch`'s component along the reference, for
+/// every integer `k` whose copy's along-extent lies within `[0, run length]`
 /// (± `TOLERANCE.coincidence_mm`). Points map through the same face frame as [`lay_bands`], the
-/// reference's `from` at the centreline's `from`. No along component, no members, or no copy that
-/// fits gives no lines.
+/// reference's `from` at the centreline's `from`. On an arc run the run length is the arc length
+/// of the reference face (radius `rf`); a detail point `(t, o)` maps to radius
+/// `radius + outward·(width/2 − o)` at angle `start_angle + sign(sweep)·t / rf`, and each member
+/// segment is written as a straight chord between its mapped ends; a mapped radius not above
+/// `TOLERANCE.coincidence_mm` is an error. No along component, no members, or no copy that fits
+/// gives no lines.
 pub fn lay_repeat(
     run: &WallRun,
     sides: &RunSides,
@@ -214,7 +218,33 @@ pub fn lay_repeat(
     members: &[(Point2, Point2, String)],
     pitch: Point2,
 ) -> Result<Vec<AssemblyLine>, String> {
-    let f = face_frame(run, sides, face)?;
+    // The run length along the reference face, and a detail point `(t, o)` placed on the run.
+    let (len, place): (f64, Box<dyn Fn(f64, f64) -> Result<Point2, String>>) = match run.centreline {
+        RunCurve::Arc { center, radius, start_angle, sweep } => {
+            let toward_left = face_on_left(sides, face)?;
+            // +1 when the face side is away from the centre, as in `lay_bands`.
+            let outward = if toward_left == (sweep > 0.0) { -1.0 } else { 1.0 };
+            let width = run.width;
+            let rf = radius + outward * width / 2.0;
+            if rf <= TOLERANCE.coincidence_mm {
+                return Err("repeat radius is not positive".into());
+            }
+            let place = move |t: f64, o: f64| {
+                let r = radius + outward * (width / 2.0 - o);
+                if r <= TOLERANCE.coincidence_mm {
+                    return Err("repeat radius is not positive".to_string());
+                }
+                let a = start_angle + sweep.signum() * t / rf;
+                Ok(Point2 { x: center.x + r * a.cos(), y: center.y + r * a.sin() })
+            };
+            (rf * sweep.abs(), Box::new(place))
+        }
+        RunCurve::Line { .. } => {
+            let f = face_frame(run, sides, face)?;
+            let width = run.width;
+            (f.len, Box::new(move |t: f64, o: f64| Ok(f.place(width, t, o))))
+        }
+    };
     let p = (pitch.x * frame.along.x + pitch.y * frame.along.y).abs();
     if p <= TOLERANCE.coincidence_mm || members.is_empty() {
         return Ok(Vec::new());
@@ -223,12 +253,12 @@ pub fn lay_repeat(
     let ts = || local.iter().flat_map(|(a, b, _)| [a.0, b.0]);
     let (tmin, tmax) = (ts().fold(f64::INFINITY, f64::min), ts().fold(f64::NEG_INFINITY, f64::max));
     let tol = TOLERANCE.coincidence_mm;
-    let (kmin, kmax) = (((-tol - tmin) / p).ceil() as i64, ((f.len + tol - tmax) / p).floor() as i64);
+    let (kmin, kmax) = (((-tol - tmin) / p).ceil() as i64, ((len + tol - tmax) / p).floor() as i64);
     let mut out = Vec::new();
     for k in kmin..=kmax {
         let s = k as f64 * p;
         for ((ta, oa), (tb, ob), layer) in &local {
-            out.push(AssemblyLine { from: f.place(run.width, ta + s, *oa), to: f.place(run.width, tb + s, *ob), layer: (*layer).clone(), arc: None });
+            out.push(AssemblyLine { from: place(ta + s, *oa)?, to: place(tb + s, *ob)?, layer: (*layer).clone(), arc: None });
         }
     }
     Ok(out)
@@ -521,12 +551,36 @@ mod tests {
     }
 
     #[test]
-    fn a_repeat_on_an_arc_run_is_an_error() {
-        let (frame, members) = stud();
-        let mut r = run(p(0.0, 0.0), p(1000.0, 0.0), 200.0);
-        r.centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
-        let one = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
-        assert_eq!(lay_repeat(&r, &one, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap_err(), "arc runs are not laid yet");
+    fn a_repeat_arrays_along_an_arc_run_as_chords_at_the_face_arc_length() {
+        use std::f64::consts::FRAC_PI_2;
+        let frame = detail_frame((p(0.0, 0.0), p(1000.0, 0.0)), &[l((0.0, 200.0), (1000.0, 200.0), "GYP")]).unwrap();
+        let members = vec![l((100.0, 50.0), (100.0, 200.0), "STUD")];
+        let outside_right = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let outside_left = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
+        let check = |sweep: f64, sides: &RunSides, rf: f64, radii: (f64, f64)| {
+            let out = lay_repeat(&arc_run(1000.0, sweep), sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap();
+            let n = ((rf * FRAC_PI_2 - 100.0) / 400.0).floor() as usize + 1;
+            assert_eq!(out.len(), n, "sweep {sweep}, rf {rf}");
+            for (k, line) in out.iter().enumerate() {
+                assert!(line.arc.is_none() && line.layer == "STUD");
+                let a = sweep.signum() * (100.0 + 400.0 * k as f64) / rf;
+                for (pt, r) in [(line.from, radii.0), (line.to, radii.1)] {
+                    assert!((pt.x - r * a.cos()).abs() < 1e-9 && (pt.y - r * a.sin()).abs() < 1e-9, "copy {k}: {pt:?} vs r {r} a {a}");
+                }
+            }
+        };
+        // Exterior outside the curve, both travel directions.
+        check(FRAC_PI_2, &outside_right, 1100.0, (1050.0, 900.0));
+        check(-FRAC_PI_2, &outside_left, 1100.0, (1050.0, 900.0));
+        // Exterior inside the curve.
+        check(FRAC_PI_2, &outside_left, 900.0, (950.0, 1100.0));
+        check(-FRAC_PI_2, &outside_right, 900.0, (950.0, 1100.0));
+        // A member reaching past the centre is an error.
+        let deep = vec![l((100.0, 50.0), (100.0, 2000.0), "STUD")];
+        assert_eq!(
+            lay_repeat(&arc_run(1000.0, 1.0), &outside_right, FaceRef::Exterior, &frame, &deep, p(400.0, 0.0)).unwrap_err(),
+            "repeat radius is not positive"
+        );
     }
 
     #[test]

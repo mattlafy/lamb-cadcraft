@@ -10,8 +10,9 @@
 //! also carries its width conflict (lamb-core's [`width_conflict`], LAMB T375): reported by
 //! ASSEMBLYPLAN and by the read-only `wallconflicts {viewId}`. Each of the detail's repeats
 //! ([`detail_repeats`], LAMB T380) is arrayed at its pitch along the run too (lamb-core's
-//! [`lay_repeat`]), every straight segment of its members kept on the member's layer; arc runs get
-//! their bands but no repeats yet. Once a plan
+//! [`lay_repeat`]), every straight segment of its members kept on the member's layer; on an arc
+//! run (LAMB T392) the copies are spaced by arc length along the reference face and each segment
+//! is written as a straight chord. Once a plan
 //! has its block, [`assembly_observer`] (LAMB T381) keeps it equal to [`assembly_lines`] after every
 //! command, inside that command's undo step; a plan without the block gets none. A plan listed in
 //! the document's `mitre_plans` (`assemblyplan {viewId, mitre}`, LAMB T385; §10 step 3) has every
@@ -118,8 +119,7 @@ fn run_lines(
     let frame = detail_frame((r.from, r.to), &lines)?;
     let mut laid = lay_bands(run, sides, face, &bands)?;
     let n = laid.len();
-    let repeats = if matches!(run.centreline, lamb_core::derivation::walls::RunCurve::Arc { .. }) { Vec::new() } else { detail_repeats(d, detail)? };
-    for rep in repeats {
+    for rep in detail_repeats(d, detail)? {
         laid.extend(lay_repeat(run, sides, face, &frame, &member_segments(d, detail, &rep.members), rep.pitch)?);
     }
     Ok((laid, n, width_conflict(run, face, &bands)))
@@ -940,6 +940,54 @@ pub(crate) mod tests {
         s.execute("layer.new", &json!({ "name": "NOTES", "current": true }))?;
         line(&mut s, [90_000.0, 90_000.0], [91_000.0, 90_000.0])?;
         assert!(Arc::ptr_eq(&b, s.doc()?.block(&name).ok_or("no block")?), "observer saw no difference");
+        Ok(())
+    }
+
+    #[test]
+    fn a_repeat_arrays_along_an_arc_run_as_chords() -> R {
+        let (mut s, plan) = d_room()?;
+        let detail = detail_id(&s)?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
+        let before = all_handles(&s)?;
+        s.execute("pline", &json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?;
+        let stud = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no stud")?;
+        let before = all_handles(&s)?;
+        s.execute("dimaligned", &json!({ "p1": [100, 0], "p2": [500, 0], "at": [300, -300] }))?;
+        let pitch = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no dimension")?;
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()] }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        crate::maintain::install(&mut s);
+
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        let runs = assembly_lines(d, plan)?;
+        let arc =
+            runs.iter().find(|r| matches!(graph.runs[r.run].centreline, lamb_core::derivation::walls::RunCurve::Arc { .. })).ok_or("no arc run")?;
+        assert_eq!(arc.bands, 3);
+        assert!(arc.lines[..3].iter().all(|l| l.arc.is_some()), "bands stay arcs");
+        assert_eq!(arc.lines.len(), 3 + 9 * 4, "{arc:?}");
+        for l in &arc.lines[3..] {
+            assert!(l.arc.is_none() && l.layer == "STUD", "{l:?}");
+            for pt in [l.from, l.to] {
+                let r = r6((pt.x - 3000.0).hypot(pt.y - 1100.0));
+                assert!(r == 1050.0 || r == 900.0, "{pt:?} at {r}");
+            }
+        }
+
+        let name = assembly_block_name(plan);
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let b = s.doc()?.block(&name).ok_or("no block")?.clone();
+        let total: usize = runs.iter().map(|r| r.lines.len()).sum();
+        assert_eq!(b.entities.len(), total);
+        let arcs = b.entities.iter().filter(|e| matches!(e.kind, EntityKind::Arc(_))).count();
+        assert_eq!(arcs, 3, "only the bands are ARCs; the chords are LINEs");
+        assert!(block_matches(&b, &assembly_lines(s.doc()?, plan)?));
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let b2 = s.doc()?.block(&name).ok_or("no block")?.clone();
+        assert!(block_matches(&b2, &assembly_lines(s.doc()?, plan)?));
+        assert_eq!(b2.entities.len(), total);
         Ok(())
     }
 
