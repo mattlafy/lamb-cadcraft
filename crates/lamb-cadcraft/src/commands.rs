@@ -45,6 +45,8 @@
 //!   moves each conflicted run's non-reference face to its detail's width — see [`crate::wallfit`].
 //!   `detailref {handle?, kind?}` (View ▸ LAMB ▸ Detail Reference): the
 //!   edited detail view's reference line and its kind — see [`crate::detailref`].
+//!   `repeat {dimension?, handles?}` (View ▸ LAMB ▸ Repeat): in the edited detail view, a linear or
+//!   aligned dimension tagged as the pitch of the geometry it repeats — see [`crate::repeats`].
 //!
 //! - `viewprops {mode, viewId, …}` (View ▸ LAMB ▸ View Properties): rename a view, a placed plan's
 //!   cut elevation, a vertical view's intent or flip — see [`crate::viewprops`].
@@ -745,6 +747,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{handle?, kind?: exterior_face|interior_face|structural_centre|grid}")
             .menu(MENU)
             .interactive(crate::detailref::detailref_machine),
+        CommandSpec::new("repeat", "Repeat", crate::repeats::repeat).params("{dimension?, handles?: [handle]}").menu(MENU),
         CommandSpec::new("accept", "Accept AI Line", crate::entitycmds::accept)
             .alias(&["acc"])
             .params("{handles?}")

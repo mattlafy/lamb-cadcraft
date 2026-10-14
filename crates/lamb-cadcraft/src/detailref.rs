@@ -110,7 +110,7 @@ pub fn detail_reference(d: &Drawing, detail: Id) -> std::result::Result<Option<D
 }
 
 /// The edited view, if it is a detail view; else the refusal.
-fn edited_detail(s: &Session) -> std::result::Result<Id, String> {
+pub(crate) fn edited_detail(s: &Session) -> std::result::Result<Id, String> {
     let refuse = || "Edit a detail view first (EDITVIEW).".to_owned();
     let view = edited_view(s).ok_or_else(refuse)?;
     is_detail(s.doc().map_err(|e| e.to_string())?, view)?.ok_or_else(refuse)?;

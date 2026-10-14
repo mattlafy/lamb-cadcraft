@@ -45,6 +45,7 @@ pub mod project_mut;
 pub mod props;
 mod querycmds;
 mod refpane;
+pub mod repeats;
 mod resolvecmd;
 pub mod rounding;
 pub mod scene;

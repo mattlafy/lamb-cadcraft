@@ -26,6 +26,7 @@ use crate::convert::to_polyline;
 use crate::detailref::{DetailRefKind, detail_reference};
 use crate::detailtags::{graph_and_sides, resolve_view_details};
 use crate::project::DrawingProject;
+use crate::repeats::repeat_members;
 use crate::schema::{assembly_block_name, read_document, view_block_name};
 
 /// One wall run's assembly: the detail it resolved to (if any), the laid lines, and why it was
@@ -42,14 +43,15 @@ pub struct RunAssembly {
     pub conflict: Option<WidthConflict>,
 }
 
-/// Every entity in `detail`'s block except `reference` that is one straight open segment, with its
-/// layer.
-fn detail_lines(d: &Drawing, detail: Id, reference: cadcraft_doc::Handle) -> Vec<(Point2, Point2, String)> {
-    let Some(block) = d.block(&view_block_name(detail)) else { return Vec::new() };
-    block
+/// Every entity in `detail`'s block except `reference` and repeat members ([`crate::repeats`]) that
+/// is one straight open segment, with its layer.
+fn detail_lines(d: &Drawing, detail: Id, reference: cadcraft_doc::Handle) -> Result<Vec<(Point2, Point2, String)>, String> {
+    let Some(block) = d.block(&view_block_name(detail)) else { return Ok(Vec::new()) };
+    let repeated = repeat_members(d, detail)?;
+    Ok(block
         .entities
         .iter()
-        .filter(|e| e.handle != reference)
+        .filter(|e| e.handle != reference && !repeated.contains(&e.handle))
         .filter_map(|e| {
             let poly = to_polyline(e).ok()?.polyline;
             match poly.segments.as_slice() {
@@ -57,7 +59,7 @@ fn detail_lines(d: &Drawing, detail: Id, reference: cadcraft_doc::Handle) -> Vec
                 _ => None,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// One run's lines from `detail` and its width conflict, or why not.
@@ -73,7 +75,7 @@ fn run_lines(
         DetailRefKind::InteriorFace => FaceRef::Interior,
         DetailRefKind::StructuralCentre | DetailRefKind::Grid => return Err("reference kind not laid yet".into()),
     };
-    let bands = detail_bands((r.from, r.to), &detail_lines(d, detail, r.handle))?;
+    let bands = detail_bands((r.from, r.to), &detail_lines(d, detail, r.handle)?)?;
     Ok((lay_bands(run, sides, face, &bands)?, width_conflict(run, face, &bands)))
 }
 

@@ -140,6 +140,17 @@ pub struct EntityData {
     /// (`cadcraft-integration.md` §9, [`crate::detailref`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail_ref: Option<DetailRefKind>,
+    /// On a linear or aligned `Dimension` in a detail view's block: the geometry it repeats at its
+    /// pitch (`cadcraft-integration.md` §9 "Repeats", [`crate::repeats`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<RepeatTag>,
+}
+
+/// A repeat's members: the entity ids (handles) the tagged dimension repeats.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepeatTag {
+    pub members: Vec<Id>,
 }
 
 /// What a detail view's reference line stands for, which the sweep aligns to a run.
@@ -164,7 +175,7 @@ pub struct DetailTag {
 
 impl Default for EntityData {
     fn default() -> Self {
-        EntityData { role: LineRole::Bylayer, ai_origin: None, view_id: None, corners: Vec::new(), detail_tag: None, detail_ref: None }
+        EntityData { role: LineRole::Bylayer, ai_origin: None, view_id: None, corners: Vec::new(), detail_tag: None, detail_ref: None, repeat: None }
     }
 }
 

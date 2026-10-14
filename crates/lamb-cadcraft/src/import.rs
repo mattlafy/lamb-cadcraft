@@ -198,7 +198,8 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
                 }
             };
             let mut common = Common { layer, ..Common::default() };
-            let data = EntityData { role: e.role, ai_origin: e.ai_origin.clone(), view_id: None, corners, detail_tag: None, detail_ref: None };
+            let data =
+                EntityData { role: e.role, ai_origin: e.ai_origin.clone(), view_id: None, corners, detail_tag: None, detail_ref: None, repeat: None };
             let deferred = data.ai_origin.is_some();
             if !deferred {
                 set_entity_data(&mut common, &data)?;
