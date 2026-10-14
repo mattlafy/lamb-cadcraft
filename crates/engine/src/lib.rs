@@ -17,6 +17,7 @@ mod finite;
 pub mod grip_dims;
 pub mod grips;
 mod guard;
+pub mod idle_pick;
 pub mod lisp;
 pub mod mtext_edit;
 pub mod panes;
@@ -171,6 +172,9 @@ pub struct DocState {
     pub block_edit: Option<blockedit::BlockEdit>,
     /// Each tile's space (LAMB fork patch 9, [`panes`]).
     pub panes: panes::Panes,
+    /// The object an idle click picked through the adapter's hook, with the space it was picked
+    /// in (LAMB fork patch, [`idle_pick`]). Session state, never saved.
+    pub picked: Option<(Space, String)>,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -198,6 +202,7 @@ impl DocState {
             binary_dxf: false,
             block_edit: None,
             panes: Default::default(),
+            picked: None,
         }
     }
     /// The drawing has changes not saved to its file, or the Block Editor has changes not yet
@@ -882,7 +887,15 @@ impl Session {
         if let Ok(st) = self.state_mut() {
             let mut seen = std::collections::HashSet::new();
             st.selection = sel.into_iter().filter(|h| seen.insert(*h)).collect();
+            st.picked = None;
         }
+    }
+    /// The key of the object the idle-click hook picked ([`idle_pick`]), while it was picked in
+    /// the current edit space and no entity is selected.
+    pub fn picked(&self) -> Option<String> {
+        let st = self.state().ok()?;
+        let (sp, key) = st.picked.as_ref()?;
+        (*sp == self.space() && st.selection.is_empty()).then(|| key.clone())
     }
 
     /// Message on the command line history.
@@ -1737,6 +1750,9 @@ impl Session {
     pub fn idle_click(&mut self, p: Vec2, shift: bool) -> Result<()> {
         let space = self.space();
         let pickadd = self.settings.pickadd;
+        if let Ok(st) = self.state_mut() {
+            st.picked = None;
+        }
         if let Some(pw) = self.pending_window.take() {
             let crossing = p.x < pw.corner.x;
             let hs = select::select_window(self.doc()?, &space, Bounds2::new(pw.corner, p), crossing);
@@ -1764,7 +1780,20 @@ impl Session {
                 }
                 self.set_selection(sel);
             }
-            None => self.pending_window = Some(PendingWindow { corner: p, during_command: false }),
+            None => {
+                // LAMB fork: an adapter's idle-pick hook may claim an empty click ([`idle_pick`]).
+                if !shift
+                    && let Some(hook) = idle_pick::idle_pick()
+                    && let Some(key) = hook(self, p, ap)
+                {
+                    self.set_selection(vec![]);
+                    if let Ok(st) = self.state_mut() {
+                        st.picked = Some((space, key));
+                    }
+                    return Ok(());
+                }
+                self.pending_window = Some(PendingWindow { corner: p, during_command: false });
+            }
         }
         Ok(())
     }
