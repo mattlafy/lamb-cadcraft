@@ -28,6 +28,9 @@
 //! - `lambproject` (View ▸ LAMB ▸ Start Project): `Level 1` and a placed `Ground Floor` plan on
 //!   it, then edit the plan; refused ("Already a LAMB project") once the drawing has views.
 //!
+//! - `viewprops {mode, viewId, …}` (View ▸ LAMB ▸ View Properties): rename a view, a placed plan's
+//!   cut elevation, a vertical view's intent or flip — see [`crate::viewprops`].
+//!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
 //!
@@ -612,6 +615,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{fromVerticalViewId, localPoint:{x,y}, name?, cutHeightMm?}")
             .menu(MENU)
             .interactive(newviews::newplanline_machine),
+        CommandSpec::new("viewprops", "View Properties", crate::viewprops::viewprops)
+            .params("{mode: rename|cutElevation|intent|flip, viewId, name | cutElevation | intent: section|elevation | flipped}")
+            .menu(MENU)
+            .interactive(crate::viewprops::viewprops_machine),
     ]
 }
 
@@ -646,7 +653,8 @@ mod tests {
     #[test]
     fn every_spec_has_a_menu_path_and_a_factory() -> R {
         install_app()?;
-        let ids = ["newplan", "newsectionline", "newelevationline", "newsheet", "editview", "newoffsetplan", "newplanline", "link", "unlink"];
+        let ids =
+            ["newplan", "newsectionline", "newelevationline", "newsheet", "editview", "newoffsetplan", "newplanline", "link", "unlink", "viewprops"];
         for id in ids {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
             assert_eq!(c.menu, MENU, "{id}");

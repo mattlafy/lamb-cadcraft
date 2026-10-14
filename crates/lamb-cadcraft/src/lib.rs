@@ -38,6 +38,7 @@ pub mod rounding;
 pub mod scene;
 pub mod schema;
 pub mod sheets;
+mod viewprops;
 pub mod views;
 
 pub use commands::commands;
