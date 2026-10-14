@@ -8,6 +8,10 @@
 //!   `{"repeats": [...]}`. `repeat {dimension}` returns that one or `null`.
 //!   `repeat {dimension, handles: [...]}` tags (replacing that dimension's members);
 //!   `handles: []` untags. One undo step; every refusal changes nothing.
+//! - `repeat {dimension, handles, copies: [...]}` converts two drawn copies (LAMB T386): the copies
+//!   must be the members' line work shifted by the pitch (either direction, one direction for the
+//!   whole set, within `TOLERANCE.coincidence_mm`); they are erased and the dimension tagged, in
+//!   one undo step. The reply adds `"erased": [...]`.
 //! - Each repeat reads back as `{dimension, members, pitch: [x, y], pitchLength, parallel}`;
 //!   `parallel` is `null` when the detail has no reference line. A pitch not parallel to the
 //!   reference is tagged anyway and flagged ("Repeat is not parallel to the reference line").
@@ -30,6 +34,7 @@ use lamb_core::model::{AnyView, Id};
 use serde_json::{Value, json};
 
 use crate::commands::{bad, other};
+use crate::convert::to_polyline;
 use crate::detailref::{detail_reference, edited_detail};
 use crate::overlays::view_id;
 use crate::schema::{RepeatTag, read_document, read_entity_data, set_entity_data, view_block_name};
@@ -129,6 +134,53 @@ fn parse_handle(v: &Value) -> Option<Handle> {
     v.as_str().and_then(Handle::parse_hex).or_else(|| v.as_u64().map(Handle))
 }
 
+fn parse_handles(v: &Value, name: &str) -> Result<Vec<Handle>> {
+    v.as_array()
+        .ok_or_else(|| bad("repeat", &format!("`{name}` must be an array of handles")))?
+        .iter()
+        .map(|v| parse_handle(v).ok_or_else(|| bad("repeat", "each handle must be a hex handle string or a number")))
+        .collect()
+}
+
+/// Whether each member pairs one-to-one with a distinct copy whose polyline is the member's shifted
+/// by `σ·pitch`, for one `σ ∈ {+1, −1}`.
+fn pair_copies(d: &Drawing, members: &[Handle], copies: &[Handle], pitch: Point2) -> std::result::Result<(), String> {
+    const LINE_WORK: &str = "Only line work can be converted";
+    const NO_MATCH: &str = "The copies do not match the selection";
+    let poly = |h: &Handle| -> std::result::Result<lamb_core::geometry::Polyline2, String> {
+        let e = d.entity(*h).ok_or(LINE_WORK)?;
+        to_polyline(e).map(|c| c.polyline).map_err(|_| LINE_WORK.to_string())
+    };
+    let ms: Vec<_> = members.iter().map(poly).collect::<std::result::Result<_, _>>()?;
+    let cs: Vec<_> = copies.iter().map(poly).collect::<std::result::Result<_, _>>()?;
+    if ms.len() != cs.len() {
+        return Err(NO_MATCH.into());
+    }
+    let tol = TOLERANCE.coincidence_mm;
+    let near = |a: Point2, b: Point2, dx: f64, dy: f64| (a.x + dx - b.x).abs() <= tol && (a.y + dy - b.y).abs() <= tol;
+    let shifted = |m: &lamb_core::geometry::Polyline2, c: &lamb_core::geometry::Polyline2, dx: f64, dy: f64| {
+        m.closed == c.closed
+            && m.segments.len() == c.segments.len()
+            && near(m.start, c.start, dx, dy)
+            && m.segments.iter().zip(&c.segments).all(|(a, b)| near(a.to, b.to, dx, dy) && (a.bulge - b.bulge).abs() <= 1e-9)
+    };
+    for sigma in [1.0, -1.0] {
+        let (dx, dy) = (sigma * pitch.x, sigma * pitch.y);
+        let mut used = vec![false; cs.len()];
+        let all = ms.iter().all(|m| match (0..cs.len()).find(|&i| !used[i] && shifted(m, &cs[i], dx, dy)) {
+            Some(i) => {
+                used[i] = true;
+                true
+            }
+            None => false,
+        });
+        if all {
+            return Ok(());
+        }
+    }
+    Err(NO_MATCH.into())
+}
+
 /// REPEAT: read the edited detail's repeats, or tag / untag one dimension's members.
 pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
     let detail = edited_detail(s).map_err(other)?;
@@ -142,12 +194,14 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(all.iter().find(|r| r.dimension == dim).map_or(Value::Null, repeat_json))
     };
     let Some(hv) = p.get("handles").filter(|v| !v.is_null()) else { return find(s) };
-    let members: Vec<Handle> = hv
-        .as_array()
-        .ok_or_else(|| bad("repeat", "`handles` must be an array of handles"))?
-        .iter()
-        .map(|v| parse_handle(v).ok_or_else(|| bad("repeat", "each handle must be a hex handle string or a number")))
-        .collect::<Result<_>>()?;
+    let members = parse_handles(hv, "handles")?;
+    let copies = match p.get("copies").filter(|v| !v.is_null()) {
+        Some(cv) => Some(parse_handles(cv, "copies")?),
+        None => None,
+    };
+    if copies.is_some() && members.is_empty() {
+        return Err(other("Nothing to repeat"));
+    }
 
     // Every refusal before `doc_mut`, so a refusal records nothing.
     let parallel = {
@@ -181,6 +235,26 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
                     return Err(other("Already in a repeat"));
                 }
             }
+            if let Some(copies) = &copies {
+                for c in copies {
+                    if !block.entities.iter().any(|e| e.handle == *c) {
+                        return Err(not_here());
+                    }
+                    if *c == dim {
+                        return Err(other("A repeat cannot contain its own pitch dimension"));
+                    }
+                    if reference.is_some_and(|r| r.handle == *c) {
+                        return Err(other("The reference line cannot be repeated"));
+                    }
+                    if members.contains(c) {
+                        return Err(other("A copy cannot also be repeated"));
+                    }
+                    if taken.contains(c) {
+                        return Err(other("Already in a repeat"));
+                    }
+                }
+                pair_copies(d, &members, copies, pitch).map_err(other)?;
+            }
             reference.map(|r| is_parallel(pitch, r.from, r.to))
         } else {
             None
@@ -189,6 +263,9 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
 
     let tag = (!members.is_empty()).then(|| RepeatTag { members: members.iter().map(|h| Id(h.0)).collect() });
     let d = s.doc_mut()?;
+    for c in copies.iter().flatten() {
+        d.remove_entity(*c);
+    }
     let mut res = Ok(());
     d.modify_entity(dim, |e| {
         res = read_entity_data(&e.common).and_then(|mut data| {
@@ -201,7 +278,13 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
     if parallel == Some(false) {
         s.echo("Repeat is not parallel to the reference line");
     }
-    find(s)
+    let Some(copies) = copies else { return find(s) };
+    s.echo(format!("Converted {} copies into a repeat", copies.len()));
+    let mut out = find(s)?;
+    if let Value::Object(m) = &mut out {
+        m.insert("erased".into(), json!(copies.iter().map(|h| h.hex()).collect::<Vec<_>>()));
+    }
+    Ok(out)
 }
 
 /// The overlay: in a detail view's block, each repeat's members drawn once more, shifted by the
@@ -442,6 +525,90 @@ mod tests {
         assert!(!ghost_points(&s, &space)?.0.is_empty(), "retagged by undo");
         s.execute("erase", &json!({ "handles": [stud.hex()] }))?;
         assert!(ghost_points(&s, &space)?.0.is_empty(), "erased member: no ghost");
+        Ok(())
+    }
+
+    fn stud_at(s: &mut Session, x: f64, y: f64) -> T<Handle> {
+        draw(s, "pline", json!({ "vertices": [[x, y], [x + 38.0, y], [x + 38.0, y + 90.0], [x, y + 90.0]], "closed": true }))
+    }
+
+    #[test]
+    fn two_drawn_copies_convert_into_one_repeat_in_one_undo_step() -> R {
+        let Fixture { mut s, detail, stud, pitch, .. } = fixture()?;
+        let copy = stud_at(&mut s, 406.4, 0.0)?;
+        let undo = undo_len(&s)?;
+        let r = s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()], "copies": [copy.hex()] }))?;
+        assert_eq!(r["members"], json!([stud.hex()]));
+        assert_eq!(r["pitch"], json!([406.4, 0.0]));
+        assert_eq!(r["erased"], json!([copy.hex()]));
+        assert!(s.doc()?.entity(copy).is_none(), "copy erased");
+        assert_eq!(undo_len(&s)?, undo + 1);
+        assert!(s.log.iter().any(|l| l == "Converted 1 copies into a repeat"), "{:?}", s.log);
+        assert_eq!(detail_repeats(s.doc()?, detail)?.iter().map(|r| r.members.clone()).collect::<Vec<_>>(), [vec![stud]]);
+        s.undo()?;
+        assert!(s.doc()?.entity(copy).is_some(), "undo restores the copy");
+        assert!(detail_repeats(s.doc()?, detail)?.is_empty(), "undo untags");
+        Ok(())
+    }
+
+    #[test]
+    fn a_copy_on_the_negative_side_converts_too() -> R {
+        let Fixture { mut s, detail, stud, pitch, .. } = fixture()?;
+        let copy = stud_at(&mut s, -406.4, 0.0)?;
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()], "copies": [copy.hex()] }))?;
+        assert!(s.doc()?.entity(copy).is_none());
+        assert_eq!(detail_repeats(s.doc()?, detail)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn copies_that_do_not_match_refuse_with_the_drawing_unchanged() -> R {
+        let Fixture { mut s, detail, reference, stud, edge, pitch, .. } = fixture()?;
+        let off = stud_at(&mut s, 407.4, 0.0)?;
+        let other_shape = draw(&mut s, "pline", json!({ "vertices": [[406.4, 0], [446.4, 0], [446.4, 90], [406.4, 90]], "closed": true }))?;
+        let good = stud_at(&mut s, 406.4, 0.0)?;
+        let text = draw(&mut s, "text", json!({ "at": [500, 500], "text": "abc" }))?;
+        let undo = undo_len(&s)?;
+        let cases: [(Vec<Handle>, Vec<Handle>, &str); 6] = [
+            (vec![stud], vec![off], "The copies do not match the selection"),
+            (vec![stud], vec![other_shape], "The copies do not match the selection"),
+            (vec![stud], vec![good, edge], "The copies do not match the selection"),
+            (vec![stud], vec![reference], "The reference line cannot be repeated"),
+            (vec![stud], vec![text], "Only line work can be converted"),
+            (vec![], vec![good], "Nothing to repeat"),
+        ];
+        for (members, copies, want) in cases {
+            let hex = |v: &[Handle]| v.iter().map(|h| h.hex()).collect::<Vec<_>>();
+            let e = s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": hex(&members), "copies": hex(&copies) })).err().ok_or(want)?;
+            assert!(e.to_string().contains(want), "{e} / {want}");
+            assert_eq!(undo_len(&s)?, undo, "{want}: no undo step");
+            assert!(detail_repeats(s.doc()?, detail)?.is_empty(), "{want}: untagged");
+            for h in copies {
+                assert!(s.doc()?.entity(h).is_some(), "{want}: copy kept");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_converted_repeat_is_laid_exactly_as_one_tagged_by_hand() -> R {
+        let laid = |convert: bool| -> T<Vec<crate::assembly::RunAssembly>> {
+            let (mut s, plan) = crate::assembly::tests::room_with("exterior_face", true, 200.0)?;
+            let detail = read_document(s.doc()?)?.views.iter().find(|v| v.name() == "D1").ok_or("no D1")?.id();
+            s.execute("editview", &json!({ "viewId": detail.0 }))?;
+            let stud = stud_at(&mut s, 0.0, 50.0)?;
+            let pitch = draw(&mut s, "dimaligned", json!({ "p1": [0, 0], "p2": [406.4, 0], "at": [200, -300] }))?;
+            let mut p = json!({ "dimension": pitch.hex(), "handles": [stud.hex()] });
+            if convert {
+                let copy = stud_at(&mut s, 406.4, 50.0)?;
+                p["copies"] = json!([copy.hex()]);
+            }
+            s.execute("repeat", &p)?;
+            Ok(crate::assembly::assembly_lines(s.doc()?, plan)?)
+        };
+        let (by_hand, converted) = (laid(false)?, laid(true)?);
+        assert!(by_hand.iter().any(|r| r.lines.len() > r.bands), "the repeat lays copies");
+        assert_eq!(converted, by_hand);
         Ok(())
     }
 }
