@@ -17,6 +17,7 @@ use lamb_core::model::Id;
 use crate::project::DrawingProject;
 use crate::schema::view_block_name;
 
+pub(crate) mod halo;
 pub(crate) mod underlay;
 
 /// Marker radius as a fraction of the visible height: `view_height / MARKER_VIEW_FRACTION`.
@@ -76,10 +77,12 @@ fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kind, pts: &[V
     list.prims.push(DPrim { handle, color, aci7: false, lw: 0.0, transparency: 0, kind, start, len: pts.len() as u32 });
 }
 
-/// The overlay provider: the edited view's underlay ([`underlay`], drawn first, pale), then its
-/// markers and cut lines, in its block's coordinates.
+/// The overlay provider: the edited view's underlay ([`underlay`], drawn first, pale), its halos
+/// ([`halo`]: RESOLVE's attention, unaccepted AI lines' glow), then its markers and cut lines, in
+/// its block's coordinates.
 pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let mut list = underlay::draw(d, space, opts);
+    append_list(&mut list, halo::draw(d, space, opts));
     let Some((dp, id)) = view_of(d, space) else { return list };
     let Ok(markers) = compute_markers_for_view(&dp, id) else { return list };
     let Ok(cuts) = compute_cut_lines_for_view(&dp, id) else { return list };
@@ -115,6 +118,18 @@ pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
         push(&mut list, Handle(c.source_view_id.0), CUT_LINE_COLOR, Kind::Infinite { ray: false }, &[base, Vec2::new(1.0, 0.0)]);
     }
     list
+}
+
+/// Append `more` to `list`, rebasing its prims onto `list`'s buffers.
+fn append_list(list: &mut DisplayList, more: DisplayList) {
+    let (v0, t0) = (list.verts.len() as u32, list.tris.len() as u32);
+    for p in &more.prims {
+        let base = if matches!(p.kind, Kind::Tris | Kind::Mask) { t0 } else { v0 };
+        list.prims.push(DPrim { start: p.start + base, ..*p });
+    }
+    list.verts.extend_from_slice(&more.verts);
+    list.tris.extend_from_slice(&more.tris);
+    list.bounds = list.bounds.union(&more.bounds);
 }
 
 /// The snap provider: every marker centre of the edited view within `aperture` of the cursor,

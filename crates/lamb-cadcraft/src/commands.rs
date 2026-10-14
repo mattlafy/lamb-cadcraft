@@ -27,6 +27,8 @@
 //! - `underlay {viewId?}` (View ▸ LAMB ▸ Underlay): another placed view of the edited view's kind
 //!   drawn pale and snappable under it; the current one again, or none, turns it off — see
 //!   [`crate::overlays::underlay`].
+//! - `resolve {}` (`res`, View ▸ LAMB ▸ Resolve): the project's issues; interactively, step through
+//!   them, each one's view edited, centred and haloed — see [`crate::resolvecmd`].
 //!
 //! - `lambproject` (View ▸ LAMB ▸ Start Project): `Level 1` and a placed `Ground Floor` plan on
 //!   it, then edit the plan; refused ("Already a LAMB project") once the drawing has views.
@@ -643,6 +645,12 @@ pub fn commands() -> Vec<CommandSpec> {
             .noundo()
             .menu(MENU)
             .interactive(crate::overlays::underlay::underlay_machine),
+        CommandSpec::new("resolve", "Resolve", crate::resolvecmd::resolve)
+            .alias(&["res"])
+            .params("{}")
+            .noundo()
+            .menu(MENU)
+            .interactive(crate::resolvecmd::resolve_machine),
         CommandSpec::new("newoffsetplan", "New Offset Plan", newviews::newoffsetplan)
             .alias(&["np"])
             .params("{mode: \"offset\"|\"height\", fromViewId, floorToFloorMm | floorElevationMm, name?, cutHeightMm?}")

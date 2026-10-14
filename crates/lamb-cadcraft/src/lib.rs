@@ -35,6 +35,7 @@ pub mod overlays;
 pub mod panes;
 pub mod project;
 mod refpane;
+mod resolvecmd;
 pub mod rounding;
 pub mod scene;
 pub mod schema;
