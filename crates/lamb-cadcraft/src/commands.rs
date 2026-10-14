@@ -5,8 +5,10 @@
 //! - `newsectionline` / `newelevationline {name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}` (`nsl`,
 //!   `nel`): a vertical view placed on a straight cut line in the host view.
 //! - `editview {viewId?}`: edit inside the view's block; no `viewId` returns to Model.
-//! - `newsheet {name, viewIds?}` (`nsh`): a paper layout with one viewport per view (default every
-//!   view), each freezing every other view's layer; returns `{layout, viewports: [hex handles]}`.
+//! - `newsheet {name, viewIds?, assemblyIds?}` (`nsh`): a paper layout with one viewport per view
+//!   (default every view, when neither list is given), then one per plan in `assemblyIds` showing
+//!   its assembly plan; each freezes every other view's layer and every other assembly layer;
+//!   returns `{layout, viewports: [hex handles]}`.
 //!
 //! - `link {a:{entityId, segmentIndex, segmentParam}, b:{…}}` (`lk`): an explicit link between two
 //!   segments in different views (the escape hatch from the same-layer auto-link rule); `entityId`
@@ -214,14 +216,18 @@ fn lambproject(s: &mut Session, _p: &Value) -> Result<Value> {
 
 fn newsheet(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_param("newsheet", p, "name")?.to_owned();
-    let ids = match p.get("viewIds").filter(|v| !v.is_null()) {
-        None => Vec::new(),
+    let ids = |key: &str| match p.get(key).filter(|v| !v.is_null()) {
+        None => Ok(Vec::new()),
         Some(v) => {
-            let arr = v.as_array().ok_or_else(|| bad("newsheet", "`viewIds` must be an array"))?;
-            arr.iter().map(|x| id_value(x).ok_or_else(|| other("No such view"))).collect::<Result<Vec<Id>>>()?
+            let arr = v.as_array().ok_or_else(|| bad("newsheet", &format!("`{key}` must be an array")))?;
+            arr.iter().map(|x| id_value(x).ok_or_else(|| other("No such view"))).collect::<Result<Vec<Id>>>()
         }
     };
-    let handles = create_sheet(s.doc_mut()?, &name, &ids).map_err(other)?;
+    let (views, assemblies) = (ids("viewIds")?, ids("assemblyIds")?);
+    // Build on a copy: touching the drawing on a refusal would still record an undo step.
+    let mut d = s.doc()?.clone();
+    let handles = create_sheet(&mut d, &name, &views, &assemblies).map_err(other)?;
+    *s.doc_mut()? = d;
     let hex: Vec<String> = handles.iter().map(|h| format!("{:X}", h.0)).collect();
     Ok(json!({ "layout": name, "viewports": hex }))
 }
@@ -687,7 +693,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}")
             .menu(MENU)
             .interactive(newelevationline_machine),
-        CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?}").menu(MENU).interactive(newsheet_machine),
+        CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?, assemblyIds?}").menu(MENU).interactive(newsheet_machine),
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU).interactive(editview_machine),
         // The typed/menu forms are outside undo; each link or unlink they make is its own step,
         // recorded by the `.apply` spec they run through (see `crate::linkcmds`).

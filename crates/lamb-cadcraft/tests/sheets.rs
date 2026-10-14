@@ -136,7 +136,7 @@ fn newsheet_one_viewport_per_view() -> R {
     assert!(e.to_string().contains("No such view"), "{e}");
     assert_eq!(s.doc()?, &before);
     let mut d = before.clone();
-    assert!(create_sheet(&mut d, "S3", &[Id(424_242)]).is_err());
+    assert!(create_sheet(&mut d, "S3", &[Id(424_242)], &[]).is_err());
     assert_eq!(d, before);
 
     // DXF keeps the layout, both viewports, their frozen layers and view ids.

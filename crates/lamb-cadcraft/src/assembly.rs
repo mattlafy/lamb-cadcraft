@@ -18,9 +18,9 @@
 
 use std::sync::Arc;
 
-use cadcraft_doc::{Block, Common, Drawing, EntityKind, Line, Space};
+use cadcraft_doc::{Block, Common, Drawing, Entity, EntityKind, Insert, Line, Space};
 use cadcraft_engine::{Result as EngineResult, Session};
-use cadcraft_geom::Vec2;
+use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
     AssemblyLine, FaceRef, WidthConflict, detail_bands, detail_frame, junction_bisector, lay_bands, lay_repeat, mitre_end, width_conflict,
 };
@@ -196,12 +196,38 @@ fn replace_block(d: &mut Drawing, plan: Id, runs: &[RunAssembly]) -> Result<(), 
     Ok(())
 }
 
+/// The block's canonical model-space INSERT (like a view's, `views::create_view`): on its own
+/// layer named after the block, at the origin, scale 1. Added only when model space has no INSERT
+/// of the block; identity is the block name, no handle is stored.
+fn ensure_assembly_insert(d: &mut Drawing, plan: Id) {
+    let name = assembly_block_name(plan);
+    if d.model.iter().any(|e| matches!(&e.kind, EntityKind::Insert(i) if i.block == name)) {
+        return;
+    }
+    d.ensure_layer(&name);
+    let insert = Insert {
+        block: name.clone(),
+        insert: Vec3::ZERO,
+        scale: Vec3::new(1.0, 1.0, 1.0),
+        rotation: 0.0,
+        attribs: Vec::new(),
+        cols: 1,
+        rows: 1,
+        col_spacing: 0.0,
+        row_spacing: 0.0,
+    };
+    let handle = d.new_handle();
+    d.model.push(Entity { handle, common: Common { layer: name, ..Common::default() }, kind: EntityKind::Insert(insert) });
+}
+
 /// Replaces the block [`assembly_block_name`]`(plan)` with one LINE per laid assembly line (an
-/// empty block when every run is skipped). `plan` must be a plan view; nothing is touched on error.
+/// empty block when every run is skipped), and gives it its model-space INSERT on its own layer
+/// when it has none. `plan` must be a plan view; nothing is touched on error.
 pub fn write_assembly_block(d: &mut Drawing, plan: Id) -> Result<Vec<RunAssembly>, String> {
     check_plan(d, plan)?;
     let runs = assembly_lines(d, plan)?;
     replace_block(d, plan, &runs)?;
+    ensure_assembly_insert(d, plan);
     Ok(runs)
 }
 
@@ -589,6 +615,60 @@ pub(crate) mod tests {
         s.execute("erase", &json!({ "handles": tags }))?;
         assert!(assembly_lines(s.doc()?, plan)?.iter().all(|r| r.skipped.as_deref() == Some("untyped")));
         assert_eq!(block_lines(&s, &name)?, Some(Vec::new()));
+        Ok(())
+    }
+
+    /// Model-space INSERTs of `block`: (handle, layer).
+    pub(crate) fn model_inserts(d: &Drawing, block: &str) -> Vec<(Handle, String)> {
+        d.model.iter().filter(|e| matches!(&e.kind, EntityKind::Insert(i) if i.block == block)).map(|e| (e.handle, e.common.layer.clone())).collect()
+    }
+
+    #[test]
+    fn assemblyplan_gives_the_block_one_model_space_insert_on_its_own_layer() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        crate::maintain::install(&mut s);
+        let name = assembly_block_name(plan);
+        let n = undo_len(&s)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let ins = model_inserts(s.doc()?, &name);
+        assert_eq!(ins.len(), 1, "{ins:?}");
+        assert_eq!(ins[0].1, name);
+        assert!(s.doc()?.layers.iter().any(|l| l.name == name));
+        let EntityKind::Insert(i) = &s.doc()?.model.iter().find(|e| e.handle == ins[0].0).ok_or("gone")?.kind else {
+            return Err("not an insert".into());
+        };
+        assert_eq!((i.insert, i.scale, i.rotation, i.cols, i.rows), (Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0), 0.0, 1, 1));
+
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(model_inserts(s.doc()?, &name).len(), 1, "a second ASSEMBLYPLAN keeps one");
+        let detail = detail_id(&s)?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.current", &json!({ "name": "GYP" }))?;
+        line(&mut s, [0.0, 100.0], [1000.0, 100.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(block_lines(&s, &name)?.map(|v| v.len()), Some(16), "observer regenerated");
+        assert_eq!(model_inserts(s.doc()?, &name), ins, "the observer keeps the same insert");
+
+        // DXF keeps the insert and its layer.
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes())?;
+        let kept = model_inserts(&back, &name);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].1, name);
+        assert!(back.block(&name).is_some());
+
+        s.execute("erase", &json!({ "handles": [ins[0].0.hex()] }))?;
+        assert!(model_inserts(s.doc()?, &name).is_empty());
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(model_inserts(s.doc()?, &name).len(), 1, "erased insert restored");
+
+        while undo_len(&s)? > n + 1 {
+            s.undo()?;
+        }
+        assert_eq!(model_inserts(s.doc()?, &name).len(), 1);
+        s.undo()?;
+        let d = s.doc()?;
+        assert!(d.block(&name).is_none() && model_inserts(d, &name).is_empty(), "one undo removes block and insert");
+        assert!(!d.layers.iter().any(|l| l.name == name), "and the layer");
         Ok(())
     }
 

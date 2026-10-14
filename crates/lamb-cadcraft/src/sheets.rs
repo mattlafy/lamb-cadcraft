@@ -3,6 +3,11 @@
 //! whole canonical inserts there, while model space keeps showing all views overlaid. The
 //! viewport records which view it shows in its `EntityData.view_id`.
 //!
+//! A plan's assembly plan (§10, [`crate::assembly`]) is a canonical model-space insert on its own
+//! layer [`assembly_block_name`]`(plan)`. Every viewport freezes every assembly layer except its
+//! own; an assembly viewport (requested by plan id) shows only that plan's assembly block, is laid
+//! after the views, and has no `view_id`.
+//!
 //! Arrangement: a grid over the layout's printable area (columns = ceil(sqrt(n)), filled row by
 //! row from the top left in the given order), each viewport its cell shrunk by 5 % on every side
 //! and zoomed to its own view block's extents. No shared plot scale yet.
@@ -13,7 +18,9 @@ use cadcraft_doc::{Common, Drawing, EntityKind, Handle, Layout, PageSetup, Space
 use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use lamb_core::model::Id;
 
-use crate::schema::{EntityData, SchemaError, read_document, set_entity_data, view_block_name};
+use lamb_core::model::AnyView;
+
+use crate::schema::{EntityData, SchemaError, assembly_block_name, read_document, set_entity_data, view_block_name};
 
 /// Why a sheet could not be created.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +33,8 @@ pub enum SheetError {
     NoSuchView(Id),
     /// There are no views to lay out.
     NoViews,
+    /// A requested plan has no assembly block yet.
+    NoAssembly(Id),
 }
 
 impl fmt::Display for SheetError {
@@ -35,6 +44,7 @@ impl fmt::Display for SheetError {
             SheetError::LayoutExists(n) => write!(f, "Layout {n} already exists"),
             SheetError::NoSuchView(id) => write!(f, "No such view {}", id.0),
             SheetError::NoViews => f.write_str("No views to place on a sheet"),
+            SheetError::NoAssembly(id) => write!(f, "Plan {} has no assembly plan — run ASSEMBLYPLAN", id.0),
         }
     }
 }
@@ -47,11 +57,14 @@ impl From<SchemaError> for SheetError {
     }
 }
 
+/// Every assembly block's (and its layer's) name starts with this ([`assembly_block_name`]).
+const ASSEMBLY_PREFIX: &str = "LAMB_ASSEMBLY_";
+
 /// Model height shown by a viewport onto an empty view.
 const EMPTY_VIEW_HEIGHT: f64 = 10_000.0;
 
-fn zoom(d: &Drawing, view: Id, vp_width: f64, vp_height: f64) -> (Vec2, f64) {
-    let ext = d.extents(&Space::Block(view_block_name(view)));
+fn zoom(d: &Drawing, block: &str, vp_width: f64, vp_height: f64) -> (Vec2, f64) {
+    let ext = d.extents(&Space::Block(block.to_owned()));
     if ext.is_empty() {
         return (Vec2::new(0.0, 0.0), EMPTY_VIEW_HEIGHT);
     }
@@ -59,26 +72,41 @@ fn zoom(d: &Drawing, view: Id, vp_width: f64, vp_height: f64) -> (Vec2, f64) {
     (ext.center(), if h.is_finite() && h > 0.0 { h } else { EMPTY_VIEW_HEIGHT })
 }
 
-/// Creates layout `name` with one viewport per view in `views` (every view in document order
-/// when empty), each freezing every other LAMB view's layer. Returns the viewports' handles in
-/// the given order. Nothing is changed on error.
-pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id]) -> Result<Vec<Handle>, SheetError> {
+/// Creates layout `name` with one viewport per view in `views`, then one per plan in `assemblies`
+/// showing that plan's assembly block (every view in document order when both are empty). Each
+/// viewport freezes every other LAMB view's layer and every assembly layer but its own. Returns
+/// the viewports' handles in that order. Nothing is changed on error.
+pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]) -> Result<Vec<Handle>, SheetError> {
     let doc = read_document(d)?;
     if d.layout(name).is_some() {
         return Err(SheetError::LayoutExists(name.to_owned()));
     }
     let all: Vec<Id> = doc.views.iter().map(|v| v.id()).collect();
-    let chosen: Vec<Id> = if views.is_empty() { all.clone() } else { views.to_vec() };
-    if chosen.is_empty() {
+    let chosen: Vec<Id> = if views.is_empty() && assemblies.is_empty() { all.clone() } else { views.to_vec() };
+    if chosen.is_empty() && assemblies.is_empty() {
         return Err(SheetError::NoViews);
     }
     if let Some(bad) = chosen.iter().find(|v| !all.contains(v)) {
         return Err(SheetError::NoSuchView(*bad));
     }
-    // Every viewport's EntityData, built before anything changes.
-    let data: Vec<EntityData> = chosen.iter().map(|v| EntityData { view_id: Some(*v), ..EntityData::default() }).collect();
-    let mut commons = Vec::with_capacity(chosen.len());
-    for dt in &data {
+    for plan in assemblies {
+        if !doc.views.iter().any(|v| v.id() == *plan && matches!(v, AnyView::Plan(_))) {
+            return Err(SheetError::NoSuchView(*plan));
+        }
+        if d.block(&assembly_block_name(*plan)).is_none() {
+            return Err(SheetError::NoAssembly(*plan));
+        }
+    }
+    let view_layers: Vec<String> = all.iter().map(|v| view_block_name(*v)).collect();
+    let assembly_layers: Vec<String> = d.layers.iter().map(|l| l.name.clone()).filter(|n| n.starts_with(ASSEMBLY_PREFIX)).collect();
+    // (block shown, EntityData) per viewport, built before anything changes.
+    let slots: Vec<(String, EntityData)> = chosen
+        .iter()
+        .map(|v| (view_block_name(*v), EntityData { view_id: Some(*v), ..EntityData::default() }))
+        .chain(assemblies.iter().map(|p| (assembly_block_name(*p), EntityData::default())))
+        .collect();
+    let mut commons = Vec::with_capacity(slots.len());
+    for (_, dt) in &slots {
         let mut c = Common::default();
         set_entity_data(&mut c, dt)?;
         commons.push(c);
@@ -104,18 +132,18 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id]) -> Result<Vec<Han
         }
     };
 
-    let n = chosen.len();
+    let n = slots.len();
     let cols = (n as f64).sqrt().ceil().max(1.0) as usize;
     let rows = n.div_ceil(cols);
     let cell = Vec2::new(area.width() / cols as f64, area.height() / rows as f64);
     let (w, h) = (cell.x * 0.9, cell.y * 0.9);
     let space = Space::Paper(name.to_owned());
     let mut handles = Vec::with_capacity(n);
-    for (i, (view, common)) in chosen.iter().zip(commons).enumerate() {
+    for (i, ((block, _), common)) in slots.iter().zip(commons).enumerate() {
         let (r, c) = (i / cols, i % cols);
         let center = Vec3::new(area.min.x + cell.x * (c as f64 + 0.5), area.max.y - cell.y * (r as f64 + 0.5), 0.0);
-        let (view_center, view_height) = zoom(d, *view, w, h);
-        let mut frozen_layers: Vec<String> = all.iter().filter(|v| *v != view).map(|v| view_block_name(*v)).collect();
+        let (view_center, view_height) = zoom(d, block, w, h);
+        let mut frozen_layers: Vec<String> = view_layers.iter().chain(&assembly_layers).filter(|l| *l != block).cloned().collect();
         frozen_layers.sort();
         let vp = Viewport { center, width: w, height: h, view_center, view_height, id: next_id + i as u32, frozen_layers, ..Viewport::default() };
         match d.add(&space, common, EntityKind::Viewport(vp)) {
@@ -127,4 +155,74 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id]) -> Result<Vec<Han
         }
     }
     Ok(handles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assembly::tests::{room_with, undo_len};
+    use crate::schema::read_entity_data;
+    use cadcraft_engine::Session;
+    use serde_json::json;
+
+    type R = std::result::Result<(), Box<dyn std::error::Error>>;
+    type T<X> = std::result::Result<X, Box<dyn std::error::Error>>;
+
+    /// (viewport, its `view_id`) for every viewport in layout `name`.
+    fn viewports(d: &Drawing, name: &str) -> T<Vec<(Viewport, Option<Id>)>> {
+        let l = d.layout(name).ok_or_else(|| format!("no layout {name}"))?;
+        let mut out = Vec::new();
+        for e in l.entities.iter() {
+            if let EntityKind::Viewport(vp) = &e.kind {
+                out.push((vp.clone(), read_entity_data(&e.common)?.view_id));
+            }
+        }
+        Ok(out)
+    }
+
+    fn views(s: &Session) -> T<Vec<(Id, bool)>> {
+        Ok(read_document(s.doc()?)?.views.iter().map(|v| (v.id(), matches!(v, AnyView::Plan(_)))).collect())
+    }
+
+    #[test]
+    fn sheets_freeze_assembly_layers_and_lay_out_a_plans_assembly() -> R {
+        let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
+        let vs = views(&s)?;
+        let detail = vs.iter().find(|v| !v.1).ok_or("no detail")?.0;
+        let name = assembly_block_name(plan);
+
+        // Refusals before ASSEMBLYPLAN, and for a detail id: nothing changes.
+        let (layouts, n) = (s.doc()?.layouts.len(), undo_len(&s)?);
+        let e = s.execute("newsheet", &json!({ "name": "S0", "assemblyIds": [plan.0] })).err().ok_or("no assembly accepted")?;
+        assert!(e.to_string().contains("has no assembly plan"), "{e}");
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let (layouts, n) = (layouts, n + 1);
+        let e = s.execute("newsheet", &json!({ "name": "S0", "assemblyIds": [detail.0] })).err().ok_or("detail accepted")?;
+        assert!(e.to_string().contains("No such view"), "{e}");
+        assert_eq!((s.doc()?.layouts.len(), undo_len(&s)?), (layouts, n));
+
+        s.execute("newsheet", &json!({ "name": "S1" }))?;
+        let vps = viewports(s.doc()?, "S1")?;
+        assert_eq!(vps.len(), vs.len());
+        assert!(vps.iter().all(|(vp, v)| v.is_some() && vp.frozen_layers.contains(&name)), "{vps:?}");
+
+        let out = s.execute("newsheet", &json!({ "name": "S2", "assemblyIds": [plan.0] }))?;
+        assert_eq!(out["viewports"].as_array().map(Vec::len), Some(1), "{out}");
+        let check = |d: &Drawing| -> R {
+            let vps = viewports(d, "S2")?;
+            assert_eq!(vps.len(), 1);
+            let (vp, v) = &vps[0];
+            assert_eq!(*v, None, "not a view");
+            let mut want: Vec<String> = vs.iter().map(|v| view_block_name(v.0)).collect();
+            want.sort();
+            assert_eq!(vp.frozen_layers, want);
+            let c = d.extents(&Space::Block(name.clone())).center();
+            assert!((vp.view_center.x - c.x).abs() < 1e-6 && (vp.view_center.y - c.y).abs() < 1e-6, "{:?} vs {c:?}", vp.view_center);
+            Ok(())
+        };
+        check(s.doc()?)?;
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes())?;
+        check(&back)?;
+        Ok(())
+    }
 }
