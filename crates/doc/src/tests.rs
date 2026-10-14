@@ -145,6 +145,45 @@ fn transform_arc_mirror_keeps_shape() {
 }
 
 #[test]
+fn rotating_a_gradient_hatch_turns_its_gradient() {
+    use std::f64::consts::FRAC_PI_4;
+    let hatch = |gradient: Option<Gradient>| {
+        EntityKind::Hatch(Hatch {
+            pattern: "SOLID".into(),
+            solid: true,
+            loops: vec![HatchLoop {
+                vertices: vec![PolyVertex::new(Vec2::new(0.0, 0.0)), PolyVertex::new(Vec2::new(2.0, 0.0)), PolyVertex::new(Vec2::new(2.0, 1.0))],
+                outer: true,
+                sources: vec![],
+            }],
+            scale: 1.0,
+            angle: FRAC_PI_4,
+            associative: false,
+            style: 0,
+            elevation: 0.0,
+            gradient,
+            origin: Vec2::ZERO,
+            background: None,
+            pattern_lines: vec![],
+        })
+    };
+    let gradient =
+        Gradient { name: "LINEAR".into(), color1: color::Color::Index(1), color2: color::Color::Index(5), angle: FRAC_PI_4, centered: false };
+    let mut k = hatch(Some(gradient));
+    k.transform(&Mat3::rotate(2.0 * FRAC_PI_4));
+    let EntityKind::Hatch(h) = k else { panic!() };
+    assert!((h.angle - 3.0 * FRAC_PI_4).abs() < 1e-9);
+    assert!((h.gradient.unwrap().angle - 3.0 * FRAC_PI_4).abs() < 1e-9);
+
+    let mut k = hatch(None);
+    k.transform(&Mat3::rotate(2.0 * FRAC_PI_4));
+    let EntityKind::Hatch(h) = k else { panic!() };
+    assert!((h.angle - 3.0 * FRAC_PI_4).abs() < 1e-9);
+    assert!(h.gradient.is_none());
+    assert!(h.loops[0].vertices[1].p.near(Vec2::new(0.0, 2.0), 1e-9));
+}
+
+#[test]
 fn insert_bounds_with_cyclic_block_terminate() {
     let mut d = Drawing::new_imperial();
     let mut b = Block::new("A");
