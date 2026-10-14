@@ -1,7 +1,8 @@
 //! Assembly lines (LAMB's `docs/07-architecture/cadcraft-integration.md` §10 "Generation", steps 1,
-//! 2 and 4, straight runs only; LAMB T369): a detail view's **continuous bands** — its straight
-//! lines parallel to the reference line — laid along a wall run, aligned on the run's matching
-//! face — and each **repeat** (LAMB T380) arrayed at its pitch along the run ([`lay_repeat`]).
+//! 2 and 4; LAMB T369): a detail view's **continuous bands** — its straight lines parallel to the
+//! reference line — laid along a wall run, aligned on the run's matching face (concentric arcs on
+//! an arc run, LAMB T389) — and each **repeat** (LAMB T380) arrayed at its pitch along a straight
+//! run ([`lay_repeat`]; arc runs are an error).
 //! Junctions are not trimmed by default; for a plan that opts into mitring (§10 step 3, LAMB T385)
 //! the adapter moves band ends at undetailed two-arm junctions onto [`junction_bisector`] with
 //! [`mitre_end`]. Computed on demand.
@@ -29,12 +30,22 @@ pub enum FaceRef {
     Interior,
 }
 
-/// One laid band: a straight line in the plan view's local space.
+/// One laid band: a straight line in the plan view's local space, or — with `arc` — an arc from
+/// `from` to `to` about `arc.center`, travelling counter-clockwise when `arc.ccw`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssemblyLine {
     pub from: Point2,
     pub to: Point2,
     pub layer: String,
+    pub arc: Option<ArcSpan>,
+}
+
+/// The circle an arc [`AssemblyLine`] lies on, and its travel direction from `from` to `to`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArcSpan {
+    pub center: Point2,
+    pub radius: f64,
+    pub ccw: bool,
 }
 
 /// A detail's own frame: `origin` is the reference line's `from`, `along` its unit direction and
@@ -128,14 +139,20 @@ impl FaceFrame {
     }
 }
 
-fn face_frame(run: &WallRun, sides: &RunSides, face: FaceRef) -> Result<FaceFrame, String> {
-    let RunCurve::Line { from, to } = run.centreline else { return Err("arc runs are not laid yet".into()) };
+/// Whether the `face` side of a run is the left of its centreline's travel: the `Outside` side for
+/// `Exterior`, the other for `Interior`. Errors unless exactly one side is `Outside`.
+fn face_on_left(sides: &RunSides, face: FaceRef) -> Result<bool, String> {
     let outside_left = match (sides.left, sides.right) {
         (SideKind::Outside, SideKind::Space(_)) => true,
         (SideKind::Space(_), SideKind::Outside) => false,
         _ => return Err("no single exterior side".into()),
     };
-    let toward_left = outside_left == (face == FaceRef::Exterior);
+    Ok(outside_left == (face == FaceRef::Exterior))
+}
+
+fn face_frame(run: &WallRun, sides: &RunSides, face: FaceRef) -> Result<FaceFrame, String> {
+    let RunCurve::Line { from, to } = run.centreline else { return Err("arc runs are not laid yet".into()) };
+    let toward_left = face_on_left(sides, face)?;
     let (dx, dy) = (to.x - from.x, to.y - from.y);
     let len = dx.hypot(dy);
     if len <= TOLERANCE.coincidence_mm {
@@ -145,17 +162,40 @@ fn face_frame(run: &WallRun, sides: &RunSides, face: FaceRef) -> Result<FaceFram
     Ok(FaceFrame { from, to, dir: Point2 { x: dx / len, y: dy / len }, len, normal: Point2 { x: -dy / len * s, y: dx / len * s } })
 }
 
-/// `bands` laid along a straight `run`: the face line is the centreline offset `width / 2` toward
-/// the `face` side, each band that face line shifted `offset` back toward the centreline, over the
-/// centreline's extent.
+/// `bands` laid along a `run`: the face line is the centreline offset `width / 2` toward the `face`
+/// side, each band that face line shifted `offset` back toward the centreline, over the
+/// centreline's extent. On an arc run each band is a concentric arc over the same angles; the left
+/// of its travel is toward the centre when `sweep > 0`. A band radius not above
+/// `TOLERANCE.coincidence_mm` is an error.
 pub fn lay_bands(run: &WallRun, sides: &RunSides, face: FaceRef, bands: &[Band]) -> Result<Vec<AssemblyLine>, String> {
+    if let RunCurve::Arc { center, radius, start_angle, sweep } = run.centreline {
+        let toward_left = face_on_left(sides, face)?;
+        // +1 when the face side is away from the centre.
+        let outward = if toward_left == (sweep > 0.0) { -1.0 } else { 1.0 };
+        let at = |r: f64, a: f64| Point2 { x: center.x + r * a.cos(), y: center.y + r * a.sin() };
+        return bands
+            .iter()
+            .map(|b| {
+                let r = radius + outward * (run.width / 2.0 - b.offset);
+                if r <= TOLERANCE.coincidence_mm {
+                    return Err("band radius is not positive".to_string());
+                }
+                Ok(AssemblyLine {
+                    from: at(r, start_angle),
+                    to: at(r, start_angle + sweep),
+                    layer: b.layer.clone(),
+                    arc: Some(ArcSpan { center, radius: r, ccw: sweep > 0.0 }),
+                })
+            })
+            .collect();
+    }
     let f = face_frame(run, sides, face)?;
     Ok(bands
         .iter()
         .map(|b| {
             let d = run.width / 2.0 - b.offset;
             let shift = |p: Point2| Point2 { x: p.x + f.normal.x * d, y: p.y + f.normal.y * d };
-            AssemblyLine { from: shift(f.from), to: shift(f.to), layer: b.layer.clone() }
+            AssemblyLine { from: shift(f.from), to: shift(f.to), layer: b.layer.clone(), arc: None }
         })
         .collect())
 }
@@ -188,7 +228,7 @@ pub fn lay_repeat(
     for k in kmin..=kmax {
         let s = k as f64 * p;
         for ((ta, oa), (tb, ob), layer) in &local {
-            out.push(AssemblyLine { from: f.place(run.width, ta + s, *oa), to: f.place(run.width, tb + s, *ob), layer: (*layer).clone() });
+            out.push(AssemblyLine { from: f.place(run.width, ta + s, *oa), to: f.place(run.width, tb + s, *ob), layer: (*layer).clone(), arc: None });
         }
     }
     Ok(out)
@@ -254,8 +294,12 @@ pub fn junction_bisector(j: &Junction) -> Option<Point2> {
 }
 
 /// Moves `line`'s `end` (`Start` → `from`, `End` → `to`) to where the line's infinite extension
-/// crosses the line through `point` along `bisector`; a line parallel to `bisector` is unchanged.
+/// crosses the line through `point` along `bisector`; a line parallel to `bisector`, or an arc, is
+/// unchanged.
 pub fn mitre_end(line: &mut AssemblyLine, end: RunEnd, point: Point2, bisector: Point2) {
+    if line.arc.is_some() {
+        return;
+    }
     let (dx, dy) = (line.to.x - line.from.x, line.to.y - line.from.y);
     let denom = dx * bisector.y - dy * bisector.x;
     let len = dx.hypot(dy) * bisector.x.hypot(bisector.y);
@@ -346,16 +390,67 @@ mod tests {
     }
 
     #[test]
-    fn arc_runs_and_ambiguous_sides_are_errors() {
+    fn ambiguous_sides_are_errors() {
         let bands = [Band { offset: 0.0, layer: "A".into() }];
-        let mut r = run(p(0.0, 0.0), p(1000.0, 0.0), 200.0);
+        let r = run(p(0.0, 0.0), p(1000.0, 0.0), 200.0);
         let both = RunSides { left: SideKind::Outside, right: SideKind::Outside, exterior: true };
         assert_eq!(lay_bands(&r, &both, FaceRef::Exterior, &bands).unwrap_err(), "no single exterior side");
         let neither = RunSides { left: SideKind::Space(0), right: SideKind::Space(1), exterior: false };
         assert_eq!(lay_bands(&r, &neither, FaceRef::Interior, &bands).unwrap_err(), "no single exterior side");
-        r.centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
-        let one = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
-        assert_eq!(lay_bands(&r, &one, FaceRef::Exterior, &bands).unwrap_err(), "arc runs are not laid yet");
+    }
+
+    fn arc_run(radius: f64, sweep: f64) -> WallRun {
+        let mut r = run(p(0.0, 0.0), p(1.0, 0.0), 200.0);
+        r.centreline = RunCurve::Arc { center: p(0.0, 0.0), radius, start_angle: 0.0, sweep };
+        r
+    }
+
+    fn arc_bands() -> [Band; 3] {
+        [Band { offset: -20.0, layer: "CLAD".into() }, Band { offset: 50.0, layer: "GYP".into() }, Band { offset: 200.0, layer: "GYP".into() }]
+    }
+
+    fn radii(lines: &[AssemblyLine]) -> Vec<f64> {
+        lines.iter().map(|l| (l.arc.unwrap().radius * 1e6).round() / 1e6).collect()
+    }
+
+    #[test]
+    fn bands_lay_as_concentric_arcs_along_an_arc_run() {
+        use std::f64::consts::FRAC_PI_2;
+        let bands = arc_bands();
+        let outside_right = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let outside_left = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
+        // Exterior outside the curve, travelling CCW (left is toward the centre).
+        let ccw = lay_bands(&arc_run(1000.0, FRAC_PI_2), &outside_right, FaceRef::Exterior, &bands).unwrap();
+        assert_eq!(radii(&ccw), [1120.0, 1050.0, 900.0]);
+        assert!(ccw.iter().all(|l| l.arc.unwrap().ccw && l.arc.unwrap().center == p(0.0, 0.0)));
+        assert_eq!(rounded(&ccw[..1]), [(1120.0, 0.0, 0.0, 1120.0)]);
+        assert_eq!(ccw[0].layer, "CLAD");
+        // Exterior outside the curve, travelling CW (left is away from the centre).
+        let cw = lay_bands(&arc_run(1000.0, -FRAC_PI_2), &outside_left, FaceRef::Exterior, &bands).unwrap();
+        assert_eq!(radii(&cw), [1120.0, 1050.0, 900.0]);
+        assert!(cw.iter().all(|l| !l.arc.unwrap().ccw));
+        assert_eq!(rounded(&cw[..1]), [(1120.0, 0.0, 0.0, -1120.0)]);
+        // Exterior inside the curve.
+        let inside = lay_bands(&arc_run(1000.0, FRAC_PI_2), &outside_left, FaceRef::Exterior, &bands).unwrap();
+        assert_eq!(radii(&inside), [880.0, 950.0, 1100.0]);
+        // Interior face of the first case is the inner face.
+        assert_eq!(radii(&lay_bands(&arc_run(1000.0, FRAC_PI_2), &outside_right, FaceRef::Interior, &bands).unwrap()), [880.0, 950.0, 1100.0]);
+    }
+
+    #[test]
+    fn a_band_past_the_centre_of_an_arc_run_is_an_error() {
+        let sides = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let deep = [Band { offset: 1000.0, layer: "A".into() }];
+        assert_eq!(lay_bands(&arc_run(300.0, 1.0), &sides, FaceRef::Exterior, &deep).unwrap_err(), "band radius is not positive");
+    }
+
+    #[test]
+    fn mitre_end_leaves_an_arc_unchanged() {
+        let sides = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let mut a = lay_bands(&arc_run(1000.0, 1.0), &sides, FaceRef::Exterior, &arc_bands()).unwrap().remove(0);
+        let before = a.clone();
+        mitre_end(&mut a, RunEnd::Start, p(0.0, 0.0), p(0.0, 1.0));
+        assert_eq!(a, before);
     }
 
     fn rounded(lines: &[AssemblyLine]) -> Vec<(f64, f64, f64, f64)> {
@@ -478,14 +573,14 @@ mod tests {
     #[test]
     fn mitre_end_moves_one_end_onto_the_bisector_line() {
         let h = 0.5f64.sqrt();
-        let mut l = AssemblyLine { from: p(100.0, -20.0), to: p(4900.0, -20.0), layer: "CLAD".into() };
+        let mut l = AssemblyLine { from: p(100.0, -20.0), to: p(4900.0, -20.0), layer: "CLAD".into(), arc: None };
         mitre_end(&mut l, RunEnd::Start, p(100.0, 100.0), p(h, h));
         assert!((l.from.x + 20.0).abs() < 1e-9 && (l.from.y + 20.0).abs() < 1e-9, "{l:?}");
         assert_eq!(l.to, p(4900.0, -20.0));
         mitre_end(&mut l, RunEnd::End, p(4900.0, 100.0), p(-h, h));
         assert!((l.to.x - 5020.0).abs() < 1e-9, "{l:?}");
         // Parallel to the bisector: unchanged.
-        let mut d = AssemblyLine { from: p(0.0, 0.0), to: p(10.0, 10.0), layer: "A".into() };
+        let mut d = AssemblyLine { from: p(0.0, 0.0), to: p(10.0, 10.0), layer: "A".into(), arc: None };
         let before = d.clone();
         mitre_end(&mut d, RunEnd::Start, p(100.0, 0.0), p(h, h));
         assert_eq!(d, before);

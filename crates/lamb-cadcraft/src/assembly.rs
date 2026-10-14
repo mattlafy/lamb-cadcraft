@@ -1,14 +1,17 @@
 //! Assembly lines for a plan view (LAMB's `docs/07-architecture/cadcraft-integration.md` §10
-//! "Generation", steps 1, 2 and 4, straight runs only; LAMB T369): for each wall run whose edge
+//! "Generation", steps 1, 2 and 4; LAMB T369): for each wall run whose edge
 //! detail resolves ([`resolve_view_details`]) to a detail with a face reference
 //! ([`detail_reference`]), that detail's continuous bands laid along the run on its matching face
 //! (lamb-core's [`detail_bands`] and [`lay_bands`]). Computed on demand by [`assembly_lines`];
 //! `assemblyplan {viewId}` ([`write_assembly_block`], LAMB T371) writes them as LINEs into the
-//! block [`assembly_block_name`]`(plan)`, replacing its contents, in one undo step. Each laid run
+//! block [`assembly_block_name`]`(plan)`, replacing its contents, in one undo step — an arc run's
+//! bands (LAMB T389) as ARCs, written counter-clockwise (a clockwise band with its ends swapped).
+//! Each laid run
 //! also carries its width conflict (lamb-core's [`width_conflict`], LAMB T375): reported by
 //! ASSEMBLYPLAN and by the read-only `wallconflicts {viewId}`. Each of the detail's repeats
 //! ([`detail_repeats`], LAMB T380) is arrayed at its pitch along the run too (lamb-core's
-//! [`lay_repeat`]), every straight segment of its members kept on the member's layer. Once a plan
+//! [`lay_repeat`]), every straight segment of its members kept on the member's layer; arc runs get
+//! their bands but no repeats yet. Once a plan
 //! has its block, [`assembly_observer`] (LAMB T381) keeps it equal to [`assembly_lines`] after every
 //! command, inside that command's undo step; a plan without the block gets none. A plan listed in
 //! the document's `mitre_plans` (`assemblyplan {viewId, mitre}`, LAMB T385; §10 step 3) has every
@@ -18,7 +21,7 @@
 
 use std::sync::Arc;
 
-use cadcraft_doc::{Block, Common, Drawing, Entity, EntityKind, Insert, Line, Space};
+use cadcraft_doc::{Arc as ArcEntity, Block, Common, Drawing, Entity, EntityKind, Insert, Line, Space};
 use cadcraft_engine::{Result as EngineResult, Session};
 use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
@@ -115,7 +118,8 @@ fn run_lines(
     let frame = detail_frame((r.from, r.to), &lines)?;
     let mut laid = lay_bands(run, sides, face, &bands)?;
     let n = laid.len();
-    for rep in detail_repeats(d, detail)? {
+    let repeats = if matches!(run.centreline, lamb_core::derivation::walls::RunCurve::Arc { .. }) { Vec::new() } else { detail_repeats(d, detail)? };
+    for rep in repeats {
         laid.extend(lay_repeat(run, sides, face, &frame, &member_segments(d, detail, &rep.members), rep.pitch)?);
     }
     Ok((laid, n, width_conflict(run, face, &bands)))
@@ -183,15 +187,26 @@ pub(crate) fn check_plan(d: &Drawing, plan: Id) -> Result<(), String> {
     }
 }
 
-/// Replaces the block [`assembly_block_name`]`(plan)` with one LINE per line of `runs`.
+/// The entity an assembly line is written as: a LINE, or for an arc line an ARC, counter-clockwise
+/// from `start` to `end` (a clockwise span's ends swapped).
+fn line_entity(l: &AssemblyLine) -> EntityKind {
+    let Some(arc) = l.arc else {
+        return EntityKind::Line(Line { a: Vec2::new(l.from.x, l.from.y).to3(0.0), b: Vec2::new(l.to.x, l.to.y).to3(0.0) });
+    };
+    let angle = |p: Point2| (p.y - arc.center.y).atan2(p.x - arc.center.x);
+    let (a, b) = if arc.ccw { (l.from, l.to) } else { (l.to, l.from) };
+    EntityKind::Arc(ArcEntity { center: Vec2::new(arc.center.x, arc.center.y).to3(0.0), radius: arc.radius, start: angle(a), end: angle(b) })
+}
+
+/// Replaces the block [`assembly_block_name`]`(plan)` with one LINE or ARC ([`line_entity`]) per
+/// line of `runs`.
 fn replace_block(d: &mut Drawing, plan: Id, runs: &[RunAssembly]) -> Result<(), String> {
     let name = assembly_block_name(plan);
     d.blocks.insert(name.clone(), Arc::new(Block::new(&name)));
     let space = Space::Block(name);
     for l in runs.iter().flat_map(|r| &r.lines) {
         let common = Common { layer: l.layer.clone(), ..Common::default() };
-        let line = Line { a: Vec2::new(l.from.x, l.from.y).to3(0.0), b: Vec2::new(l.to.x, l.to.y).to3(0.0) };
-        d.add(&space, common, EntityKind::Line(line)).map_err(|e| e.to_string())?;
+        d.add(&space, common, line_entity(l)).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -232,14 +247,30 @@ pub fn write_assembly_block(d: &mut Drawing, plan: Id) -> Result<Vec<RunAssembly
 }
 
 /// `true` when `block` holds exactly the lines of `runs`, in write order: same count, each pair on
-/// the same layer with both ends within [`TOLERANCE`]`.coincidence_mm`.
+/// the same layer and of the same kind ([`line_entity`]) — a LINE's ends within
+/// [`TOLERANCE`]`.coincidence_mm`; an ARC's centre and radius within that, its start and end angles
+/// within `TOLERANCE.angle_deg`.
 fn block_matches(block: &Block, runs: &[RunAssembly]) -> bool {
-    let near = |p: cadcraft_geom::Vec3, q: Point2| (p.x - q.x).hypot(p.y - q.y) <= TOLERANCE.coincidence_mm;
+    let tol = TOLERANCE.coincidence_mm;
+    let near = |p: cadcraft_geom::Vec3, q: cadcraft_geom::Vec3| (p.x - q.x).hypot(p.y - q.y) <= tol;
+    let same_angle = |a: f64, b: f64| {
+        let d = (a - b).rem_euclid(std::f64::consts::TAU);
+        d.min(std::f64::consts::TAU - d) <= TOLERANCE.angle_deg.to_radians()
+    };
     let mut want = runs.iter().flat_map(|r| &r.lines);
     for e in block.entities.iter() {
         let Some(l) = want.next() else { return false };
-        let EntityKind::Line(line) = &e.kind else { return false };
-        if e.common.layer != l.layer || !near(line.a, l.from) || !near(line.b, l.to) {
+        if e.common.layer != l.layer {
+            return false;
+        }
+        let ok = match (&e.kind, line_entity(l)) {
+            (EntityKind::Line(got), EntityKind::Line(w)) => near(got.a, w.a) && near(got.b, w.b),
+            (EntityKind::Arc(got), EntityKind::Arc(w)) => {
+                near(got.center, w.center) && (got.radius - w.radius).abs() <= tol && same_angle(got.start, w.start) && same_angle(got.end, w.end)
+            }
+            _ => false,
+        };
+        if !ok {
             return false;
         }
     }
@@ -734,6 +765,107 @@ pub(crate) mod tests {
             v.push((r6(l.a.x), r6(l.a.y), r6(l.b.x), r6(l.b.y), e.common.layer.clone()));
         }
         Ok(v)
+    }
+
+    /// A plan with a D-shaped room of 200 mm walls: straight bottom, left and top faces and a
+    /// semicircular right end about (3000, 1100) — outer face radius 1100, inner 900, so the arc
+    /// run's centreline has radius 1000 — and [`room`]'s exterior-face detail tagged on the bottom.
+    fn d_room() -> T<(Session, Id)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let detail = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": format!("{:X}", r.0), "kind": "exterior_face" }))?;
+        s.execute("layer.new", &json!({ "name": "CLAD", "current": true }))?;
+        line(&mut s, [0.0, -20.0], [1000.0, -20.0])?;
+        s.execute("layer.new", &json!({ "name": "GYP", "current": true }))?;
+        line(&mut s, [0.0, 50.0], [1000.0, 50.0])?;
+        line(&mut s, [0.0, 200.0], [1000.0, 200.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        let v = |x: f64, y: f64, bulge: f64| json!({ "p": [x, y], "bulge": bulge });
+        s.execute(
+            "pline",
+            &json!({ "vertices": [v(0.0, 0.0, 0.0), v(3000.0, 0.0, 1.0), v(3000.0, 2200.0, 0.0), v(0.0, 2200.0, 0.0)], "closed": true }),
+        )?;
+        s.execute(
+            "pline",
+            &json!({ "vertices": [v(200.0, 200.0, 0.0), v(3000.0, 200.0, 1.0), v(3000.0, 2000.0, 0.0), v(200.0, 2000.0, 0.0)], "closed": true }),
+        )?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 1500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
+        Ok((s, plan))
+    }
+
+    #[test]
+    fn an_arc_run_gets_its_bands_as_concentric_arcs_in_the_block() -> R {
+        let (mut s, plan) = d_room()?;
+        crate::maintain::install(&mut s);
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        let arcs = graph.runs.iter().filter(|r| matches!(r.centreline, lamb_core::derivation::walls::RunCurve::Arc { .. })).count();
+        assert_eq!(arcs, 1, "{:?}", graph.runs.iter().map(|r| &r.centreline).collect::<Vec<_>>());
+        let runs = assembly_lines(d, plan)?;
+        assert!(runs.iter().all(|r| r.skipped.is_none() && r.lines.len() == 3), "{runs:?}");
+
+        let name = assembly_block_name(plan);
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let b = s.doc()?.block(&name).ok_or("no block")?.clone();
+        let mut got_arcs: Vec<(f64, String, f64, f64)> = Vec::new();
+        let mut lines = 0;
+        for e in b.entities.iter() {
+            match &e.kind {
+                EntityKind::Arc(a) => {
+                    assert_eq!((r6(a.center.x), r6(a.center.y)), (3000.0, 1100.0), "{a:?}");
+                    got_arcs.push((r6(a.radius), e.common.layer.clone(), r6(a.start.to_degrees()), r6(a.end.to_degrees())));
+                }
+                EntityKind::Line(_) => lines += 1,
+                k => return Err(format!("unexpected {k:?}").into()),
+            }
+        }
+        assert_eq!(lines, runs.len() * 3 - 3, "straight runs keep LINEs");
+        got_arcs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let half = |r: f64, l: &str| (r, l.to_string(), -90.0, 90.0);
+        assert_eq!(got_arcs, [half(900.0, "GYP"), half(1050.0, "GYP"), half(1120.0, "CLAD")]);
+
+        // A second ASSEMBLYPLAN and an unrelated edit leave the block as it is.
+        assert!(block_matches(&b, &assembly_lines(s.doc()?, plan)?));
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let b = s.doc()?.block(&name).ok_or("no block")?.clone();
+        assert!(block_matches(&b, &assembly_lines(s.doc()?, plan)?));
+        s.execute("editview", &json!({ "viewId": null }))?;
+        s.execute("layer.new", &json!({ "name": "NOTES", "current": true }))?;
+        line(&mut s, [90_000.0, 90_000.0], [91_000.0, 90_000.0])?;
+        assert!(Arc::ptr_eq(&b, s.doc()?.block(&name).ok_or("no block")?), "observer saw no difference");
+        Ok(())
+    }
+
+    #[test]
+    fn block_matches_tells_an_arc_from_a_line_and_a_clockwise_arc_is_written_swapped() {
+        let cw = AssemblyLine {
+            from: Point2 { x: 0.0, y: 1000.0 },
+            to: Point2 { x: 1000.0, y: 0.0 },
+            layer: "A".into(),
+            arc: Some(lamb_core::derivation::assembly::ArcSpan { center: Point2 { x: 0.0, y: 0.0 }, radius: 1000.0, ccw: false }),
+        };
+        let EntityKind::Arc(a) = line_entity(&cw) else { panic!("not an arc") };
+        assert_eq!((r6(a.start.to_degrees()), r6(a.end.to_degrees())), (0.0, 90.0));
+        let run = |l: AssemblyLine| RunAssembly { run: 0, detail: None, lines: vec![l], bands: 1, skipped: None, conflict: None };
+        let mut block = Block::new("X");
+        block.entities.push(Entity {
+            handle: cadcraft_doc::Handle(1),
+            common: Common { layer: "A".into(), ..Common::default() },
+            kind: line_entity(&cw),
+        });
+        assert!(block_matches(&block, &[run(cw.clone())]));
+        let straight = AssemblyLine { arc: None, ..cw.clone() };
+        assert!(!block_matches(&block, &[run(straight)]), "a LINE where an ARC is");
+        let bigger = AssemblyLine { arc: Some(lamb_core::derivation::assembly::ArcSpan { radius: 1001.0, ..cw.arc.unwrap() }), ..cw };
+        assert!(!block_matches(&block, &[run(bigger)]));
     }
 
     #[test]
