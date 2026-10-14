@@ -27,6 +27,7 @@
 pub mod commands;
 pub mod convert;
 pub mod corners;
+pub mod detailref;
 pub mod detailtags;
 mod entitycmds;
 pub mod fillet;

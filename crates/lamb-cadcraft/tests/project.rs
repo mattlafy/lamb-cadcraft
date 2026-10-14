@@ -98,8 +98,11 @@ fn drawing() -> Result<Drawing, String> {
     d.layers.push(grid);
 
     let mut wall = on("0", line(WALL, (0.0, 0.0), (0.0, 1000.0)));
-    set_entity_data(&mut wall.common, &EntityData { role: LineRole::Cut, ai_origin: None, view_id: None, corners: vec![], detail_tag: None })
-        .map_err(|e| e.to_string())?;
+    set_entity_data(
+        &mut wall.common,
+        &EntityData { role: LineRole::Cut, ai_origin: None, view_id: None, corners: vec![], detail_tag: None, detail_ref: None },
+    )
+    .map_err(|e| e.to_string())?;
     let mut plan = Block::new(&view_block_name(PLAN));
     plan.entities.push(wall);
     plan.entities.push(on("GRID", line(GRID_LINE, (-3000.0, -1000.0), (3000.0, 2000.0))));
@@ -360,8 +363,11 @@ fn all_default_slots_are_not_written() -> R {
     if !e.common.ext.is_empty() {
         return Err("default EntityData wrote a slot".into());
     }
-    set_entity_data(&mut e.common, &EntityData { role: LineRole::Seen, ai_origin: None, view_id: None, corners: vec![], detail_tag: None })
-        .map_err(|e| e.to_string())?;
+    set_entity_data(
+        &mut e.common,
+        &EntityData { role: LineRole::Seen, ai_origin: None, view_id: None, corners: vec![], detail_tag: None, detail_ref: None },
+    )
+    .map_err(|e| e.to_string())?;
     if e.common.ext.get(EXT_KEY) != Some(&json!({ "role": "seen" })) {
         return Err(format!("slot {:?}", e.common.ext));
     }

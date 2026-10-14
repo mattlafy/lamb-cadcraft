@@ -35,7 +35,8 @@
 //!
 //! - `newdetail {name}` (View ▸ LAMB ▸ New Detail): a floating detail view, entered; `detailtag`
 //!   (`dtag`) / `detailtags`: detail tags in a plan view and their resolution report — see
-//!   [`crate::detailtags`].
+//!   [`crate::detailtags`]. `detailref {handle?, kind?}` (View ▸ LAMB ▸ Detail Reference): the
+//!   edited detail view's reference line and its kind — see [`crate::detailref`].
 //!
 //! - `viewprops {mode, viewId, …}` (View ▸ LAMB ▸ View Properties): rename a view, a placed plan's
 //!   cut elevation, a vertical view's intent or flip — see [`crate::viewprops`].
@@ -676,6 +677,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .menu(MENU)
             .interactive(crate::detailtags::detailtag_machine),
         CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU),
+        CommandSpec::new("detailref", "Detail Reference", crate::detailref::detailref)
+            .params("{handle?, kind?: exterior_face|interior_face|structural_centre|grid}")
+            .menu(MENU)
+            .interactive(crate::detailref::detailref_machine),
         CommandSpec::new("accept", "Accept AI Line", crate::entitycmds::accept)
             .alias(&["acc"])
             .params("{handles?}")
@@ -736,6 +741,7 @@ mod tests {
             "viewprops",
             "newdetail",
             "detailtag",
+            "detailref",
             "accept",
             "setrole",
             "layerrole",

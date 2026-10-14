@@ -130,6 +130,20 @@ pub struct EntityData {
     /// `vertices[0]` ([`crate::detailtags`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail_tag: Option<DetailTag>,
+    /// On a straight line in a detail view's block: that detail's reference line and its kind
+    /// (`cadcraft-integration.md` §9, [`crate::detailref`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_ref: Option<DetailRefKind>,
+}
+
+/// What a detail view's reference line stands for, which the sweep aligns to a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailRefKind {
+    ExteriorFace,
+    InteriorFace,
+    StructuralCentre,
+    Grid,
 }
 
 /// A detail tag's assignment: the detail view it names, and whether it tags a junction (a corner
@@ -144,7 +158,7 @@ pub struct DetailTag {
 
 impl Default for EntityData {
     fn default() -> Self {
-        EntityData { role: LineRole::Bylayer, ai_origin: None, view_id: None, corners: Vec::new(), detail_tag: None }
+        EntityData { role: LineRole::Bylayer, ai_origin: None, view_id: None, corners: Vec::new(), detail_tag: None, detail_ref: None }
     }
 }
 
