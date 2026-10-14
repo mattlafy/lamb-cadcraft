@@ -8,8 +8,10 @@
 //! also carries its width conflict (lamb-core's [`width_conflict`], LAMB T375): reported by
 //! ASSEMBLYPLAN and by the read-only `wallconflicts {viewId}`. Each of the detail's repeats
 //! ([`detail_repeats`], LAMB T380) is arrayed at its pitch along the run too (lamb-core's
-//! [`lay_repeat`]), every straight segment of its members kept on the member's layer. Not the
-//! AI-line sweep in [`crate::sweeps`].
+//! [`lay_repeat`]), every straight segment of its members kept on the member's layer. Once a plan
+//! has its block, [`assembly_observer`] (LAMB T381) keeps it equal to [`assembly_lines`] after every
+//! command, inside that command's undo step; a plan without the block gets none. Not the AI-line
+//! sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
 
@@ -19,6 +21,7 @@ use cadcraft_geom::Vec2;
 use lamb_core::derivation::assembly::{AssemblyLine, FaceRef, WidthConflict, detail_bands, detail_frame, lay_bands, lay_repeat, width_conflict};
 use lamb_core::derivation::detail_tags::RunDetail;
 use lamb_core::geometry::Point2;
+use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::AnyView;
 use lamb_core::model::Id;
 use serde_json::{Value, json};
@@ -147,11 +150,8 @@ pub(crate) fn check_plan(d: &Drawing, plan: Id) -> Result<(), String> {
     }
 }
 
-/// Replaces the block [`assembly_block_name`]`(plan)` with one LINE per laid assembly line (an
-/// empty block when every run is skipped). `plan` must be a plan view; nothing is touched on error.
-pub fn write_assembly_block(d: &mut Drawing, plan: Id) -> Result<Vec<RunAssembly>, String> {
-    check_plan(d, plan)?;
-    let runs = assembly_lines(d, plan)?;
+/// Replaces the block [`assembly_block_name`]`(plan)` with one LINE per line of `runs`.
+fn replace_block(d: &mut Drawing, plan: Id, runs: &[RunAssembly]) -> Result<(), String> {
     let name = assembly_block_name(plan);
     d.blocks.insert(name.clone(), Arc::new(Block::new(&name)));
     let space = Space::Block(name);
@@ -160,7 +160,69 @@ pub fn write_assembly_block(d: &mut Drawing, plan: Id) -> Result<Vec<RunAssembly
         let line = Line { a: Vec2::new(l.from.x, l.from.y).to3(0.0), b: Vec2::new(l.to.x, l.to.y).to3(0.0) };
         d.add(&space, common, EntityKind::Line(line)).map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+/// Replaces the block [`assembly_block_name`]`(plan)` with one LINE per laid assembly line (an
+/// empty block when every run is skipped). `plan` must be a plan view; nothing is touched on error.
+pub fn write_assembly_block(d: &mut Drawing, plan: Id) -> Result<Vec<RunAssembly>, String> {
+    check_plan(d, plan)?;
+    let runs = assembly_lines(d, plan)?;
+    replace_block(d, plan, &runs)?;
     Ok(runs)
+}
+
+/// `true` when `block` holds exactly the lines of `runs`, in write order: same count, each pair on
+/// the same layer with both ends within [`TOLERANCE`]`.coincidence_mm`.
+fn block_matches(block: &Block, runs: &[RunAssembly]) -> bool {
+    let near = |p: cadcraft_geom::Vec3, q: Point2| (p.x - q.x).hypot(p.y - q.y) <= TOLERANCE.coincidence_mm;
+    let mut want = runs.iter().flat_map(|r| &r.lines);
+    for e in block.entities.iter() {
+        let Some(l) = want.next() else { return false };
+        let EntityKind::Line(line) = &e.kind else { return false };
+        if e.common.layer != l.layer || !near(line.a, l.from) || !near(line.b, l.to) {
+            return false;
+        }
+    }
+    want.next().is_none()
+}
+
+/// The after-command observer: every plan view whose assembly block exists gets it rewritten when
+/// it no longer equals [`assembly_lines`]; the drawing is written back only when some block
+/// changed. A plan whose derivation fails is echoed and its block left as it was.
+pub fn assembly_observer(s: &mut Session, _before: &Arc<Drawing>) {
+    let mut rewrite = Vec::new();
+    let mut errors = Vec::new();
+    {
+        let Ok(d) = s.doc() else { return };
+        let Ok(doc) = read_document(d) else { return };
+        for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_))) {
+            let plan = v.id();
+            let Some(block) = d.block(&assembly_block_name(plan)) else { continue };
+            match assembly_lines(d, plan) {
+                Ok(runs) if !block_matches(block, &runs) => rewrite.push((plan, runs)),
+                Ok(_) => {}
+                Err(e) => errors.push(e),
+            }
+        }
+    }
+    for e in errors {
+        s.echo(format!("LAMB assembly: {e}"));
+    }
+    if rewrite.is_empty() {
+        return;
+    }
+    let Ok(current) = s.doc() else { return };
+    let mut after = current.clone();
+    for (plan, runs) in &rewrite {
+        if let Err(e) = replace_block(&mut after, *plan, runs) {
+            s.echo(format!("LAMB assembly: {e}"));
+            return;
+        }
+    }
+    if let Ok(d) = s.doc_mut() {
+        *d = after;
+    }
 }
 
 /// The runs' width conflicts as `[{run, delta, toward, text}]`, in run order.
@@ -403,6 +465,79 @@ pub(crate) mod tests {
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
         s.undo()?;
         assert_eq!(block_lines(&s, &name)?, None, "one undo removes it all");
+        Ok(())
+    }
+
+    fn detail_id(s: &Session) -> T<Id> {
+        Ok(read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id())
+    }
+
+    #[test]
+    fn the_assembly_block_regenerates_in_the_same_undo_step_as_a_detail_edit() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        crate::maintain::install(&mut s);
+        let name = assembly_block_name(plan);
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(block_lines(&s, &name)?.map(|v| v.len()), Some(12));
+
+        let detail = detail_id(&s)?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.current", &json!({ "name": "GYP" }))?;
+        let n = undo_len(&s)?;
+        line(&mut s, [0.0, 100.0], [1000.0, 100.0])?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let lines = block_lines(&s, &name)?.ok_or("no block")?;
+        assert_eq!(lines.len(), 16, "no further ASSEMBLYPLAN");
+        assert_eq!(lines.iter().filter(|(a, b, l)| l == "GYP" && a == b && (*a - 100.0).abs() < 1e-6).count(), 1, "{lines:?}");
+
+        while undo_len(&s)? > n {
+            s.undo()?;
+        }
+        assert_eq!(block_lines(&s, &name)?.map(|v| v.len()), Some(12), "regeneration rode the line's step");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_without_an_assembly_block_gets_none_and_unrelated_edits_leave_the_block_alone() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        crate::maintain::install(&mut s);
+        let detail = detail_id(&s)?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.current", &json!({ "name": "GYP" }))?;
+        line(&mut s, [0.0, 100.0], [1000.0, 100.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        line(&mut s, [0.0, -3000.0], [1000.0, -3000.0])?;
+        assert!(s.doc()?.blocks.keys().all(|k| !k.starts_with("LAMB_ASSEMBLY_")));
+
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let name = assembly_block_name(plan);
+        let block = s.doc()?.block(&name).ok_or("no block")?.clone();
+        s.execute("editview", &json!({ "viewId": null }))?;
+        s.execute("layer.new", &json!({ "name": "NOTES", "current": true }))?;
+        line(&mut s, [90_000.0, 90_000.0], [91_000.0, 90_000.0])?;
+        assert!(Arc::ptr_eq(&block, s.doc()?.block(&name).ok_or("no block")?), "unrelated command left the block untouched");
+        Ok(())
+    }
+
+    #[test]
+    fn erasing_the_detail_tag_empties_the_block_but_keeps_it() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        crate::maintain::install(&mut s);
+        let name = assembly_block_name(plan);
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let d = s.doc()?;
+        let tags: Vec<String> = d
+            .model
+            .iter()
+            .chain(d.blocks.values().flat_map(|b| b.entities.iter()))
+            .filter(|e| e.common.layer == "TAGS")
+            .map(|e| e.handle.hex())
+            .collect();
+        assert!(!tags.is_empty(), "no tag entities");
+        s.execute("erase", &json!({ "handles": tags }))?;
+        assert!(assembly_lines(s.doc()?, plan)?.iter().all(|r| r.skipped.as_deref() == Some("untyped")));
+        assert_eq!(block_lines(&s, &name)?, Some(Vec::new()));
         Ok(())
     }
 

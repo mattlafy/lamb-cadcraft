@@ -16,7 +16,9 @@
 //! while the stored vertices stay sharp ([`rounding`]), and kept on their vertex when a CADCraft
 //! command rewrites the vertices ([`corners`]), and the derived 3D scene as renderer-agnostic meshes
 //! that pick back to their source lines ([`scene`]), lamb-core's `ProjectWrite` over a `Drawing`
-//! ([`project_mut`]) and the after-command AI-line / solid-cut sweeps written through it ([`sweeps`]), and ACCEPT /
+//! ([`project_mut`]) and the after-command AI-line / solid-cut sweeps written through it ([`sweeps`]), and
+//! each plan's assembly lines, written by ASSEMBLYPLAN into a block that an after-command observer
+//! keeps regenerated ([`assembly`]), and ACCEPT /
 //! SETROLE / LAYERROLE ([`entitycmds`]), the read-only SHOWLINKS / QUERY ([`querycmds`]), and
 //! DUPLICATEVIEW / PLACEVIEW / UNPLACEVIEW / LEVEL ([`viewlife`]), and CUTLINE ([`cutlinecmd`]), and the Properties palette's LAMB group — Role, cut/seen height source per segment ([`props`]), and clicking a cut line in a plan picks that view ([`viewpick`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
@@ -58,6 +60,7 @@ mod viewprops;
 pub mod views;
 pub mod wallfit;
 
+pub use assembly::assembly_observer;
 pub use commands::commands;
 pub use convert::{Converted, Flattened, Unsupported, UnsupportedReason, from_polyline, to_polyline};
 pub use corners::{corner_observer, maintain_corners};
