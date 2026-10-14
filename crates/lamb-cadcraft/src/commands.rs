@@ -49,6 +49,9 @@
 //! - `duplicateview {viewId?, name?}`, `placeview {viewId, kind, …}` (parameter-only),
 //!   `unplaceview {viewId?}` and `level {mode, …}` (View ▸ LAMB): a view's lifecycle and the level
 //!   cascade — see [`crate::viewlife`].
+//! - `cutline {planViewId, elevation}` (`cl`, View ▸ LAMB ▸ Cut Line): move a placed plan's cut
+//!   elevation by picking its cut line in a placed section, then placing it — see
+//!   [`crate::cutlinecmd`].
 //!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
@@ -723,6 +726,11 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{mode: \"create\", name, floorElevationMm, order?} | {mode: \"rename\", levelId, name} | {mode: \"elevation\", levelId, floorElevationMm}")
             .menu(MENU)
             .interactive(crate::viewlife::level_machine),
+        CommandSpec::new("cutline", "Cut Line", crate::cutlinecmd::cutline)
+            .alias(&["cl"])
+            .params("{planViewId, elevation}")
+            .menu(MENU)
+            .interactive(crate::cutlinecmd::cutline_machine),
     ]
 }
 
@@ -774,6 +782,7 @@ mod tests {
             "accept",
             "setrole",
             "layerrole",
+            "cutline",
         ];
         for id in ids {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
