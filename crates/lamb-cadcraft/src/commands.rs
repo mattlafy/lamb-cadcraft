@@ -44,6 +44,8 @@
 //! - `accept {handles?}` (`acc`), `setrole {handles?, role}`, `layerrole {layer, role}` (View ▸
 //!   LAMB): take ownership of AI lines, an entity's role, a layer's default role — see
 //!   [`crate::entitycmds`].
+//! - `showlinks {handle?}` (`sl`, View ▸ LAMB ▸ Show Links) and `query {…}` (parameter-only):
+//!   read-only — an edit's link blast radius, and the filter lookup; see [`crate::querycmds`].
 //!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
@@ -694,6 +696,15 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{layer, role: cut|seen|datum|view_clip|annotation|reference}")
             .menu(MENU)
             .interactive(crate::entitycmds::layerrole_machine),
+        CommandSpec::new("showlinks", "Show Links", crate::querycmds::showlinks)
+            .alias(&["sl"])
+            .params("{handle?}")
+            .noundo()
+            .menu(MENU)
+            .interactive(crate::querycmds::showlinks_machine),
+        CommandSpec::new("query", "Query", crate::querycmds::query)
+            .params("{viewId?, layerName?, role?, kind?, closed?, near?: {entityIds?, layerName?, minMm?, maxMm?}, include?: \"geometry\", limit?}")
+            .noundo(),
     ]
 }
 

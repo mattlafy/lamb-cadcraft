@@ -1,7 +1,7 @@
 //! Automatic linking through hollow markers, and finding the link behind a marker (TS
 //! `linking.ts`).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use super::markers::{Marker, compute_markers_for_view};
 use super::read::{EntityRef, ProjectRead};
@@ -92,4 +92,63 @@ fn coincides_one_way(doc: &impl ProjectRead, drawn: &LinkAnchor, source: &LinkAn
     };
     let tolerance_mm = TOLERANCE.coincidence_mm + 2.0;
     Ok((marker.position.x - point.x).hypot(marker.position.y - point.y) <= tolerance_mm)
+}
+
+/// Every entity an edit to `entity` propagates to (TS `lookup.ts` `linkedEntityComponent`): a
+/// breadth-first walk over `Automatic` links only, entity-level, `entity` itself included. An
+/// `Explicit` link is where propagation stops.
+pub fn linked_entity_component(doc: &impl ProjectRead, entity: Id) -> BTreeSet<Id> {
+    let mut visited = BTreeSet::from([entity]);
+    let mut queue = VecDeque::from([entity]);
+    while let Some(current) = queue.pop_front() {
+        for link in doc.links() {
+            if link.origin != LinkOrigin::Automatic {
+                continue;
+            }
+            let other = if link.a.entity_id == current {
+                Some(link.b.entity_id)
+            } else if link.b.entity_id == current {
+                Some(link.a.entity_id)
+            } else {
+                None
+            };
+            if let Some(o) = other.filter(|o| visited.insert(*o)) {
+                queue.push_back(o);
+            }
+        }
+    }
+    visited
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::empty_project;
+
+    fn link(id: u64, a: u64, b: u64, origin: LinkOrigin) -> LinkRecord {
+        LinkRecord {
+            id: Id(id),
+            a: LinkAnchor { entity_id: Id(a), segment_index: 0, segment_param: 0.5 },
+            b: LinkAnchor { entity_id: Id(b), segment_index: 0, segment_param: 0.5 },
+            origin,
+            created_at: String::new(),
+            created_by: Actor::User { user_id: "u".into() },
+            stale: None,
+        }
+    }
+
+    #[test]
+    fn component_follows_automatic_links_and_stops_at_explicit() {
+        let mut p = empty_project(None);
+        p.links = vec![
+            link(1, 10, 11, LinkOrigin::Automatic),
+            link(2, 12, 11, LinkOrigin::Automatic),
+            link(3, 12, 13, LinkOrigin::Explicit),
+            link(4, 14, 15, LinkOrigin::Automatic),
+        ];
+        let ids = |v: &[u64]| v.iter().map(|x| Id(*x)).collect::<BTreeSet<_>>();
+        assert_eq!(linked_entity_component(&p, Id(10)), ids(&[10, 11, 12]));
+        assert_eq!(linked_entity_component(&p, Id(13)), ids(&[13]));
+        assert_eq!(linked_entity_component(&p, Id(99)), ids(&[99]), "an unlinked id is its own component");
+    }
 }

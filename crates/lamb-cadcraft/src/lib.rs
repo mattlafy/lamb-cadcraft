@@ -17,7 +17,7 @@
 //! command rewrites the vertices ([`corners`]), and the derived 3D scene as renderer-agnostic meshes
 //! that pick back to their source lines ([`scene`]), lamb-core's `ProjectWrite` over a `Drawing`
 //! ([`project_mut`]) and the after-command AI-line / solid-cut sweeps written through it ([`sweeps`]), and ACCEPT /
-//! SETROLE / LAYERROLE ([`entitycmds`]).
+//! SETROLE / LAYERROLE ([`entitycmds`]), and the read-only SHOWLINKS / QUERY ([`querycmds`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
 //! the remaining overlay display lists (datums, repeat ghosts). Sits above
 //! `cadcraft-engine` and below the UI shells and MCP.
@@ -39,6 +39,7 @@ pub mod overlays;
 pub mod panes;
 pub mod project;
 pub mod project_mut;
+mod querycmds;
 mod refpane;
 mod resolvecmd;
 pub mod rounding;
