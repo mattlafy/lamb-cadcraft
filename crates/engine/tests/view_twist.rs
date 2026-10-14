@@ -35,7 +35,7 @@ fn near(a: f64, b: f64) -> bool {
 fn dview_twist_sets_viewtwist_and_zoom_previous_turns_it_back() {
     let mut s = session();
     assert_eq!(view(&s).twist, 0.0);
-    typed(&mut s, &["dview", "tw", "30", ""]);
+    typed(&mut s, &["dview", "", "tw", "30", ""]);
     assert!(near(twist_deg(&s), 30.0), "twist {}", twist_deg(&s));
     let vt = sysvars::get(&s, "VIEWTWIST").and_then(|v| v.as_f64()).unwrap();
     assert!(near(vt, 30.0), "VIEWTWIST {vt}");
@@ -52,8 +52,8 @@ fn dview_twist_sets_viewtwist_and_zoom_previous_turns_it_back() {
     // JSON form; negative angles wrap into 0..360.
     s.execute("dview", &json!({ "twist": -90 })).unwrap();
     assert!(near(twist_deg(&s), 270.0));
-    // The 3D options are refused, the command carries on.
-    typed(&mut s, &["dview", "ca", "x"]);
+    // The 3D options are not available yet; the command carries on.
+    typed(&mut s, &["dview", "", "ca", ""]);
     assert!(s.current_prompt().is_none());
     // Not in a layout.
     let layout = s.doc().unwrap().layouts.first().map(|l| l.name.clone()).unwrap();

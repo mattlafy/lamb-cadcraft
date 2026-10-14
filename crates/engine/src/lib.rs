@@ -42,7 +42,7 @@ pub use cadcraft_geom as geom;
 pub use cadcraft_render as render;
 pub use cmd::hatch::{HatchPicks, PatternChoice, PickMode, pattern_choices};
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
-pub use prompt::{Accept, Drag, Input, Interactive, Picker, Prompt, Step};
+pub use prompt::{Accept, DisplayOnly, Drag, Input, Interactive, Picker, Prompt, Step};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -243,8 +243,8 @@ impl DocState {
         match self.active_viewport() {
             Some((_, vp)) => {
                 let k = vp.view_height / vp.height;
-                // Layout viewports have no twist (yet): the model view inside one is untwisted.
-                View { center: vp.view_center + (pv.center - vp.center.xy()) * k, height: pv.height * k, twist: 0.0 }
+                // The viewport's twist turns the model view inside it.
+                View { center: vp.paper_to_model(pv.center), height: pv.height * k, twist: vp.view_twist() }
             }
             None => pv,
         }
@@ -259,14 +259,15 @@ impl DocState {
             if vp.locked {
                 // A locked viewport keeps its scale: pan/zoom the sheet instead.
                 let k0 = vp.view_height / vp.height;
-                let pc = vp.center.xy() + (v.center - vp.view_center) / k0;
+                let pc = vp.model_to_paper(v.center);
                 let paper = View { center: pc, height: v.height / k0, twist: pv.twist };
                 if !usable_view(&paper) {
                     return false;
                 }
                 self.put_paper_view(paper);
             } else {
-                let center = v.center - (pv.center - vp.center.xy()) * k;
+                // The viewport keeps its own twist: `v`'s is the one it shows.
+                let center = v.center - ((pv.center - vp.center.xy()) * k).rotate(-vp.view_twist());
                 let height = vp.height * k;
                 if !usable_view(&View { center, height, twist: 0.0 }) {
                     return false;
@@ -342,7 +343,7 @@ impl DocState {
     /// The view ZOOM starts from: the model view of the active unlocked viewport, else [`Self::view`].
     pub fn zoom_frame(&self) -> View {
         match self.zoom_viewport() {
-            Some(v) => View { center: v.view_center, height: v.view_height, twist: 0.0 },
+            Some(v) => View { center: v.view_center, height: v.view_height, twist: v.view_twist() },
             None => self.view(),
         }
     }
@@ -357,7 +358,8 @@ impl DocState {
             Some(vp) => {
                 let pv = self.paper_view();
                 let k = f.height / vp.height;
-                View { center: f.center + (pv.center - vp.center.xy()) * k, height: pv.height * k, twist: pv.twist }
+                let twist = vp.view_twist();
+                View { center: f.center + ((pv.center - vp.center.xy()) * k).rotate(-twist), height: pv.height * k, twist }
             }
             None => f,
         };
@@ -1449,6 +1451,13 @@ impl Session {
             (None, None) => Vec::new(),
         };
         kinds.into_iter().map(|k| Entity { handle: Handle(0), common: common.clone(), kind: k }).collect()
+    }
+
+    /// What the drawing area shows in place of the drawing while a command runs (DVIEW's preview
+    /// set, see [`Interactive::display_only`]), also while a transparent command interrupts it.
+    /// `None`: the drawing.
+    pub fn display_only(&self) -> Option<DisplayOnly> {
+        [&self.running, &self.suspended].into_iter().flatten().find_map(|r| r.machine.display_only(self))
     }
 
     /// The active command's preview as a transform of existing objects (see
