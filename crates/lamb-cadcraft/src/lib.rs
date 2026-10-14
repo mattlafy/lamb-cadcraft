@@ -18,7 +18,7 @@
 //! that pick back to their source lines ([`scene`]), lamb-core's `ProjectWrite` over a `Drawing`
 //! ([`project_mut`]) and the after-command AI-line / solid-cut sweeps written through it ([`sweeps`]), and
 //! each plan's assembly lines, written by ASSEMBLYPLAN into a block that an after-command observer
-//! keeps regenerated ([`assembly`]), and ACCEPT /
+//! keeps regenerated ([`assembly`]), each detail tag's bubble — a `LAMB_DTAG` insert naming its detail — kept by an after-command observer ([`bubbles`]), and ACCEPT /
 //! SETROLE / LAYERROLE ([`entitycmds`]), the read-only SHOWLINKS / QUERY ([`querycmds`]), and
 //! DUPLICATEVIEW / PLACEVIEW / UNPLACEVIEW / LEVEL ([`viewlife`]), and CUTLINE ([`cutlinecmd`]), and the Properties palette's LAMB group — Role, cut/seen height source per segment ([`props`]), and clicking a cut line in a plan picks that view ([`viewpick`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 pub mod assembly;
+pub mod bubbles;
 pub mod commands;
 pub mod convert;
 pub mod corners;
@@ -64,6 +65,7 @@ pub mod wallfit;
 mod wallrun;
 
 pub use assembly::assembly_observer;
+pub use bubbles::bubble_observer;
 pub use commands::commands;
 pub use convert::{Converted, Flattened, Unsupported, UnsupportedReason, from_polyline, to_polyline};
 pub use corners::{corner_observer, maintain_corners};
