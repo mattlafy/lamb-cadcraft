@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use cadcraft_doc::{Arc as ArcEntity, Block, Common, Drawing, Entity, EntityKind, Insert, Line, Space};
-use cadcraft_engine::{Result as EngineResult, Session};
+use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
 use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
     AssemblyLine, FaceRef, WidthConflict, detail_bands, detail_frame, junction_bisector, lay_bands, lay_repeat, mitre_end, width_conflict,
@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 use crate::commands::{id_value, other};
 use crate::convert::to_polyline;
 use crate::detailref::{DetailRefKind, detail_reference};
-use crate::detailtags::{graph_and_sides, resolve_view_details};
+use crate::detailtags::{edited_plan, graph_and_sides, resolve_view_details};
 use crate::project::DrawingProject;
 use crate::repeats::{detail_repeats, repeat_members};
 use crate::schema::{assembly_block_name, read_document, view_block_name, write_document};
@@ -360,6 +360,105 @@ pub fn wallconflicts(s: &mut Session, p: &Value) -> EngineResult<Value> {
     let conflicts = conflicts_json(&assembly_lines(d, plan).map_err(other)?);
     s.echo(format!("{} width conflicts", conflicts.len()));
     Ok(json!({ "conflicts": conflicts }))
+}
+
+/// ASSEMBLYPLAN's interactive form, on the edited plan view: one Yes/No prompt for mitring, Enter
+/// keeping the plan's current setting.
+struct AssemblyPlanM;
+
+fn mitred(s: &Session, plan: Id) -> bool {
+    s.doc().ok().and_then(|d| read_document(d).ok()).is_some_and(|doc| doc.mitre_plans.contains(&plan))
+}
+
+impl Interactive for AssemblyPlanM {
+    fn name(&self) -> &'static str {
+        "assemblyplan"
+    }
+    fn prompt(&self, s: &Session) -> Prompt {
+        let current = edited_plan(s).is_ok_and(|plan| mitred(s, plan));
+        Prompt::new("Mitre missing corner details", Accept::TEXT).kw(&["Yes", "No"]).default(if current { "Yes" } else { "No" }.to_owned())
+    }
+    fn begin(&mut self, s: &mut Session) -> EngineResult<Step> {
+        if let Err(e) = edited_plan(s) {
+            s.echo(e);
+            return Ok(Step::Done);
+        }
+        Ok(Step::Continue)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> EngineResult<Step> {
+        let mitre = match i {
+            Input::Cancel => return Ok(Step::Cancel),
+            Input::Enter => None,
+            Input::Text(t) | Input::Keyword(t) => match t.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => Some(true),
+                "n" | "no" => Some(false),
+                _ => {
+                    s.echo("Yes or No");
+                    return Ok(Step::Continue);
+                }
+            },
+            _ => return Ok(Step::Continue),
+        };
+        let plan = edited_plan(s).map_err(other)?;
+        let mut p = json!({ "viewId": plan.0 });
+        if let Some(m) = mitre {
+            p["mitre"] = json!(m);
+        }
+        match assemblyplan(s, &p) {
+            Ok(r) => {
+                let skipped = r["skipped"].as_array().map_or(0, Vec::len);
+                let conflicts = r["conflicts"].as_array().map_or(0, Vec::len);
+                s.echo(format!("Assembly plan: {} lines, {skipped} runs skipped, {conflicts} width conflicts", r["lines"]));
+            }
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn assemblyplan_machine(_s: &Session) -> EngineResult<Box<dyn Interactive>> {
+    Ok(Box::new(AssemblyPlanM))
+}
+
+/// WALLCONFLICTS' interactive form: no prompt; the edited plan's conflicts, one line each.
+struct WallConflictsM;
+
+impl Interactive for WallConflictsM {
+    fn name(&self) -> &'static str {
+        "wallconflicts"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Wall conflicts", Accept::TEXT)
+    }
+    fn begin(&mut self, s: &mut Session) -> EngineResult<Step> {
+        let plan = match edited_plan(s) {
+            Ok(plan) => plan,
+            Err(e) => {
+                s.echo(e);
+                return Ok(Step::Done);
+            }
+        };
+        match wallconflicts(s, &json!({ "viewId": plan.0 })) {
+            Ok(r) => {
+                let list = r["conflicts"].as_array().cloned().unwrap_or_default();
+                if list.is_empty() {
+                    s.echo("No width conflicts");
+                }
+                for c in list {
+                    s.echo(format!("Run {}: {}", c["run"], c["text"].as_str().unwrap_or_default()));
+                }
+            }
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+    fn input(&mut self, _s: &mut Session, _i: Input) -> EngineResult<Step> {
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn wallconflicts_machine(_s: &Session) -> EngineResult<Box<dyn Interactive>> {
+    Ok(Box::new(WallConflictsM))
 }
 
 #[cfg(test)]
@@ -980,6 +1079,88 @@ pub(crate) mod tests {
         // Omitting `mitre` keeps the option.
         s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
         assert_eq!(read_document(s.doc()?)?.mitre_plans, [plan]);
+        Ok(())
+    }
+    fn prompt_default(s: &Session) -> Option<String> {
+        s.current_prompt().and_then(|p| p.default)
+    }
+
+    #[test]
+    fn the_interactive_assemblyplan_matches_the_parameter_form_and_keeps_or_sets_mitre() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        let name = assembly_block_name(plan);
+        let n = undo_len(&s)?;
+        s.start("assemblyplan")?;
+        let p = s.current_prompt().ok_or("no prompt")?;
+        assert_eq!(p.display(), "Mitre missing corner details or [Yes/No] <No>:");
+        s.input(Input::Enter)?;
+        assert!(s.running.is_none());
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert!(s.log.iter().any(|l| l == "Assembly plan: 12 lines, 0 runs skipped, 0 width conflicts"), "{:?}", s.log);
+        let interactive = block_xy(&s, &name)?;
+        assert!(read_document(s.doc()?)?.mitre_plans.is_empty(), "Enter keeps the setting");
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(block_xy(&s, &name)?, interactive);
+
+        s.start("assemblyplan")?;
+        s.input(Input::Text("x".into()))?;
+        assert!(s.running.is_some(), "re-asks");
+        assert!(s.log.iter().any(|l| l == "Yes or No"), "{:?}", s.log);
+        s.input(Input::Text("Y".into()))?;
+        assert!(s.running.is_none());
+        assert_eq!(read_document(s.doc()?)?.mitre_plans, [plan]);
+        let mitred = block_xy(&s, &name)?;
+        assert_ne!(mitred, interactive);
+        s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": true }))?;
+        assert_eq!(block_xy(&s, &name)?, mitred);
+
+        s.start("assemblyplan")?;
+        assert_eq!(prompt_default(&s).as_deref(), Some("Yes"));
+        s.input(Input::Enter)?;
+        assert_eq!(read_document(s.doc()?)?.mitre_plans, [plan], "Enter keeps Yes");
+        assert_eq!(block_xy(&s, &name)?, mitred);
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_wallconflicts_lists_each_conflict_without_an_undo_step() -> R {
+        let (mut s, _plan) = room_with("exterior_face", true, 210.0)?;
+        let n = undo_len(&s)?;
+        s.log.clear();
+        s.start("wallconflicts")?;
+        assert!(s.running.is_none());
+        assert_eq!(undo_len(&s)?, n);
+        let lines: Vec<&String> = s.log.iter().filter(|l| l.starts_with("Run ")).collect();
+        assert_eq!(lines.len(), 4, "{:?}", s.log);
+        assert!(lines.iter().all(|l| l.ends_with(": -10.0mm toward interior")), "{lines:?}");
+
+        let (mut s, _plan) = room_with("exterior_face", true, 200.0)?;
+        s.start("wallconflicts")?;
+        assert!(s.log.iter().any(|l| l == "No width conflicts"), "{:?}", s.log);
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_forms_refuse_without_an_edited_plan_and_change_nothing() -> R {
+        let (mut s, _plan) = room_with("exterior_face", true, 210.0)?;
+        let detail = detail_id(&s)?;
+        for edit in [json!({ "viewId": detail.0 }), json!({})] {
+            s.execute("editview", &edit)?;
+            if edit == json!({}) {
+                assert_eq!(edited_plan(&s), Err("Edit a plan view first (EDITVIEW)".to_owned()));
+            }
+            let why = edited_plan(&s).err().ok_or("a plan is edited")?;
+            for cmd in ["assemblyplan", "wallconflicts", "wallfit"] {
+                let before = s.doc()?.clone();
+                let n = undo_len(&s)?;
+                s.log.clear();
+                s.start(cmd)?;
+                assert!(s.running.is_none(), "{cmd}");
+                assert!(s.log.contains(&why), "{cmd}: {:?}", s.log);
+                assert_eq!(undo_len(&s)?, n, "{cmd}");
+                assert_eq!(*s.doc()?, before, "{cmd}");
+            }
+        }
         Ok(())
     }
 }

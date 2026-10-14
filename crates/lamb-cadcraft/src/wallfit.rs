@@ -7,7 +7,7 @@
 //! corner vertex compose). Arc runs carry no conflict yet and are never fitted.
 
 use cadcraft_doc::{Drawing, EntityKind, Handle};
-use cadcraft_engine::{Result as EngineResult, Session};
+use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
 use lamb_core::derivation::assembly::{FaceRef, WidthConflict};
 use lamb_core::derivation::wall_spaces::SideKind;
 use lamb_core::derivation::walls::RunCurve;
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::assembly::{assembly_lines, check_plan};
 use crate::commands::{id_value, other};
-use crate::detailtags::graph_and_sides;
+use crate::detailtags::{edited_plan, graph_and_sides};
 use crate::project::DrawingProject;
 
 /// Which face of a fitted run stays put.
@@ -214,6 +214,61 @@ pub fn wallfit(s: &mut Session, p: &Value) -> EngineResult<Value> {
     Ok(json!({ "fitted": fitted, "hold": hold.name() }))
 }
 
+/// WALLFIT's interactive form, on the edited plan view: which face holds, then every conflicted run
+/// is fitted.
+struct WallFitM;
+
+const HOLD_WORDS: [&str; 4] = ["Reference", "Exterior", "Interior", "Centre"];
+
+fn parse_hold_word(t: &str) -> Option<&'static str> {
+    let t = t.trim();
+    HOLD_WORDS.iter().find(|w| t.eq_ignore_ascii_case(w) || (t.len() == 1 && w[..1].eq_ignore_ascii_case(t))).map(|w| match *w {
+        "Reference" => "reference",
+        "Exterior" => "exterior",
+        "Interior" => "interior",
+        _ => "centre",
+    })
+}
+
+impl Interactive for WallFitM {
+    fn name(&self) -> &'static str {
+        "wallfit"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Hold", Accept::TEXT).kw(&HOLD_WORDS).default("Reference".to_owned())
+    }
+    fn begin(&mut self, s: &mut Session) -> EngineResult<Step> {
+        if let Err(e) = edited_plan(s) {
+            s.echo(e);
+            return Ok(Step::Done);
+        }
+        Ok(Step::Continue)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> EngineResult<Step> {
+        let hold = match i {
+            Input::Cancel => return Ok(Step::Cancel),
+            Input::Enter => "reference",
+            Input::Text(t) | Input::Keyword(t) => match parse_hold_word(&t) {
+                Some(h) => h,
+                None => {
+                    s.echo("Reference, Exterior, Interior or Centre");
+                    return Ok(Step::Continue);
+                }
+            },
+            _ => return Ok(Step::Continue),
+        };
+        let plan = edited_plan(s).map_err(other)?;
+        if let Err(e) = wallfit(s, &json!({ "viewId": plan.0, "hold": hold })) {
+            s.echo(e.to_string());
+        }
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn wallfit_machine(_s: &Session) -> EngineResult<Box<dyn Interactive>> {
+    Ok(Box::new(WallFitM))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::assembly::tests::{room_with, undo_len};
@@ -356,6 +411,33 @@ mod tests {
         assert!(e.to_string().contains("hold must be reference, exterior, interior or centre"), "{e}");
         assert_eq!(undo_len(&s)?, n);
         assert_eq!(plines(&s, plan)?, before);
+        Ok(())
+    }
+    #[test]
+    fn the_interactive_wallfit_matches_the_parameter_form() -> R {
+        use cadcraft_engine::Input;
+        let (mut s, plan) = room_with("exterior_face", true, 210.0)?;
+        let n = undo_len(&s)?;
+        s.start("wallfit")?;
+        assert_eq!(s.current_prompt().ok_or("no prompt")?.display(), "Hold or [Reference/Exterior/Interior/Centre] <Reference>:");
+        s.input(Input::Text("bogus".into()))?;
+        assert!(s.running.is_some(), "re-asks");
+        assert!(s.log.iter().any(|l| l == "Reference, Exterior, Interior or Centre"), "{:?}", s.log);
+        s.input(Input::Keyword("Exterior".into()))?;
+        assert!(s.running.is_none());
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let interactive = plines(&s, plan)?;
+
+        let (mut p, plan2) = room_with("exterior_face", true, 210.0)?;
+        p.execute("wallfit", &json!({ "viewId": plan2.0, "hold": "exterior" }))?;
+        assert_eq!(plines(&p, plan2)?, interactive);
+
+        let (mut s, plan) = room_with("exterior_face", true, 210.0)?;
+        s.start("wallfit")?;
+        s.input(Input::Enter)?;
+        let (mut p, plan2) = room_with("exterior_face", true, 210.0)?;
+        p.execute("wallfit", &json!({ "viewId": plan2.0 }))?;
+        assert_eq!(plines(&s, plan)?, plines(&p, plan2)?, "Enter holds the reference");
         Ok(())
     }
 }

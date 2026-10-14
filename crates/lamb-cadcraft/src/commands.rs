@@ -45,11 +45,14 @@
 //!   [`crate::dxfimport`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
 //!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's laid
 //!   detail bands written into its block `LAMB_ASSEMBLY_<id>`, `mitre` turning the plan's mitring
-//!   of undetailed corners on or off — see [`crate::assembly`].
+//!   of undetailed corners on or off — see [`crate::assembly`]; interactive on the edited plan:
+//!   `Mitre missing corner details [Yes/No]`, Enter keeping the current setting.
 //!   `wallconflicts {viewId}` (View ▸ LAMB ▸ Wall Conflicts): each run whose detail is thicker or
-//!   thinner than the drawn wall, read-only. `wallfit {viewId, runs?, hold?}` (View ▸ LAMB ▸ Wall Fit):
-//!   moves each conflicted run's faces to its detail's width, holding the reference face, the
-//!   exterior, the interior or the centre — see [`crate::wallfit`].
+//!   thinner than the drawn wall, read-only; interactive, the edited plan's conflicts one per line.
+//!   `wallfit {viewId, runs?, hold?}` (View ▸ LAMB ▸ Wall Fit): moves each conflicted run's faces to
+//!   its detail's width, holding the reference face, the exterior, the interior or the centre — see
+//!   [`crate::wallfit`]; interactive on the edited plan: `Hold [Reference/Exterior/Interior/Centre]`,
+//!   then every conflicted run is fitted.
 //!   `detailref {handle?, kind?}` (View ▸ LAMB ▸ Detail Reference): the
 //!   edited detail view's reference line and its kind — see [`crate::detailref`].
 //!   `repeat {dimension?, handles?}` (View ▸ LAMB ▸ Repeat): in the edited detail view, a linear or
@@ -759,9 +762,19 @@ pub fn commands() -> Vec<CommandSpec> {
             .menu(MENU)
             .interactive(crate::outside::outsidepoint_machine),
         CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU),
-        CommandSpec::new("assemblyplan", "Assembly Plan", crate::assembly::assemblyplan).params("{viewId, mitre?: bool}").menu(MENU),
-        CommandSpec::new("wallconflicts", "Wall Conflicts", crate::assembly::wallconflicts).params("{viewId}").noundo().menu(MENU),
-        CommandSpec::new("wallfit", "Wall Fit", crate::wallfit::wallfit).params("{viewId, runs?: [index], hold?: reference|exterior|interior|centre}").menu(MENU),
+        CommandSpec::new("assemblyplan", "Assembly Plan", crate::assembly::assemblyplan)
+            .params("{viewId, mitre?: bool}")
+            .menu(MENU)
+            .interactive(crate::assembly::assemblyplan_machine),
+        CommandSpec::new("wallconflicts", "Wall Conflicts", crate::assembly::wallconflicts)
+            .params("{viewId}")
+            .noundo()
+            .menu(MENU)
+            .interactive(crate::assembly::wallconflicts_machine),
+        CommandSpec::new("wallfit", "Wall Fit", crate::wallfit::wallfit)
+            .params("{viewId, runs?: [index], hold?: reference|exterior|interior|centre}")
+            .menu(MENU)
+            .interactive(crate::wallfit::wallfit_machine),
         CommandSpec::new("detailref", "Detail Reference", crate::detailref::detailref)
             .params("{handle?, kind?: exterior_face|interior_face|structural_centre|grid}")
             .menu(MENU)
