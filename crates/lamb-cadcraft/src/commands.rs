@@ -38,7 +38,9 @@
 //!
 //! - `newdetail {name}` (View ▸ LAMB ▸ New Detail): a floating detail view, entered; `detailtag`
 //!   (`dtag`) / `detailtags`: detail tags in a plan view and their resolution report — see
-//!   [`crate::detailtags`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
+//!   [`crate::detailtags`]. `dxfimport {path | data, fileName?, name?, unitScale?}` (View ▸ LAMB ▸
+//!   Import DXF as View): a DXF/DWG file's line work as a new unplaced plan view — see
+//!   [`crate::dxfimport`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
 //!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's laid
 //!   detail bands written into its block `LAMB_ASSEMBLY_<id>`, `mitre` turning the plan's mitring
 //!   of undetailed corners on or off — see [`crate::assembly`].
@@ -742,6 +744,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{detailViewId, corner?: bool, tip:{x,y}, bubble:{x,y}}")
             .menu(MENU)
             .interactive(crate::detailtags::detailtag_machine),
+        CommandSpec::new("dxfimport", "Import DXF as View", crate::dxfimport::dxfimport)
+            .params("{path | data: base64, fileName?, name?, unitScale?} → {viewId, imported, skipped: {TYPE: n}}")
+            .menu(MENU)
+            .interactive(crate::dxfimport::dxfimport_machine),
         CommandSpec::new("outsidepoint", "Outside Point", crate::outside::outsidepoint)
             .params("{point:{x,y}}")
             .menu(MENU)
@@ -845,6 +851,7 @@ mod tests {
             "newdetail",
             "detailtag",
             "outsidepoint",
+            "dxfimport",
             "detailref",
             "accept",
             "setrole",

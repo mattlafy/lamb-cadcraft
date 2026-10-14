@@ -34,6 +34,7 @@ pub mod corners;
 mod cutlinecmd;
 pub mod detailref;
 pub mod detailtags;
+mod dxfimport;
 mod entitycmds;
 pub mod fillet;
 pub mod import;
