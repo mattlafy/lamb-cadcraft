@@ -1,6 +1,6 @@
 //! DVIEW: the dynamic view, on CADCraft's 2D plan views.
 //!
-//! As in AutoCAD and BricsCAD it starts with "Select objects or <use DVIEWBLOCK>:": the objects
+//! As in AutoCAD it starts with "Select objects or <use DVIEWBLOCK>:": the objects
 //! picked are the preview set, and Enter with nothing picked previews the DVIEWBLOCK block (the
 //! drawing's own block of that name, else a built-in sample house). While DVIEW runs only the
 //! preview set is drawn ([`Interactive::display_only`]); the whole drawing is regenerated when it
@@ -24,8 +24,7 @@ use super::super::machines::{SelOutcome, SelectPhase, number};
 use super::super::*;
 use crate::{Accept, DisplayOnly, EngineError, Input, Interactive, Prompt, Result, Session, Snapshot, Step, View};
 
-/// What DVIEW (and a view twist asked for anywhere) says on a layout with no active viewport, as
-/// BricsCAD does.
+/// What DVIEW (and a view twist asked for anywhere) says on a layout with no active viewport.
 pub(super) const PAPER_SPACE: &str = "This command is not available in Paper space.";
 
 /// The option prompt's keywords, in AutoCAD's order.
@@ -148,7 +147,7 @@ fn run_dview(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The built-in DVIEWBLOCK: a house front in the unit square, origin at the lower-left corner
-/// (the size and origin AutoCAD documents for a DVIEWBLOCK of one's own). CADCraft's own drawing.
+/// (the size and origin AutoCAD gives a DVIEWBLOCK of one's own). CADCraft's own drawing.
 fn sample_house() -> Vec<(Vec2, Vec2)> {
     let p = Vec2::new;
     let mut lines = Vec::new();
