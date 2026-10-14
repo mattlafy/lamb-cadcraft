@@ -11,7 +11,8 @@
 //! - Each repeat reads back as `{dimension, members, pitch: [x, y], pitchLength, parallel}`;
 //!   `parallel` is `null` when the detail has no reference line. A pitch not parallel to the
 //!   reference is tagged anyway and flagged ("Repeat is not parallel to the reference line").
-//! - Repeat members are not continuous: [`crate::assembly`] lays no band from them.
+//! - Repeat members are not continuous: [`crate::assembly`] lays no band from them; it arrays them
+//!   at the pitch along each run instead (LAMB T380).
 
 use std::collections::HashSet;
 
@@ -341,7 +342,11 @@ mod tests {
         s.execute("editview", &json!({ "viewId": detail.0 }))?;
         let stud = line(&mut s, [0.0, 100.0], [1000.0, 100.0])?;
         let pitch = draw(&mut s, "dimaligned", json!({ "p1": [0, 0], "p2": [406.4, 0], "at": [200, -300] }))?;
-        let bands = |s: &Session| -> T<Vec<usize>> { Ok(crate::assembly::assembly_lines(s.doc()?, plan)?.iter().map(|r| r.lines.len()).collect()) };
+        // Bands span the whole run; the member's own copies (laid by the repeat) are 1000 long.
+        let bands = |s: &Session| -> T<Vec<usize>> {
+            let runs = crate::assembly::assembly_lines(s.doc()?, plan)?;
+            Ok(runs.iter().map(|r| r.lines.iter().filter(|l| (l.to.x - l.from.x).hypot(l.to.y - l.from.y) > 1001.0).count()).collect())
+        };
         assert_eq!(bands(&s)?, [4, 4, 4, 4], "untagged, the line is a band");
         s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()] }))?;
         assert_eq!(bands(&s)?, [3, 3, 3, 3], "tagged, it is not");

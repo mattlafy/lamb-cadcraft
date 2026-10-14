@@ -6,15 +6,17 @@
 //! `assemblyplan {viewId}` ([`write_assembly_block`], LAMB T371) writes them as LINEs into the
 //! block [`assembly_block_name`]`(plan)`, replacing its contents, in one undo step. Each laid run
 //! also carries its width conflict (lamb-core's [`width_conflict`], LAMB T375): reported by
-//! ASSEMBLYPLAN and by the read-only `wallconflicts {viewId}`. Not the AI-line sweep in
-//! [`crate::sweeps`].
+//! ASSEMBLYPLAN and by the read-only `wallconflicts {viewId}`. Each of the detail's repeats
+//! ([`detail_repeats`], LAMB T380) is arrayed at its pitch along the run too (lamb-core's
+//! [`lay_repeat`]), every straight segment of its members kept on the member's layer. Not the
+//! AI-line sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
 
 use cadcraft_doc::{Block, Common, Drawing, EntityKind, Line, Space};
 use cadcraft_engine::{Result as EngineResult, Session};
 use cadcraft_geom::Vec2;
-use lamb_core::derivation::assembly::{AssemblyLine, FaceRef, WidthConflict, detail_bands, lay_bands, width_conflict};
+use lamb_core::derivation::assembly::{AssemblyLine, FaceRef, WidthConflict, detail_bands, detail_frame, lay_bands, lay_repeat, width_conflict};
 use lamb_core::derivation::detail_tags::RunDetail;
 use lamb_core::geometry::Point2;
 use lamb_core::model::AnyView;
@@ -26,7 +28,7 @@ use crate::convert::to_polyline;
 use crate::detailref::{DetailRefKind, detail_reference};
 use crate::detailtags::{graph_and_sides, resolve_view_details};
 use crate::project::DrawingProject;
-use crate::repeats::repeat_members;
+use crate::repeats::{detail_repeats, repeat_members};
 use crate::schema::{assembly_block_name, read_document, view_block_name};
 
 /// One wall run's assembly: the detail it resolved to (if any), the laid lines, and why it was
@@ -62,7 +64,30 @@ fn detail_lines(d: &Drawing, detail: Id, reference: cadcraft_doc::Handle) -> Res
         .collect())
 }
 
-/// One run's lines from `detail` and its width conflict, or why not.
+/// Every straight segment of the `members` of `detail`'s block (each through [`to_polyline`], open
+/// or closed; bulged segments and entities it refuses are skipped), with the member's layer.
+fn member_segments(d: &Drawing, detail: Id, members: &[cadcraft_doc::Handle]) -> Vec<(Point2, Point2, String)> {
+    let Some(block) = d.block(&view_block_name(detail)) else { return Vec::new() };
+    let mut out = Vec::new();
+    for e in block.entities.iter().filter(|e| members.contains(&e.handle)) {
+        let Ok(c) = to_polyline(e) else { continue };
+        let poly = c.polyline;
+        let mut at = poly.start;
+        for seg in &poly.segments {
+            if seg.bulge == 0.0 {
+                out.push((at, seg.to, e.common.layer.clone()));
+            }
+            at = seg.to;
+        }
+        if poly.closed && at != poly.start {
+            out.push((at, poly.start, e.common.layer.clone()));
+        }
+    }
+    out
+}
+
+/// One run's lines from `detail` (bands, then each repeat's copies) and its width conflict, or why
+/// not.
 fn run_lines(
     d: &Drawing,
     detail: Id,
@@ -75,8 +100,14 @@ fn run_lines(
         DetailRefKind::InteriorFace => FaceRef::Interior,
         DetailRefKind::StructuralCentre | DetailRefKind::Grid => return Err("reference kind not laid yet".into()),
     };
-    let bands = detail_bands((r.from, r.to), &detail_lines(d, detail, r.handle)?)?;
-    Ok((lay_bands(run, sides, face, &bands)?, width_conflict(run, face, &bands)))
+    let lines = detail_lines(d, detail, r.handle)?;
+    let bands = detail_bands((r.from, r.to), &lines)?;
+    let frame = detail_frame((r.from, r.to), &lines)?;
+    let mut laid = lay_bands(run, sides, face, &bands)?;
+    for rep in detail_repeats(d, detail)? {
+        laid.extend(lay_repeat(run, sides, face, &frame, &member_segments(d, detail, &rep.members), rep.pitch)?);
+    }
+    Ok((laid, width_conflict(run, face, &bands)))
 }
 
 /// Every run of `plan`'s wall graph, in graph order, with its detail's bands laid along it.
@@ -318,6 +349,60 @@ pub(crate) mod tests {
         assert!(e.to_string().contains("No such view"), "{e}");
         assert_eq!(s.doc()?.blocks.len(), blocks);
         assert!(s.doc()?.blocks.keys().all(|k| !k.starts_with("LAMB_ASSEMBLY_")));
+        Ok(())
+    }
+
+    #[test]
+    fn assemblyplan_arrays_a_repeat_at_its_pitch_along_each_run() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
+        let before = all_handles(&s)?;
+        s.execute("pline", &json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?;
+        let stud = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no stud")?;
+        let before = all_handles(&s)?;
+        s.execute("dimaligned", &json!({ "p1": [100, 0], "p2": [500, 0], "at": [300, -300] }))?;
+        let pitch = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no dimension")?;
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()] }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        let runs = assembly_lines(d, plan)?;
+        assert_eq!(runs.len(), 4);
+        let r6 = |v: f64| (v * 1e6).round() / 1e6;
+        let mut total = 0;
+        let mut saw_bottom = false;
+        for r in &runs {
+            let lamb_core::derivation::walls::RunCurve::Line { from, to } = graph.runs[r.run].centreline else { return Err("arc run".into()) };
+            let len = (to.x - from.x).hypot(to.y - from.y);
+            let copies = ((len - 138.0) / 400.0).floor() as usize + 1;
+            assert_eq!(r.lines.len(), 3 + 4 * copies, "run {}: {r:?}", r.run);
+            assert_eq!(r.lines[..3].iter().map(|l| l.layer.as_str()).collect::<Vec<_>>(), ["CLAD", "GYP", "GYP"]);
+            assert!(r.lines[3..].iter().all(|l| l.layer == "STUD"));
+            total += r.lines.len();
+            if from.y < 2000.0 && (from.y - to.y).abs() < 1e-9 {
+                saw_bottom = true;
+                // Exterior face at y = 0: the stud's first edge sits 50 into the wall, 100 along.
+                let first = &r.lines[3];
+                let dir = (to.x - from.x) / len;
+                assert_eq!((r6(first.from.x), r6(first.from.y), r6(first.to.y)), (r6(from.x + dir * 100.0), 50.0, 50.0));
+            }
+        }
+        assert!(saw_bottom, "no bottom run");
+
+        let n = undo_len(&s)?;
+        let out = s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(out["lines"].as_u64(), Some(total as u64), "{out}");
+        let name = assembly_block_name(plan);
+        let lines = block_lines(&s, &name)?.ok_or("no block")?;
+        assert_eq!(lines.len(), total);
+        assert_eq!(lines.iter().filter(|(_, _, l)| l == "STUD").count(), total - 12);
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        s.undo()?;
+        assert_eq!(block_lines(&s, &name)?, None, "one undo removes it all");
         Ok(())
     }
 

@@ -1,7 +1,8 @@
 //! Assembly lines (LAMB's `docs/07-architecture/cadcraft-integration.md` §10 "Generation", steps 1,
 //! 2 and 4, straight runs only; LAMB T369): a detail view's **continuous bands** — its straight
 //! lines parallel to the reference line — laid along a wall run, aligned on the run's matching
-//! face. No junction trimming, no repeats; computed on demand.
+//! face — and each **repeat** (LAMB T380) arrayed at its pitch along the run ([`lay_repeat`]). No
+//! junction trimming; computed on demand.
 //!
 //! Not the AI-line sweep (`crate::sweeps` in the adapter); everything here is "assembly".
 
@@ -33,42 +34,69 @@ pub struct AssemblyLine {
     pub layer: String,
 }
 
-/// The bands of a detail whose reference line runs `reference.0 → reference.1`: every line parallel
-/// to it (either direction, within `TOLERANCE.angle_deg`), its offset the signed distance of its
-/// midpoint. The wall side is the side of the band farthest from the reference; a tie between the
-/// two sides, or no bands at all, is an error rather than a guess. Sorted by offset, duplicates
-/// (same offset within `TOLERANCE.coincidence_mm`, same layer) collapsed.
-pub fn detail_bands(reference: (Point2, Point2), lines: &[(Point2, Point2, String)]) -> Result<Vec<Band>, String> {
+/// A detail's own frame: `origin` is the reference line's `from`, `along` its unit direction and
+/// `into` the unit normal pointing to the wall side, as [`detail_frame`] decides it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailFrame {
+    pub origin: Point2,
+    pub along: Point2,
+    pub into: Point2,
+}
+
+impl DetailFrame {
+    /// `p` as `(t along, o into)`.
+    fn local(&self, p: Point2) -> (f64, f64) {
+        let (dx, dy) = (p.x - self.origin.x, p.y - self.origin.y);
+        (dx * self.along.x + dy * self.along.y, dx * self.into.x + dy * self.into.y)
+    }
+}
+
+/// Every line of `lines` parallel to the unit direction `u` (either direction, within
+/// `TOLERANCE.angle_deg`), its offset the signed distance of its midpoint from `a` along `n`.
+fn parallel_offsets(a: Point2, u: Point2, n: Point2, lines: &[(Point2, Point2, String)]) -> Vec<Band> {
+    let max_sin = TOLERANCE.angle_deg.to_radians().sin();
+    let mut bands = Vec::new();
+    for (p, q, layer) in lines {
+        let (lx, ly) = (q.x - p.x, q.y - p.y);
+        let l = lx.hypot(ly);
+        if l <= TOLERANCE.coincidence_mm || (u.x * ly - u.y * lx).abs() / l > max_sin {
+            continue;
+        }
+        let (mx, my) = ((p.x + q.x) / 2.0, (p.y + q.y) / 2.0);
+        bands.push(Band { offset: (mx - a.x) * n.x + (my - a.y) * n.y, layer: layer.clone() });
+    }
+    bands
+}
+
+/// The frame of a detail whose reference line runs `reference.0 → reference.1`. The wall side is
+/// the side of the band line ([`detail_bands`]) farthest from the reference; a tie between the two
+/// sides, or no bands at all, is an error rather than a guess.
+pub fn detail_frame(reference: (Point2, Point2), lines: &[(Point2, Point2, String)]) -> Result<DetailFrame, String> {
     let (a, b) = reference;
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     let len = dx.hypot(dy);
     if len <= TOLERANCE.coincidence_mm {
         return Err("the reference line has no length".into());
     }
-    let (ux, uy) = (dx / len, dy / len);
-    let max_sin = TOLERANCE.angle_deg.to_radians().sin();
-    let mut bands: Vec<Band> = Vec::new();
-    for (p, q, layer) in lines {
-        let (lx, ly) = (q.x - p.x, q.y - p.y);
-        let l = lx.hypot(ly);
-        if l <= TOLERANCE.coincidence_mm || (ux * ly - uy * lx).abs() / l > max_sin {
-            continue;
-        }
-        let (mx, my) = ((p.x + q.x) / 2.0, (p.y + q.y) / 2.0);
-        // Left normal of the reference is (-uy, ux).
-        let offset = (mx - a.x) * -uy + (my - a.y) * ux;
-        bands.push(Band { offset, layer: layer.clone() });
-    }
+    let along = Point2 { x: dx / len, y: dy / len };
+    let left_normal = Point2 { x: -along.y, y: along.x };
+    let bands = parallel_offsets(a, along, left_normal, lines);
     let far = |sign: f64| bands.iter().map(|b| b.offset * sign).filter(|o| *o > 0.0).fold(0.0, f64::max);
     let (left, right) = (far(1.0), far(-1.0));
     if bands.is_empty() || (left - right).abs() <= TOLERANCE.coincidence_mm {
         return Err("the detail's wall side is ambiguous: its farthest bands on each side of the reference tie".into());
     }
-    if right > left {
-        for b in &mut bands {
-            b.offset = -b.offset;
-        }
-    }
+    let into = if right > left { Point2 { x: along.y, y: -along.x } } else { left_normal };
+    Ok(DetailFrame { origin: a, along, into })
+}
+
+/// The bands of a detail whose reference line runs `reference.0 → reference.1`: every line parallel
+/// to it (either direction, within `TOLERANCE.angle_deg`), its offset the signed distance of its
+/// midpoint toward the wall side ([`detail_frame`], whose errors it shares). Sorted by offset,
+/// duplicates (same offset within `TOLERANCE.coincidence_mm`, same layer) collapsed.
+pub fn detail_bands(reference: (Point2, Point2), lines: &[(Point2, Point2, String)]) -> Result<Vec<Band>, String> {
+    let f = detail_frame(reference, lines)?;
+    let mut bands = parallel_offsets(f.origin, f.along, f.into, lines);
     bands.sort_by(|a, b| a.offset.total_cmp(&b.offset).then_with(|| a.layer.cmp(&b.layer)));
     let mut out: Vec<Band> = Vec::new();
     for b in bands {
@@ -79,10 +107,25 @@ pub fn detail_bands(reference: (Point2, Point2), lines: &[(Point2, Point2, Strin
     Ok(out)
 }
 
-/// `bands` laid along a straight `run`: the face line is the centreline offset `width / 2` toward
-/// the `face` side (the `Outside` side for `Exterior`, the other for `Interior`), each band that
-/// face line shifted `offset` back toward the centreline, over the centreline's extent.
-pub fn lay_bands(run: &WallRun, sides: &RunSides, face: FaceRef, bands: &[Band]) -> Result<Vec<AssemblyLine>, String> {
+/// A straight run's face frame: `from`, `to`, unit direction and length of the centreline, and the
+/// unit normal toward the `face` side (the `Outside` side for `Exterior`, the other for
+/// `Interior`). A detail point `(t along, o into)` lands at `from + dir·t + normal·(width/2 − o)`.
+struct FaceFrame {
+    from: Point2,
+    to: Point2,
+    dir: Point2,
+    len: f64,
+    normal: Point2,
+}
+
+impl FaceFrame {
+    fn place(&self, width: f64, t: f64, o: f64) -> Point2 {
+        let d = width / 2.0 - o;
+        Point2 { x: self.from.x + self.dir.x * t + self.normal.x * d, y: self.from.y + self.dir.y * t + self.normal.y * d }
+    }
+}
+
+fn face_frame(run: &WallRun, sides: &RunSides, face: FaceRef) -> Result<FaceFrame, String> {
     let RunCurve::Line { from, to } = run.centreline else { return Err("arc runs are not laid yet".into()) };
     let outside_left = match (sides.left, sides.right) {
         (SideKind::Outside, SideKind::Space(_)) => true,
@@ -96,15 +139,56 @@ pub fn lay_bands(run: &WallRun, sides: &RunSides, face: FaceRef, bands: &[Band])
         return Err("the run has no length".into());
     }
     let s = if toward_left { 1.0 } else { -1.0 };
-    let (nx, ny) = (-dy / len * s, dx / len * s);
+    Ok(FaceFrame { from, to, dir: Point2 { x: dx / len, y: dy / len }, len, normal: Point2 { x: -dy / len * s, y: dx / len * s } })
+}
+
+/// `bands` laid along a straight `run`: the face line is the centreline offset `width / 2` toward
+/// the `face` side, each band that face line shifted `offset` back toward the centreline, over the
+/// centreline's extent.
+pub fn lay_bands(run: &WallRun, sides: &RunSides, face: FaceRef, bands: &[Band]) -> Result<Vec<AssemblyLine>, String> {
+    let f = face_frame(run, sides, face)?;
     Ok(bands
         .iter()
         .map(|b| {
             let d = run.width / 2.0 - b.offset;
-            let shift = |p: Point2| Point2 { x: p.x + nx * d, y: p.y + ny * d };
-            AssemblyLine { from: shift(from), to: shift(to), layer: b.layer.clone() }
+            let shift = |p: Point2| Point2 { x: p.x + f.normal.x * d, y: p.y + f.normal.y * d };
+            AssemblyLine { from: shift(f.from), to: shift(f.to), layer: b.layer.clone() }
         })
         .collect())
+}
+
+/// A repeat's `members` (straight segments in the detail's space, with their layers) arrayed along
+/// a straight `run`: copies shifted `k·|p|` along, `p` being `pitch`'s component along the
+/// reference, for every integer `k` whose copy's along-extent lies within `[0, run length]`
+/// (± `TOLERANCE.coincidence_mm`). Points map through the same face frame as [`lay_bands`], the
+/// reference's `from` at the centreline's `from`. No along component, no members, or no copy that
+/// fits gives no lines.
+pub fn lay_repeat(
+    run: &WallRun,
+    sides: &RunSides,
+    face: FaceRef,
+    frame: &DetailFrame,
+    members: &[(Point2, Point2, String)],
+    pitch: Point2,
+) -> Result<Vec<AssemblyLine>, String> {
+    let f = face_frame(run, sides, face)?;
+    let p = (pitch.x * frame.along.x + pitch.y * frame.along.y).abs();
+    if p <= TOLERANCE.coincidence_mm || members.is_empty() {
+        return Ok(Vec::new());
+    }
+    let local: Vec<_> = members.iter().map(|(a, b, layer)| (frame.local(*a), frame.local(*b), layer)).collect();
+    let ts = || local.iter().flat_map(|(a, b, _)| [a.0, b.0]);
+    let (tmin, tmax) = (ts().fold(f64::INFINITY, f64::min), ts().fold(f64::NEG_INFINITY, f64::max));
+    let tol = TOLERANCE.coincidence_mm;
+    let (kmin, kmax) = (((-tol - tmin) / p).ceil() as i64, ((f.len + tol - tmax) / p).floor() as i64);
+    let mut out = Vec::new();
+    for k in kmin..=kmax {
+        let s = k as f64 * p;
+        for ((ta, oa), (tb, ob), layer) in &local {
+            out.push(AssemblyLine { from: f.place(run.width, ta + s, *oa), to: f.place(run.width, tb + s, *ob), layer: (*layer).clone() });
+        }
+    }
+    Ok(out)
 }
 
 /// A run whose detail is thicker or thinner than the drawn wall: the detail's width minus the
@@ -235,6 +319,82 @@ mod tests {
         r.centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
         let one = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
         assert_eq!(lay_bands(&r, &one, FaceRef::Exterior, &bands).unwrap_err(), "arc runs are not laid yet");
+    }
+
+    fn rounded(lines: &[AssemblyLine]) -> Vec<(f64, f64, f64, f64)> {
+        let r = |v: f64| (v * 1e6).round() / 1e6;
+        lines.iter().map(|l| (r(l.from.x), r(l.from.y), r(l.to.x), r(l.to.y))).collect()
+    }
+
+    /// A 38-wide stud at t in [100, 138], o in [50, 200], as four segments, in a detail whose
+    /// reference is (0,0)-(1000,0) with its wall above (+y).
+    fn stud() -> (DetailFrame, Vec<(Point2, Point2, String)>) {
+        let frame = detail_frame((p(0.0, 0.0), p(1000.0, 0.0)), &[l((0.0, 200.0), (1000.0, 200.0), "GYP")]).unwrap();
+        let members = vec![
+            l((100.0, 50.0), (138.0, 50.0), "STUD"),
+            l((138.0, 50.0), (138.0, 200.0), "STUD"),
+            l((138.0, 200.0), (100.0, 200.0), "STUD"),
+            l((100.0, 200.0), (100.0, 50.0), "STUD"),
+        ];
+        (frame, members)
+    }
+
+    #[test]
+    fn the_detail_frame_points_to_the_wall_side_detail_bands_picks() {
+        let r = (p(0.0, 0.0), p(1000.0, 0.0));
+        let up = detail_frame(r, &[l((0.0, -20.0), (1000.0, -20.0), "A"), l((0.0, 200.0), (1000.0, 200.0), "A")]).unwrap();
+        assert_eq!((up.origin, up.along, up.into), (p(0.0, 0.0), p(1.0, 0.0), p(0.0, 1.0)));
+        let down = detail_frame(r, &[l((0.0, 20.0), (1000.0, 20.0), "A"), l((0.0, -200.0), (1000.0, -200.0), "A")]).unwrap();
+        assert_eq!(down.into, p(0.0, -1.0));
+        assert!(detail_frame(r, &[]).is_err());
+    }
+
+    #[test]
+    fn a_repeat_arrays_along_the_run_on_either_exterior_side() {
+        let (frame, members) = stud();
+        let r = run(p(0.0, 100.0), p(2000.0, 100.0), 200.0);
+        // Outside below (right of +x): face at y = 0, into the wall is +y.
+        let right_out = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let out = lay_repeat(&r, &right_out, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap();
+        assert_eq!(out.len(), 20, "k = 0..4, four segments each");
+        assert!(out.iter().all(|l| l.layer == "STUD"));
+        let got = rounded(&out);
+        for k in 0..5 {
+            let x = 100.0 + 400.0 * k as f64;
+            let want = [(x, 50.0, x + 38.0, 50.0), (x + 38.0, 50.0, x + 38.0, 200.0), (x + 38.0, 200.0, x, 200.0), (x, 200.0, x, 50.0)];
+            assert_eq!(got[4 * k..4 * k + 4], want, "copy {k}");
+        }
+        // Outside above: face at y = 200, into the wall is -y.
+        let left_out = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
+        let got = rounded(&lay_repeat(&r, &left_out, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap());
+        assert_eq!(got.len(), 20);
+        assert_eq!(got[0], (100.0, 150.0, 138.0, 150.0));
+        assert_eq!(got[18], (1738.0, 0.0, 1700.0, 0.0));
+        // A reversed pitch arrays the same copies.
+        assert_eq!(rounded(&lay_repeat(&r, &left_out, FaceRef::Exterior, &frame, &members, p(-400.0, 0.0)).unwrap()), got);
+    }
+
+    #[test]
+    fn a_repeat_uses_only_the_along_component_of_its_pitch() {
+        let (frame, members) = stud();
+        let r = run(p(0.0, 100.0), p(2000.0, 100.0), 200.0);
+        let sides = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        assert!(lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(0.0, 400.0)).unwrap().is_empty());
+        let skew = lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 30.0)).unwrap();
+        let straight = lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap();
+        assert_eq!(rounded(&skew), rounded(&straight));
+        // A run shorter than the member: no copy fits.
+        let short = run(p(0.0, 100.0), p(120.0, 100.0), 200.0);
+        assert!(lay_repeat(&short, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_repeat_on_an_arc_run_is_an_error() {
+        let (frame, members) = stud();
+        let mut r = run(p(0.0, 0.0), p(1000.0, 0.0), 200.0);
+        r.centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
+        let one = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
+        assert_eq!(lay_repeat(&r, &one, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap_err(), "arc runs are not laid yet");
     }
 
     #[test]
