@@ -9,6 +9,8 @@ use crate::CadApp;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
+/// A registered extra cell per Layers-palette layer row (fork-only, LAMB T362).
+pub mod layer_ext;
 /// The hatch pattern picker.
 pub mod patterns;
 /// A registered extra property group (fork-only, LAMB T361).
@@ -380,6 +382,8 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
     let cur = d.header.str("CLAYER", "0");
     let layers: Vec<(String, bool, bool, bool, Color)> = d.layers.iter().map(|l| (l.name.clone(), l.on, l.frozen, l.locked, l.color)).collect();
     let cur_info = layers.iter().find(|l| l.0.eq_ignore_ascii_case(&cur)).cloned();
+    let cells: Vec<_> = layers.iter().map(|l| layer_ext::cell_for(d, &l.0)).collect();
+    let mut cell_action = None;
     let mut set_current = None;
     let mut toggle: Option<(String, &str, bool)> = None;
     ui.horizontal(|ui| {
@@ -456,7 +460,7 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
     });
     if app.ui.show_layer_list {
         ui.add_space(2.0);
-        for (name, on, frozen, locked, color) in &layers {
+        for ((name, on, frozen, locked, color), cell) in layers.iter().zip(&cells) {
             ui.horizontal(|ui| {
                 ui.add_space(14.0);
                 if icons::button(ui, if *on { Icon::Bulb } else { Icon::BulbOff }, 18.0, "On/Off", false).clicked() {
@@ -475,6 +479,9 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
                     set_current = Some(name.clone());
                 }
                 crate::shortcut_menus::attach(app, &r, |app| crate::shortcut_menus::layer_entries(app, name));
+                if let Some(a) = cell.as_ref().and_then(|c| layer_ext::show(ui, c)) {
+                    cell_action = Some(a);
+                }
             });
         }
     }
@@ -483,6 +490,9 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     if let Some((n, k, v)) = toggle {
         let _ = app.run("layer.set", json!({ "name": n, k: v }));
+    }
+    if let Some((id, params)) = cell_action {
+        let _ = app.run(&id, params);
     }
 }
 

@@ -256,6 +256,12 @@ fn lamb_property_group(
     })
 }
 
+/// The Layers palette's LAMB default-role column (fork, LAMB T362).
+fn lamb_layer_cell(d: &cadcraft_engine::doc::Drawing, layer: &str) -> Option<cadcraft_ui_egui::palettes::layer_ext::LayerCell> {
+    let c = lamb_cadcraft::layer_role_cell(d, layer)?;
+    Some(cadcraft_ui_egui::palettes::layer_ext::LayerCell { value: c.value, tip: c.tip, choices: c.choices })
+}
+
 fn main() -> eframe::Result {
     // First, so every start-up record is captured; see `logging`.
     let logger = logging::install();
@@ -275,6 +281,9 @@ fn main() -> eframe::Result {
     }
     if let Err(e) = cadcraft_ui_egui::palettes::props_ext::register_property_source(lamb_property_group) {
         log::warn!("LAMB Properties group not installed: {e}");
+    }
+    if let Err(e) = cadcraft_ui_egui::palettes::layer_ext::register_layer_cell(lamb_layer_cell) {
+        log::warn!("LAMB Layers role column not installed: {e}");
     }
     // lossy, so a value that is not Unicode is reported like any other bad port instead of ignored
     let mut control_port =

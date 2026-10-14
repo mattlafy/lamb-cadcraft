@@ -14,7 +14,7 @@
 //!
 //! `handles` are hex strings or numbers; absent, the current selection (engine `cmd::targets`'
 //! rule, parsed here because that fn is crate-private upstream). The Properties Role row (`props`)
-//! runs SETROLE; the Layers palette role column is not built yet.
+//! runs SETROLE; the Layers palette role column ([`layer_role_cell`], T362) runs LAYERROLE.
 
 use std::collections::HashSet;
 
@@ -159,6 +159,31 @@ pub(crate) fn setrole(s: &mut Session, p: &Value) -> Result<Value> {
         message += &format!(", {skipped} not in a LAMB view skipped");
     }
     Ok(json!({ "changed": changed, "skipped": skipped, "message": message }))
+}
+
+/// The Layers palette's role cell for one layer (fork, T362): its default role and a choice per
+/// settable role, each a LAYERROLE call. Mapped to ui-egui's `LayerCell` by the desktop app.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerRoleCell {
+    pub value: String,
+    pub tip: Option<String>,
+    /// (label, command id, params).
+    pub choices: Vec<(String, String, Value)>,
+}
+
+/// `layer`'s role cell; `None` when the drawing has no LAMB views or no such layer (TS
+/// `LayersPanel.tsx`'s `layer-default-role` select over `DEFAULT_ROLE_OPTIONS`).
+pub fn layer_role_cell(d: &cadcraft_doc::Drawing, layer: &str) -> Option<LayerRoleCell> {
+    if !DrawingProject::new(d).ok().is_some_and(|p| p.views().next().is_some()) {
+        return None;
+    }
+    let role = read_layer_data(d.layer(layer)?).ok()?.default_role;
+    let choices = ROLE_WORDS
+        .iter()
+        .filter(|(_, r)| *r != LineRole::Bylayer)
+        .map(|(w, r)| ((*w).to_owned(), "layerrole".to_owned(), json!({ "layer": layer, "role": r })))
+        .collect();
+    Some(LayerRoleCell { value: role_word(role).to_owned(), tip: Some("Default role for ByLayer entities on this layer".into()), choices })
 }
 
 /// LAYERROLE: a layer's default role.
@@ -477,6 +502,30 @@ mod tests {
         assert_eq!(role(&s)?, LineRole::Datum);
         s.undo()?;
         assert_eq!(role(&s)?, LineRole::Seen);
+        Ok(())
+    }
+
+    #[test]
+    fn layer_role_cell_reads_the_default_and_its_choices_run_layerrole() -> R {
+        let (mut s, _) = session()?;
+        s.doc_mut()?.ensure_layer("A-WALL");
+        let cell = layer_role_cell(s.doc()?, "A-WALL").ok_or("no cell")?;
+        assert_eq!(cell.value, "Cut", "default");
+        assert_eq!(cell.choices.len(), 6);
+        assert!(cell.choices.iter().all(|c| c.0 != "Bylayer" && c.1 == "layerrole"));
+        s.execute("layerrole", &json!({ "layer": "A-WALL", "role": "seen" }))?;
+        assert_eq!(layer_role_cell(s.doc()?, "A-WALL").ok_or("no cell")?.value, "Seen");
+        let (_, id, params) = cell.choices.iter().find(|c| c.0 == "Viewclip").ok_or("no Viewclip")?.clone();
+        assert_eq!(params, json!({ "layer": "A-WALL", "role": "view_clip" }));
+        s.execute(&id, &params)?;
+        assert_eq!(layer_role_cell(s.doc()?, "A-WALL").ok_or("no cell")?.value, "Viewclip");
+        s.undo()?;
+        assert_eq!(layer_role_cell(s.doc()?, "A-WALL").ok_or("no cell")?.value, "Seen", "one UNDO restores it");
+        assert_eq!(layer_role_cell(s.doc()?, "NOPE"), None, "unknown layer");
+
+        let mut bare = Session::new();
+        bare.new_drawing(true);
+        assert_eq!(layer_role_cell(bare.doc()?, "0"), None, "no LAMB views");
         Ok(())
     }
 
