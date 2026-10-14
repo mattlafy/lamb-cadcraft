@@ -3,7 +3,7 @@
 //! clears, a line drawn through a hollow marker auto-links, an unlinked MOVE leaves links alone, and
 //! a rigidly moved linked segment carries its partner across views (travel) only when the link is
 //! in the selection's travel set — seeded by an idle crossing box, emptied by a window box or Esc —
-//! and is flagged stale otherwise, each in the command's own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`).
+//! and is flagged stale otherwise, erasing a travel-set line erases its partner, each in the command's own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`).
 //!
 //! The command registry is process-global, so registration goes through one `Once`.
 
@@ -530,6 +530,63 @@ fn trim_reanchors_links() -> R {
     let bottom = json!({"handle": hex(sec_e), "pick": [1000, 500], "edges": [e5.hex()]});
     let (_, report) = raw_report(&base3, sec_view, "trim", &bottom, &[])?;
     assert_eq!(report.dropped, vec![link.id], "{report:?}");
+    Ok(())
+}
+
+/// T370 (TS T109 ERASE): erasing a line whose link is in the travel set erases the partner in the
+/// other view too, in one undo step; with an empty travel set the partner stays; a TRIM or BREAK
+/// that cuts the anchor away is not an erase and leaves the partner.
+#[test]
+fn erase_takes_travelling_partners() -> R {
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let original = read_document(&d)?.links;
+    let (link, plan_e, sec_e, plan_view) = crossbar(&d)?;
+    let erase = json!({"handles": [hex(plan_e)]});
+
+    let (after, report) = raw_report(&d, plan_view, "erase", &erase, &[link.id])?;
+    assert_eq!(report.erased, vec![sec_e], "{report:?}");
+    assert!(after.entity(Handle(sec_e.0)).is_none(), "the section partner is gone");
+    let gone: Vec<Id> = original.iter().filter(|l| on(l, plan_e) || on(l, sec_e)).map(|l| l.id).collect();
+    assert_eq!(report.dropped, gone, "every link touching either is dropped");
+    assert_eq!(read_document(&after)?.links, original.iter().filter(|l| !gone.contains(&l.id)).cloned().collect::<Vec<_>>());
+
+    let mut s = Session::new();
+    s.open_drawing(d.clone(), "u-wall", None);
+    install_link_maintenance(&mut s);
+    let ext_before = s.doc()?.ext.get(lamb_cadcraft::EXT_KEY).cloned();
+    let (plan_ent, sec_ent) = (s.doc()?.entity(Handle(plan_e.0)).cloned(), s.doc()?.entity(Handle(sec_e.0)).cloned());
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    s.set_travel(vec![link.id.0]);
+    s.execute("erase", &erase)?;
+    assert!(s.doc()?.entity(Handle(plan_e.0)).is_none() && s.doc()?.entity(Handle(sec_e.0)).is_none(), "both erased");
+    assert!(!links(&s)?.iter().any(|l| on(l, plan_e) || on(l, sec_e)));
+    s.undo()?;
+    assert_eq!(s.doc()?.entity(Handle(plan_e.0)).cloned(), plan_ent, "one undo restores the plan entity");
+    assert_eq!(s.doc()?.entity(Handle(sec_e.0)).cloned(), sec_ent, "and the section partner");
+    assert_eq!(s.doc()?.ext.get(lamb_cadcraft::EXT_KEY).cloned(), ext_before, "and the LAMB slot, byte-identical");
+
+    // Empty travel set: the link is dropped, the partner stays.
+    let (after, report) = raw_report(&d, plan_view, "erase", &erase, &[])?;
+    assert!(report.erased.is_empty(), "{report:?}");
+    assert!(after.entity(Handle(sec_e.0)).is_some(), "the partner stays");
+    assert!(report.dropped.contains(&link.id), "{report:?}");
+
+    // TRIM / BREAK cutting the anchor away, link in the travel set: not an erase.
+    let mut s = Session::new();
+    s.open_drawing(d.clone(), "u-wall", None);
+    install_link_maintenance(&mut s);
+    let e1 = draw_edge(&mut s, plan_view, [4000.0, -500.0], [4000.0, 500.0])?;
+    let e2 = draw_edge(&mut s, plan_view, [6000.0, -500.0], [6000.0, 500.0])?;
+    let base = s.doc()?.clone();
+    let near = json!({"handle": hex(plan_e), "pick": [5000, 0], "edges": [e1.hex(), e2.hex()]});
+    let (after, report) = raw_report(&base, plan_view, "trim", &near, &[link.id])?;
+    assert_eq!(report.dropped, vec![link.id], "{report:?}");
+    assert!(report.erased.is_empty() && after.entity(Handle(sec_e.0)).is_some(), "trim erases no partner: {report:?}");
+    let brk = json!({"handle": hex(plan_e), "p1": [4000, 0], "p2": [6000, 0]});
+    let (after, report) = raw_report(&base, plan_view, "break", &brk, &[link.id])?;
+    assert_eq!(report.dropped, vec![link.id], "{report:?}");
+    assert!(report.erased.is_empty() && after.entity(Handle(sec_e.0)).is_some(), "break erases no partner: {report:?}");
     Ok(())
 }
 

@@ -19,6 +19,9 @@
 //!    is a sub-span of the old one and still holds the anchor point — same link id, origin and
 //!    creation stamp (§13 phase 3 "TRIM a linked line → links maintained"). No such piece: the
 //!    anchor was cut away and step 1 drops the link (TS `break.ts` `remapAnchor` parity);
+//! 0c. erases travelling partners: an entity the command erased outright (its view gained no
+//!    entity, so not a TRIM/BREAK cut-away) takes the partner of every travel-set link on it with it
+//!    — one hop, no cascade, unaccepted AI partners included (TS T109 `erase.ts` parity);
 //! 1. drops every link with an anchor whose entity is no longer in any view block (ERASE);
 //! 2. re-checks every link with an anchor on a touched entity (new, or a different polyline) or in
 //!    a touched view (its document entry, or its host's, changed) with lamb-core's
@@ -30,7 +33,7 @@
 //!    fills).
 //!
 //! [`install`] registers [`link_observer`] on a `Session`, so all of this lands in the command's own
-//! undo step. Out of scope: travel cascading past the first partner, Tier 2 declarations.
+//! undo step. Out of scope: travel or erase cascading past the first partner, Tier 2 declarations.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -65,6 +68,8 @@ pub struct MaintenanceReport {
     pub travelled: Vec<Id>,
     /// Links moved onto a new piece of an entity the command replaced (TRIM, BREAK).
     pub reanchored: Vec<Id>,
+    /// Partner entities (not links) erased with an erased entity across a travel-set link.
+    pub erased: Vec<Id>,
 }
 
 impl MaintenanceReport {
@@ -75,6 +80,7 @@ impl MaintenanceReport {
             && self.created.is_empty()
             && self.travelled.is_empty()
             && self.reanchored.is_empty()
+            && self.erased.is_empty()
     }
 }
 
@@ -260,6 +266,38 @@ fn reanchor(before_entities: &EntityMap, after: &mut Drawing) -> Result<Vec<Id>,
     Ok(moved)
 }
 
+/// Step 0c, erase cascade. For each link in `travel` with one end's entity gone from `after` (after
+/// step 0b) and the other still there, removes that partner — unless the gone entity's view gained an
+/// entity this command, which is TRIM/BREAK replacing it with pieces, not an erase. One hop: the
+/// partners are chosen against `after` as the command left it, so a partner's own links never
+/// cascade. An unaccepted AI partner goes too — the line it mirrors is gone.
+fn erase_partners(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -> Result<Vec<Id>, SchemaError> {
+    let erased = {
+        let p = DrawingProject::new(after)?;
+        let after_entities = entity_map(&p);
+        let grown: BTreeSet<Id> = after_entities.iter().filter(|(id, _)| !before_entities.contains_key(id)).map(|(_, (v, _))| *v).collect();
+        let mut out: Vec<Id> = Vec::new();
+        for link in p.document().links.iter().filter(|l| travel_set.contains(&l.id)) {
+            for (mine, other) in [(&link.a, &link.b), (&link.b, &link.a)] {
+                let Some((view, _)) = before_entities.get(&mine.entity_id) else { continue };
+                if after_entities.contains_key(&mine.entity_id)
+                    || grown.contains(view)
+                    || !after_entities.contains_key(&other.entity_id)
+                    || out.contains(&other.entity_id)
+                {
+                    continue;
+                }
+                out.push(other.entity_id);
+            }
+        }
+        out
+    };
+    for id in &erased {
+        after.remove_entity(Handle(id.0));
+    }
+    Ok(erased)
+}
+
 /// Some link already joins segment `a` to segment `b`, either way round.
 fn already_joined(links: &[LinkRecord], r: &LinkRecord) -> bool {
     let key = |x: &LinkAnchor| (x.entity_id, x.segment_index);
@@ -283,6 +321,8 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
     report.travelled = travel(&before_entities, after, travel_set)?;
     // 0b: re-anchor ends whose entity was replaced by pieces, before step 1 would drop them.
     report.reanchored = reanchor(&before_entities, after)?;
+    // 0c: an erased entity takes its travel-set partners with it; step 1 drops their links.
+    report.erased = erase_partners(&before_entities, after, travel_set)?;
 
     // 1 + 2: drop and re-check, against one read of `after`.
     let (new_entities, links) = {
