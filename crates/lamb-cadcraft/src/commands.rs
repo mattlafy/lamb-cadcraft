@@ -621,6 +621,38 @@ fn ucsalign(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "on": on, "message": format!("<UCS align {}>", if on { "on" } else { "off" }) }))
 }
 
+/// One LAMB status-bar toggle; the app maps it onto ui-egui's `statusext::StatusToggle`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatusToggle {
+    pub label: String,
+    pub on: bool,
+    pub tip: String,
+    pub command: (String, Value),
+}
+
+/// The status-bar toggles (LAMB T360): pane LOCK (PANELOCK) and UCS (UCSALIGN), only while the
+/// drawing has LAMB views.
+pub fn status_toggles(s: &Session) -> Vec<StatusToggle> {
+    let has_views = s.doc().ok().and_then(|d| DrawingProject::new(d).ok()).is_some_and(|p| p.views().next().is_some());
+    if !has_views {
+        return Vec::new();
+    }
+    vec![
+        StatusToggle {
+            label: "LOCK".into(),
+            on: s.panes_locked(),
+            tip: "Pane camera lock (PANELOCK)".into(),
+            command: ("panelock".into(), json!({})),
+        },
+        StatusToggle {
+            label: "UCS".into(),
+            on: !s.world_ortho(),
+            tip: "ORTHO follows the pane's rotation (UCSALIGN, F6)".into(),
+            command: ("ucsalign".into(), json!({})),
+        },
+    ]
+}
+
 /// View ▸ LAMB ▸ <the command's label>.
 const MENU: &[&str] = &["View", "LAMB", ""];
 
@@ -960,6 +992,28 @@ mod tests {
         assert_eq!(s.state()?.view().height, 100.0, "Model keeps its window");
         s.execute("editview", &json!({ "viewId": id }))?;
         assert_eq!(s.state()?.view().height, 7.0, "a revisit keeps the view it had");
+        Ok(())
+    }
+
+    #[test]
+    fn status_toggles_follow_panelock_and_ucsalign_on_a_lamb_drawing_only() -> R {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+        install_app()?;
+        let plain = session()?;
+        assert!(status_toggles(&plain).is_empty(), "a plain drawing has no LAMB toggles");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamb-core/tests/lamb/u-wall-two-sections.lamb.json");
+        let files: BTreeMap<String, String> = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let project = lamb_core::persistence::files_to_project(&files).map_err(|e| format!("{e:?}"))?;
+        let (d, _, _) = crate::import::project_to_drawing(&project)?;
+        let mut s = Session::new();
+        s.open_drawing(d, "u-wall", None);
+        let state = |s: &Session| status_toggles(s).into_iter().map(|t| (t.label, t.on)).collect::<Vec<_>>();
+        assert_eq!(state(&s), vec![("LOCK".to_string(), false), ("UCS".to_string(), true)]);
+        for t in status_toggles(&s) {
+            s.execute(&t.command.0, &t.command.1)?;
+        }
+        assert_eq!(state(&s), vec![("LOCK".to_string(), true), ("UCS".to_string(), false)]);
         Ok(())
     }
 }

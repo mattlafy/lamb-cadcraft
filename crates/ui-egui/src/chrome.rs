@@ -8,6 +8,7 @@ use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
 pub mod annoscale;
+pub mod statusext;
 
 const TOOLBAR: &[&[(Icon, &str, &str, Option<&str>)]] = &[
     &[
@@ -377,6 +378,8 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             // Scale and lock of the active or selected viewport.
             coord_right = crate::vpscale::status(app, ui, coord_right + 4.0, r.center().y) - 10.0;
         }
+        // Fork (LAMB T360): registered text toggles, left of everything above.
+        coord_right = statusext::status(app, ui, coord_right, r.center().y);
         // Layout tabs: Model, "+", then the layouts that fit before the right-hand controls (the
         // current one always); the layout list reaches the rest.
         let mut tabs: Vec<String> = vec!["Model".into()];

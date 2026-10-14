@@ -234,6 +234,13 @@ fn lamb_view_rows(d: &cadcraft_engine::doc::Drawing, edit: &cadcraft_engine::doc
         .collect()
 }
 
+fn lamb_status_toggles(s: &cadcraft_engine::Session) -> Vec<cadcraft_ui_egui::chrome::statusext::StatusToggle> {
+    lamb_cadcraft::commands::status_toggles(s)
+        .into_iter()
+        .map(|t| cadcraft_ui_egui::chrome::statusext::StatusToggle { label: t.label, on: t.on, tip: t.tip, command: t.command })
+        .collect()
+}
+
 fn main() -> eframe::Result {
     // First, so every start-up record is captured; see `logging`.
     let logger = logging::install();
@@ -247,6 +254,9 @@ fn main() -> eframe::Result {
     }
     if let Err(e) = cadcraft_ui_egui::viewlist::register_row_source(lamb_view_rows) {
         log::warn!("LAMB Views palette not installed: {e}");
+    }
+    if let Err(e) = cadcraft_ui_egui::chrome::statusext::register_status_toggles(lamb_status_toggles) {
+        log::warn!("LAMB status toggles not installed: {e}");
     }
     // lossy, so a value that is not Unicode is reported like any other bad port instead of ignored
     let mut control_port =
@@ -406,6 +416,15 @@ mod tests {
 
     fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         move |k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| OsString::from(v))
+    }
+
+    #[test]
+    fn lamb_binds_f6_to_ucsalign() {
+        assert!(lamb_cadcraft::commands::install_app().is_ok());
+        use egui::Key::*;
+        let table = [F1, F2, F3, F5, F7, F8, F9, F10, F11, F12];
+        let keys = cadcraft_ui_egui::menus::spec_function_keys(cadcraft_engine::command_specs(), &table);
+        assert_eq!(keys, vec![(F6, "ucsalign", true)]);
     }
 
     #[test]

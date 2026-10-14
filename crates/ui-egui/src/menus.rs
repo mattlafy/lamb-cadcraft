@@ -597,6 +597,22 @@ pub fn activate(app: &mut CadApp, id: &str) {
     app.start(id);
 }
 
+/// Fork (LAMB T360): the bare function keys command specs ask for (`shortcut` exactly `F1`..`F12`)
+/// that `bound` doesn't already hold, as (key, command id, transparent). Built-ins' keys are all in
+/// the static table, so this only ever adds a provider's (LAMB's F6 UCSALIGN).
+pub fn spec_function_keys(specs: &[cadcraft_engine::CommandSpec], bound: &[egui::Key]) -> Vec<(egui::Key, &'static str, bool)> {
+    let mut out: Vec<(egui::Key, &'static str, bool)> = Vec::new();
+    for spec in specs {
+        let Some(name) = spec.shortcut else { continue };
+        let fkey = name.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=12).contains(&n));
+        let Some(key) = egui::Key::from_name(name).filter(|_| fkey) else { continue };
+        if !bound.contains(&key) && !out.iter().any(|(k, _, _)| *k == key) {
+            out.push((key, spec.id, spec.transparent));
+        }
+    }
+    out
+}
+
 /// Keyboard shortcuts and function keys.
 pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
     use egui::{Key, KeyboardShortcut, Modifiers};
@@ -640,13 +656,35 @@ pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
     }
     // Cmd/Ctrl+C, X and V arrive as clipboard events, not key presses.
     let mut fire = crate::clipboard::shortcut_commands(app, ctx);
+    let bound: Vec<Key> = pairs.iter().filter(|(s, _)| s.modifiers == Modifiers::NONE).map(|(s, _)| s.logical_key).collect();
+    let spec_keys = spec_function_keys(cadcraft_engine::command_specs(), &bound);
+    let mut spec_fire: Vec<(&str, bool)> = Vec::new();
     ctx.input_mut(|i| {
         for (s, id) in pairs {
             if i.consume_shortcut(s) && !fire.contains(id) {
                 fire.push(*id);
             }
         }
+        for &(k, id, transparent) in &spec_keys {
+            if i.consume_shortcut(&sc(Modifiers::NONE, k)) {
+                spec_fire.push((id, transparent));
+            }
+        }
     });
+    for (id, transparent) in spec_fire {
+        if !transparent {
+            activate(app, id);
+            continue;
+        }
+        match app.session.execute(id, &json!({})) {
+            Ok(v) => {
+                if let Some(m) = v.get("message").and_then(Value::as_str) {
+                    app.session.echo(m.to_string());
+                }
+            }
+            Err(e) => app.status = Some((e.to_string(), crate::now_ms())),
+        }
+    }
     for id in fire {
         // ISOPLANE (F5, Ctrl+E) switches the plane without cancelling the active command.
         if id == "isoplane" {
@@ -784,5 +822,34 @@ mod units_dialog_tests {
         assert!(app.ui.dialog.is_none(), "JSON calls never open dialogs");
         let h = &app.session.doc().unwrap().header;
         assert_eq!((h.i64("LUNITS", 0), h.i64("LUPREC", 0), h.i64("INSUNITS", 0)), (4, 3, 4));
+    }
+
+    fn noop(_: &mut cadcraft_engine::Session, _: &serde_json::Value) -> cadcraft_engine::Result<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+
+    /// The bare function keys the static table in `shortcuts` binds.
+    const TABLE_FKEYS: &[egui::Key] = {
+        use egui::Key::*;
+        &[F1, F2, F3, F5, F7, F8, F9, F10, F11, F12]
+    };
+
+    #[test]
+    fn a_spec_function_key_is_bound_unless_the_table_holds_it() {
+        use cadcraft_engine::CommandSpec;
+        let specs = [
+            CommandSpec::new("ucsalign", "UCS Align", noop).key("F6").transparent(),
+            CommandSpec::new("clash", "Clash", noop).key("F8"),
+            CommandSpec::new("again", "Again", noop).key("F6"),
+            CommandSpec::new("ctrl", "Ctrl", noop).key("Ctrl+F4"),
+            CommandSpec::new("f13", "F13", noop).key("F13"),
+        ];
+        let keys = super::spec_function_keys(&specs, TABLE_FKEYS);
+        assert_eq!(keys, vec![(egui::Key::F6, "ucsalign", true)]);
+    }
+
+    #[test]
+    fn no_built_in_function_key_is_bound_twice() {
+        assert_eq!(super::spec_function_keys(cadcraft_engine::command_specs(), TABLE_FKEYS), vec![]);
     }
 }
