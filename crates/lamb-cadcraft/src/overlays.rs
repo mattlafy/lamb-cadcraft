@@ -87,12 +87,14 @@ fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kind, pts: &[V
 
 /// The overlay provider: the edited view's underlay ([`underlay`], drawn first, pale), its halos
 /// ([`halo`]: RESOLVE's attention, unaccepted AI lines' glow), a detail's reference line
-/// ([`crate::detailref`], magenta), then its markers and cut lines, in
+/// ([`crate::detailref`], magenta), a detail's repeat ghosts ([`crate::repeats::draw`], one pale copy
+/// of each repeat's members at its pitch), then its markers and cut lines, in
 /// its block's coordinates.
 pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let mut list = underlay::draw(d, space, opts);
     append_list(&mut list, halo::draw(d, space, opts));
     append_list(&mut list, crate::detailref::draw(d, space, opts));
+    append_list(&mut list, crate::repeats::draw(d, space, opts));
     let Some((dp, id)) = view_of(d, space) else { return list };
     let Ok(markers) = compute_markers_for_view(&dp, id) else { return list };
     let Ok(cuts) = compute_cut_lines_for_view(&dp, id) else { return list };

@@ -13,19 +13,31 @@
 //!   reference is tagged anyway and flagged ("Repeat is not parallel to the reference line").
 //! - Repeat members are not continuous: [`crate::assembly`] lays no band from them; it arrays them
 //!   at the pitch along each run instead (LAMB T380).
+//! - [`draw`], through LAMB's overlay provider, draws one ghosted copy of each repeat's members at
+//!   the pitch while the detail is edited (LAMB T383). Overlay only: nothing is added to the
+//!   drawing.
 
 use std::collections::HashSet;
 
-use cadcraft_doc::{DimKind, Drawing, Entity, EntityKind, Handle};
+use cadcraft_color::Rgb;
+use cadcraft_doc::{DimKind, Drawing, Entity, EntityKind, Handle, Space};
 use cadcraft_engine::{Result, Session};
+use cadcraft_geom::{Bounds2, Vec2};
+use cadcraft_render::{DPrim, DisplayList, Kind, Options};
 use lamb_core::geometry::Point2;
 use lamb_core::geometry::tolerance::{TOLERANCE, deg_to_rad};
-use lamb_core::model::Id;
+use lamb_core::model::{AnyView, Id};
 use serde_json::{Value, json};
 
 use crate::commands::{bad, other};
 use crate::detailref::{detail_reference, edited_detail};
-use crate::schema::{RepeatTag, read_entity_data, set_entity_data, view_block_name};
+use crate::overlays::view_id;
+use crate::schema::{RepeatTag, read_document, read_entity_data, set_entity_data, view_block_name};
+
+/// The ghosted copy's colour.
+pub(crate) const GHOST_COLOR: Rgb = Rgb(150, 150, 150);
+/// The ghosted copy's transparency, percent.
+const GHOST_TRANSPARENCY: u8 = 60;
 
 /// A detail's repeat: the pitch dimension, the members still in the block, the pitch vector in
 /// the detail's local coordinates, and whether it runs parallel to the reference line (`None`
@@ -192,10 +204,44 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
     find(s)
 }
 
+/// The overlay: in a detail view's block, each repeat's members drawn once more, shifted by the
+/// pitch, in [`GHOST_COLOR`] and translucent. Wipeouts are skipped; an infinite line's base moves,
+/// its direction does not. Empty anywhere else, and on any error.
+pub(crate) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
+    let mut out = DisplayList { bounds: Bounds2::EMPTY, ..DisplayList::default() };
+    let Some(id) = view_id(space) else { return out };
+    let Ok(doc) = read_document(d) else { return out };
+    if !doc.views.iter().any(|v| v.id() == id && matches!(v, AnyView::Detail(_))) {
+        return out;
+    }
+    let Ok(repeats) = detail_repeats(d, id) else { return out };
+    let opts = Options { view: None, ..opts.clone() };
+    for r in &repeats {
+        let src = cadcraft_render::build_entities(d, r.members.iter().filter_map(|h| d.entity(*h).map(|e| &**e)), &opts);
+        let shift = Vec2::new(r.pitch.x, r.pitch.y);
+        for prim in &src.prims {
+            if prim.kind == Kind::Mask {
+                continue;
+            }
+            let infinite = matches!(prim.kind, Kind::Infinite { .. });
+            let pts: Vec<Vec2> = src.points(prim).iter().enumerate().map(|(i, p)| if infinite && i > 0 { *p } else { *p + shift }).collect();
+            let buf = if prim.kind == Kind::Tris { &mut out.tris } else { &mut out.verts };
+            let start = buf.len() as u32;
+            buf.extend_from_slice(&pts);
+            if !infinite {
+                for p in &pts {
+                    out.bounds.add(*p);
+                }
+            }
+            out.prims.push(DPrim { color: GHOST_COLOR, aci7: false, transparency: GHOST_TRANSPARENCY, start, len: pts.len() as u32, ..*prim });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::read_document;
     use std::collections::HashSet;
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -350,6 +396,52 @@ mod tests {
         assert_eq!(bands(&s)?, [4, 4, 4, 4], "untagged, the line is a band");
         s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()] }))?;
         assert_eq!(bands(&s)?, [3, 3, 3, 3], "tagged, it is not");
+        Ok(())
+    }
+
+    fn ghost_points(s: &Session, space: &Space) -> T<(Vec<Vec2>, Bounds2)> {
+        let list = crate::overlays::lamb_overlay(s.doc()?, space, &Options::default());
+        let mut pts = Vec::new();
+        let mut bounds = Bounds2::EMPTY;
+        for p in list.prims.iter().filter(|p| p.color == GHOST_COLOR && p.transparency == GHOST_TRANSPARENCY) {
+            for q in list.points(p) {
+                pts.push(*q);
+                bounds.add(*q);
+            }
+        }
+        Ok((pts, bounds))
+    }
+
+    fn has(pts: &[Vec2], x: f64, y: f64) -> bool {
+        pts.iter().any(|p| (p.x - x).abs() < 1e-9 && (p.y - y).abs() < 1e-9)
+    }
+
+    #[test]
+    fn a_repeat_ghosts_its_members_one_pitch_along_without_changing_the_drawing() -> R {
+        let Fixture { mut s, plan, detail, stud, pitch, .. } = fixture()?;
+        let space = Space::Block(view_block_name(detail));
+        assert!(ghost_points(&s, &space)?.0.is_empty(), "untagged: no ghost");
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()] }))?;
+
+        let (undo, count) = (undo_len(&s)?, s.doc()?.blocks.values().map(|b| b.entities.len()).sum::<usize>() + s.doc()?.model.len());
+        let (pts, bounds) = ghost_points(&s, &space)?;
+        let built = cadcraft_render::build_entities(s.doc()?, s.doc()?.entity(stud).map(|e| &**e), &Options::default());
+        let want: Vec<Vec2> = built.prims.iter().flat_map(|p| built.points(p).iter().map(|q| *q + Vec2::new(406.4, 0.0))).collect();
+        assert_eq!(pts, want);
+        assert!(has(&pts, 406.4, 0.0) && has(&pts, 444.4, 90.0), "{pts:?}");
+        assert!((bounds.max.x - 444.4).abs() < 1e-9, "{bounds:?}");
+        assert_eq!(undo_len(&s)?, undo, "drawing the overlay records nothing");
+        assert_eq!(s.doc()?.blocks.values().map(|b| b.entities.len()).sum::<usize>() + s.doc()?.model.len(), count);
+
+        assert!(ghost_points(&s, &Space::Block(view_block_name(plan)))?.0.is_empty(), "plan: no ghost");
+        assert!(ghost_points(&s, &Space::Model)?.0.is_empty(), "model: no ghost");
+
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [] }))?;
+        assert!(ghost_points(&s, &space)?.0.is_empty(), "untagged: no ghost");
+        s.undo()?;
+        assert!(!ghost_points(&s, &space)?.0.is_empty(), "retagged by undo");
+        s.execute("erase", &json!({ "handles": [stud.hex()] }))?;
+        assert!(ghost_points(&s, &space)?.0.is_empty(), "erased member: no ghost");
         Ok(())
     }
 }
