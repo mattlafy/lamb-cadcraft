@@ -19,6 +19,9 @@
 //! - `newoffsetplan` (`np`) and `newplanline` (`npln`): placed plans at a new level — see
 //!   [`crate::newviews`]. NEWSECTIONLINE in a placed section takes one click for a perpendicular cut.
 //!
+//! - `refpane {on?, viewId?}` (View ▸ LAMB ▸ Reference Pane): the reference pane — two tiles, the
+//!   edited view's reference in the other one, chosen for you and overridable; see [`crate::refpane`].
+//!
 //! - `lambproject` (View ▸ LAMB ▸ Start Project): `Level 1` and a placed `Ground Floor` plan on
 //!   it, then edit the plan; refused ("Already a LAMB project") once the drawing has views.
 //!
@@ -289,7 +292,8 @@ pub(crate) fn echo_created(s: &mut Session, word: &str, name: &str, r: &Value) -
 
 /// Make `space` the edit space (EDITVIEW, NEWPLAN, LAMBPROJECT, a Views palette click). A space
 /// the session has never shown (no stored view for it) is fitted with zoom extents, so it doesn't
-/// open on whatever window the last space had.
+/// open on whatever window the last space had. A shown reference pane then re-picks the other
+/// tile's view ([`crate::refpane::refresh`]).
 pub(crate) fn enter_space(s: &mut Session, space: Space) -> Result<()> {
     let st = s.state_mut()?;
     let first_visit = !st.views.iter().any(|(sp, _)| *sp == space);
@@ -300,7 +304,8 @@ pub(crate) fn enter_space(s: &mut Session, space: Space) -> Result<()> {
         let _ = s.zoom_extents();
     }
     s.touch();
-    Ok(())
+    // The reference pane follows the edited view.
+    crate::refpane::refresh(s)
 }
 
 /// NEWPLAN: `Enter plan name <Plan N>:`, then edit inside the new plan.
@@ -565,6 +570,11 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("unlink", "Unlink", unlink).alias(&["ulk"]).params("{linkId}"),
         CommandSpec::new("panelock", "Pane Lock", panelock).params("{on?: bool}").noundo().menu(MENU),
         CommandSpec::new("lambproject", "Start Project", lambproject).menu(MENU),
+        CommandSpec::new("refpane", "Reference Pane", crate::refpane::refpane)
+            .params("{on?: bool, viewId?}")
+            .noundo()
+            .menu(MENU)
+            .interactive(crate::refpane::refpane_machine),
         CommandSpec::new("newoffsetplan", "New Offset Plan", newviews::newoffsetplan)
             .alias(&["np"])
             .params("{mode: \"offset\"|\"height\", fromViewId, floorToFloorMm | floorElevationMm, name?, cutHeightMm?}")

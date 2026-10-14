@@ -94,21 +94,36 @@ fn row(label: String, active: bool, command: &str, params: serde_json::Value) ->
 
 /// The Views palette for `d` while editing `edit`: `Model`, then each view in document order as
 /// `"<name> — <kind>"` (`" (floating)"` without a placement), the edited one active, each running
-/// `editview`; a drawing with no views offers `Start LAMB project` (LAMBPROJECT). An unreadable
-/// LAMB slot gives just the Model row.
+/// `editview`; a drawing with no views offers `Start LAMB project` (LAMBPROJECT). When the edited
+/// view has eligible reference views: a `Reference pane` heading, `Show reference pane` (active
+/// while shown, toggling REFPANE) and one row per eligible view, active when the pane shows it,
+/// running `refpane {viewId}`. An unreadable LAMB slot gives just the Model row.
 pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     let mut rows = vec![row("Model".into(), *edit == Space::Model, "editview", serde_json::json!({}))];
     let Ok(doc) = read_document(d) else { return rows };
     for v in &doc.views {
-        let floating = if v.placement().is_none() { " (floating)" } else { "" };
-        let label = format!("{} — {}{floating}", v.name(), crate::commands::kind_word(v));
         let active = matches!(edit, Space::Block(name) if *name == view_block_name(v.id()));
-        rows.push(row(label, active, "editview", serde_json::json!({ "viewId": v.id().0 })));
+        rows.push(row(view_label(v), active, "editview", serde_json::json!({ "viewId": v.id().0 })));
     }
     if doc.views.is_empty() {
         rows.push(row("Start LAMB project".into(), false, "lambproject", serde_json::json!({})));
     }
+    // The reference pane (LAMB T345), when the edited view has a reference to show.
+    if let Some((eligible, pick)) = crate::overlays::view_id(edit).and_then(|e| crate::refpane::pick(d, e)) {
+        let shown = crate::refpane::shown_in(d);
+        rows.push(BrowserRow { label: "Reference pane".into(), active: false, heading: true, command: None });
+        rows.push(row("Show reference pane".into(), shown, "refpane", serde_json::json!({ "on": !shown })));
+        for v in eligible.iter().filter_map(|id| doc.views.iter().find(|v| v.id() == *id)) {
+            rows.push(row(view_label(v), shown && v.id() == pick, "refpane", serde_json::json!({ "viewId": v.id().0 })));
+        }
+    }
     rows
+}
+
+/// `"<name> — <kind>"`, `" (floating)"` without a placement.
+fn view_label(v: &AnyView) -> String {
+    let floating = if v.placement().is_none() { " (floating)" } else { "" };
+    format!("{} — {}{floating}", v.name(), crate::commands::kind_word(v))
 }
 
 #[cfg(test)]
@@ -166,6 +181,42 @@ mod tests {
         let (cmd, params) = r[0].command.clone().ok_or("no command")?;
         s.execute(&cmd, &params)?;
         assert!(rows(&s)?[0].active);
+        Ok(())
+    }
+
+    #[test]
+    fn reference_rows_toggle_the_pane_and_pick_its_view() -> R {
+        let _g = crate::refpane::tests::lock();
+        let (mut s, plan, a, b) = crate::refpane::tests::project()?;
+        let r = rows(&s)?;
+        let tail: Vec<_> = r[4..].iter().map(|r| (r.label.as_str(), r.active, r.heading)).collect();
+        assert_eq!(
+            tail,
+            [
+                ("Reference pane", false, true),
+                ("Show reference pane", false, false),
+                ("A-A — Section", false, false),
+                ("B-B — Section", false, false)
+            ]
+        );
+        assert_eq!(r[4].command, None);
+        assert_eq!(r[5].command, Some(("refpane".into(), json!({ "on": true }))));
+        assert_eq!(r[7].command, Some(("refpane".into(), json!({ "viewId": b.0 }))));
+
+        let (cmd, params) = r[7].command.clone().ok_or("no command")?;
+        s.execute(&cmd, &params)?;
+        let r = rows(&s)?;
+        assert_eq!(r[4..].iter().map(|r| r.active).collect::<Vec<_>>(), [false, true, false, true], "shown, showing B-B");
+        assert_eq!(r[5].command, Some(("refpane".into(), json!({ "on": false }))));
+
+        s.execute("editview", &json!({ "viewId": a.0 }))?;
+        let r = rows(&s)?;
+        let tail: Vec<_> = r[4..].iter().map(|r| (r.label.as_str(), r.active)).collect();
+        assert_eq!(tail, [("Reference pane", false), ("Show reference pane", true), ("Ground Floor — Plan", true), ("B-B — Section", false)]);
+        assert_eq!(r[6].command, Some(("refpane".into(), json!({ "viewId": plan.0 }))));
+
+        s.execute("editview", &json!({}))?;
+        assert_eq!(rows(&s)?.len(), 4, "Model has no reference rows");
         Ok(())
     }
 

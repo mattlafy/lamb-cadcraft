@@ -32,6 +32,7 @@ mod newviews;
 pub mod overlays;
 pub mod panes;
 pub mod project;
+mod refpane;
 pub mod rounding;
 pub mod scene;
 pub mod schema;

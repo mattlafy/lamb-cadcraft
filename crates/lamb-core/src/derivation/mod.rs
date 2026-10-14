@@ -9,6 +9,7 @@ pub mod markers;
 pub mod projection;
 pub mod proposals;
 pub mod read;
+pub mod reference;
 pub mod resolve;
 pub mod solid_cut_lines;
 pub mod solids;
