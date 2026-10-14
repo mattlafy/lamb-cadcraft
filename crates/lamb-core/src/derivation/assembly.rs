@@ -1,11 +1,14 @@
 //! Assembly lines (LAMB's `docs/07-architecture/cadcraft-integration.md` §10 "Generation", steps 1,
 //! 2 and 4, straight runs only; LAMB T369): a detail view's **continuous bands** — its straight
 //! lines parallel to the reference line — laid along a wall run, aligned on the run's matching
-//! face — and each **repeat** (LAMB T380) arrayed at its pitch along the run ([`lay_repeat`]). No
-//! junction trimming; computed on demand.
+//! face — and each **repeat** (LAMB T380) arrayed at its pitch along the run ([`lay_repeat`]).
+//! Junctions are not trimmed by default; for a plan that opts into mitring (§10 step 3, LAMB T385)
+//! the adapter moves band ends at undetailed two-arm junctions onto [`junction_bisector`] with
+//! [`mitre_end`]. Computed on demand.
 //!
 //! Not the AI-line sweep (`crate::sweeps` in the adapter); everything here is "assembly".
 
+use super::wall_junctions::{Junction, RunEnd};
 use super::wall_spaces::{RunSides, SideKind};
 use super::walls::{RunCurve, WallRun};
 use crate::geometry::Point2;
@@ -233,6 +236,40 @@ pub fn width_conflict(run: &WallRun, face: FaceRef, bands: &[Band]) -> Option<Wi
     Some(WidthConflict { delta, toward })
 }
 
+/// The mitre direction at a two-arm junction: the sum of the arms' unit directions, normalised; for
+/// opposed arms (a sum shorter than 1e-9), the left normal of arm 0. `None` unless exactly two arms.
+pub fn junction_bisector(j: &Junction) -> Option<Point2> {
+    let [a, b] = j.arms.as_slice() else { return None };
+    let unit = |deg: f64| {
+        let r = deg.to_radians();
+        Point2 { x: r.cos(), y: r.sin() }
+    };
+    let (u, v) = (unit(a.direction_deg), unit(b.direction_deg));
+    let (sx, sy) = (u.x + v.x, u.y + v.y);
+    let len = sx.hypot(sy);
+    if len < 1e-9 {
+        return Some(Point2 { x: -u.y, y: u.x });
+    }
+    Some(Point2 { x: sx / len, y: sy / len })
+}
+
+/// Moves `line`'s `end` (`Start` → `from`, `End` → `to`) to where the line's infinite extension
+/// crosses the line through `point` along `bisector`; a line parallel to `bisector` is unchanged.
+pub fn mitre_end(line: &mut AssemblyLine, end: RunEnd, point: Point2, bisector: Point2) {
+    let (dx, dy) = (line.to.x - line.from.x, line.to.y - line.from.y);
+    let denom = dx * bisector.y - dy * bisector.x;
+    let len = dx.hypot(dy) * bisector.x.hypot(bisector.y);
+    if len <= 0.0 || denom.abs() <= 1e-12 * len {
+        return;
+    }
+    let t = ((point.x - line.from.x) * bisector.y - (point.y - line.from.y) * bisector.x) / denom;
+    let hit = Point2 { x: line.from.x + dx * t, y: line.from.y + dy * t };
+    match end {
+        RunEnd::Start => line.from = hit,
+        RunEnd::End => line.to = hit,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +456,38 @@ mod tests {
         r.width = 200.0;
         r.centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
         assert_eq!(width_conflict(&r, FaceRef::Exterior, &bands), None);
+    }
+
+    fn junction(dirs: &[f64]) -> Junction {
+        use crate::derivation::wall_junctions::JunctionArm;
+        let arms = dirs.iter().enumerate().map(|(i, d)| JunctionArm { run: i, end: RunEnd::Start, direction_deg: *d }).collect();
+        Junction { point: p(100.0, 100.0), arms, gaps_deg: Vec::new() }
+    }
+
+    #[test]
+    fn a_two_arm_junction_bisects_its_arms_and_others_have_no_bisector() {
+        let b = junction_bisector(&junction(&[0.0, 90.0])).unwrap();
+        let h = 0.5f64.sqrt();
+        assert!((b.x - h).abs() < 1e-12 && (b.y - h).abs() < 1e-12, "{b:?}");
+        let b = junction_bisector(&junction(&[0.0, 180.0])).unwrap();
+        assert!(b.x.abs() < 1e-12 && (b.y - 1.0).abs() < 1e-12, "perpendicular: {b:?}");
+        assert_eq!(junction_bisector(&junction(&[0.0, 90.0, 180.0])), None);
+        assert_eq!(junction_bisector(&junction(&[0.0])), None);
+    }
+
+    #[test]
+    fn mitre_end_moves_one_end_onto_the_bisector_line() {
+        let h = 0.5f64.sqrt();
+        let mut l = AssemblyLine { from: p(100.0, -20.0), to: p(4900.0, -20.0), layer: "CLAD".into() };
+        mitre_end(&mut l, RunEnd::Start, p(100.0, 100.0), p(h, h));
+        assert!((l.from.x + 20.0).abs() < 1e-9 && (l.from.y + 20.0).abs() < 1e-9, "{l:?}");
+        assert_eq!(l.to, p(4900.0, -20.0));
+        mitre_end(&mut l, RunEnd::End, p(4900.0, 100.0), p(-h, h));
+        assert!((l.to.x - 5020.0).abs() < 1e-9, "{l:?}");
+        // Parallel to the bisector: unchanged.
+        let mut d = AssemblyLine { from: p(0.0, 0.0), to: p(10.0, 10.0), layer: "A".into() };
+        let before = d.clone();
+        mitre_end(&mut d, RunEnd::Start, p(100.0, 0.0), p(h, h));
+        assert_eq!(d, before);
     }
 }

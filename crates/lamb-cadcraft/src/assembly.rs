@@ -10,15 +10,20 @@
 //! ([`detail_repeats`], LAMB T380) is arrayed at its pitch along the run too (lamb-core's
 //! [`lay_repeat`]), every straight segment of its members kept on the member's layer. Once a plan
 //! has its block, [`assembly_observer`] (LAMB T381) keeps it equal to [`assembly_lines`] after every
-//! command, inside that command's undo step; a plan without the block gets none. Not the AI-line
-//! sweep in [`crate::sweeps`].
+//! command, inside that command's undo step; a plan without the block gets none. A plan listed in
+//! the document's `mitre_plans` (`assemblyplan {viewId, mitre}`, LAMB T385; §10 step 3) has every
+//! band end at a two-arm junction with no corner detail (`Untyped` or `Conflict`) moved onto that
+//! junction's bisector (lamb-core's [`junction_bisector`], [`mitre_end`]); repeats are not mitred.
+//! Not the AI-line sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
 
 use cadcraft_doc::{Block, Common, Drawing, EntityKind, Line, Space};
 use cadcraft_engine::{Result as EngineResult, Session};
 use cadcraft_geom::Vec2;
-use lamb_core::derivation::assembly::{AssemblyLine, FaceRef, WidthConflict, detail_bands, detail_frame, lay_bands, lay_repeat, width_conflict};
+use lamb_core::derivation::assembly::{
+    AssemblyLine, FaceRef, WidthConflict, detail_bands, detail_frame, junction_bisector, lay_bands, lay_repeat, mitre_end, width_conflict,
+};
 use lamb_core::derivation::detail_tags::RunDetail;
 use lamb_core::geometry::Point2;
 use lamb_core::geometry::tolerance::TOLERANCE;
@@ -32,7 +37,7 @@ use crate::detailref::{DetailRefKind, detail_reference};
 use crate::detailtags::{graph_and_sides, resolve_view_details};
 use crate::project::DrawingProject;
 use crate::repeats::{detail_repeats, repeat_members};
-use crate::schema::{assembly_block_name, read_document, view_block_name};
+use crate::schema::{assembly_block_name, read_document, view_block_name, write_document};
 
 /// One wall run's assembly: the detail it resolved to (if any), the laid lines, and why it was
 /// skipped when `lines` is empty for a reason.
@@ -42,6 +47,8 @@ pub struct RunAssembly {
     pub run: usize,
     pub detail: Option<Id>,
     pub lines: Vec<AssemblyLine>,
+    /// `lines[..bands]` are the continuous bands; the rest are repeat copies.
+    pub bands: usize,
     pub skipped: Option<String>,
     /// The detail is thicker or thinner than the drawn wall; `None` when they agree or the run was
     /// skipped.
@@ -89,14 +96,14 @@ fn member_segments(d: &Drawing, detail: Id, members: &[cadcraft_doc::Handle]) ->
     out
 }
 
-/// One run's lines from `detail` (bands, then each repeat's copies) and its width conflict, or why
-/// not.
+/// One run's lines from `detail` (bands, then each repeat's copies), how many of them are bands, and
+/// its width conflict, or why not.
 fn run_lines(
     d: &Drawing,
     detail: Id,
     run: &lamb_core::derivation::walls::WallRun,
     sides: &lamb_core::derivation::wall_spaces::RunSides,
-) -> Result<(Vec<AssemblyLine>, Option<WidthConflict>), String> {
+) -> Result<(Vec<AssemblyLine>, usize, Option<WidthConflict>), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let face = match r.kind {
         DetailRefKind::ExteriorFace => FaceRef::Exterior,
@@ -107,25 +114,35 @@ fn run_lines(
     let bands = detail_bands((r.from, r.to), &lines)?;
     let frame = detail_frame((r.from, r.to), &lines)?;
     let mut laid = lay_bands(run, sides, face, &bands)?;
+    let n = laid.len();
     for rep in detail_repeats(d, detail)? {
         laid.extend(lay_repeat(run, sides, face, &frame, &member_segments(d, detail, &rep.members), rep.pitch)?);
     }
-    Ok((laid, width_conflict(run, face, &bands)))
+    Ok((laid, n, width_conflict(run, face, &bands)))
 }
 
-/// Every run of `plan`'s wall graph, in graph order, with its detail's bands laid along it.
+/// Every run of `plan`'s wall graph, in graph order, with its detail's bands laid along it — mitred
+/// at undetailed two-arm junctions when `plan` is in the document's `mitre_plans`.
 pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String> {
-    let (details, _) = resolve_view_details(d, plan)?;
+    let (details, corners) = resolve_view_details(d, plan)?;
+    let mitre = read_document(d).map_err(|e| e.to_string())?.mitre_plans.contains(&plan);
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let (graph, sides) = graph_and_sides(&p, plan);
-    Ok(graph
+    let mut runs: Vec<RunAssembly> = graph
         .runs
         .iter()
         .zip(&sides.runs)
         .zip(&details)
         .enumerate()
         .map(|(i, ((run, side), resolved))| {
-            let skip = |why: &str, detail: Option<Id>| RunAssembly { run: i, detail, lines: Vec::new(), skipped: Some(why.into()), conflict: None };
+            let skip = |why: &str, detail: Option<Id>| RunAssembly {
+                run: i,
+                detail,
+                lines: Vec::new(),
+                bands: 0,
+                skipped: Some(why.into()),
+                conflict: None,
+            };
             let id = match resolved {
                 RunDetail::Tagged(id) | RunDetail::Spread(id) | RunDetail::Gap(id) => id,
                 RunDetail::Conflict => return skip("conflict", None),
@@ -133,11 +150,27 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             };
             let Ok(detail) = id.parse::<u64>().map(Id) else { return skip("detail id is not a number", None) };
             match run_lines(d, detail, run, side) {
-                Ok((lines, conflict)) => RunAssembly { run: i, detail: Some(detail), lines, skipped: None, conflict },
+                Ok((lines, bands, conflict)) => RunAssembly { run: i, detail: Some(detail), lines, bands, skipped: None, conflict },
                 Err(e) => skip(&e, Some(detail)),
             }
         })
-        .collect())
+        .collect();
+    if mitre {
+        for (j, corner) in graph.junctions.iter().zip(&corners) {
+            if !matches!(corner, RunDetail::Untyped | RunDetail::Conflict) {
+                continue;
+            }
+            let Some(bisector) = junction_bisector(j) else { continue };
+            for arm in &j.arms {
+                let Some(r) = runs.get_mut(arm.run).filter(|r| r.skipped.is_none()) else { continue };
+                let n = r.bands;
+                for l in &mut r.lines[..n] {
+                    mitre_end(l, arm.end, j.point, bisector);
+                }
+            }
+        }
+    }
+    Ok(runs)
 }
 
 /// `Ok` when `plan` names a plan view.
@@ -230,13 +263,31 @@ fn conflicts_json(runs: &[RunAssembly]) -> Vec<Value> {
     runs.iter().filter_map(|r| r.conflict.map(|c| json!({ "run": r.run, "delta": c.delta, "toward": c.toward.name(), "text": c.text() }))).collect()
 }
 
-/// ASSEMBLYPLAN `{viewId}`: [`write_assembly_block`] for that plan. Returns
+/// ASSEMBLYPLAN `{viewId, mitre?}`: [`write_assembly_block`] for that plan; a given `mitre` first
+/// adds the plan to (or removes it from) the document's `mitre_plans`, in the same undo step. Returns
 /// `{block, lines, skipped: [{run, reason}], conflicts: [{run, delta, toward, text}]}`.
 pub fn assemblyplan(s: &mut Session, p: &Value) -> EngineResult<Value> {
     let plan = p.get("viewId").and_then(id_value).ok_or_else(|| other("No such view"))?;
     // Validate before `doc_mut`: touching the drawing on a refusal would still record an undo step.
+    let mitre = match p.get("mitre") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(other("mitre must be true or false")),
+    };
     check_plan(s.doc()?, plan).map_err(other)?;
-    let runs = write_assembly_block(s.doc_mut()?, plan).map_err(other)?;
+    let mut doc = read_document(s.doc()?).map_err(|e| other(e.to_string()))?;
+    let flag_changes = mitre.is_some_and(|m| m != doc.mitre_plans.contains(&plan));
+    if let (true, Some(m)) = (flag_changes, mitre) {
+        doc.mitre_plans.retain(|v| *v != plan);
+        if m {
+            doc.mitre_plans.push(plan);
+        }
+    }
+    let d = s.doc_mut()?;
+    if flag_changes {
+        write_document(d, &doc).map_err(|e| other(e.to_string()))?;
+    }
+    let runs = write_assembly_block(d, plan).map_err(other)?;
     let lines: usize = runs.iter().map(|r| r.lines.len()).sum();
     let skipped: Vec<Value> = runs.iter().filter_map(|r| r.skipped.as_ref().map(|why| json!({ "run": r.run, "reason": why }))).collect();
     s.echo(format!("{lines} assembly lines, {} runs skipped", skipped.len()));
@@ -576,6 +627,147 @@ pub(crate) mod tests {
         let e = s.execute("wallconflicts", &json!({ "viewId": 999_999 })).err().ok_or("unknown accepted")?;
         assert!(e.to_string().contains("No such view"), "{e}");
         assert_eq!(undo_len(&s)?, n);
+        Ok(())
+    }
+
+    fn r6(v: f64) -> f64 {
+        (v * 1e6).round() / 1e6
+    }
+
+    /// Each band of the run whose centreline is horizontal at `y` (within 1 mm): (band y, min x,
+    /// max x), in lay order.
+    fn horizontal_spans(runs: &[RunAssembly], graph: &lamb_core::derivation::wall_junctions::WallGraph, y: f64) -> T<Vec<(f64, f64, f64)>> {
+        for r in runs {
+            let lamb_core::derivation::walls::RunCurve::Line { from, to } = graph.runs[r.run].centreline else { continue };
+            if (from.y - y).abs() < 1.0 && (to.y - y).abs() < 1.0 {
+                return Ok(r.lines[..r.bands].iter().map(|l| (r6(l.from.y), r6(l.from.x.min(l.to.x)), r6(l.from.x.max(l.to.x)))).collect());
+            }
+        }
+        Err(format!("no run at y = {y}").into())
+    }
+
+    fn block_xy(s: &Session, name: &str) -> T<Vec<(f64, f64, f64, f64, String)>> {
+        let b = s.doc()?.block(name).ok_or("no block")?;
+        let mut v = Vec::new();
+        for e in b.entities.iter() {
+            let EntityKind::Line(l) = &e.kind else { return Err("not a LINE".into()) };
+            v.push((r6(l.a.x), r6(l.a.y), r6(l.b.x), r6(l.b.y), e.common.layer.clone()));
+        }
+        Ok(v)
+    }
+
+    #[test]
+    fn mitre_moves_band_ends_at_undetailed_l_corners_onto_the_bisector() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        let r = s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": true }))?;
+        assert_eq!(r["lines"], 12, "{r}");
+        assert_eq!(read_document(s.doc()?)?.mitre_plans, [plan]);
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        let runs = assembly_lines(d, plan)?;
+        assert_eq!(horizontal_spans(&runs, &graph, 100.0)?, [(-20.0, -20.0, 5020.0), (50.0, 50.0, 4950.0), (200.0, 200.0, 4800.0)]);
+        assert_eq!(horizontal_spans(&runs, &graph, 3900.0)?, [(4020.0, -20.0, 5020.0), (3950.0, 50.0, 4950.0), (3800.0, 200.0, 4800.0)]);
+        // The left run's bands meet the bottom ones on y = x.
+        let mut met = 0;
+        for r in &runs {
+            let lamb_core::derivation::walls::RunCurve::Line { from, to } = graph.runs[r.run].centreline else { continue };
+            if (from.x - 100.0).abs() < 1.0 && (to.x - 100.0).abs() < 1.0 {
+                for l in &r.lines[..r.bands] {
+                    let low = if l.from.y < l.to.y { l.from } else { l.to };
+                    assert!((low.x - low.y).abs() < 1e-6, "{l:?}");
+                    met += 1;
+                }
+            }
+        }
+        assert_eq!(met, 3);
+        // The block holds the mitred lines.
+        let block = block_xy(&s, &assembly_block_name(plan))?;
+        assert!(block.iter().any(|l| l.1 == -20.0 && l.0.min(l.2) == -20.0 && l.0.max(l.2) == 5020.0), "{block:?}");
+
+        // Without the option, a fresh fixture spans the centreline's x extent, as before.
+        let (s, plan) = room("exterior_face", true)?;
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        assert_eq!(
+            horizontal_spans(&assembly_lines(d, plan)?, &graph, 100.0)?,
+            [(-20.0, 200.0, 4800.0), (50.0, 200.0, 4800.0), (200.0, 200.0, 4800.0)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corner_tagged_junctions_stay_unmitred_and_mitre_false_or_undo_restores() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        let unmitred = {
+            s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+            let b = block_xy(&s, &assembly_block_name(plan))?;
+            s.undo()?;
+            b
+        };
+        // Two different corner details on the bottom corners: those two junctions are tagged; the
+        // top two see both details across their gap and resolve to a conflict, still undetailed.
+        let d1 = detail_id(&s)?;
+        let d2 = Id(s.execute("newdetail", &json!({ "name": "D2" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        for (detail, tip) in [(d1, (0.0, 0.0)), (d2, (5000.0, 0.0))] {
+            s.execute("detailtag", &json!({ "detailViewId": detail.0, "corner": true, "tip": {"x": tip.0, "y": tip.1}, "bubble": {"x": tip.0 - 1000.0, "y": tip.1 - 1000.0} }))?;
+        }
+        let (_, corners) = resolve_view_details(s.doc()?, plan)?;
+        assert_eq!(corners.iter().filter(|c| matches!(c, RunDetail::Tagged(_))).count(), 2, "{corners:?}");
+        assert_eq!(corners.iter().filter(|c| matches!(c, RunDetail::Conflict | RunDetail::Untyped)).count(), 2, "{corners:?}");
+
+        let name = assembly_block_name(plan);
+        let n = undo_len(&s)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": true }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "flag and block in one undo step");
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        let runs = assembly_lines(d, plan)?;
+        assert_eq!(
+            horizontal_spans(&runs, &graph, 100.0)?,
+            [(-20.0, 200.0, 4800.0), (50.0, 200.0, 4800.0), (200.0, 200.0, 4800.0)],
+            "tagged corners"
+        );
+        assert_eq!(
+            horizontal_spans(&runs, &graph, 3900.0)?,
+            [(4020.0, -20.0, 5020.0), (3950.0, 50.0, 4950.0), (3800.0, 200.0, 4800.0)],
+            "untagged corners"
+        );
+        let mitred = block_xy(&s, &name)?;
+        assert_ne!(mitred, unmitred);
+
+        s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": false }))?;
+        assert_eq!(block_xy(&s, &name)?, unmitred);
+        assert!(read_document(s.doc()?)?.mitre_plans.is_empty());
+        s.undo()?;
+        assert_eq!(block_xy(&s, &name)?, mitred, "undo restores the mitred block");
+        assert_eq!(read_document(s.doc()?)?.mitre_plans, [plan]);
+        s.undo()?;
+        assert!(s.doc()?.block(&name).is_none());
+        assert!(read_document(s.doc()?)?.mitre_plans.is_empty(), "undo removes the flag too");
+
+        let e = s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": "yes" })).err().ok_or("accepted a string")?;
+        assert!(e.to_string().contains("mitre must be"), "{e}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unrelated_edit_keeps_the_mitred_block() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        crate::maintain::install(&mut s);
+        s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": true }))?;
+        let name = assembly_block_name(plan);
+        let block = s.doc()?.block(&name).ok_or("no block")?.clone();
+        s.execute("editview", &json!({ "viewId": null }))?;
+        s.execute("layer.new", &json!({ "name": "NOTES", "current": true }))?;
+        line(&mut s, [90_000.0, 90_000.0], [91_000.0, 90_000.0])?;
+        assert!(Arc::ptr_eq(&block, s.doc()?.block(&name).ok_or("no block")?), "observer saw no difference");
+        // Omitting `mitre` keeps the option.
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(read_document(s.doc()?)?.mitre_plans, [plan]);
         Ok(())
     }
 }

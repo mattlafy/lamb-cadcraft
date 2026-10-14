@@ -39,8 +39,9 @@
 //! - `newdetail {name}` (View ▸ LAMB ▸ New Detail): a floating detail view, entered; `detailtag`
 //!   (`dtag`) / `detailtags`: detail tags in a plan view and their resolution report — see
 //!   [`crate::detailtags`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
-//!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `assemblyplan {viewId}` (View ▸ LAMB ▸ Assembly Plan): the plan's laid
-//!   detail bands written into its block `LAMB_ASSEMBLY_<id>` — see [`crate::assembly`].
+//!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's laid
+//!   detail bands written into its block `LAMB_ASSEMBLY_<id>`, `mitre` turning the plan's mitring
+//!   of undetailed corners on or off — see [`crate::assembly`].
 //!   `wallconflicts {viewId}` (View ▸ LAMB ▸ Wall Conflicts): each run whose detail is thicker or
 //!   thinner than the drawn wall, read-only. `wallfit {viewId, runs?, hold?}` (View ▸ LAMB ▸ Wall Fit):
 //!   moves each conflicted run's faces to its detail's width, holding the reference face, the
@@ -746,7 +747,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .menu(MENU)
             .interactive(crate::outside::outsidepoint_machine),
         CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU),
-        CommandSpec::new("assemblyplan", "Assembly Plan", crate::assembly::assemblyplan).params("{viewId}").menu(MENU),
+        CommandSpec::new("assemblyplan", "Assembly Plan", crate::assembly::assemblyplan).params("{viewId, mitre?: bool}").menu(MENU),
         CommandSpec::new("wallconflicts", "Wall Conflicts", crate::assembly::wallconflicts).params("{viewId}").noundo().menu(MENU),
         CommandSpec::new("wallfit", "Wall Fit", crate::wallfit::wallfit).params("{viewId, runs?: [index], hold?: reference|exterior|interior|centre}").menu(MENU),
         CommandSpec::new("detailref", "Detail Reference", crate::detailref::detailref)

@@ -74,6 +74,10 @@ pub struct LambDocument {
     pub links: Vec<LinkRecord>,
     #[serde(default)]
     pub suppressed_proposals: Vec<String>,
+    /// Plan views whose assembly mitres band ends at undetailed two-arm junctions
+    /// ([`crate::assembly`], `assemblyplan {mitre}`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mitre_plans: Vec<Id>,
 }
 
 impl LambDocument {
@@ -88,6 +92,7 @@ impl LambDocument {
             views: Vec::new(),
             links: Vec::new(),
             suppressed_proposals: Vec::new(),
+            mitre_plans: Vec::new(),
         }
     }
 }
