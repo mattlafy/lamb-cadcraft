@@ -11,16 +11,25 @@
 //! tile's space), so the tile turns the other way: minus it is added to the tile's `Xf` twist
 //! only; it is never written to the drawing, the tile's view or
 //! `View.twist`, and is never an undo step. Pointer input follows through `Xf::to_world`.
+//!
+//! Hover crosses the seams (LAMB T321, [`draw_hover`]): the hovered point — the current tile's
+//! snapped cursor, or a point snapped in an inactive tile's own space — is mapped through
+//! `Session::tile_crosshairs_from` into every related tile, which draws a full-tile crosshair
+//! for a point or one line for a line. Hover only: a click in an inactive tile still just makes
+//! it current.
 
 use cadcraft_color::Rgb;
 use cadcraft_doc::Space;
 use cadcraft_engine::ModelTile;
-use cadcraft_geom::Bounds2;
+use cadcraft_engine::panes::PaneMap;
+use cadcraft_engine::snap::{self, SnapHit};
+use cadcraft_geom::{Bounds2, Vec2};
 use cadcraft_render::DisplayList;
-use egui::Rect;
+use egui::{Pos2, Rect, Stroke, pos2};
 
-use super::{Xf, build_window, draw_list, lamb_overlays, tile_xf};
+use super::{Xf, build_window, clip_infinite, draw_crosshair, draw_list, draw_snap_marker, lamb_overlays, tile_xf};
 use crate::CadApp;
+use crate::theme::Tokens;
 
 /// What a tile's list was built from: drawing uid, revision, space, tessellation band and
 /// lineweight display.
@@ -126,6 +135,89 @@ pub(super) fn draw_overlays(app: &CadApp, p: &egui::Painter, xf: &Xf, bg: Rgb, i
     }
 }
 
+/// Where the pointer hovers, as the source of the cross-tile crosshair.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Hover {
+    /// The hovered tile.
+    pub tile: usize,
+    /// The (snapped) point, in that tile's space.
+    pub point: Vec2,
+    /// The snap found in an inactive tile (the current tile draws its own).
+    pub snap: Option<SnapHit>,
+    /// The pointer, on screen.
+    pub at: Pos2,
+}
+
+/// The hover source for pointer position `hover`: in the current tile, the canvas's cursor
+/// (already snapped by `effective_point`); in an inactive tile, the pointer in that tile's view
+/// snapped against that tile's own space. `None` off the tiles, or untiled.
+pub(super) fn hover_source(app: &CadApp, tiles: &[(Rect, ModelTile)], rots: &[f64], hover: Option<Pos2>) -> Option<Hover> {
+    let hp = hover?;
+    let (h, (r, tile)) = tiles.iter().enumerate().find(|(_, (r, _))| r.width() >= 1.0 && r.height() >= 1.0 && r.contains(hp))?;
+    if tile.active {
+        return Some(Hover { tile: h, point: app.canvas.cursor?, snap: None, at: hp });
+    }
+    let xf = tile_xf(*r, tile, rotation(rots, h));
+    let w = xf.to_world(hp);
+    let space = app.session.tile_spaces().get(h).cloned()?;
+    let st = app.session.state().ok()?;
+    let s = &app.session.settings;
+    let hit = snap::osnap(&st.doc, &space, w, s.aperture / xf.scale, s.osmode, None, false);
+    Some(Hover { tile: h, point: hit.map_or(w, |hit| hit.point), snap: hit, at: hp })
+}
+
+/// The screen segments `src` draws in the other tiles, each with its tile's index: a
+/// screen-aligned horizontal and vertical line across the tile through a mapped point (each
+/// only while it lies within the tile), one line for a mapped line, nothing in an unrelated
+/// tile. The current tile uses the canvas's own transform.
+pub(super) fn hover_lines(app: &CadApp, tiles: &[(Rect, ModelTile)], rots: &[f64], src: &Hover) -> Vec<(usize, [Pos2; 2])> {
+    let maps = app.session.tile_crosshairs_from(src.tile, src.point);
+    let mut out = Vec::new();
+    for (i, m) in maps.into_iter().enumerate() {
+        let (Some(m), Some((r, tile))) = (m, tiles.get(i)) else { continue };
+        let xf = if tile.active { app.canvas.xf } else { Some(tile_xf(*r, tile, rotation(rots, i))) };
+        let Some(xf) = xf else { continue };
+        match m {
+            PaneMap::Point(q) => {
+                let s = xf.to_screen(q);
+                if r.y_range().contains(s.y) {
+                    out.push((i, [pos2(r.left(), s.y), pos2(r.right(), s.y)]));
+                }
+                if r.x_range().contains(s.x) {
+                    out.push((i, [pos2(s.x, r.top()), pos2(s.x, r.bottom())]));
+                }
+            }
+            PaneMap::Line { through, dir } => {
+                if let Some(seg) = clip_infinite(&xf, through, dir, false) {
+                    out.push((i, seg));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Draw the cross-tile hover (after `draw_tiles`): the mapped lines in every related tile and,
+/// over an inactive tile, its own crosshair and snap marker, with the OS cursor hidden as over
+/// the current one. `hover` is the pointer, `None` when the canvas isn't hovered.
+pub(super) fn draw_hover(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, ModelTile)], rots: &[f64], hover: Option<Pos2>) {
+    let Some(src) = hover_source(app, tiles, rots, hover) else { return };
+    let stroke = Stroke::new(1.0, Tokens::get().crosshair);
+    for (i, seg) in hover_lines(app, tiles, rots, &src) {
+        ui.painter_at(tiles[i].0).line_segment(seg, stroke);
+    }
+    let (r, tile) = &tiles[src.tile];
+    if tile.active {
+        return;
+    }
+    ui.ctx().set_cursor_icon(if app.ui.system_cursor { egui::CursorIcon::Crosshair } else { egui::CursorIcon::None });
+    let p = ui.painter_at(*r);
+    if let Some(hit) = src.snap {
+        draw_snap_marker(&p, tile_xf(*r, tile, rotation(rots, src.tile)).to_screen(hit.point), &hit);
+    }
+    draw_crosshair(app, &p, *r, src.at, false);
+}
+
 #[cfg(test)]
 mod tests {
     use cadcraft_engine::{Session, View};
@@ -195,11 +287,77 @@ mod tests {
         fn rotation(_: &cadcraft_doc::Drawing, a: &Space, b: &Space) -> Option<f64> {
             (*a == Space::Block("B".into()) && *b == Space::Model).then_some(0.5)
         }
-        let _ = cadcraft_engine::panes::register_pane_relations(cadcraft_engine::panes::PaneRelations {
-            rotation,
-            map: |_, _, _, _| None,
-            centre: |_, _, _, _, _| None,
-        });
+        let _ =
+            cadcraft_engine::panes::register_pane_relations(cadcraft_engine::panes::PaneRelations { rotation, map, centre: |_, _, _, _, _| None });
+    }
+
+    /// The test relation's map: B → Model is a vertical line through the point; Model → B the
+    /// point shifted by (-100, -100).
+    fn map(_: &cadcraft_doc::Drawing, a: &Space, b: &Space, p: Vec2) -> Option<PaneMap> {
+        match (a, b) {
+            (Space::Block(_), Space::Model) => Some(PaneMap::Line { through: p, dir: Vec2::new(0.0, 1.0) }),
+            (Space::Model, Space::Block(_)) => Some(PaneMap::Point(p - Vec2::new(100.0, 100.0))),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn hover_crosses_the_seams() {
+        register();
+        let (mut app, tiles) = app();
+        let rots = rotations(&app);
+        let (r0, r1) = (tiles[0].0, tiles[1].0);
+        let xf0 = tile_xf(r0, &tiles[0].1, rotation(&rots, 0));
+        let xf1 = tile_xf(r1, &tiles[1].1, rotation(&rots, 1));
+        app.canvas.xf = Some(xf1);
+
+        // Hover in the current tile (model space): a point relation — two segments across tile
+        // 0, crossing where the mapped point lands.
+        app.canvas.cursor = Some(Vec2::new(105.0, 100.0));
+        let src = hover_source(&app, &tiles, &rots, Some(r1.center())).unwrap();
+        assert_eq!((src.tile, src.point), (1, Vec2::new(105.0, 100.0)));
+        let lines = hover_lines(&app, &tiles, &rots, &src);
+        let s = xf0.to_screen(Vec2::new(5.0, 0.0));
+        assert!(r0.contains(s));
+        assert_eq!(lines, vec![(0, [pos2(r0.left(), s.y), pos2(r0.right(), s.y)]), (0, [pos2(s.x, r0.top()), pos2(s.x, r0.bottom())])]);
+
+        // Hover in the inactive tile (block B): it snaps to B's endpoint (10,0) in B's own
+        // space, not to model space's nearer endpoint under the same world point.
+        app.session.execute("line", &json!({"points": [[9.95, 0.1], [9.95, 30]]})).unwrap();
+        app.session.settings.osmode = snap::mode::END;
+        app.session.settings.aperture = 10.0;
+        let hp = xf0.to_screen(Vec2::new(10.0, 0.1));
+        let src = hover_source(&app, &tiles, &rots, Some(hp)).unwrap();
+        assert_eq!(src.tile, 0);
+        assert!((src.point - Vec2::new(10.0, 0.0)).len() < 1e-9, "{:?}", src.point);
+        assert!(src.snap.is_some());
+        // The line relation: one segment in the current tile, vertical through x = 10.
+        let lines = hover_lines(&app, &tiles, &rots, &src);
+        assert_eq!(lines.len(), 1);
+        let (i, [a, b]) = lines[0];
+        let x = xf1.to_screen(Vec2::new(10.0, 0.0)).x;
+        assert_eq!(i, 1);
+        assert!((a.x - x).abs() < 1e-3 && (b.x - x).abs() < 1e-3 && a.y != b.y, "{a:?} {b:?}");
+
+        // Not hovering: nothing.
+        assert!(hover_source(&app, &tiles, &rots, None).is_none());
+    }
+
+    #[test]
+    fn an_unrelated_tile_draws_no_hover() {
+        register();
+        let (mut app, tiles) = app();
+        app.session.activate_tile(0).unwrap();
+        app.session.state_mut().unwrap().space = Space::Model;
+        app.session.activate_tile(1).unwrap();
+        let tiles: Vec<_> = tiles.iter().enumerate().map(|(i, (r, t))| (*r, ModelTile { active: i == 1, ..*t })).collect();
+        let rots = rotations(&app);
+        app.canvas.xf = Some(tile_xf(tiles[1].0, &tiles[1].1, 0.0));
+        app.canvas.cursor = Some(Vec2::new(105.0, 100.0));
+        let src = hover_source(&app, &tiles, &rots, Some(tiles[1].0.center())).unwrap();
+        assert!(hover_lines(&app, &tiles, &rots, &src).is_empty());
+        let src = hover_source(&app, &tiles, &rots, Some(tiles[0].0.center())).unwrap();
+        assert!(hover_lines(&app, &tiles, &rots, &src).is_empty());
     }
 
     #[test]

@@ -9,7 +9,8 @@
 //! Relations between two tiles' spaces — the rotation a tile takes to line up with another, where
 //! a point in one lands in another (the crosshair), where a locked tile re-centres — are geometry
 //! the engine doesn't know: an adapter registers them once ([`register_pane_relations`]) and the
-//! canvas reads them through [`Session::tile_rotations`] / [`Session::tile_crosshairs`].
+//! canvas reads them through [`Session::tile_rotations`] / [`Session::tile_crosshairs_from`]
+//! (from whichever tile the pointer is over; [`Session::tile_crosshairs`] from the current one).
 //!
 //! Camera lock ([`Panes::locked`], off by default, toggled by LAMB's `panelock`): every view change
 //! of the current tile ([`after_view`], from `DocState::set_view`/`set_view_quiet`) re-centres each
@@ -192,17 +193,32 @@ impl Session {
     /// [`Session::model_tiles`] entry: `None` for the current tile itself and for any tile whose
     /// space is unrelated. All `None` with no relations registered.
     pub fn tile_crosshairs(&self, p: Vec2) -> Vec<Option<PaneMap>> {
-        let tiles = self.model_tiles();
-        let spaces = self.tile_spaces();
-        let (Some(rel), Ok(d)) = (pane_relations(), self.doc()) else { return vec![None; spaces.len()] };
-        let Some(a) = tiles.iter().position(|t| t.active) else { return vec![None; spaces.len()] };
-        (0..spaces.len()).map(|i| if i == a { None } else { (rel.map)(d, &spaces[a], &spaces[i], p) }).collect()
+        let Some(a) = self.model_tiles().iter().position(|t| t.active) else { return vec![None; self.tile_spaces().len()] };
+        self.tile_crosshairs_from(a, p)
     }
+
+    /// Where `p` (in tile `from`'s space) lands in each tile, one per [`Session::model_tiles`]
+    /// entry: `None` for tile `from` itself and for any tile whose space is unrelated — the
+    /// hover crosshair of whichever tile the pointer is over. All `None` with no relations
+    /// registered or `from` out of range.
+    pub fn tile_crosshairs_from(&self, from: usize, p: Vec2) -> Vec<Option<PaneMap>> {
+        let spaces = self.tile_spaces();
+        match self.doc() {
+            Ok(d) => crosshairs(pane_relations(), d, &spaces, from, p),
+            Err(_) => vec![None; spaces.len()],
+        }
+    }
+}
+
+/// [`Session::tile_crosshairs_from`] for the relations `rel`.
+fn crosshairs(rel: Option<&PaneRelations>, d: &Drawing, spaces: &[Space], from: usize, p: Vec2) -> Vec<Option<PaneMap>> {
+    let (Some(rel), Some(sf)) = (rel, spaces.get(from)) else { return vec![None; spaces.len()] };
+    spaces.iter().enumerate().map(|(i, s)| if i == from { None } else { (rel.map)(d, sf, s, p) }).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use cadcraft_doc::Space;
+    use cadcraft_doc::{Drawing, Space};
     use serde_json::json;
 
     use crate::*;
@@ -287,6 +303,38 @@ mod tests {
         assert!(super::pane_relations().is_none());
         assert_eq!(s.tile_rotations(), vec![0.0, 0.0]);
         assert_eq!(s.tile_crosshairs(Vec2::new(1.0, 2.0)), vec![None, None]);
+    }
+
+    #[test]
+    fn crosshairs_map_from_any_tile() {
+        // A local relation (the process-wide registry stays empty in the engine's tests): Model
+        // → B is a point shifted by (1, 0); B → Model a vertical line; nothing else relates.
+        fn map(_: &Drawing, a: &Space, b: &Space, p: Vec2) -> Option<super::PaneMap> {
+            match (a, b) {
+                (Space::Model, Space::Block(_)) => Some(super::PaneMap::Point(p + Vec2::new(1.0, 0.0))),
+                (Space::Block(_), Space::Model) => Some(super::PaneMap::Line { through: p, dir: Vec2::new(0.0, 1.0) }),
+                _ => None,
+            }
+        }
+        let rel = super::PaneRelations { rotation: |_, _, _| None, map, centre: |_, _, _, _, _| None };
+        let s = two_tiles_with_block();
+        let d = s.doc().unwrap();
+        let spaces = [b(), Space::Model, Space::Model];
+        let p = Vec2::new(2.0, 3.0);
+        assert_eq!(
+            super::crosshairs(Some(&rel), d, &spaces, 0, p),
+            vec![
+                None,
+                Some(super::PaneMap::Line { through: p, dir: Vec2::new(0.0, 1.0) }),
+                Some(super::PaneMap::Line { through: p, dir: Vec2::new(0.0, 1.0) })
+            ]
+        );
+        assert_eq!(super::crosshairs(Some(&rel), d, &spaces, 1, p), vec![Some(super::PaneMap::Point(Vec2::new(3.0, 3.0))), None, None]);
+        assert_eq!(super::crosshairs(Some(&rel), d, &spaces, 7, p), vec![None, None, None]);
+        assert_eq!(super::crosshairs(None, d, &spaces, 0, p), vec![None, None, None]);
+        // The session's own: `tile_crosshairs` is `tile_crosshairs_from` the current tile.
+        assert_eq!(s.tile_crosshairs(p), s.tile_crosshairs_from(active(&s), p));
+        assert_eq!(s.tile_crosshairs_from(1, p), vec![None, None]);
     }
 
     #[test]

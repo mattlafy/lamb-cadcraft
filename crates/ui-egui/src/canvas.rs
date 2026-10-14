@@ -1851,6 +1851,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     panes::prepare(app, &tiles, &rots);
     draw_tiles(app, ui, &tiles, &rots);
+    panes::draw_hover(app, ui, &tiles, &rots, hover_pos.filter(|_| resp.hovered())); // LAMB (fork): T321
     // UCS icon, ViewCube and viewport label.
     if app.ui.show_ucs_icon {
         draw_ucs_icon(&painter, rect);
