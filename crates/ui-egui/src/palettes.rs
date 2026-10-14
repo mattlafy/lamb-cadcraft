@@ -11,6 +11,8 @@ use crate::theme::Tokens;
 
 /// The hatch pattern picker.
 pub mod patterns;
+/// A registered extra property group (fork-only, LAMB T361).
+pub mod props_ext;
 /// The QuickCalc palette.
 pub mod quickcalc;
 
@@ -596,6 +598,14 @@ fn read_only(ui: &mut egui::Ui, text: &str) {
     value_box(ui, crate::i18n::t(text), false, false).on_hover_text(crate::tl!("Read-only"));
 }
 
+/// A Properties group caption bar ("General", "Geometry", ...).
+fn group(ui: &mut egui::Ui, title: &str) {
+    let t = Tokens::get();
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+    ui.painter().rect_filled(r.shrink2(vec2(6.0, 1.0)), 2.0, t.chrome_dark);
+    ui.painter().text(pos2(r.left() + 12.0, r.center().y), egui::Align2::LEFT_CENTER, crate::i18n::t(title), crate::theme::small(), t.text_dim);
+}
+
 /// The Properties header: All/My, the selection-type filter and the PICKADD / Select Objects /
 /// Quick Select buttons.
 fn properties_header(app: &mut CadApp, ui: &mut egui::Ui) {
@@ -672,7 +682,6 @@ fn properties_header(app: &mut CadApp, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
-    let t = Tokens::get();
     properties_header(app, ui);
     let sel = app.session.selection();
     let Ok(d) = app.session.doc() else { return };
@@ -837,11 +846,6 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
     let ids: Vec<String> = sel.iter().map(|h| h.hex()).collect();
     let mut set: Option<Value> = None;
     let mut custom_set: Option<Value> = None;
-    let group = |ui: &mut egui::Ui, title: &str| {
-        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-        ui.painter().rect_filled(r.shrink2(vec2(6.0, 1.0)), 2.0, t.chrome_dark);
-        ui.painter().text(pos2(r.left() + 12.0, r.center().y), egui::Align2::LEFT_CENTER, crate::i18n::t(title), crate::theme::small(), t.text_dim);
-    };
     group(ui, "General");
     prop_row(ui, "Color", |ui| {
         ui.menu_button(format!("■ {}", crate::i18n::t(&color)), |ui| {
@@ -1097,4 +1101,6 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
     if let Some(p) = custom_set {
         let _ = app.run("blocks.reference.set", p);
     }
+    // Fork (LAMB T361): a registered extra group under Geometry, multi-selection included.
+    props_ext::show(app, ui);
 }

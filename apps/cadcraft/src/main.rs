@@ -241,6 +241,21 @@ fn lamb_status_toggles(s: &cadcraft_engine::Session) -> Vec<cadcraft_ui_egui::ch
         .collect()
 }
 
+/// The Properties palette's LAMB group (fork, LAMB T361): Role and the cut/seen height source.
+fn lamb_property_group(
+    d: &cadcraft_engine::doc::Drawing,
+    sel: &[cadcraft_engine::doc::Handle],
+    segment: usize,
+) -> Option<cadcraft_ui_egui::palettes::props_ext::PropGroup> {
+    use cadcraft_ui_egui::palettes::props_ext::{PropGroup, PropRow};
+    let g = lamb_cadcraft::props::property_group(d, sel, segment)?;
+    Some(PropGroup {
+        title: g.title,
+        segments: g.segments,
+        rows: g.rows.into_iter().map(|r| PropRow { label: r.label, value: r.value, tip: r.tip, choices: r.choices }).collect(),
+    })
+}
+
 fn main() -> eframe::Result {
     // First, so every start-up record is captured; see `logging`.
     let logger = logging::install();
@@ -257,6 +272,9 @@ fn main() -> eframe::Result {
     }
     if let Err(e) = cadcraft_ui_egui::chrome::statusext::register_status_toggles(lamb_status_toggles) {
         log::warn!("LAMB status toggles not installed: {e}");
+    }
+    if let Err(e) = cadcraft_ui_egui::palettes::props_ext::register_property_source(lamb_property_group) {
+        log::warn!("LAMB Properties group not installed: {e}");
     }
     // lossy, so a value that is not Unicode is reported like any other bad port instead of ignored
     let mut control_port =

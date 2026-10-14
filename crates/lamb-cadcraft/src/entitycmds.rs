@@ -13,8 +13,8 @@
 //!   `<CLAYER>`, then the role with the layer's current default as the default.
 //!
 //! `handles` are hex strings or numbers; absent, the current selection (engine `cmd::targets`'
-//! rule, parsed here because that fn is crate-private upstream). The Properties Role row and the
-//! Layers palette role column are not built yet; they can call these.
+//! rule, parsed here because that fn is crate-private upstream). The Properties Role row (`props`)
+//! runs SETROLE; the Layers palette role column is not built yet.
 
 use std::collections::HashSet;
 
@@ -43,7 +43,7 @@ fn handles(cmd: &str, s: &Session, p: &Value) -> Result<Vec<Handle>> {
 }
 
 /// The keyword word of each role, as the role prompt offers it.
-const ROLE_WORDS: [(&str, LineRole); 7] = [
+pub(crate) const ROLE_WORDS: [(&str, LineRole); 7] = [
     ("Cut", LineRole::Cut),
     ("Seen", LineRole::Seen),
     ("Datum", LineRole::Datum),
