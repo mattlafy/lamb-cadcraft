@@ -111,6 +111,8 @@ pub struct CanvasState {
     vp_hover: VpHighlight,
     /// Model space seen through the active MSPACE viewport (see [`VpContent`]).
     vp: VpContent,
+    /// What a running command shows in place of the drawing (see [`OnlyList`]).
+    only: OnlyList,
     /// Indices of infinite-line primitives in `list` (drawn on the CPU in GPU mode).
     infinite: Vec<usize>,
     /// Milliseconds spent converting the display list to vertex data (last rebuild).
@@ -431,12 +433,12 @@ impl VpContent {
 }
 
 /// How a list built for view `built` (centre, height) of viewport `vp` maps to its current
-/// view, as `p = k·p0 + b` on paper. A model point m is at p0 = c + s0 (m − c0) in the list and
-/// belongs at p = c + s (m − vc), with c the viewport's centre and s, s0 paper units per model
-/// unit, so k = s / s0 and b = c (1 − k) + s (c0 − vc).
+/// view, as `p = k·p0 + b` on paper. A model point m is at p0 = c + s0 R(m − c0) in the list and
+/// belongs at p = c + s R(m − vc), with c the viewport's centre, R its view twist and s, s0 paper
+/// units per model unit, so k = s / s0 and b = c (1 − k) + s R(c0 − vc).
 fn vp_motion(vp: &cadcraft_doc::Viewport, built: (Vec2, f64)) -> Option<(f64, Vec2)> {
     let (s, k) = (vp.height / vp.view_height, built.1 / vp.view_height);
-    let b = vp.center.xy() * (1.0 - k) + (built.0 - vp.view_center) * s;
+    let b = vp.center.xy() * (1.0 - k) + (built.0 - vp.view_center).rotate(vp.view_twist()) * s;
     (k.is_finite() && k > 0.0 && b.is_finite()).then_some((k, b))
 }
 
@@ -657,6 +659,32 @@ impl VpHighlight {
             self.list = cadcraft_render::build_entities(&st.doc, ents, &cadcraft_render::Options { tolerance, ..Default::default() });
             self.key = Some(key);
             self.list_gen = self.list_gen.wrapping_add(1);
+        }
+    }
+}
+
+/// The display list of what a running command shows in place of the drawing
+/// ([`cadcraft_engine::Session::display_only`]: DVIEW's preview set), rebuilt when the drawing,
+/// the set or the 2x zoom band changes.
+#[derive(Default)]
+struct OnlyList {
+    key: Option<u64>,
+    list: DisplayList,
+}
+
+impl OnlyList {
+    fn update(&mut self, st: &cadcraft_engine::DocState, only: &cadcraft_engine::DisplayOnly, scale: f64) {
+        let band = (1.0 / scale.max(1e-300)).log2().floor() as i32;
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (st.uid, st.revision, std::sync::Arc::as_ptr(&st.doc) as usize, band, &only.handles, format!("{:?}", only.extra)).hash(&mut h);
+            h.finish()
+        };
+        if self.key != Some(key) {
+            let ents = only.handles.iter().filter_map(|h| st.doc.entity(*h)).map(|e| e.as_ref()).chain(only.extra.iter());
+            self.list = rebuilt_preview(&st.doc, ents, 2f64.powi(-band));
+            self.key = Some(key);
         }
     }
 }
@@ -1655,16 +1683,32 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // The active viewport's contents, drawn apart from the layout's list, under its own objects.
     // `masked`: its outline is in the stencil buffer this frame.
     let mut masked = false;
-    if let Some(f) = ensure_vp_content(app, &xf_paper, ui.ctx()) {
-        let gpu = app.canvas.gpu.is_some();
-        let clipped = painter.with_clip_rect(f.on_screen.intersect(rect));
-        draw_vp_content(&mut app.canvas.vp, gpu, &clipped, &f, &xf_paper, bg, app.session.settings.lwdisplay);
-        masked = gpu && f.outline.is_some();
-    }
-    if app.canvas.gpu.is_some() {
-        draw_list_gpu(&mut app.canvas, &painter, &xf_paper, bg, app.session.settings.lwdisplay);
-    } else if let Some(list) = &app.canvas.list {
-        draw_list(&painter, &xf_paper, list, bg, app.session.settings.lwdisplay);
+    if let Some(only) = app.session.display_only() {
+        // A command that shows only some objects while it runs (DVIEW's preview set): those,
+        // in the view being changed (inside the active viewport, clipped to it).
+        let clip = active_vp.as_ref().map_or(rect, |vp| {
+            Rect::from_two_pos(
+                xf_paper.to_screen(Vec2::new(vp.center.x - vp.width / 2.0, vp.center.y + vp.height / 2.0)),
+                xf_paper.to_screen(Vec2::new(vp.center.x + vp.width / 2.0, vp.center.y - vp.height / 2.0)),
+            )
+            .intersect(rect)
+        });
+        if let Ok(st) = app.session.state() {
+            app.canvas.only.update(st, &only, scale);
+        }
+        draw_list(&painter.with_clip_rect(clip), &xf, &app.canvas.only.list, bg, app.session.settings.lwdisplay);
+    } else {
+        if let Some(f) = ensure_vp_content(app, &xf_paper, ui.ctx()) {
+            let gpu = app.canvas.gpu.is_some();
+            let clipped = painter.with_clip_rect(f.on_screen.intersect(rect));
+            draw_vp_content(&mut app.canvas.vp, gpu, &clipped, &f, &xf_paper, bg, app.session.settings.lwdisplay);
+            masked = gpu && f.outline.is_some();
+        }
+        if app.canvas.gpu.is_some() {
+            draw_list_gpu(&mut app.canvas, &painter, &xf_paper, bg, app.session.settings.lwdisplay);
+        } else if let Some(list) = &app.canvas.list {
+            draw_list(&painter, &xf_paper, list, bg, app.session.settings.lwdisplay);
+        }
     }
     lamb_overlays::draw(app, &painter, &xf, bg);
     if let Some(vp) = &active_vp {
@@ -2548,6 +2592,27 @@ pub(crate) mod tests {
         };
         let xf = tile_xf(Rect::from_min_size(Pos2::ZERO, vec2(100.0, 100.0)), &tile, 0.0);
         assert_eq!((xf.twist, xf.center, xf.scale), (0.5, Vec2::new(1.0, 2.0), 2.0));
+    }
+
+    /// The active viewport's list, built at one view of a twisted viewport, lands where the
+    /// viewport now shows each model point after a pan and a zoom.
+    #[test]
+    fn vp_motion_follows_a_twisted_viewport() {
+        let built = cadcraft_doc::Viewport {
+            center: cadcraft_geom::Vec3::new(5.0, 4.0, 0.0),
+            width: 8.0,
+            height: 6.0,
+            view_center: Vec2::new(1.0, 2.0),
+            view_height: 12.0,
+            twist: 0.7,
+            ..Default::default()
+        };
+        let now = cadcraft_doc::Viewport { view_center: Vec2::new(-3.0, 0.5), view_height: 7.0, ..built.clone() };
+        let (k, b) = vp_motion(&now, (built.view_center, built.view_height)).unwrap();
+        for m in [Vec2::new(0.0, 0.0), Vec2::new(4.0, -2.5), Vec2::new(-7.0, 3.0)] {
+            let moved = built.model_to_paper(m) * k + b;
+            assert!((moved - now.model_to_paper(m)).len() < 1e-9, "{m:?}");
+        }
     }
 
     #[test]

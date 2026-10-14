@@ -7,8 +7,9 @@ use serde_json::{Value, json};
 
 use super::machines::{SelectRun, number};
 use super::*;
-use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step, View};
+use crate::{Accept, Input, Interactive, Prompt, Result, Session, Step, View};
 
+mod dview;
 mod named_views;
 pub(crate) mod vports;
 
@@ -94,16 +95,10 @@ pub fn specs() -> Vec<CommandSpec> {
         .alias(&["r"])
         .noundo()
         .transparent(),
-        CommandSpec::new("dview", "DView", run_dview)
-            .alias(&["dv"])
-            .params("{twist: degrees counterclockwise} (the Model tab's view twist, as DVIEW TWist; 2D only: the 3D options are not available)")
-            .noundo()
-            .interactive(|s| {
-                // Refused as it starts in a layout, as BricsCAD does.
-                twist_view(s)?;
-                Ok(Box::new(DviewM::default()))
-            }),
-        CommandSpec::new("view.set", "Set View", run_view_set).params("{center: [x,y], height, twist?: degrees (default: keep the current twist)}").noundo(),
+        dview::spec(),
+        CommandSpec::new("view.set", "Set View", run_view_set)
+            .params("{center: [x,y], height, twist?: degrees (default: keep the current twist; in a layout viewport it is the viewport's twist, an undoable edit; not in Paper space)}")
+            .noundo(),
         CommandSpec::new("view.get", "Get View", |s, _| {
             let v = s.state()?.view();
             Ok(json!({"center": [v.center.x, v.center.y], "height": v.height, "twist": v.twist.to_degrees(), "viewportPx": [s.viewport_px.0, s.viewport_px.1]}))
@@ -284,99 +279,30 @@ fn run_view_set(s: &mut Session, p: &Value) -> Result<Value> {
         Some(t) => t.as_f64().filter(|t| t.is_finite()).ok_or_else(|| bad("view.set", "twist must be a number of degrees"))?.to_radians(),
         None => s.state()?.view().twist,
     };
-    // Only the Model tab's view turns.
-    if twist != 0.0 && twist_view(s).is_err() {
-        return Err(EngineError::Other(PAPER_SPACE.into()));
-    }
+    // As DVIEW TWist: the Model tab's view or the active layout viewport turns; a layout sheet
+    // (paper space) is never twisted.
+    let target = match dview::target(s) {
+        Ok(t) => Some(t),
+        Err(_) if twist == 0.0 => None,
+        Err(e) => return Err(e),
+    };
+    let before = (s.state()?.doc.clone(), s.state()?.selection.clone());
+    let twist = match target {
+        Some(t @ dview::Target::Viewport(_)) => {
+            dview::set_twist(s, t, twist)?;
+            s.state()?.view().twist
+        }
+        Some(dview::Target::Model) => twist.rem_euclid(std::f64::consts::TAU),
+        None => 0.0,
+    };
     if !s.state_mut()?.set_view(View { center: c, height: h, twist }) {
+        s.state_mut()?.doc = before.0;
         return Err(bad("view.set", "the view is too large to show. Nothing was changed"));
     }
+    if let Some(dview::Target::Viewport(h)) = target {
+        dview::record_viewport_edit(s, before, h)?;
+    }
     ok()
-}
-
-// ---------------- DVIEW ----------------
-
-/// The DVIEW options that need a 3D view (CADCraft views are 2D plan views).
-const DVIEW_3D: &[&str] =
-    &["camera", "ca", "target", "ta", "distance", "d", "points", "po", "pan", "pa", "zoom", "z", "clip", "cl", "hide", "h", "off", "o", "undo", "u"];
-const DVIEW_2D_ONLY: &str = "Only the view twist is available: CADCraft views are 2D.";
-/// What DVIEW (and a view twist asked for anywhere) says in a layout, as BricsCAD does.
-const PAPER_SPACE: &str = "This command is not available in Paper space.";
-
-/// The view twist DVIEW changes: the Model tab's (outside a layout viewport).
-fn twist_view(s: &Session) -> Result<View> {
-    let st = s.state()?;
-    if st.space != Space::Model || st.mspace.is_some() {
-        return Err(EngineError::Other(PAPER_SPACE.into()));
-    }
-    Ok(st.view())
-}
-
-/// Set the view twist to `twist` radians: a view change like ZOOM (into the view history, so
-/// ZOOM Previous turns it back), not an undo step.
-fn set_twist(s: &mut Session, twist: f64) -> Result<()> {
-    let v = twist_view(s)?;
-    if !twist.is_finite() {
-        return Err(bad("dview", "the twist must be a finite angle"));
-    }
-    // Kept in [0°, 360°), as files hold it.
-    s.state_mut()?.set_view(View { twist: twist.rem_euclid(std::f64::consts::TAU), ..v });
-    Ok(())
-}
-
-fn run_dview(s: &mut Session, p: &Value) -> Result<Value> {
-    let deg = f64_req("dview", p, "twist")?;
-    set_twist(s, deg.to_radians())?;
-    let v = s.state()?.view();
-    Ok(json!({ "twist": v.twist.to_degrees() }))
-}
-
-/// DVIEW, 2D: "Enter option [TWist/eXit]" then "Specify view twist angle <current>:".
-#[derive(Default)]
-struct DviewM {
-    twisting: bool,
-}
-
-impl Interactive for DviewM {
-    fn name(&self) -> &'static str {
-        "DVIEW"
-    }
-    fn prompt(&self, s: &Session) -> Prompt {
-        if self.twisting {
-            let cur = s.state().map(|st| st.view().twist.to_degrees()).unwrap_or(0.0);
-            return Prompt::new("Specify view twist angle", Accept::NUMBER).default(format!("{cur:.2}"));
-        }
-        Prompt::new("Enter option", Accept::TEXT).kw(&["TWist", "eXit"])
-    }
-    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
-        let text = match &i {
-            Input::Text(t) | Input::Keyword(t) => Some(t.trim().to_ascii_lowercase()),
-            _ => None,
-        };
-        if matches!(i, Input::Cancel) {
-            return Ok(Step::Cancel);
-        }
-        if self.twisting {
-            self.twisting = false;
-            let Some(t) = text.filter(|t| !t.is_empty()) else { return Ok(Step::Continue) };
-            let a = s.angle_settings().rotation(&t).ok_or_else(|| EngineError::Other("Requires a valid angle.".into()))?;
-            set_twist(s, a)?;
-            return Ok(Step::Continue);
-        }
-        match text.as_deref() {
-            None | Some("") | Some("x") | Some("exit") => Ok(Step::Done),
-            Some("tw") | Some("twist") => {
-                twist_view(s)?;
-                self.twisting = true;
-                Ok(Step::Continue)
-            }
-            Some(t) if DVIEW_3D.contains(&t) => {
-                s.echo(DVIEW_2D_ONLY);
-                Ok(Step::Continue)
-            }
-            Some(_) => Err(EngineError::Other("Invalid option keyword.".into())),
-        }
-    }
 }
 
 fn run_layout_set(s: &mut Session, p: &Value) -> Result<Value> {

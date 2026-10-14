@@ -1084,6 +1084,10 @@ fn entity_body(w: &mut W, d: &Drawing, e: &Entity, owner: &str, paper: bool, cx:
             w.i(69, i64::from(v.id));
             w.p2(12, v.view_center);
             w.f(45, v.view_height);
+            // View twist (degrees), when the viewport has one.
+            if v.view_twist() != 0.0 {
+                w.f(51, v.view_twist().to_degrees());
+            }
             // Status flags: 16384 = display locked, 32768 = always set, 65536 = clipped by the
             // 340 entity, 131072 = off.
             let clip = v.clip.filter(|h| *h != e.handle && d.entity(*h).is_some());

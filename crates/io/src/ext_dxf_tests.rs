@@ -249,6 +249,7 @@ fn first_viewport_of_a_layout_keeps_its_ext() {
             layer_colors: Vec::new(),
             clip: None,
             on: true,
+            twist: 0.0,
         })
     };
     for id in [2, 3] {
