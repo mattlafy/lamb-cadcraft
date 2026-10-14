@@ -28,6 +28,10 @@
 //! - `lambproject` (View ▸ LAMB ▸ Start Project): `Level 1` and a placed `Ground Floor` plan on
 //!   it, then edit the plan; refused ("Already a LAMB project") once the drawing has views.
 //!
+//! - `newdetail {name}` (View ▸ LAMB ▸ New Detail): a floating detail view, entered; `detailtag`
+//!   (`dtag`) / `detailtags`: detail tags in a plan view and their resolution report — see
+//!   [`crate::detailtags`].
+//!
 //! - `viewprops {mode, viewId, …}` (View ▸ LAMB ▸ View Properties): rename a view, a placed plan's
 //!   cut elevation, a vertical view's intent or flip — see [`crate::viewprops`].
 //!
@@ -48,7 +52,8 @@ use lamb_core::geometry::polyline::line2;
 use lamb_core::geometry::polyline::resolved_segments;
 use lamb_core::geometry::{IDENTITY_TRANSFORM, Point2};
 use lamb_core::model::{
-    Actor, AnyView, Id, Level, LinkAnchor, LinkOrigin, LinkRecord, Placement, PlanView, VerticalIntent, VerticalView, authored_field, is_plan_view,
+    Actor, AnyView, CutDirection, DetailView, Id, Level, LinkAnchor, LinkOrigin, LinkRecord, Placement, PlanView, VerticalIntent, VerticalView,
+    authored_field, is_plan_view,
 };
 use serde_json::{Value, json};
 
@@ -93,6 +98,23 @@ pub(crate) fn create(s: &mut Session, view: AnyView) -> Result<Value> {
 fn newplan(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_param("newplan", p, "name")?.to_owned();
     create(s, AnyView::Plan(PlanView { id: Id(0), name, entities: Vec::new(), placement: None }))
+}
+
+/// NEWDETAIL: a floating detail view (plan cut direction, no condition or hosts yet).
+fn newdetail(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = str_param("newdetail", p, "name")?.to_owned();
+    create(
+        s,
+        AnyView::Detail(DetailView {
+            id: Id(0),
+            name,
+            entities: Vec::new(),
+            placement: None,
+            condition_type: String::new(),
+            host_element_ids: Vec::new(),
+            cut_direction: CutDirection::Plan,
+        }),
+    )
 }
 
 fn new_vertical(s: &mut Session, p: &Value, cmd: &str, intent: VerticalIntent) -> Result<Value> {
@@ -324,26 +346,30 @@ pub(crate) fn enter_space(s: &mut Session, space: Space) -> Result<()> {
     crate::refpane::refresh(s)
 }
 
-/// NEWPLAN: `Enter plan name <Plan N>:`, then edit inside the new plan.
+/// NEWPLAN: `Enter plan name <Plan N>:`, then edit inside the new plan. NEWDETAIL the same with
+/// `Enter detail name <Detail N>:`.
 struct NewPlan {
     default: String,
+    detail: bool,
 }
 
 impl Interactive for NewPlan {
     fn name(&self) -> &'static str {
-        "newplan"
+        if self.detail { "newdetail" } else { "newplan" }
     }
     fn prompt(&self, _s: &Session) -> Prompt {
-        Prompt::new("Enter plan name", Accept::TEXT).default(self.default.clone())
+        let msg = if self.detail { "Enter detail name" } else { "Enter plan name" };
+        Prompt::new(msg, Accept::TEXT).default(self.default.clone())
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         if i == Input::Cancel {
             return Ok(Step::Cancel);
         }
         let Some(name) = name_input(i, &self.default) else { return Ok(Step::Continue) };
-        match newplan(s, &json!({ "name": name })) {
+        let (run, word): (fn(&mut Session, &Value) -> Result<Value>, &str) = if self.detail { (newdetail, "Detail") } else { (newplan, "Plan") };
+        match run(s, &json!({ "name": name })) {
             Ok(r) => {
-                if let Some(id) = echo_created(s, "Plan", &name, &r) {
+                if let Some(id) = echo_created(s, word, &name, &r) {
                     enter_space(s, Space::Block(view_block_name(id)))?;
                 }
             }
@@ -354,7 +380,11 @@ impl Interactive for NewPlan {
 }
 
 fn newplan_machine(s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(NewPlan { default: next_name(s, "Plan", is_plan_view) }))
+    Ok(Box::new(NewPlan { default: next_name(s, "Plan", is_plan_view), detail: false }))
+}
+
+fn newdetail_machine(s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(NewPlan { default: next_name(s, "Detail", |v| matches!(v, AnyView::Detail(_))), detail: true }))
 }
 
 /// NEWSECTIONLINE / NEWELEVATIONLINE: two points of the cut line in the edited view, then a name.
@@ -619,6 +649,13 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{mode: rename|cutElevation|intent|flip, viewId, name | cutElevation | intent: section|elevation | flipped}")
             .menu(MENU)
             .interactive(crate::viewprops::viewprops_machine),
+        CommandSpec::new("newdetail", "New Detail", newdetail).params("{name}").menu(MENU).interactive(newdetail_machine),
+        CommandSpec::new("detailtag", "Detail Tag", crate::detailtags::detailtag)
+            .alias(&["dtag"])
+            .params("{detailViewId, corner?: bool, tip:{x,y}, bubble:{x,y}}")
+            .menu(MENU)
+            .interactive(crate::detailtags::detailtag_machine),
+        CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU),
     ]
 }
 
@@ -653,8 +690,20 @@ mod tests {
     #[test]
     fn every_spec_has_a_menu_path_and_a_factory() -> R {
         install_app()?;
-        let ids =
-            ["newplan", "newsectionline", "newelevationline", "newsheet", "editview", "newoffsetplan", "newplanline", "link", "unlink", "viewprops"];
+        let ids = [
+            "newplan",
+            "newsectionline",
+            "newelevationline",
+            "newsheet",
+            "editview",
+            "newoffsetplan",
+            "newplanline",
+            "link",
+            "unlink",
+            "viewprops",
+            "newdetail",
+            "detailtag",
+        ];
         for id in ids {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
             assert_eq!(c.menu, MENU, "{id}");

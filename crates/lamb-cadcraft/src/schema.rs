@@ -126,11 +126,25 @@ pub struct EntityData {
     /// skipped there.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub corners: Vec<CornerEntry>,
+    /// On a `Leader` in a plan view's block: a detail tag (`cadcraft-integration.md` §9), its tip
+    /// `vertices[0]` ([`crate::detailtags`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_tag: Option<DetailTag>,
+}
+
+/// A detail tag's assignment: the detail view it names, and whether it tags a junction (a corner
+/// detail) rather than a run (an edge detail).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailTag {
+    pub detail_view_id: Id,
+    #[serde(default)]
+    pub corner: bool,
 }
 
 impl Default for EntityData {
     fn default() -> Self {
-        EntityData { role: LineRole::Bylayer, ai_origin: None, view_id: None, corners: Vec::new() }
+        EntityData { role: LineRole::Bylayer, ai_origin: None, view_id: None, corners: Vec::new(), detail_tag: None }
     }
 }
 

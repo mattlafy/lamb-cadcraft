@@ -25,6 +25,7 @@
 pub mod commands;
 pub mod convert;
 pub mod corners;
+pub mod detailtags;
 pub mod fillet;
 pub mod import;
 mod linkcmds;
