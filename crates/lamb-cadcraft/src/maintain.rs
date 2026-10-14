@@ -4,7 +4,13 @@
 //!
 //! [`maintain_links`] compares the drawing before and after one command and, in order:
 //! 0. travels: a linked segment the command rigidly translated carries its unchanged partner in the
-//!    other view with it (`selection-and-link-editing.md` §4b ray-sliding, lamb-core
+//!    other view with it — only for a link in the selection's **travel set** (TS T109/T110: an idle
+//!    crossing box seeds every link touching a swept entity, a window box seeds none, the set dies
+//!    with the selection; [`travel_box_observer`] seeds it, engine patch 19 holds it). Any command
+//!    whose rigid translation this step detects travels (MOVE, STRETCH, grips) — a superset of TS's
+//!    MOVE, kept because §13 phase 3's gate is STRETCH. A touched link outside the set is left to
+//!    step 2, which flags it stale rather than deleting it as TS does on separation (visible and
+//!    reversible; RESOLVE lists it) (`selection-and-link-editing.md` §4b ray-sliding, lamb-core
 //!    `travel_segment_move`), so the link stays live — §13 phase 3 "STRETCH a linked plan line → the
 //!    section follows in one undo step"; an unaccepted AI line never travels — the after-command
 //!    sweep ([`crate::sweeps`]) re-seats it on its slot instead;
@@ -116,7 +122,7 @@ fn rigid_delta(before: &Polyline2, after: &Polyline2, index: usize) -> Option<Po
     (rigid && d.x.hypot(d.y) > tol).then_some(d)
 }
 
-/// Step 0, travel. For each link with exactly one end's entity changed by the command (same view,
+/// Step 0, travel. For each link in `travel` with exactly one end's entity changed by the command (same view,
 /// different polyline) and the other unchanged, when the anchored segment was rigidly translated,
 /// slides the partner by `travel_segment_move` and writes its new geometry into `after` (keeping
 /// the entity's handle, layer and `ext`). Each partner travels at most once, first link in
@@ -126,7 +132,7 @@ fn rigid_delta(before: &Polyline2, after: &Polyline2, index: usize) -> Option<Po
 /// Known limitation, TS parity: an oblique segment slid along its own direction is a translation
 /// whose crossing does not move, yet travel shifts the partner by the delta's component along the
 /// cut; step 2 then flags that link stale.
-fn travel(before_entities: &EntityMap, after: &mut Drawing) -> Result<Vec<Id>, SchemaError> {
+fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -> Result<Vec<Id>, SchemaError> {
     let writes: Vec<(Id, Polyline2)> = {
         let p = DrawingProject::new(after)?;
         let after_entities = entity_map(&p);
@@ -135,7 +141,7 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing) -> Result<Vec<Id>, S
             _ => None,
         };
         let mut writes: Vec<(Id, Polyline2)> = Vec::new();
-        for link in &p.document().links {
+        for link in p.document().links.iter().filter(|l| travel_set.contains(&l.id)) {
             for (mine, other) in [(&link.a, &link.b), (&link.b, &link.a)] {
                 let (Some((bp, ap)), Some((op_before, op_after))) = (pair(&mine.entity_id), pair(&other.entity_id)) else { continue };
                 if bp == ap || op_before != op_after || writes.iter().any(|(id, _)| *id == other.entity_id) {
@@ -263,10 +269,10 @@ fn already_joined(links: &[LinkRecord], r: &LinkRecord) -> bool {
     })
 }
 
-/// Keeps `after`'s links true to its geometry, given the drawing `before` the command ran.
-/// Writes `after`'s LAMB document once per step that changed it; when nothing changes, `after` is
+/// Keeps `after`'s links true to its geometry, given the drawing `before` the command ran and the
+/// selection's travel set (`travel`: the only links step 0 may travel). Writes `after`'s LAMB document once per step that changed it; when nothing changes, `after` is
 /// left untouched.
-pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str) -> Result<MaintenanceReport, SchemaError> {
+pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_set: &[Id]) -> Result<MaintenanceReport, SchemaError> {
     let mut report = MaintenanceReport::default();
     let before_project = DrawingProject::new(before)?;
     let before_entities = entity_map(&before_project);
@@ -274,7 +280,7 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str) -> Resul
     drop(before_project);
 
     // 0: travel, before anything reads `after`.
-    report.travelled = travel(&before_entities, after)?;
+    report.travelled = travel(&before_entities, after, travel_set)?;
     // 0b: re-anchor ends whose entity was replaced by pieces, before step 1 would drop them.
     report.reanchored = reanchor(&before_entities, after)?;
 
@@ -357,7 +363,8 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str) -> Resul
 pub fn link_observer(s: &mut Session, before: &Arc<Drawing>) {
     let Ok(current) = s.doc() else { return };
     let mut after = current.clone();
-    match maintain_links(before, &mut after, &now()) {
+    let travel_set: Vec<Id> = s.travel().into_iter().map(Id).collect();
+    match maintain_links(before, &mut after, &now(), &travel_set) {
         Ok(report) if !report.is_empty() => {
             if let Ok(d) = s.doc_mut() {
                 *d = after;
@@ -368,10 +375,28 @@ pub fn link_observer(s: &mut Session, before: &Arc<Drawing>) {
     }
 }
 
+/// The idle selection-box observer (engine patch 19): a crossing box makes the travel set every
+/// link with an end on an entity it selected; a window box empties it. Not a LAMB drawing: nothing.
+pub fn travel_box_observer(s: &mut Session, handles: &[Handle], crossing: bool) {
+    if !crossing {
+        s.set_travel(Vec::new());
+        return;
+    }
+    let ids: Vec<u64> = {
+        let Ok(d) = s.doc() else { return };
+        let Ok(p) = DrawingProject::new(d) else { return };
+        let on = |id: Id| handles.contains(&Handle(id.0));
+        p.document().links.iter().filter(|l| on(l.a.entity_id) || on(l.b.entity_id)).map(|l| l.id.0).collect()
+    };
+    s.set_travel(ids);
+}
+
 /// Registers [`crate::corners::corner_observer`], [`link_observer`] then
 /// [`crate::sweeps::sweep_observer`] on `s` (each once), so link travel reads corner tags already
-/// re-seated by the same command, and the AI / solid-cut sweeps see the links already maintained.
+/// re-seated by the same command, and the AI / solid-cut sweeps see the links already maintained;
+/// and [`travel_box_observer`] once per process.
 pub fn install(s: &mut Session) {
+    let _ = cadcraft_engine::travel::register_box_observer(travel_box_observer);
     let fs: [cadcraft_engine::AfterCommand; 3] = [crate::corners::corner_observer, link_observer, crate::sweeps::sweep_observer];
     for f in fs {
         if !s.observers.iter().any(|o| std::ptr::fn_addr_eq(*o, f)) {

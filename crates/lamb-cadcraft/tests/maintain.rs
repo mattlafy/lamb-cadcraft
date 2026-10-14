@@ -1,8 +1,9 @@
 //! The link-maintenance observer (`maintain`): on the imported `u-wall-two-sections` fixture, ERASE
 //! drops exactly the erased entity's links, a non-rigid STRETCH off a crossing flags stale and back
 //! clears, a line drawn through a hollow marker auto-links, an unlinked MOVE leaves links alone, and
-//! a rigidly moved linked segment carries its partner across views (travel) — each in the command's
-//! own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`).
+//! a rigidly moved linked segment carries its partner across views (travel) only when the link is
+//! in the selection's travel set — seeded by an idle crossing box, emptied by a window box or Esc —
+//! and is flagged stale otherwise, each in the command's own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`).
 //!
 //! The command registry is process-global, so registration goes through one `Once`.
 
@@ -88,7 +89,7 @@ fn link_observer_maintains_links() -> R {
     }
     // An identical before/after changes nothing.
     let mut same = d.clone();
-    assert!(maintain_links(&d, &mut same, "t")?.is_empty());
+    assert!(maintain_links(&d, &mut same, "t", &[])?.is_empty());
 
     let mut s = Session::new();
     s.open_drawing(d, "u-wall", None);
@@ -216,20 +217,21 @@ fn link_observer_maintains_links() -> R {
     Ok(())
 }
 
-/// Runs one command on a copy of `d` in a session WITHOUT the observer, then `maintain_links` on it:
-/// the report the observer would have acted on.
+/// Runs one command on a copy of `d` in a session WITHOUT the observer, then `maintain_links` on it
+/// with travel set `travel`: the report the observer would have acted on.
 fn raw_report(
     d: &Drawing,
     view: Id,
     cmd: &str,
     args: &serde_json::Value,
+    travel: &[Id],
 ) -> Result<(Drawing, lamb_cadcraft::MaintenanceReport), Box<dyn std::error::Error>> {
     let mut s = Session::new();
     s.open_drawing(d.clone(), "raw", None);
     s.execute("editview", &json!({"viewId": view.0}))?;
     s.execute(cmd, args)?;
     let mut after = s.doc()?.clone();
-    let report = maintain_links(d, &mut after, "t")?;
+    let report = maintain_links(d, &mut after, "t", travel)?;
     Ok((after, report))
 }
 
@@ -244,8 +246,9 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6
 }
 
-/// §13 phase 3 gate: STRETCH a linked plan line → the section follows in one undo step; the same
-/// from the section side. Moving both ends, or a non-rigid edit, travels nothing.
+/// §13 phase 3 gate: STRETCH a linked plan line, its link in the travel set → the section follows in
+/// one undo step; the same from the section side. Moving both ends, or a non-rigid edit, travels
+/// nothing.
 #[test]
 fn rigid_move_travels_partner() -> R {
     register();
@@ -263,7 +266,7 @@ fn rigid_move_travels_partner() -> R {
     let stretch = json!({"window": [[lo - 100.0, seg.from.y - 100.0], [hi + 100.0, seg.from.y + 100.0]], "delta": [0, 1000]});
 
     // The gate, plan side. The report names the section partner.
-    let (_, report) = raw_report(&d, plan_view, "stretch", &stretch)?;
+    let (_, report) = raw_report(&d, plan_view, "stretch", &stretch, &[link.id])?;
     assert_eq!(report.travelled, vec![sec_e], "{report:?}");
     let mut s = Session::new();
     s.open_drawing(d.clone(), "u-wall", None);
@@ -272,6 +275,7 @@ fn rigid_move_travels_partner() -> R {
     let ext_before = s.doc()?.ext.get(lamb_cadcraft::EXT_KEY).cloned();
     let (plan_ent, sec_ent) = (s.doc()?.entity(Handle(plan_e.0)).cloned(), s.doc()?.entity(Handle(sec_e.0)).cloned());
     s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    s.set_travel(vec![link.id.0]);
     s.execute("stretch", &stretch)?;
     let sec_after = anchor_point(s.doc()?, &link, sec_e)?;
     assert!(close(sec_after.x - sec_before.x, 1000.0) && close(sec_after.y, sec_before.y), "section anchor {sec_before:?} -> {sec_after:?}");
@@ -288,10 +292,11 @@ fn rigid_move_travels_partner() -> R {
     // Section side: MOVE the section line along u → the plan segment slides along the cut, its
     // neighbours ray-slide, vertex count unchanged.
     let mv = json!({"handles": [hex(sec_e)], "delta": [1000, 0]});
-    let (_, report) = raw_report(&d, sec_view, "move", &mv)?;
+    let (_, report) = raw_report(&d, sec_view, "move", &mv, &[link.id])?;
     assert_eq!(report.travelled, vec![plan_e], "{report:?}");
     let before = poly(s.doc()?, plan_e)?;
     s.execute("editview", &json!({"viewId": sec_view.0}))?;
+    s.set_travel(vec![link.id.0]);
     s.execute("move", &mv)?;
     let after = poly(s.doc()?, plan_e)?;
     assert_eq!(after.segments.len(), before.segments.len(), "vertex count unchanged");
@@ -308,15 +313,111 @@ fn rigid_move_travels_partner() -> R {
     assert_eq!(s.doc()?.ext.get(lamb_cadcraft::EXT_KEY).cloned(), ext_before);
 
     // Both ends moved in one command: the user moved both, nothing travels.
-    let (after, report) = raw_report(&d, plan_view, "move", &json!({"handles": [hex(plan_e), hex(sec_e)], "delta": [0, 500]}))?;
+    let (after, report) = raw_report(&d, plan_view, "move", &json!({"handles": [hex(plan_e), hex(sec_e)], "delta": [0, 500]}), &[link.id])?;
     assert!(report.travelled.is_empty(), "{report:?}");
     assert!(poly(&after, plan_e)? != poly(&d, plan_e)? && poly(&after, sec_e)? != poly(&d, sec_e)?, "both ends really moved");
 
     // A non-rigid edit (one endpoint of the plan segment) travels nothing.
     let one_end = json!({"window": [[seg.to.x - 100.0, seg.to.y - 100.0], [seg.to.x + 100.0, seg.to.y + 100.0]], "delta": [0, 1000]});
-    let (after, report) = raw_report(&d, plan_view, "stretch", &one_end)?;
+    let (after, report) = raw_report(&d, plan_view, "stretch", &one_end, &[link.id])?;
     assert!(report.travelled.is_empty(), "{report:?}");
     assert_eq!(poly(&after, sec_e)?, poly(&d, sec_e)?);
+    Ok(())
+}
+
+/// The crossbar link (plan wall segment 1 (0,0)-(10000,0) crossed at (5000,0) ↔ the section line
+/// at u = 1000), its plan and section entities, and their views.
+fn crossbar(d: &Drawing) -> Result<(LinkRecord, Id, Id, Id), Box<dyn std::error::Error>> {
+    let link = read_document(d)?.links.into_iter().find(|l| l.a.segment_index == 1 || l.b.segment_index == 1).ok_or("no seg-1 link")?;
+    let (plan_e, sec_e) =
+        if is_plan(d, view_of(d, link.a.entity_id)?)? { (link.a.entity_id, link.b.entity_id) } else { (link.b.entity_id, link.a.entity_id) };
+    let plan_view = view_of(d, plan_e)?;
+    Ok((link, plan_e, sec_e, plan_view))
+}
+
+/// T367: the same rigid STRETCH with the link outside the travel set leaves the section partner
+/// where it is and flags the link stale; one undo restores both.
+#[test]
+fn outside_the_travel_set_a_rigid_move_flags_stale() -> R {
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let original = read_document(&d)?.links;
+    let (link, plan_e, sec_e, plan_view) = crossbar(&d)?;
+    let stretch = json!({"window": [[-100, -100], [10100, 100]], "delta": [0, 1000]});
+
+    let (_, report) = raw_report(&d, plan_view, "stretch", &stretch, &[])?;
+    assert!(report.travelled.is_empty(), "{report:?}");
+    assert!(report.staled.contains(&link.id), "{report:?}");
+
+    let mut s = Session::new();
+    s.open_drawing(d.clone(), "u-wall", None);
+    install_link_maintenance(&mut s);
+    let (plan_ent, sec_poly) = (s.doc()?.entity(Handle(plan_e.0)).cloned(), poly(s.doc()?, sec_e)?);
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    assert!(s.travel().is_empty());
+    s.execute("stretch", &stretch)?;
+    assert!(s.doc()?.entity(Handle(plan_e.0)).cloned() != plan_ent, "the plan wall moved");
+    assert_eq!(poly(s.doc()?, sec_e)?, sec_poly, "the section partner did not travel");
+    assert_eq!(find_link(&links(&s)?, link.id)?.stale, Some(true), "the link is flagged, not dropped");
+    s.undo()?;
+    assert_eq!(s.doc()?.entity(Handle(plan_e.0)).cloned(), plan_ent);
+    assert_eq!(links(&s)?, original, "undo clears the flag");
+    Ok(())
+}
+
+/// T367, through real idle input in the plan: a right-to-left (crossing) box over the wall seeds
+/// the travel set with the wall's links, a left-to-right (window) box empties it, Esc clears it,
+/// and an interactive MOVE of a crossing-boxed wall carries the section partner — the set dies
+/// with the selection afterwards.
+#[test]
+fn a_crossing_box_seeds_the_travel_set() -> R {
+    use cadcraft_engine::Input;
+    use cadcraft_geom::Vec2;
+
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let original = read_document(&d)?.links;
+    let (link, plan_e, sec_e, plan_view) = crossbar(&d)?;
+    let mut s = Session::new();
+    s.open_drawing(d.clone(), "u-wall", None);
+    install_link_maintenance(&mut s);
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    let boxed = |s: &mut Session, a: (f64, f64), b: (f64, f64)| -> R {
+        assert!(s.begin_window(Vec2::new(a.0, a.1)), "box opened");
+        s.idle_click(Vec2::new(b.0, b.1), false)?;
+        Ok(())
+    };
+    let crossing = |s: &mut Session| boxed(s, (5100.0, 100.0), (4900.0, -100.0));
+
+    crossing(&mut s)?;
+    let sel = s.selection();
+    assert!(sel.contains(&Handle(plan_e.0)), "the crossing box caught the wall: {sel:?}");
+    let expect: Vec<u64> = original.iter().filter(|l| sel.iter().any(|h| on(l, Id(h.0)))).map(|l| l.id.0).collect();
+    assert!(expect.contains(&link.id.0));
+    assert_eq!(s.travel(), expect, "every link on a swept entity");
+
+    boxed(&mut s, (4900.0, -100.0), (5100.0, 100.0))?;
+    assert!(s.travel().is_empty(), "a window box seeds none");
+    crossing(&mut s)?;
+    assert!(!s.travel().is_empty());
+    s.cancel();
+    assert!(s.selection().is_empty() && s.travel().is_empty(), "Esc clears");
+
+    crossing(&mut s)?;
+    let sec_before = anchor_point(s.doc()?, &link, sec_e)?;
+    s.start("move")?;
+    s.input(Input::Point(Vec2::new(0.0, 0.0)))?;
+    s.input(Input::Point(Vec2::new(0.0, 1000.0)))?;
+    assert!(s.running.is_none(), "MOVE finished");
+    let sec_after = anchor_point(s.doc()?, &link, sec_e)?;
+    assert!(close(sec_after.x - sec_before.x, 1000.0) && close(sec_after.y, sec_before.y), "section anchor {sec_before:?} -> {sec_after:?}");
+    {
+        let p = DrawingProject::new(s.doc()?)?;
+        assert!(link_still_coincides(&p, &find_link(&links(&s)?, link.id)?)?, "the travelled link holds");
+    }
+    assert!(s.selection().is_empty() && s.travel().is_empty(), "the set died with the selection");
+    s.undo()?;
+    assert_eq!(anchor_point(s.doc()?, &link, sec_e)?, sec_before, "one undo puts the partner back");
     Ok(())
 }
 
@@ -367,7 +468,7 @@ fn trim_reanchors_links() -> R {
 
     // --- The gate: trim the far span.
     let far = json!({"handle": hex(plan_e), "pick": [7500, 0], "edges": edges});
-    let (_, report) = raw_report(&base, plan_view, "trim", &far)?;
+    let (_, report) = raw_report(&base, plan_view, "trim", &far, &[])?;
     assert!(report.reanchored.contains(&link.id), "{report:?}");
     assert!(report.dropped.is_empty() && report.created.is_empty(), "{report:?}");
     let ext_before = s.doc()?.ext.get(lamb_cadcraft::EXT_KEY).cloned();
@@ -397,7 +498,7 @@ fn trim_reanchors_links() -> R {
     let e4 = draw_edge(&mut s, plan_view, [6000.0, -500.0], [6000.0, 500.0])?;
     let base2 = s.doc()?.clone();
     let near = json!({"handle": hex(plan_e), "pick": [5000, 0], "edges": [e3.hex(), e4.hex()]});
-    let (after, report) = raw_report(&base2, plan_view, "trim", &near)?;
+    let (after, report) = raw_report(&base2, plan_view, "trim", &near, &[])?;
     assert_eq!(report.dropped, vec![link.id], "{report:?}");
     assert!(report.created.is_empty(), "{report:?}");
     let after_links = read_document(&after)?.links;
@@ -406,7 +507,7 @@ fn trim_reanchors_links() -> R {
 
     // --- BREAK across the line on one side of the crossing: the link lands on the piece holding it.
     let brk = json!({"handle": hex(plan_e), "p1": [7000, 0], "p2": [8000, 0]});
-    let (after, report) = raw_report(&base, plan_view, "break", &brk)?;
+    let (after, report) = raw_report(&base, plan_view, "break", &brk, &[])?;
     assert!(report.reanchored.contains(&link.id) && report.dropped.is_empty(), "{report:?}");
     let l = find_link(&read_document(&after)?.links, link.id)?;
     let piece = if l.a.entity_id == sec_e { l.b.entity_id } else { l.a.entity_id };
@@ -419,7 +520,7 @@ fn trim_reanchors_links() -> R {
     let e5 = draw_edge(&mut s, sec_view, [500.0, 2000.0], [1500.0, 2000.0])?;
     let base3 = s.doc()?.clone();
     let top = json!({"handle": hex(sec_e), "pick": [1000, 2500], "edges": [e5.hex()]});
-    let (after, report) = raw_report(&base3, sec_view, "trim", &top)?;
+    let (after, report) = raw_report(&base3, sec_view, "trim", &top, &[])?;
     assert_eq!(report.reanchored, vec![link.id], "{report:?}");
     assert!(report.dropped.is_empty() && report.created.is_empty(), "{report:?}");
     let l = find_link(&read_document(&after)?.links, link.id)?;
@@ -427,7 +528,7 @@ fn trim_reanchors_links() -> R {
     assert!(link_still_coincides(&DrawingProject::new(&after)?, &l)?);
     // Trimming the bottom (holding the anchor) away drops it instead.
     let bottom = json!({"handle": hex(sec_e), "pick": [1000, 500], "edges": [e5.hex()]});
-    let (_, report) = raw_report(&base3, sec_view, "trim", &bottom)?;
+    let (_, report) = raw_report(&base3, sec_view, "trim", &bottom, &[])?;
     assert_eq!(report.dropped, vec![link.id], "{report:?}");
     Ok(())
 }

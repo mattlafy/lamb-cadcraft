@@ -29,6 +29,7 @@ pub mod select;
 pub mod snap;
 pub mod spatial;
 pub mod sysvars;
+pub mod travel;
 pub mod undoctl;
 pub mod units;
 pub mod vcorner;
@@ -175,6 +176,9 @@ pub struct DocState {
     /// The object an idle click picked through the adapter's hook, with the space it was picked
     /// in (LAMB fork patch, [`idle_pick`]). Session state, never saved.
     pub picked: Option<(Space, String)>,
+    /// Ids an adapter attached to the current selection (LAMB fork patch 19, [`travel`]). Session
+    /// state, never saved, not in undo snapshots; dies with the selection at the quiet points.
+    pub travel: Vec<u64>,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -189,6 +193,13 @@ impl DocState {
         self.picked = v;
         if let Some(f) = idle_pick::picked_observer() {
             f(self.picked.as_ref());
+        }
+    }
+    /// Clear the travel set when nothing is selected (LAMB fork patch 19, [`travel`]). Called at
+    /// the quiet points only, never from `set_selection`.
+    fn drop_travel_if_unselected(&mut self) {
+        if self.selection.is_empty() {
+            self.travel.clear();
         }
     }
     pub fn new(doc: Drawing, title: &str, path: Option<String>) -> Self {
@@ -214,6 +225,7 @@ impl DocState {
             block_edit: None,
             panes: Default::default(),
             picked: None,
+            travel: Vec::new(),
         }
     }
     /// The drawing has changes not saved to its file, or the Block Editor has changes not yet
@@ -903,6 +915,22 @@ impl Session {
             st.set_picked(None);
         }
     }
+    /// The ids attached to the current selection ([`travel`]).
+    pub fn travel(&self) -> Vec<u64> {
+        self.state().map(|s| s.travel.clone()).unwrap_or_default()
+    }
+    /// Replace the ids attached to the current selection ([`travel`]).
+    pub fn set_travel(&mut self, ids: Vec<u64>) {
+        if let Ok(st) = self.state_mut() {
+            st.travel = ids;
+        }
+    }
+    /// Clear the travel set when nothing is selected, at a quiet point ([`travel`]).
+    fn drop_travel_if_unselected(&mut self) {
+        if let Ok(st) = self.state_mut() {
+            st.drop_travel_if_unselected();
+        }
+    }
     /// The key of the object the idle-click hook picked ([`idle_pick`]), while it was picked in
     /// the current edit space and no entity is selected.
     pub fn picked(&self) -> Option<String> {
@@ -1004,6 +1032,7 @@ impl Session {
             {
                 self.run_observers(doc);
             }
+            self.drop_travel_if_unselected();
         }
         let result = match (result, &before) {
             (Ok(v), Some((doc, sel, uid))) if spec.undoable => self.refuse_non_finite(Some(*uid), doc, sel, spec.id).map(|()| v),
@@ -1408,6 +1437,7 @@ impl Session {
         }
         // Observers run once, for the outer command, so their edits share its undo step.
         self.run_observers(&run.before);
+        self.drop_travel_if_unselected();
         if let Ok(st) = self.state_mut()
             && !Arc::ptr_eq(&run.before, &st.doc)
         {
@@ -1461,6 +1491,7 @@ impl Session {
         } else {
             self.pending_window = None;
             self.set_selection(Vec::new());
+            self.drop_travel_if_unselected();
         }
     }
 
@@ -1768,6 +1799,12 @@ impl Session {
     /// PICKADD on (the default): picks add to the selection and Shift removes. PICKADD off: each pick
     /// replaces the selection and Shift adds (Shift+pick on a selected object removes it).
     pub fn idle_click(&mut self, p: Vec2, shift: bool) -> Result<()> {
+        let r = self.idle_click_inner(p, shift);
+        self.drop_travel_if_unselected();
+        r
+    }
+
+    fn idle_click_inner(&mut self, p: Vec2, shift: bool) -> Result<()> {
         let space = self.space();
         let pickadd = self.settings.pickadd;
         if let Ok(st) = self.state_mut() {
@@ -1778,12 +1815,17 @@ impl Session {
             let hs = select::select_window(self.doc()?, &space, Bounds2::new(pw.corner, p), crossing);
             let hs = cmd::groups::expand(self, hs);
             let mut sel = if pickadd || shift { self.selection() } else { Vec::new() };
-            if shift && pickadd {
+            let removing = shift && pickadd;
+            if removing {
                 sel.retain(|h| !hs.contains(h));
             } else {
-                sel.extend(hs);
+                sel.extend(hs.iter().copied());
             }
             self.set_selection(sel);
+            // LAMB fork patch 19: a new gather tells the adapter's box observer ([`travel`]).
+            if !removing && let Some(f) = travel::box_observer() {
+                f(self, &hs, crossing);
+            }
             return Ok(());
         }
         let ap = self.pixel_size() * self.settings.pickbox.max(1.0) * 1.5;

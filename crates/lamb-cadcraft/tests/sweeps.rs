@@ -314,6 +314,9 @@ fn move_source_moves_ai_line_and_one_undo_restores_both() -> R {
     let doc_before = s.doc()?.clone();
 
     s.execute("editview", &json!({"viewId": source_view.0}))?;
+    // The source's user links travel with it (as a crossing box over it would seed them, T367).
+    let on_source = read_document(s.doc()?)?.links.iter().filter(|l| l.a.entity_id == source || l.b.entity_id == source).map(|l| l.id.0).collect();
+    s.set_travel(on_source);
     s.execute("move", &json!({"handles": [Handle(source.0).hex()], "delta": [300, 200]}))?;
     assert_ne!(polyline_of(s.doc()?, source)?, source_before, "the source moved");
     let after = ai_lines(s.doc()?)?;

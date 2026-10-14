@@ -60,7 +60,7 @@ pub use convert::{Converted, Flattened, Unsupported, UnsupportedReason, from_pol
 pub use corners::{corner_observer, maintain_corners};
 pub use entitycmds::{LayerRoleCell, layer_role_cell};
 pub use import::{IdMap, ImportError, ImportReport, project_to_drawing};
-pub use maintain::{MaintenanceReport, install, link_observer, maintain_links};
+pub use maintain::{MaintenanceReport, install, link_observer, maintain_links, travel_box_observer};
 pub use overlays::{lamb_overlay, lamb_snaps, register_providers};
 pub use project::DrawingProject;
 pub use project_mut::DrawingProjectMut;
