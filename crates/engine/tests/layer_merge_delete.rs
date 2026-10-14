@@ -159,3 +159,17 @@ fn layer_delete_clears_viewport_overrides_for_the_layer() {
     s.execute("layer.new", &json!({ "name": "C" })).unwrap();
     assert!(viewport_lists(&s).iter().all(|(f, _)| !f.contains(&"C".to_string())));
 }
+
+#[test]
+fn renaming_a_layer_renames_it_in_viewport_lists() {
+    let mut s = drawing();
+    let lists = |f: &[&str], c: &[&str]| vec![(f.iter().map(|n| n.to_string()).collect(), c.iter().map(|n| n.to_string()).collect())];
+    s.execute("rename", &json!({ "table": "layer", "from": "A", "to": "Walls" })).unwrap();
+    assert_eq!(viewport_lists(&s), lists(&["Walls", "C"], &["B"]));
+    // The match is case-insensitive, as layer names are.
+    s.execute("layer.set", &json!({ "name": "b", "newName": "Glass" })).unwrap();
+    assert_eq!(viewport_lists(&s), lists(&["Walls", "C"], &["Glass"]));
+    s.undo().unwrap();
+    s.undo().unwrap();
+    assert_eq!(viewport_lists(&s), lists(&["A", "C"], &["B"]));
+}
