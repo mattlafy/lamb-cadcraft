@@ -107,6 +107,48 @@ pub fn lay_bands(run: &WallRun, sides: &RunSides, face: FaceRef, bands: &[Band])
         .collect())
 }
 
+/// A run whose detail is thicker or thinner than the drawn wall: the detail's width minus the
+/// run's, and the face that would move to close it (the non-reference face). Positive `delta`
+/// moves that face further toward its own side — the wall grows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WidthConflict {
+    pub delta: f64,
+    pub toward: FaceRef,
+}
+
+impl WidthConflict {
+    /// `+10.2mm toward interior`.
+    pub fn text(&self) -> String {
+        format!("{:+.1}mm toward {}", self.delta, self.toward.name())
+    }
+}
+
+impl FaceRef {
+    /// `exterior` / `interior`.
+    pub fn name(self) -> &'static str {
+        match self {
+            FaceRef::Exterior => "exterior",
+            FaceRef::Interior => "interior",
+        }
+    }
+}
+
+/// The width conflict between `run` and a detail referenced on `face` with `bands`, or `None` when
+/// they agree within `TOLERANCE.coincidence_mm`. The detail's width is its farthest band into the
+/// wall; bands outside the reference don't count. Arc runs are allowed — width is a run property.
+pub fn width_conflict(run: &WallRun, face: FaceRef, bands: &[Band]) -> Option<WidthConflict> {
+    let width = bands.iter().map(|b| b.offset).fold(0.0, f64::max);
+    let delta = width - run.width;
+    if delta.abs() <= TOLERANCE.coincidence_mm {
+        return None;
+    }
+    let toward = match face {
+        FaceRef::Exterior => FaceRef::Interior,
+        FaceRef::Interior => FaceRef::Exterior,
+    };
+    Some(WidthConflict { delta, toward })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +235,29 @@ mod tests {
         r.centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
         let one = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
         assert_eq!(lay_bands(&r, &one, FaceRef::Exterior, &bands).unwrap_err(), "arc runs are not laid yet");
+    }
+
+    #[test]
+    fn a_detail_wider_or_narrower_than_the_run_is_a_conflict_on_the_other_face() {
+        let bands =
+            [Band { offset: -20.0, layer: "CLAD".into() }, Band { offset: 50.0, layer: "GYP".into() }, Band { offset: 200.0, layer: "GYP".into() }];
+        let mut r = run(p(0.0, 0.0), p(1000.0, 0.0), 200.0);
+        assert_eq!(width_conflict(&r, FaceRef::Exterior, &bands), None);
+        r.width = 189.8;
+        let c = width_conflict(&r, FaceRef::Exterior, &bands).unwrap();
+        assert!((c.delta - 10.2).abs() < 1e-9, "{c:?}");
+        assert_eq!(c.toward, FaceRef::Interior);
+        assert_eq!(c.text(), "+10.2mm toward interior");
+        let c = width_conflict(&r, FaceRef::Interior, &bands).unwrap();
+        assert_eq!(c.toward, FaceRef::Exterior);
+        assert_eq!(c.text(), "+10.2mm toward exterior");
+        r.width = 210.0;
+        let c = width_conflict(&r, FaceRef::Exterior, &bands).unwrap();
+        assert!((c.delta + 10.0).abs() < 1e-9, "{c:?}");
+        assert_eq!(c.text(), "-10.0mm toward interior");
+        // Arc runs are judged by width alone.
+        r.width = 200.0;
+        r.centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
+        assert_eq!(width_conflict(&r, FaceRef::Exterior, &bands), None);
     }
 }

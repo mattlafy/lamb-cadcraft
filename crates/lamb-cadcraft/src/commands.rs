@@ -39,7 +39,9 @@
 //! - `newdetail {name}` (View ▸ LAMB ▸ New Detail): a floating detail view, entered; `detailtag`
 //!   (`dtag`) / `detailtags`: detail tags in a plan view and their resolution report — see
 //!   [`crate::detailtags`]. `assemblyplan {viewId}` (View ▸ LAMB ▸ Assembly Plan): the plan's laid
-//!   detail bands written into its block `LAMB_ASSEMBLY_<id>` — see [`crate::assembly`]. `detailref {handle?, kind?}` (View ▸ LAMB ▸ Detail Reference): the
+//!   detail bands written into its block `LAMB_ASSEMBLY_<id>` — see [`crate::assembly`].
+//!   `wallconflicts {viewId}` (View ▸ LAMB ▸ Wall Conflicts): each run whose detail is thicker or
+//!   thinner than the drawn wall, read-only. `detailref {handle?, kind?}` (View ▸ LAMB ▸ Detail Reference): the
 //!   edited detail view's reference line and its kind — see [`crate::detailref`].
 //!
 //! - `viewprops {mode, viewId, …}` (View ▸ LAMB ▸ View Properties): rename a view, a placed plan's
@@ -735,6 +737,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .interactive(crate::detailtags::detailtag_machine),
         CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU),
         CommandSpec::new("assemblyplan", "Assembly Plan", crate::assembly::assemblyplan).params("{viewId}").menu(MENU),
+        CommandSpec::new("wallconflicts", "Wall Conflicts", crate::assembly::wallconflicts).params("{viewId}").noundo().menu(MENU),
         CommandSpec::new("detailref", "Detail Reference", crate::detailref::detailref)
             .params("{handle?, kind?: exterior_face|interior_face|structural_centre|grid}")
             .menu(MENU)
