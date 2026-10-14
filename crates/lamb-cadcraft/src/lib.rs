@@ -61,6 +61,7 @@ pub mod viewpick;
 mod viewprops;
 pub mod views;
 pub mod wallfit;
+mod wallrun;
 
 pub use assembly::assembly_observer;
 pub use commands::commands;

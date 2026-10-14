@@ -983,7 +983,7 @@ pub(crate) mod tests {
     /// A plan with a D-shaped room of 200 mm walls: straight bottom, left and top faces and a
     /// semicircular right end about (3000, 1100) — outer face radius 1100, inner 900, so the arc
     /// run's centreline has radius 1000 — and [`room`]'s exterior-face detail tagged on the bottom.
-    fn d_room() -> T<(Session, Id)> {
+    pub(crate) fn d_room() -> T<(Session, Id)> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);

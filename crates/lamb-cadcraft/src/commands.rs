@@ -49,6 +49,9 @@
 //!   `Mitre missing corner details [Yes/No]`, Enter keeping the current setting.
 //!   `wallconflicts {viewId}` (View ▸ LAMB ▸ Wall Conflicts): each run whose detail is thicker or
 //!   thinner than the drawn wall, read-only; interactive, the edited plan's conflicts one per line.
+//!   `wallrun {viewId, point:{x,y}}` (View ▸ LAMB ▸ Wall Run): the wall run under a point — its
+//!   resolved detail, faces, width and conflict, read-only — see [`crate::wallrun`]; interactive on
+//!   the edited plan, each pick echoed and its faces haloed.
 //!   `wallfit {viewId, runs?, hold?}` (View ▸ LAMB ▸ Wall Fit): moves each conflicted run's faces to
 //!   its detail's width, holding the reference face, the exterior, the interior or the centre — see
 //!   [`crate::wallfit`]; interactive on the edited plan: `Hold [Reference/Exterior/Interior/Centre]`,
@@ -771,6 +774,11 @@ pub fn commands() -> Vec<CommandSpec> {
             .noundo()
             .menu(MENU)
             .interactive(crate::assembly::wallconflicts_machine),
+        CommandSpec::new("wallrun", "Wall Run", crate::wallrun::wallrun)
+            .params("{viewId, point}")
+            .noundo()
+            .menu(MENU)
+            .interactive(crate::wallrun::wallrun_machine),
         CommandSpec::new("wallfit", "Wall Fit", crate::wallfit::wallfit)
             .params("{viewId, runs?: [index], hold?: reference|exterior|interior|centre}")
             .menu(MENU)
@@ -870,6 +878,7 @@ mod tests {
             "newdetail",
             "detailtag",
             "outsidepoint",
+            "wallrun",
             "dxfimport",
             "detailref",
             "accept",
