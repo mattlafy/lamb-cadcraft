@@ -27,6 +27,7 @@ pub mod convert;
 pub mod corners;
 pub mod fillet;
 pub mod import;
+mod linkcmds;
 pub mod maintain;
 mod newviews;
 pub mod overlays;

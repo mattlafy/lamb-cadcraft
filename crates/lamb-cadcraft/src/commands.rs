@@ -12,6 +12,9 @@
 //!   segments in different views (the escape hatch from the same-layer auto-link rule); `entityId`
 //!   is a hex handle string or a JSON number. Returns `{"linkId": <id>}`.
 //! - `unlink {linkId}` (`ulk`): removes that link.
+//!   Both are interactive too (View ▸ LAMB ▸ Link / Unlink): pick a line then its match in another
+//!   pane, or click a filled marker — see [`crate::linkcmds`]. Both run through `link.apply` /
+//!   `unlink.apply`, which hold the undo step.
 //! - `panelock {on?}`: camera lock for VPORTS panes (absent `on` toggles; off by default) — panning
 //!   or zooming the current tile re-centres every related tile at the same scale. Returns
 //!   `{on, message}` (`<Pane lock on>` / `<Pane lock off>`); not an undo step.
@@ -232,6 +235,16 @@ fn link(s: &mut Session, p: &Value) -> Result<Value> {
     });
     write_document(d, &doc).map_err(other)?;
     Ok(json!({ "linkId": id.0 }))
+}
+
+/// LINK's JSON form: `link.apply`, one undo step.
+fn link_json(s: &mut Session, p: &Value) -> Result<Value> {
+    s.execute("link.apply", p)
+}
+
+/// UNLINK's JSON form: `unlink.apply`, one undo step.
+fn unlink_json(s: &mut Session, p: &Value) -> Result<Value> {
+    s.execute("unlink.apply", p)
 }
 
 fn unlink(s: &mut Session, p: &Value) -> Result<Value> {
@@ -566,8 +579,22 @@ pub fn commands() -> Vec<CommandSpec> {
             .interactive(newelevationline_machine),
         CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?}").menu(MENU).interactive(newsheet_machine),
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU).interactive(editview_machine),
-        CommandSpec::new("link", "Link", link).alias(&["lk"]).params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}"),
-        CommandSpec::new("unlink", "Unlink", unlink).alias(&["ulk"]).params("{linkId}"),
+        // The typed/menu forms are outside undo; each link or unlink they make is its own step,
+        // recorded by the `.apply` spec they run through (see `crate::linkcmds`).
+        CommandSpec::new("link", "Link", link_json)
+            .alias(&["lk"])
+            .params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}")
+            .noundo()
+            .menu(MENU)
+            .interactive(crate::linkcmds::link_machine),
+        CommandSpec::new("unlink", "Unlink", unlink_json)
+            .alias(&["ulk"])
+            .params("{linkId}")
+            .noundo()
+            .menu(MENU)
+            .interactive(crate::linkcmds::unlink_machine),
+        CommandSpec::new("link.apply", "Link", link).params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}"),
+        CommandSpec::new("unlink.apply", "Unlink", unlink).params("{linkId}"),
         CommandSpec::new("panelock", "Pane Lock", panelock).params("{on?: bool}").noundo().menu(MENU),
         CommandSpec::new("lambproject", "Start Project", lambproject).menu(MENU),
         CommandSpec::new("refpane", "Reference Pane", crate::refpane::refpane)
@@ -619,7 +646,7 @@ mod tests {
     #[test]
     fn every_spec_has_a_menu_path_and_a_factory() -> R {
         install_app()?;
-        let ids = ["newplan", "newsectionline", "newelevationline", "newsheet", "editview", "newoffsetplan", "newplanline"];
+        let ids = ["newplan", "newsectionline", "newelevationline", "newsheet", "editview", "newoffsetplan", "newplanline", "link", "unlink"];
         for id in ids {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
             assert_eq!(c.menu, MENU, "{id}");
