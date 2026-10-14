@@ -21,6 +21,7 @@ mod graphics;
 mod logging;
 #[cfg(target_os = "macos")]
 mod native_menu;
+mod scene3d;
 mod spacemouse;
 mod system_animations;
 mod workspace;
@@ -239,6 +240,10 @@ fn main() -> eframe::Result {
     // LAMB (fork): its commands, overlays and snaps, before anything builds the command registry.
     if let Err(e) = lamb_cadcraft::commands::install_app() {
         log::warn!("LAMB not installed: {e}");
+    }
+    // LAMB (fork, T341): the 3D pane draws LAMB's derived model.
+    if let Err(e) = scene3d::register() {
+        log::warn!("LAMB 3D scene not installed: {e}");
     }
     if let Err(e) = cadcraft_ui_egui::viewlist::register_row_source(lamb_view_rows) {
         log::warn!("LAMB Views palette not installed: {e}");

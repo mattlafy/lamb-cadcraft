@@ -556,6 +556,7 @@ dependencies = [
  "egui",
  "hidapi",
  "lamb-cadcraft",
+ "lamb-core",
  "log",
  "muda",
  "objc2-app-kit 0.3.2",
