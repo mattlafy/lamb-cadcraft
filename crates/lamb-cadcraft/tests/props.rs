@@ -7,11 +7,11 @@ use std::path::Path;
 
 use cadcraft_doc::{Drawing, Handle};
 use cadcraft_engine::Session;
-use lamb_cadcraft::props::property_group;
-use lamb_cadcraft::{DrawingProject, commands, install, project_to_drawing};
+use lamb_cadcraft::props::{picked_view_group, property_group};
+use lamb_cadcraft::{DrawingProject, commands, install, project_to_drawing, read_document, view_block_name};
 use lamb_core::derivation::read::{ProjectRead, ViewKind};
 use lamb_core::derivation::resolve::resolve_cut_segment;
-use lamb_core::model::{Id, LineRole, Project};
+use lamb_core::model::{AnyView, Id, LineRole, Placement, Project};
 use lamb_core::persistence::files_to_project;
 use serde_json::Value;
 
@@ -107,5 +107,72 @@ fn varies_none_for_non_lamb_and_a_role_choice_sets_the_role_with_one_undo() -> R
     assert_eq!(g.rows[1].label, "Z source", "a seen line shows its z source");
     s.undo()?;
     assert_eq!(role_of(s.doc()?, wall)?, before, "one UNDO restores the role");
+    Ok(())
+}
+
+/// The placed plan and a placed vertical view.
+fn plan_and_section(d: &Drawing) -> Result<(Id, Id), Box<dyn std::error::Error>> {
+    let doc = read_document(d)?;
+    let plan = doc.views.iter().find(|v| matches!(v, AnyView::Plan(_)) && v.placement().is_some()).ok_or("no placed plan")?.id();
+    let sec = doc.views.iter().find(|v| matches!(v, AnyView::Vertical(_)) && v.placement().is_some()).ok_or("no placed section")?.id();
+    Ok((plan, sec))
+}
+
+fn view_name(d: &Drawing, id: Id) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(read_document(d)?.views.iter().find(|v| v.id() == id).ok_or("view gone")?.name().to_owned())
+}
+
+fn flipped(d: &Drawing, id: Id) -> Result<bool, Box<dyn std::error::Error>> {
+    let doc = read_document(d)?;
+    let v = doc.views.iter().find(|v| v.id() == id).ok_or("view gone")?;
+    let Some(Placement::Vertical { flipped, .. }) = v.placement() else { return Err("not placed vertical".into()) };
+    Ok(flipped.unwrap_or(false))
+}
+
+#[test]
+fn the_picked_views_form_rows_run_viewprops_with_one_undo_each() -> R {
+    let mut s = session()?;
+    let (plan, sec) = plan_and_section(s.doc()?)?;
+    assert!(picked_view_group(s.doc()?, "LAMB_VIEW_999999").is_none(), "unknown view");
+    assert!(picked_view_group(s.doc()?, "SOMEBLOCK").is_none(), "not a view key");
+
+    let g = picked_view_group(s.doc()?, &view_block_name(plan)).ok_or("no plan form")?;
+    assert_eq!(g.title, "Plan");
+    let labels: Vec<_> = g.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["Name", "Cut elevation"]);
+    let name = g.rows[0].edit.as_ref().ok_or("Name not editable")?;
+    assert_eq!((name.command.as_str(), name.key.as_str(), name.number), ("viewprops", "name", false));
+    assert_eq!(name.params, serde_json::json!({ "mode": "rename", "viewId": plan.0 }));
+    let cut = g.rows[1].edit.as_ref().ok_or("Cut elevation not editable")?;
+    assert_eq!((cut.key.as_str(), cut.number), ("cutElevation", true));
+    assert_eq!(cut.params, serde_json::json!({ "mode": "cutElevation", "viewId": plan.0 }));
+
+    // The Name edit, as the palette commits it.
+    let before = view_name(s.doc()?, plan)?;
+    let mut p = name.params.clone();
+    p["name"] = "Ground".into();
+    s.execute(&name.command, &p)?;
+    assert_eq!(view_name(s.doc()?, plan)?, "Ground");
+    assert_eq!(picked_view_group(s.doc()?, &view_block_name(plan)).ok_or("form")?.rows[0].value, "Ground");
+    s.undo()?;
+    assert_eq!(view_name(s.doc()?, plan)?, before, "one UNDO restores the name");
+
+    let g = picked_view_group(s.doc()?, &view_block_name(sec)).ok_or("no section form")?;
+    let labels: Vec<_> = g.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["Name", "Intent", "Flip"]);
+    assert!(g.rows[0].edit.is_some());
+    let intent: Vec<_> = g.rows[1].choices.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(intent, ["Section", "Elevation"]);
+    assert_eq!(g.title, g.rows[1].value, "the title is the kind word, which for a vertical is its intent");
+    let flip = &g.rows[2];
+    assert_eq!(flip.value, "Not flipped");
+    let (label, id, params) = flip.choices.first().ok_or("no Flip choice")?;
+    assert_eq!(label, "Flip");
+    assert_eq!(params, &serde_json::json!({ "mode": "flip", "viewId": sec.0, "flipped": true }));
+    s.execute(id, params)?;
+    assert!(flipped(s.doc()?, sec)?);
+    assert_eq!(picked_view_group(s.doc()?, &view_block_name(sec)).ok_or("form")?.rows[2].value, "Flipped");
+    s.undo()?;
+    assert!(!flipped(s.doc()?, sec)?, "one UNDO restores the flip");
     Ok(())
 }

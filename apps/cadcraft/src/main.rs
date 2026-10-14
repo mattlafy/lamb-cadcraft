@@ -247,12 +247,30 @@ fn lamb_property_group(
     sel: &[cadcraft_engine::doc::Handle],
     segment: usize,
 ) -> Option<cadcraft_ui_egui::palettes::props_ext::PropGroup> {
-    use cadcraft_ui_egui::palettes::props_ext::{PropGroup, PropRow};
-    let g = lamb_cadcraft::props::property_group(d, sel, segment)?;
+    lamb_property_group_map(lamb_cadcraft::props::property_group(d, sel, segment)?)
+}
+
+/// The Properties palette's picked-view form (fork, LAMB T365): a cut line picked in a plan.
+fn lamb_picked_group(d: &cadcraft_engine::doc::Drawing, key: &str) -> Option<cadcraft_ui_egui::palettes::props_ext::PropGroup> {
+    lamb_property_group_map(lamb_cadcraft::props::picked_view_group(d, key)?)
+}
+
+fn lamb_property_group_map(g: lamb_cadcraft::props::LambGroup) -> Option<cadcraft_ui_egui::palettes::props_ext::PropGroup> {
+    use cadcraft_ui_egui::palettes::props_ext::{PropEdit, PropGroup, PropRow};
     Some(PropGroup {
         title: g.title,
         segments: g.segments,
-        rows: g.rows.into_iter().map(|r| PropRow { label: r.label, value: r.value, tip: r.tip, choices: r.choices }).collect(),
+        rows: g
+            .rows
+            .into_iter()
+            .map(|r| PropRow {
+                label: r.label,
+                value: r.value,
+                tip: r.tip,
+                choices: r.choices,
+                edit: r.edit.map(|e| PropEdit { command: e.command, params: e.params, key: e.key, number: e.number }),
+            })
+            .collect(),
     })
 }
 
@@ -281,6 +299,9 @@ fn main() -> eframe::Result {
     }
     if let Err(e) = cadcraft_ui_egui::palettes::props_ext::register_property_source(lamb_property_group) {
         log::warn!("LAMB Properties group not installed: {e}");
+    }
+    if let Err(e) = cadcraft_ui_egui::palettes::props_ext::register_picked_source(lamb_picked_group) {
+        log::warn!("LAMB picked-view form not installed: {e}");
     }
     if let Err(e) = cadcraft_ui_egui::palettes::layer_ext::register_layer_cell(lamb_layer_cell) {
         log::warn!("LAMB Layers role column not installed: {e}");

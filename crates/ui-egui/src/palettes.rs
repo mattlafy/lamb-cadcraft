@@ -694,6 +694,10 @@ fn properties_header(app: &mut CadApp, ui: &mut egui::Ui) {
 pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
     properties_header(app, ui);
     let sel = app.session.selection();
+    // Fork (LAMB T365): an idle-picked object's form replaces the current-properties rows.
+    if sel.is_empty() && props_ext::show_picked(app, ui) {
+        return;
+    }
     let Ok(d) = app.session.doc() else { return };
     ui.add_space(4.0);
     let h = &d.header;
