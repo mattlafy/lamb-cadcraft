@@ -42,6 +42,7 @@ pub mod palettes;
 pub mod parametric;
 pub mod plotstyles;
 pub mod quick;
+pub mod scene3d;
 pub mod shortcut_menus;
 pub mod theme;
 pub mod viewcube;
@@ -244,6 +245,8 @@ pub struct CadApp {
     pub hatch_dlg: Option<hatchdlg::HatchDlgState>,
     /// The Edit Block Definition dialog ([`bedit`]).
     pub bedit: bedit::State,
+    /// The 3D pane's scene cache and camera (fork-only, [`scene3d`]).
+    pub scene3d: scene3d::Scene3dState,
 }
 
 impl CadApp {
@@ -282,6 +285,7 @@ impl CadApp {
             gpu_notice: None,
             hatch_dlg: None,
             bedit: bedit::State::default(),
+            scene3d: scene3d::Scene3dState::default(),
         }
     }
 

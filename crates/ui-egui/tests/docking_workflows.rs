@@ -361,3 +361,17 @@ fn views_palette_is_in_the_default_left_column_and_optional_in_saved_workspaces(
     h.run_steps(3);
     h.get_by_role_and_label(egui::accesskit::Role::Tab, "Views");
 }
+
+#[test]
+fn window_3d_view_opens_the_scene3d_panel_on_demand() {
+    let default = cadcraft_ui_egui::docking::Workspace::default();
+    assert!(!default.layout.contains(&Panel::Scene3d), "the 3D pane is opened on request");
+    let mut h = harness(None, 1280.0, 1.0);
+    h.state_mut().run("ui.panel.scene3d", json!({})).unwrap();
+    assert!(h.state().ui.docking.layout.contains(&Panel::Scene3d));
+    h.state().ui.docking.validate().unwrap();
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::Tab, "3D View");
+    h.state_mut().run("ui.dock", json!({"operation":"close","panel":"scene3d"})).unwrap();
+    assert!(!h.state().ui.docking.layout.contains(&Panel::Scene3d));
+}
