@@ -95,11 +95,12 @@ fn attach_junction(graph: &WallGraph, tip: Point2) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// The view's wall graph and sides, with `WALL-EXT*` layers exterior.
+/// The view's wall graph and sides, with `WALL-EXT*` layers exterior and the view's outside pick
+/// points ([`crate::outside::outside_points`]) marking their regions outside.
 pub(crate) fn graph_and_sides(p: &DrawingProject<'_>, view: Id) -> (WallGraph, WallSides) {
     let graph = wall_graph(p, view, &WallRunParams::defaults(p.layers()));
     let exterior_layer_ids = p.layers().iter().filter(|l| starts_with_ci(&l.name, "WALL-EXT")).map(|l| l.id.clone()).collect();
-    let sides = wall_sides(p, &graph, &SideParams { outside_points: Vec::new(), exterior_layer_ids });
+    let sides = wall_sides(p, &graph, &SideParams { outside_points: crate::outside::outside_points(p.drawing(), view), exterior_layer_ids });
     (graph, sides)
 }
 
@@ -227,7 +228,7 @@ pub(crate) fn detailtags(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The edited view, if it is a plan view; else the refusal.
-fn edited_plan(s: &Session) -> std::result::Result<Id, String> {
+pub(crate) fn edited_plan(s: &Session) -> std::result::Result<Id, String> {
     let view = edited_view(s).ok_or("Edit a plan view first (EDITVIEW)")?;
     plan_view(s.doc().map_err(|e| e.to_string())?, view)?;
     Ok(view)

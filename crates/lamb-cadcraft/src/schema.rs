@@ -5,7 +5,8 @@
 //! - `Drawing.ext["LAMB"]` = [`LambDocument`]: name, defaults, levels, views (metadata only),
 //!   links, suppressed proposals.
 //! - `Common.ext["LAMB"]` = [`EntityData`]: an entity's line role, AI provenance and virtual
-//!   (fillet/chamfer) corner tags, and on a sheet's viewport the view it shows.
+//!   (fillet/chamfer) corner tags, on a sheet's viewport the view it shows, and on a plan's POINT
+//!   whether it is an outside pick point.
 //! - `Layer.ext["LAMB"]` = [`LayerData`]: a layer's default role.
 //!
 //! A view's entities live in the block [`view_block_name`]`(id)`; an entity's id is its handle.
@@ -144,6 +145,14 @@ pub struct EntityData {
     /// pitch (`cadcraft-integration.md` §9 "Repeats", [`crate::repeats`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<RepeatTag>,
+    /// On a `Point` in a plan view's block: an outside pick point — the region around it is
+    /// outside the building (`cadcraft-integration.md` §8 "Inside and outside", [`crate::outside`]).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub outside: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A repeat's members: the entity ids (handles) the tagged dimension repeats.
@@ -175,7 +184,16 @@ pub struct DetailTag {
 
 impl Default for EntityData {
     fn default() -> Self {
-        EntityData { role: LineRole::Bylayer, ai_origin: None, view_id: None, corners: Vec::new(), detail_tag: None, detail_ref: None, repeat: None }
+        EntityData {
+            role: LineRole::Bylayer,
+            ai_origin: None,
+            view_id: None,
+            corners: Vec::new(),
+            detail_tag: None,
+            detail_ref: None,
+            repeat: None,
+            outside: false,
+        }
     }
 }
 

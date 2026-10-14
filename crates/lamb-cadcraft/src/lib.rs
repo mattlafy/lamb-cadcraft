@@ -40,6 +40,7 @@ pub mod import;
 mod linkcmds;
 pub mod maintain;
 mod newviews;
+mod outside;
 pub mod overlays;
 pub mod panes;
 pub mod project;
