@@ -80,6 +80,8 @@ pub struct CanvasState {
     vp_sel: VpHighlight,
     /// LAMB (fork-only): the overlay providers' lists for the edit space.
     pub lamb_overlays: lamb_overlays::Cache,
+    /// LAMB (fork-only): each other model tile's own list and overlays.
+    pub panes: panes::Lists,
     vp_hover: VpHighlight,
     /// Model space seen through the active MSPACE viewport (see [`VpContent`]).
     vp: VpContent,
@@ -1827,6 +1829,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     if let (Some(hit), Some(_)) = (app.canvas.snap, app.canvas.cursor) {
         draw_snap_marker(&painter, xf.to_screen(hit.point), &hit);
     }
+    panes::prepare(app, &tiles);
     draw_tiles(app, ui, &tiles);
     // UCS icon, ViewCube and viewport label.
     if app.ui.show_ucs_icon {
@@ -1902,14 +1905,15 @@ fn tile_xf(r: Rect, tile: &cadcraft_engine::ModelTile) -> Xf {
 fn draw_tiles(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, cadcraft_engine::ModelTile)]) {
     let t = Tokens::get();
     let bg = Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b());
-    for (r, tile) in tiles.iter().filter(|(r, tile)| !tile.active && r.width() >= 1.0 && r.height() >= 1.0) {
+    for (i, (r, tile)) in tiles.iter().enumerate().filter(|(_, (r, tile))| !tile.active && r.width() >= 1.0 && r.height() >= 1.0) {
         let p = ui.painter_at(*r);
         let xf = tile_xf(*r, tile);
         p.rect_filled(*r, 0.0, t.canvas);
         draw_grid(app, &p, &xf);
-        if let Some(list) = &app.canvas.list {
+        if let Some(list) = panes::list_for(app, i).or(app.canvas.list.as_ref()) {
             draw_list(&p, &xf, list, bg, app.session.settings.lwdisplay);
         }
+        panes::draw_overlays(app, &p, &xf, bg, i);
         viewport_label(&p, *r);
     }
     let p = ui.painter();
@@ -2609,6 +2613,8 @@ mod blockedit;
 mod compare;
 /// LAMB (fork-only): overlay providers' markers and cut lines over the drawing.
 mod lamb_overlays;
+/// LAMB (fork-only): each model tile draws its own space.
+mod panes;
 
 /// Background rebuilds of the display list for a new view.
 mod rebuild;
