@@ -199,7 +199,18 @@ impl DocState {
     /// the quiet points only, never from `set_selection`.
     fn drop_travel_if_unselected(&mut self) {
         if self.selection.is_empty() {
-            self.travel.clear();
+            self.set_travel_ids(Vec::new());
+        }
+    }
+    /// Replace the travel set; when it changed, tell the adapter's travel observer (LAMB fork
+    /// patch 19, [`travel::register_travel_observer`]). Every write to `travel` goes through here.
+    fn set_travel_ids(&mut self, ids: Vec<u64>) {
+        if self.travel == ids {
+            return;
+        }
+        self.travel = ids;
+        if let Some(f) = travel::travel_observer() {
+            f(&self.travel);
         }
     }
     pub fn new(doc: Drawing, title: &str, path: Option<String>) -> Self {
@@ -922,7 +933,7 @@ impl Session {
     /// Replace the ids attached to the current selection ([`travel`]).
     pub fn set_travel(&mut self, ids: Vec<u64>) {
         if let Ok(st) = self.state_mut() {
-            st.travel = ids;
+            st.set_travel_ids(ids);
         }
     }
     /// Clear the travel set when nothing is selected, at a quiet point ([`travel`]).
@@ -1846,11 +1857,17 @@ impl Session {
                 // LAMB fork: an adapter's idle-pick hook may claim an empty click ([`idle_pick`]).
                 if !shift
                     && let Some(hook) = idle_pick::idle_pick()
-                    && let Some(key) = hook(self, p, ap)
+                    && let Some(res) = hook(self, p, ap)
                 {
-                    self.set_selection(vec![]);
-                    if let Ok(st) = self.state_mut() {
-                        st.set_picked(Some((space, key)));
+                    match res {
+                        idle_pick::IdlePicked::Pick(key) => {
+                            self.set_selection(vec![]);
+                            if let Ok(st) = self.state_mut() {
+                                st.set_picked(Some((space, key)));
+                            }
+                        }
+                        // The hook acted on the click itself: selection and window untouched.
+                        idle_pick::IdlePicked::Consumed => {}
                     }
                     return Ok(());
                 }

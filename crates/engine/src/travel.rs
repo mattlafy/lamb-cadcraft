@@ -35,6 +35,22 @@ pub fn box_observer() -> Option<BoxObserver> {
     OBSERVER.get().copied()
 }
 
+/// Told the new travel set whenever `DocState::travel` changes value (and only then) — an adapter
+/// that draws the set (LAMB: the travel ring) mirrors it from here.
+pub type TravelObserver = fn(&[u64]);
+
+static TRAVEL_OBSERVER: OnceLock<TravelObserver> = OnceLock::new();
+
+/// Register the travel-set observer. Once per process; a second call is an error.
+pub fn register_travel_observer(f: TravelObserver) -> Result<(), &'static str> {
+    TRAVEL_OBSERVER.set(f).map_err(|_| "travel observer already registered")
+}
+
+/// The registered travel-set observer, if any.
+pub fn travel_observer() -> Option<TravelObserver> {
+    TRAVEL_OBSERVER.get().copied()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -77,6 +93,31 @@ mod tests {
     fn a_second_registration_is_refused() {
         let _ = register_box_observer(observer);
         assert!(register_box_observer(observer).is_err());
+    }
+
+    thread_local! {
+        /// Travel-set changes the travel observer saw on this test's thread.
+        static TOLD: std::cell::RefCell<Vec<Vec<u64>>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn travel_seen(ids: &[u64]) {
+        TOLD.with(|t| t.borrow_mut().push(ids.to_vec()));
+    }
+
+    #[test]
+    fn the_travel_observer_counts_only_real_changes() {
+        let _ = register_travel_observer(travel_seen);
+        assert!(register_travel_observer(travel_seen).is_err());
+        let (mut s, h) = session();
+        TOLD.with(|t| t.borrow_mut().clear());
+        s.set_travel(vec![7]);
+        s.set_travel(vec![7]);
+        s.set_travel(vec![7, 8]);
+        assert_eq!(TOLD.with(|t| t.borrow().clone()), vec![vec![7], vec![7, 8]], "same value twice is told once");
+        // Dropped at a quiet point (Esc with an empty selection): told the empty set, once.
+        s.set_selection(vec![h]);
+        s.cancel();
+        s.cancel();
+        assert_eq!(TOLD.with(|t| t.borrow().clone()), vec![vec![7], vec![7, 8], vec![]]);
     }
 
     #[test]

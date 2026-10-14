@@ -3,9 +3,11 @@
 //! (LAMB: a section's cut line drawn by an overlay picks that section's view).
 //!
 //! The adapter registers one hook ([`register_idle_pick`]). [`Session::idle_click`] asks it only
-//! when `select::pick` found nothing and Shift is up; a `Some(key)` clears the entity selection,
-//! stores `(edit space, key)` as the picked object (`DocState::picked`, session state, never
-//! saved) and opens no selection window. Any `set_selection` and every idle click clear it again;
+//! when `select::pick` found nothing and Shift is up; a `Some(IdlePicked::Pick(key))` clears the
+//! entity selection, stores `(edit space, key)` as the picked object (`DocState::picked`, session
+//! state, never saved) and opens no selection window. `Some(IdlePicked::Consumed)` means the hook
+//! acted on the click itself (LAMB: toggling a marker's link in the travel set): the click ends
+//! there, the selection kept and no window opened. Any `set_selection` and every idle click clear it again;
 //! [`Session::picked`] reads it back.
 //!
 //! An adapter that draws the pick registers one observer ([`register_picked_observer`]); it is
@@ -18,8 +20,18 @@ use cadcraft_geom::Vec2;
 
 use crate::Session;
 
-/// `(session, point in the edit space, pick aperture in drawing units)` → the picked object's key.
-pub type IdlePick = fn(&mut Session, Vec2, f64) -> Option<String>;
+/// What the idle-pick hook did with an empty click.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdlePicked {
+    /// Picked an object of the adapter's: its key.
+    Pick(String),
+    /// Acted on the click itself; the selection stays and no window opens.
+    Consumed,
+}
+
+/// `(session, point in the edit space, pick aperture in drawing units)` → what the hook did, or
+/// `None` to leave the click to the window.
+pub type IdlePick = fn(&mut Session, Vec2, f64) -> Option<IdlePicked>;
 
 static HOOK: OnceLock<IdlePick> = OnceLock::new();
 
@@ -66,12 +78,12 @@ mod tests {
         /// Times the hook ran on this test's thread (the hook runs on the clicking thread).
         static ASKED: Cell<usize> = const { Cell::new(0) };
     }
-    fn hook(s: &mut Session, _p: Vec2, _ap: f64) -> Option<String> {
+    fn hook(s: &mut Session, _p: Vec2, _ap: f64) -> Option<IdlePicked> {
         if s.space() != space() {
             return None;
         }
         ASKED.with(|a| a.set(a.get() + 1));
-        Some("thing".into())
+        Some(IdlePicked::Pick("thing".into()))
     }
 
     /// A session editing block `IDLEPICK` (a line from 0,0 to 10,0), with the test hook registered.

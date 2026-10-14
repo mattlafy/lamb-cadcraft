@@ -11,6 +11,7 @@ use cadcraft_doc::{Drawing, Handle, Space};
 use cadcraft_engine::snap::{SnapHit, register_snap_provider};
 use cadcraft_geom::Vec2;
 use cadcraft_render::{DPrim, DisplayList, Kind, Options, register_overlay_provider};
+use lamb_core::derivation::linking::find_link_for_marker;
 use lamb_core::derivation::markers::{Marker, MarkerShape, compute_cut_lines_for_view, compute_markers_for_view, compute_plan_cut_lines_for_view};
 use lamb_core::model::Id;
 
@@ -49,11 +50,16 @@ pub(crate) fn view_of<'a>(d: &'a Drawing, space: &Space) -> Option<(DrawingProje
 }
 
 fn marker_radius(opts: &Options) -> f64 {
-    if opts.view_height > 0.0 { opts.view_height / MARKER_VIEW_FRACTION } else { MARKER_FALLBACK_RADIUS_MM }
+    marker_radius_at(opts.view_height)
+}
+
+/// Marker radius at a visible height of `view_height` (0: none known).
+pub(crate) fn marker_radius_at(view_height: f64) -> f64 {
+    if view_height > 0.0 { view_height / MARKER_VIEW_FRACTION } else { MARKER_FALLBACK_RADIUS_MM }
 }
 
 /// Semi-axes (along local X, along local Y) of a marker of radius `r`.
-fn semi_axes(shape: MarkerShape, r: f64) -> (f64, f64) {
+pub(crate) fn semi_axes(shape: MarkerShape, r: f64) -> (f64, f64) {
     match shape {
         MarkerShape::Circle => (r, r),
         MarkerShape::Ellipse2 => (2.0 * r, r),
@@ -95,6 +101,10 @@ pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let picked = crate::viewpick::highlighted();
     let cut_color = |v: Id| if picked == Some(v) { SELECTED_OVERLAY_COLOR } else { CUT_LINE_COLOR };
     let r = marker_radius(opts);
+    // The travel ring sits 4 px outside the marker (TS `drawTravelRing`); plots have no pixels.
+    let r_ring = if opts.min_dash > 0.0 { r + 2.0 * opts.min_dash } else { r * 1.3 };
+    let travelling = crate::viewpick::travelling();
+    let travels = |m: &Marker| !travelling.is_empty() && find_link_for_marker(&dp, m, id).is_some_and(|l| travelling.contains(&l.id));
     for m in &markers {
         let handle = Handle(m.source_entity_id.0);
         let color = if m.assumed_z { MARKER_ASSUMED_Z_COLOR } else { MARKER_COLOR };
@@ -111,6 +121,16 @@ pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
             ring.push(first);
         }
         push(&mut list, handle, color, Kind::Polyline, &ring);
+        if travels(m) {
+            let mut tr = outline(m, r_ring);
+            if let Some(first) = tr.first().copied() {
+                tr.push(first);
+            }
+            for p in &tr {
+                list.bounds.add(*p);
+            }
+            push(&mut list, handle, color, Kind::Polyline, &tr);
+        }
     }
     for c in &cuts {
         let pts = [Vec2::new(c.from.x, c.from.y), Vec2::new(c.to.x, c.to.y)];

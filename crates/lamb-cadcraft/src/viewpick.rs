@@ -9,17 +9,24 @@
 //! [`highlighted`], which the overlay provider reads to stroke that view's cut lines in the
 //! selected colour. Accepted limitation: the mirror is process-global, so with two drawings open
 //! the other drawing's cut line with the same view id would also highlight.
+//!
+//! With entities selected, an empty click on a filled marker toggles that marker's link in or out
+//! of the selection's travel set instead (TS T110 `toggleTravelLink`); the selection stays. The
+//! engine's travel observer mirrors the set into [`travelling`], which the overlay provider reads
+//! to ring each travelling link's markers — process-global in the same way as [`highlighted`].
 
 use std::sync::{Mutex, PoisonError};
 
 use cadcraft_doc::Space;
 use cadcraft_engine::Session;
+use cadcraft_engine::idle_pick::IdlePicked;
 use cadcraft_geom::Vec2;
-use lamb_core::derivation::markers::compute_cut_lines_for_view;
+use lamb_core::derivation::linking::find_link_for_marker;
+use lamb_core::derivation::markers::{Marker, compute_cut_lines_for_view, compute_markers_for_view};
 use lamb_core::geometry::point::Point2;
 use lamb_core::model::Id;
 
-use crate::overlays::{view_id, view_of};
+use crate::overlays::{marker_radius_at, semi_axes, view_id, view_of};
 use crate::schema::view_block_name;
 
 /// Distance from `p` to segment `a`–`b` (TS `distToSegment`).
@@ -47,6 +54,62 @@ pub fn pick_cut_line(s: &mut Session, p: Vec2, aperture: f64) -> Option<String> 
     Some(view_block_name(id))
 }
 
+/// How far inside marker `m` drawn at radius `r` the point `p` is: 0 at its centre, 1 on its
+/// outline (TS `findMarkerAt` hits within the drawn outline). Within `aperture` of the centre
+/// always counts as 0..1.
+fn marker_hit(m: &Marker, r: f64, p: Vec2, aperture: f64) -> Option<f64> {
+    let (a, b) = semi_axes(m.shape, r);
+    let (dx, dy) = (p.x - m.position.x, p.y - m.position.y);
+    let k = ((dx / a).powi(2) + (dy / b).powi(2)).sqrt();
+    let near = (dx * dx + dy * dy).sqrt() <= aperture;
+    (k <= 1.0 || near).then_some(k.min(1.0))
+}
+
+/// With a selection, in any LAMB view: the link of the nearest filled marker under `p` (within its
+/// drawn outline — a marker sits on its entity, so a hit within the pick aperture alone would
+/// always be taken by the entity first), toggled in the travel set (echo `Link travels` /
+/// `Link stays`). Hollow markers never toggle.
+fn toggle_travel_link(s: &mut Session, p: Vec2, aperture: f64) -> bool {
+    if s.selection().is_empty() {
+        return false;
+    }
+    let space = s.space();
+    let r = marker_radius_at(s.state().map(|st| st.view().height).unwrap_or(0.0));
+    let link = {
+        let Ok(d) = s.doc() else { return false };
+        let Some((dp, view)) = view_of(d, &space) else { return false };
+        let Ok(markers) = compute_markers_for_view(&dp, view) else { return false };
+        markers
+            .iter()
+            .filter(|m| m.filled)
+            .filter_map(|m| marker_hit(m, r, p, aperture).map(|k| (k, m)))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .and_then(|(_, m)| find_link_for_marker(&dp, m, view))
+            .map(|l| l.id)
+    };
+    let Some(link) = link else { return false };
+    let mut travel = s.travel();
+    let msg = if let Some(i) = travel.iter().position(|t| *t == link.0) {
+        travel.remove(i);
+        "Link stays"
+    } else {
+        travel.push(link.0);
+        "Link travels"
+    };
+    s.set_travel(travel);
+    s.echo(msg.to_string());
+    true
+}
+
+/// The engine's idle-pick hook: a marker click toggling a travelling link
+/// ([`toggle_travel_link`]) first, else [`pick_cut_line`].
+pub fn idle_pick(s: &mut Session, p: Vec2, aperture: f64) -> Option<IdlePicked> {
+    if toggle_travel_link(s, p, aperture) {
+        return Some(IdlePicked::Consumed);
+    }
+    pick_cut_line(s, p, aperture).map(IdlePicked::Pick)
+}
+
 /// The view an idle click picked, while it is still in the document.
 pub fn picked_view(s: &Session) -> Option<Id> {
     let id = view_id(&Space::Block(s.picked()?))?;
@@ -70,11 +133,26 @@ pub(crate) fn highlighted() -> Option<Id> {
     *PICKED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Register [`pick_cut_line`] as the engine's idle-pick hook and [`mirror_pick`] as its
-/// picked-object observer.
+/// The selection's travel set, mirrored out of the engine for the overlay provider.
+static TRAVEL: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+
+/// The engine's travel observer: mirror the set and redraw the overlays.
+fn mirror_travel(ids: &[u64]) {
+    *TRAVEL.lock().unwrap_or_else(PoisonError::into_inner) = ids.iter().copied().map(Id).collect();
+    cadcraft_render::bump_overlays();
+}
+
+/// The links whose markers draw a travel ring.
+pub(crate) fn travelling() -> Vec<Id> {
+    TRAVEL.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// Register [`idle_pick`] as the engine's idle-pick hook, [`mirror_pick`] as its picked-object
+/// observer and [`mirror_travel`] as its travel observer.
 pub(crate) fn register() -> Result<(), &'static str> {
-    cadcraft_engine::idle_pick::register_idle_pick(pick_cut_line)?;
-    cadcraft_engine::idle_pick::register_picked_observer(mirror_pick)
+    cadcraft_engine::idle_pick::register_idle_pick(idle_pick)?;
+    cadcraft_engine::idle_pick::register_picked_observer(mirror_pick)?;
+    cadcraft_engine::travel::register_travel_observer(mirror_travel)
 }
 
 #[cfg(test)]
