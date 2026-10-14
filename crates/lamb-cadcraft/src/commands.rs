@@ -16,6 +16,9 @@
 //!   or zooming the current tile re-centres every related tile at the same scale. Returns
 //!   `{on, message}` (`<Pane lock on>` / `<Pane lock off>`); not an undo step.
 //!
+//! - `newoffsetplan` (`np`) and `newplanline` (`npln`): placed plans at a new level — see
+//!   [`crate::newviews`]. NEWSECTIONLINE in a placed section takes one click for a perpendicular cut.
+//!
 //! - `lambproject` (View ▸ LAMB ▸ Start Project): `Level 1` and a placed `Ground Floor` plan on
 //!   it, then edit the plan; refused ("Already a LAMB project") once the drawing has views.
 //!
@@ -41,16 +44,17 @@ use lamb_core::model::{
 use serde_json::{Value, json};
 
 use crate::maintain::now;
+use crate::newviews;
 use crate::project::DrawingProject;
 use crate::schema::{read_document, view_block_name, write_document};
 use crate::sheets::create_sheet;
 use crate::views::create_view;
 
-fn other(e: impl std::fmt::Display) -> EngineError {
+pub(crate) fn other(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(e.to_string())
 }
 
-fn bad(cmd: &str, msg: &str) -> EngineError {
+pub(crate) fn bad(cmd: &str, msg: &str) -> EngineError {
     EngineError::BadParams { cmd: cmd.into(), msg: msg.into() }
 }
 
@@ -59,11 +63,11 @@ fn str_param<'a>(cmd: &str, p: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 /// A view id: a JSON number, or a decimal string.
-fn id_value(v: &Value) -> Option<Id> {
+pub(crate) fn id_value(v: &Value) -> Option<Id> {
     v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).map(Id)
 }
 
-fn point_param(cmd: &str, p: &Value, key: &str) -> Result<Point2> {
+pub(crate) fn point_param(cmd: &str, p: &Value, key: &str) -> Result<Point2> {
     let q = p.get(key).ok_or_else(|| bad(cmd, &format!("`{key}` is required")))?;
     let c = |k: &str| q.get(k).and_then(Value::as_f64).filter(|v| v.is_finite());
     match (c("x"), c("y")) {
@@ -72,7 +76,7 @@ fn point_param(cmd: &str, p: &Value, key: &str) -> Result<Point2> {
     }
 }
 
-fn create(s: &mut Session, view: AnyView) -> Result<Value> {
+pub(crate) fn create(s: &mut Session, view: AnyView) -> Result<Value> {
     let id = create_view(s.doc_mut()?, view).map_err(other)?;
     Ok(json!({ "viewId": id.0 }))
 }
@@ -248,7 +252,7 @@ fn next_name(s: &Session, prefix: &str, kind: impl Fn(&AnyView) -> bool) -> Stri
 }
 
 /// The LAMB view the session is editing (`Space::Block(view_block_name(id))`), if any.
-fn edited_view(s: &Session) -> Option<Id> {
+pub(crate) fn edited_view(s: &Session) -> Option<Id> {
     let Space::Block(name) = &s.state().ok()?.space else { return None };
     let id = Id(name.strip_prefix("LAMB_VIEW_")?.parse().ok()?);
     let doc = read_document(s.doc().ok()?).ok()?;
@@ -256,7 +260,7 @@ fn edited_view(s: &Session) -> Option<Id> {
 }
 
 /// The answer to a name prompt: typed text, or the default on Enter.
-fn name_input(i: Input, default: &str) -> Option<String> {
+pub(crate) fn name_input(i: Input, default: &str) -> Option<String> {
     match i {
         Input::Enter => Some(default.to_owned()),
         Input::Text(t) | Input::Keyword(t) => {
@@ -277,7 +281,7 @@ pub(crate) fn kind_word(v: &AnyView) -> &'static str {
 }
 
 /// Echo `Plan "Ground" created (view 12).` for a creating command's result.
-fn echo_created(s: &mut Session, word: &str, name: &str, r: &Value) -> Option<Id> {
+pub(crate) fn echo_created(s: &mut Session, word: &str, name: &str, r: &Value) -> Option<Id> {
     let id = r.get("viewId").and_then(Value::as_u64).map(Id)?;
     s.echo(format!("{word} \"{name}\" created (view {}).", id.0));
     Some(id)
@@ -286,7 +290,7 @@ fn echo_created(s: &mut Session, word: &str, name: &str, r: &Value) -> Option<Id
 /// Make `space` the edit space (EDITVIEW, NEWPLAN, LAMBPROJECT, a Views palette click). A space
 /// the session has never shown (no stored view for it) is fitted with zoom extents, so it doesn't
 /// open on whatever window the last space had.
-fn enter_space(s: &mut Session, space: Space) -> Result<()> {
+pub(crate) fn enter_space(s: &mut Session, space: Space) -> Result<()> {
     let st = s.state_mut()?;
     let first_visit = !st.views.iter().any(|(sp, _)| *sp == space);
     st.space = space;
@@ -338,11 +342,14 @@ struct NewVertical {
     host: Option<Id>,
     first: Option<Vec2>,
     second: Option<Vec2>,
+    /// NEWSECTIONLINE begun in a placed section: one click gives a cut perpendicular to it, on its
+    /// host plan ([`newviews::perpendicular_cut`]); `host` is the section until then.
+    one_click: bool,
 }
 
 impl NewVertical {
     fn new(intent: VerticalIntent) -> Self {
-        NewVertical { intent, host: None, first: None, second: None }
+        NewVertical { intent, host: None, first: None, second: None, one_click: false }
     }
     fn word(&self) -> &'static str {
         if self.intent == VerticalIntent::Elevation { "Elevation" } else { "Section" }
@@ -359,6 +366,7 @@ impl Interactive for NewVertical {
     }
     fn prompt(&self, s: &Session) -> Prompt {
         match (self.first, self.second) {
+            (None, _) if self.one_click => Prompt::new("Click a point for a section perpendicular to this one", Accept::POINT),
             (None, _) => Prompt::new("Specify first point of cut line", Accept::POINT),
             (Some(a), None) => Prompt::new("Specify second point of cut line", Accept::POINT).base(a),
             (Some(_), Some(_)) => Prompt::new(format!("Enter {} name", self.word().to_ascii_lowercase()), Accept::TEXT).default(self.default_name(s)),
@@ -370,11 +378,30 @@ impl Interactive for NewVertical {
             s.echo("Edit a plan or section first (EDITVIEW).");
             return Ok(Step::Done);
         }
+        self.one_click = self.intent == VerticalIntent::Section && self.host.is_some_and(|h| newviews::is_placed_vertical(s, h));
         Ok(Step::Continue)
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         if i == Input::Cancel {
             return Ok(Step::Cancel);
+        }
+        if let (true, None, Some(view)) = (self.one_click, self.first, self.host) {
+            match i {
+                Input::Point(p) => match newviews::perpendicular_cut(s, view, p) {
+                    Ok(cut) => {
+                        self.host = Some(cut.host_view_id);
+                        self.first = Some(Vec2::new(cut.cut_from.x, cut.cut_from.y));
+                        self.second = Some(Vec2::new(cut.cut_to.x, cut.cut_to.y));
+                    }
+                    Err(e) => {
+                        s.echo(e.to_string());
+                        return Ok(Step::Done);
+                    }
+                },
+                Input::Enter => return Ok(Step::Cancel),
+                _ => {}
+            }
+            return Ok(Step::Continue);
         }
         let (Some(first), Some(second), Some(host)) = (self.first, self.second, self.host) else {
             match i {
@@ -402,9 +429,10 @@ impl Interactive for NewVertical {
         }
         Ok(Step::Done)
     }
-    fn preview(&self, _s: &Session, cursor: Vec2) -> Vec<EntityKind> {
-        match (self.first, self.second) {
-            (Some(a), None) => vec![EntityKind::Line(Line { a: a.to3(0.0), b: cursor.to3(0.0) })],
+    fn preview(&self, s: &Session, cursor: Vec2) -> Vec<EntityKind> {
+        match (self.first, self.second, self.host) {
+            (None, _, Some(view)) if self.one_click => newviews::vertical_preview(s, view, cursor),
+            (Some(a), None, _) => vec![EntityKind::Line(Line { a: a.to3(0.0), b: cursor.to3(0.0) })],
             _ => Vec::new(),
         }
     }
@@ -537,6 +565,16 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("unlink", "Unlink", unlink).alias(&["ulk"]).params("{linkId}"),
         CommandSpec::new("panelock", "Pane Lock", panelock).params("{on?: bool}").noundo().menu(MENU),
         CommandSpec::new("lambproject", "Start Project", lambproject).menu(MENU),
+        CommandSpec::new("newoffsetplan", "New Offset Plan", newviews::newoffsetplan)
+            .alias(&["np"])
+            .params("{mode: \"offset\"|\"height\", fromViewId, floorToFloorMm | floorElevationMm, name?, cutHeightMm?}")
+            .menu(MENU)
+            .interactive(newviews::newoffsetplan_machine),
+        CommandSpec::new("newplanline", "Plan Here", newviews::newplanline)
+            .alias(&["npln"])
+            .params("{fromVerticalViewId, localPoint:{x,y}, name?, cutHeightMm?}")
+            .menu(MENU)
+            .interactive(newviews::newplanline_machine),
     ]
 }
 
@@ -571,7 +609,7 @@ mod tests {
     #[test]
     fn every_spec_has_a_menu_path_and_a_factory() -> R {
         install_app()?;
-        let ids = ["newplan", "newsectionline", "newelevationline", "newsheet", "editview"];
+        let ids = ["newplan", "newsectionline", "newelevationline", "newsheet", "editview", "newoffsetplan", "newplanline"];
         for id in ids {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
             assert_eq!(c.menu, MENU, "{id}");

@@ -28,6 +28,7 @@ pub mod corners;
 pub mod fillet;
 pub mod import;
 pub mod maintain;
+mod newviews;
 pub mod overlays;
 pub mod panes;
 pub mod project;
