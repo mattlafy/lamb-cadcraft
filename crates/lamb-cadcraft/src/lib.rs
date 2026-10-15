@@ -39,6 +39,7 @@ mod dxfimport;
 mod entitycmds;
 pub mod fillet;
 pub mod import;
+mod lambopen;
 mod linkcmds;
 pub mod maintain;
 mod newviews;
