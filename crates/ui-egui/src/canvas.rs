@@ -1429,6 +1429,11 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     if resp.dragged_by(egui::PointerButton::Primary) && app.session.realtime_zoom_active() {
         let _ = app.session.realtime_zoom(f64::from(resp.drag_delta().y));
     }
+    // PAN (realtime): the drawing follows a left-button drag.
+    if resp.dragged_by(egui::PointerButton::Primary) && app.session.realtime_pan_active() {
+        let d = resp.drag_delta();
+        let _ = app.session.realtime_pan(f64::from(d.x), f64::from(d.y));
+    }
     // A click in another tile makes it current (or answers -VPORTS Join's prompts).
     if pressed_primary
         && let Some(hp) = hover_pos
@@ -1509,7 +1514,8 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // and eframe hands a slow frame's clicks over together, which egui reports as one.
     let point_prompt = app.session.current_prompt().is_some_and(|p| cadcraft_engine::pointmod::accepts(&p))
         && app.session.pending_window.is_none()
-        && !app.session.realtime_zoom_active();
+        && !app.session.realtime_zoom_active()
+        && !app.session.realtime_pan_active();
     let pressed_primary = pressed_primary || (point_prompt && resp.drag_stopped_by(egui::PointerButton::Primary));
     if point_prompt && inside && pressed_primary && !middle_down && app.cmd.options.is_none() && app.cmd.buffer.is_empty() {
         let releases: Vec<egui::Pos2> = ui.input(|i| {
