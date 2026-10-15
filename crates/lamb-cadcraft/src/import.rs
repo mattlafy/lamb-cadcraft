@@ -14,15 +14,23 @@
 //! Virtual (fillet/chamfer) corner tags go into the entity's `EntityData.corners`, so they are not
 //! reported as flattened — unless the polyline became a Circle, which has no vertices to tag.
 //!
-//! Only polyline geometry is imported; text, hatch, dimension and anything else is skipped and
-//! listed in the [`ImportReport`], and a link to a skipped entity is dropped and listed.
+//! Polylines (and legacy circles, through `circle_as_polyline`) import as polylines/circles, text
+//! as TEXT (left-baseline, rotation in radians as both sides store it) and dimensions as
+//! non-associative DIMENSIONs in the drawing's current dimension style, their points mapped onto
+//! the DXF definition points. Hatches are skipped and listed in the [`ImportReport`], and a link to
+//! a skipped entity is dropped and listed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use cadcraft_doc::color::{Color, Rgb};
-use cadcraft_doc::{Common, Drawing, EntityKind, Lineweight, Space};
+use cadcraft_doc::geom::Vec3;
+use cadcraft_doc::{Common, DimKind, Dimension, Drawing, EntityKind, HAlign, Lineweight, Space, Text, VAlign};
 use lamb_core::derivation::proposals::remap_slot_key;
+use lamb_core::geometry::Point2;
+use lamb_core::geometry::circle_fit::{CircleFit, circle_as_polyline};
+use lamb_core::geometry::dimension::{Axis, Dimension2};
+use lamb_core::geometry::polyline::CornerEntry;
 use lamb_core::geometry::polyline::virtual_corner_entries;
 use lamb_core::model::{AnyView, DrawingLayer, EntityGeometry, Id, Placement, Project};
 
@@ -141,6 +149,104 @@ fn remap_placement(p: &mut Option<Placement>, map: &IdMap) {
     }
 }
 
+fn v3(p: Point2) -> Vec3 {
+    Vec3::new(p.x, p.y, 0.0)
+}
+
+/// A polyline's kind, corner tags (only an LwPolyline carries them) and flattening warnings.
+fn polyline_kind(geometry: &lamb_core::geometry::Polyline2) -> (EntityKind, Vec<CornerEntry>, Vec<Flattened>) {
+    let (kind, mut warnings) = from_polyline(geometry);
+    let corners = if matches!(kind, EntityKind::LwPolyline(_)) {
+        warnings.retain(|w| *w != Flattened::VirtualCorner);
+        virtual_corner_entries(geometry)
+    } else {
+        Vec::new()
+    };
+    (kind, corners, warnings)
+}
+
+/// A lamb-core dimension as a non-associative CADCraft DIMENSION in `style`. Linear and aligned put
+/// `defpt` at the foot of `to` on the dimension line, by lamb-core's own formula
+/// (`geometry/dimension.rs` `resolve_offset_dimension`, copied: it is private there).
+fn dimension_kind(dim: &Dimension2, style: &str) -> EntityKind {
+    let unit = |p: Point2| {
+        let l = p.x.hypot(p.y);
+        if l > 0.0 { Point2 { x: p.x / l, y: p.y / l } } else { Point2 { x: 0.0, y: 0.0 } }
+    };
+    let foot = |from: Point2, to: Point2, dir: Point2, offset: f64| {
+        let n = Point2 { x: -dir.y, y: dir.x };
+        let t = (to.x - from.x) * dir.x + (to.y - from.y) * dir.y;
+        Point2 { x: from.x + dir.x * t + n.x * offset, y: from.y + dir.y * t + n.y * offset }
+    };
+    let (kind, defpt, p13, p14, p15, text) = match dim {
+        Dimension2::Linear { from, to, axis, offset, override_text } => {
+            let (dir, rotation) = match axis {
+                Axis::X => (Point2 { x: 1.0, y: 0.0 }, 0.0),
+                Axis::Y => (Point2 { x: 0.0, y: 1.0 }, std::f64::consts::FRAC_PI_2),
+            };
+            (DimKind::Linear { rotation }, foot(*from, *to, dir, *offset), *from, *to, Point2::default(), override_text)
+        }
+        Dimension2::Aligned { from, to, offset, override_text } => {
+            let dir = unit(Point2 { x: to.x - from.x, y: to.y - from.y });
+            (DimKind::Aligned, foot(*from, *to, dir, *offset), *from, *to, Point2::default(), override_text)
+        }
+        Dimension2::Radius { from, to, override_text } => (DimKind::Radius, *from, Point2::default(), Point2::default(), *to, override_text),
+        Dimension2::Angular { from, to, vertex, radius, override_text } => {
+            let tau = std::f64::consts::TAU;
+            let a1 = (from.y - vertex.y).atan2(from.x - vertex.x);
+            let a2 = (to.y - vertex.y).atan2(to.x - vertex.x);
+            let sweep = ((a2 - a1) % tau + tau) % tau;
+            let mid = a1 + sweep / 2.0;
+            let at = Point2 { x: vertex.x + radius * mid.cos(), y: vertex.y + radius * mid.sin() };
+            (DimKind::Angular3P, at, *from, *to, *vertex, override_text)
+        }
+    };
+    EntityKind::Dimension(Dimension {
+        kind,
+        defpt: v3(defpt),
+        text_mid: Vec3::ZERO,
+        p13: v3(p13),
+        p14: v3(p14),
+        p15: v3(p15),
+        p16: Vec3::ZERO,
+        text: text.clone().unwrap_or_default(),
+        style: style.to_owned(),
+        measurement: 0.0,
+        text_rotation: 0.0,
+        user_text_pos: false,
+        block: None,
+        overrides: Default::default(),
+        assoc: Vec::new(),
+        marks: Default::default(),
+    })
+}
+
+/// What `g` imports as — kind, corner tags, flattening warnings — or `None` if it is skipped.
+fn entity_kind(g: &EntityGeometry, dim_style: &str) -> Option<(EntityKind, Vec<CornerEntry>, Vec<Flattened>)> {
+    match g {
+        EntityGeometry::Polyline { geometry } => Some(polyline_kind(geometry)),
+        EntityGeometry::Circle { center, radius } => Some(polyline_kind(&circle_as_polyline(&CircleFit { center: *center, radius: *radius }))),
+        EntityGeometry::Text { position, content, height, rotation } => Some((
+            EntityKind::Text(Text {
+                insert: v3(*position),
+                align_pt: None,
+                height: *height,
+                value: content.clone(),
+                rotation: *rotation,
+                width_factor: 1.0,
+                oblique: 0.0,
+                style: "Standard".into(),
+                halign: HAlign::Left,
+                valign: VAlign::Baseline,
+            }),
+            Vec::new(),
+            Vec::new(),
+        )),
+        EntityGeometry::Dimension { dimension } => Some((dimension_kind(dimension, dim_style), Vec::new(), Vec::new())),
+        EntityGeometry::Hatch(_) => None,
+    }
+}
+
 /// One slot-key token — an old id's decimal — as its new handle's decimal, if `map` has it.
 fn remap_token(s: &str, map: &IdMap) -> Option<String> {
     s.parse::<u64>().ok().and_then(|n| map.get(Id(n))).map(|id| id.0.to_string())
@@ -172,20 +278,14 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
     // Entities with an AI origin, set once every entity has its handle: the origin's source entity
     // and the ids inside its slot key are rewritten onto handles (T355).
     let mut pending_origin = Vec::new();
+    let dim_style = d.header.str("DIMSTYLE", "Standard");
     for v in &project.views {
         let Some(view_id) = map.get(v.id()) else { continue };
         let space = Space::Block(view_block_name(view_id));
         for e in v.entities() {
-            let EntityGeometry::Polyline { geometry } = &e.geometry else {
+            let Some((kind, corners, warnings)) = entity_kind(&e.geometry, &dim_style) else {
                 report.skipped.push((e.id, geometry_kind(&e.geometry)));
                 continue;
-            };
-            let (kind, mut warnings) = from_polyline(geometry);
-            let corners = if matches!(kind, EntityKind::LwPolyline(_)) {
-                warnings.retain(|w| *w != Flattened::VirtualCorner);
-                virtual_corner_entries(geometry)
-            } else {
-                Vec::new()
             };
             report.flattened.extend(warnings.into_iter().map(|w| (e.id, w)));
             let layer = match layer_names.get(e.layer_id.as_str()) {

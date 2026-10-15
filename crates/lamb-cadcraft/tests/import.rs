@@ -4,12 +4,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use cadcraft_doc::Drawing;
+use cadcraft_doc::{DimKind, Dimension, Drawing, EntityKind, Handle};
 use lamb_cadcraft::convert::apply_corners;
-use lamb_cadcraft::{DrawingProject, Flattened, IdMap, ImportReport, project_to_drawing};
+use lamb_cadcraft::{DrawingProject, Flattened, IdMap, ImportReport, project_to_drawing, read_entity_data, view_block_name};
 use lamb_core::derivation::issues::find_issues;
 use lamb_core::derivation::markers::{Marker, compute_markers_for_view};
 use lamb_core::derivation::read::ProjectRead;
+use lamb_core::geometry::dimension::{Axis, Dimension2, resolve_dimension};
 use lamb_core::geometry::polyline::{CornerEntry, VirtualCornerEntry, virtual_corner_entries};
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::geometry::{Point2, PolySegment, Polyline2};
@@ -212,32 +213,144 @@ fn apply_corners_skips_an_index_that_is_not_a_corner() {
     assert_eq!(virtual_corner_entries(&p), vec![CornerEntry { corner_index: 1, entry: fillet }]);
 }
 
-#[test]
-fn text_entity_is_skipped_and_its_link_dropped() -> R {
-    let mut p = load("u-wall-two-sections")?;
-    let template = p.links.first().ok_or("fixture has no link")?.clone();
-    let text_id = Id(9_000_001);
+/// `p` with `entities` added to its first plan view; returns that plan's id.
+fn add_to_plan(p: &mut Project, entities: Vec<(Id, LineRole, EntityGeometry)>) -> Result<Id, String> {
     let AnyView::Plan(plan) = p.views.iter_mut().find(|v| matches!(v, AnyView::Plan(_))).ok_or("no plan")? else {
         return Err("no plan".into());
     };
-    plan.entities.push(DrawingEntity {
-        id: text_id,
-        view_id: plan.id,
-        role: LineRole::Annotation,
-        layer_id: "layer-annotation".into(),
-        geometry: EntityGeometry::Text { position: Point2 { x: 1.0, y: 2.0 }, content: "A".into(), height: 100.0, rotation: 0.0 },
-        color_override: None,
-        lineweight_override: None,
-        ai_origin: None,
-    });
+    for (id, role, geometry) in entities {
+        plan.entities.push(DrawingEntity {
+            id,
+            view_id: plan.id,
+            role,
+            layer_id: "layer-annotation".into(),
+            geometry,
+            color_override: None,
+            lineweight_override: None,
+            ai_origin: None,
+        });
+    }
+    Ok(plan.id)
+}
+
+/// The imported entity for old id `old`, checked to sit in its view's block.
+fn imported<'a>(d: &'a Drawing, map: &IdMap, view: Id, old: Id) -> Result<&'a cadcraft_doc::Entity, String> {
+    let h = Handle(mapped(map, old)?.0);
+    let block = d.block(&view_block_name(mapped(map, view)?)).ok_or("no view block")?;
+    assert!(block.entities.contains(h), "{old} not in its view's block");
+    d.entity(h).map(|e| e.as_ref()).ok_or_else(|| format!("{old} not on the drawing"))
+}
+
+fn dimension_of(e: &cadcraft_doc::Entity) -> Result<&Dimension, String> {
+    match &e.kind {
+        EntityKind::Dimension(d) => Ok(d),
+        other => Err(format!("not a dimension: {other:?}")),
+    }
+}
+
+fn pt(x: f64, y: f64) -> Point2 {
+    Point2 { x, y }
+}
+
+fn xy(v: cadcraft_doc::geom::Vec3) -> Point2 {
+    Point2 { x: v.x, y: v.y }
+}
+
+/// `defpt` lies at the `to` end of the dimension line `resolve_dimension` draws — same side.
+fn on_drawn_dimension_line(dim: &Dimension2, defpt: Point2, to: Point2) -> bool {
+    resolve_dimension(dim, 100.0).lines.iter().any(|l| l.points.len() == 2 && near(l.points[1], defpt) && !near(l.points[0], to))
+}
+
+#[test]
+fn text_imports_as_text_on_its_layer_with_its_role() -> R {
+    let mut p = load("u-wall-two-sections")?;
+    let text_id = Id(9_000_001);
+    let text = EntityGeometry::Text { position: pt(1.0, 2.0), content: "A".into(), height: 250.0, rotation: 0.5 };
+    let plan = add_to_plan(&mut p, vec![(text_id, LineRole::Annotation, text)])?;
+    let (d, map, report) = project_to_drawing(&p)?;
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    let e = imported(&d, &map, plan, text_id)?;
+    let EntityKind::Text(t) = &e.kind else { return Err(format!("not a text: {:?}", e.kind).into()) };
+    assert_eq!((t.insert.x, t.insert.y, t.height, t.rotation, t.value.as_str()), (1.0, 2.0, 250.0, 0.5, "A"));
+    let layer = p.layers.iter().find(|l| l.id == "layer-annotation").ok_or("no annotation layer")?;
+    assert_eq!(e.common.layer, layer.name);
+    assert_eq!(read_entity_data(&e.common)?.role, LineRole::Annotation);
+    Ok(())
+}
+
+#[test]
+fn dimensions_import_with_their_points_on_the_drawn_side() -> R {
+    let mut p = load("u-wall-two-sections")?;
+    let lin_x = Dimension2::Linear { from: pt(0.0, 0.0), to: pt(3000.0, 0.0), axis: Axis::X, offset: 500.0, override_text: None };
+    let lin_y = Dimension2::Linear { from: pt(100.0, 0.0), to: pt(400.0, 2000.0), axis: Axis::Y, offset: -700.0, override_text: None };
+    let aligned = Dimension2::Aligned { from: pt(0.0, 0.0), to: pt(3000.0, 4000.0), offset: -600.0, override_text: Some("EQ".into()) };
+    let radius = Dimension2::Radius { from: pt(10.0, 20.0), to: pt(510.0, 20.0), override_text: None };
+    let angular = Dimension2::Angular { from: pt(1000.0, 0.0), to: pt(0.0, 1000.0), vertex: pt(0.0, 0.0), radius: 800.0, override_text: None };
+    let dims = [lin_x, lin_y, aligned, radius, angular];
+    let ids: Vec<Id> = (0..dims.len() as u64).map(|i| Id(9_100_000 + i)).collect();
+    let entities = ids.iter().zip(&dims).map(|(id, dim)| (*id, LineRole::Annotation, EntityGeometry::Dimension { dimension: dim.clone() })).collect();
+    let plan = add_to_plan(&mut p, entities)?;
+    let (d, map, report) = project_to_drawing(&p)?;
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    let got: Vec<&Dimension> = ids.iter().map(|id| imported(&d, &map, plan, *id).and_then(dimension_of)).collect::<Result<_, _>>()?;
+
+    // Linear X: ends at p13/p14, defpt on the dimension line 500 up.
+    assert_eq!(got[0].kind, DimKind::Linear { rotation: 0.0 });
+    assert_eq!((xy(got[0].p13), xy(got[0].p14)), (pt(0.0, 0.0), pt(3000.0, 0.0)));
+    assert!(close(got[0].defpt.y, 500.0) && close(got[0].defpt.x, 3000.0), "{:?}", got[0].defpt);
+    assert!(on_drawn_dimension_line(&dims[0], xy(got[0].defpt), pt(3000.0, 0.0)));
+    assert!(got[0].text.is_empty() && got[0].assoc.is_empty());
+
+    // Linear Y and aligned with negative offsets: same side as lamb-core draws.
+    assert_eq!(got[1].kind, DimKind::Linear { rotation: std::f64::consts::FRAC_PI_2 });
+    assert!(near(xy(got[1].defpt), pt(800.0, 2000.0)), "{:?}", got[1].defpt);
+    assert!(on_drawn_dimension_line(&dims[1], xy(got[1].defpt), pt(400.0, 2000.0)));
+    assert_eq!(got[2].kind, DimKind::Aligned);
+    assert!(on_drawn_dimension_line(&dims[2], xy(got[2].defpt), pt(3000.0, 4000.0)));
+    assert_eq!(got[2].text, "EQ");
+
+    // Radius: defpt = centre, p15 = on the curve.
+    assert_eq!(got[3].kind, DimKind::Radius);
+    assert_eq!((xy(got[3].defpt), xy(got[3].p15)), (pt(10.0, 20.0), pt(510.0, 20.0)));
+
+    // Angular: rays at p13/p14, vertex at p15, defpt on the arc at mid-sweep (45 degrees here).
+    assert_eq!(got[4].kind, DimKind::Angular3P);
+    assert_eq!((xy(got[4].p13), xy(got[4].p14), xy(got[4].p15)), (pt(1000.0, 0.0), pt(0.0, 1000.0), pt(0.0, 0.0)));
+    let h = 800.0 * std::f64::consts::FRAC_1_SQRT_2;
+    assert!(near(xy(got[4].defpt), pt(h, h)), "{:?}", got[4].defpt);
+    Ok(())
+}
+
+#[test]
+fn a_link_to_a_dimension_is_kept_and_nothing_is_skipped() -> R {
+    let mut p = load("u-wall-two-sections")?;
+    let template = p.links.first().ok_or("fixture has no link")?.clone();
+    let dim_id = Id(9_000_001);
+    let dim = Dimension2::Aligned { from: pt(0.0, 0.0), to: pt(1000.0, 0.0), offset: 300.0, override_text: None };
+    let text = EntityGeometry::Text { position: pt(1.0, 2.0), content: "A".into(), height: 100.0, rotation: 0.0 };
+    let circle = EntityGeometry::Circle { center: pt(5000.0, 5000.0), radius: 250.0 };
+    add_to_plan(
+        &mut p,
+        vec![
+            (dim_id, LineRole::Annotation, EntityGeometry::Dimension { dimension: dim }),
+            (Id(9_000_003), LineRole::Annotation, text),
+            (Id(9_000_004), LineRole::Annotation, circle),
+        ],
+    )?;
     let mut link = template;
     link.id = Id(9_000_002);
-    link.a.entity_id = text_id;
+    link.a.entity_id = dim_id;
     link.a.segment_index = 0;
     p.links.push(link);
 
-    let (report, _) = check_agrees("u-wall-two-sections + text", &p)?;
-    assert_eq!(report.skipped, vec![(text_id, "text")]);
-    assert_eq!(report.dropped_links, vec![Id(9_000_002)]);
+    let (d, map, report) = project_to_drawing(&p)?;
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(report.dropped_links.is_empty(), "{:?}", report.dropped_links);
+    let dp = DrawingProject::new(&d)?;
+    let kept = dp.document().links.iter().find(|l| l.id == Id(9_000_002)).ok_or("dimension link dropped")?;
+    assert_eq!(kept.a.entity_id, mapped(&map, dim_id)?);
+    // The legacy circle became a CADCraft circle.
+    let c = d.entity(Handle(mapped(&map, Id(9_000_004))?.0)).ok_or("circle missing")?;
+    assert!(matches!(c.kind, EntityKind::Circle(_)), "{:?}", c.kind);
     Ok(())
 }
