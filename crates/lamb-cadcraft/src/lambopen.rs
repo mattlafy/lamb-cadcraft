@@ -61,6 +61,12 @@ pub(crate) fn lambopen(s: &mut Session, p: &Value) -> Result<Value> {
     if !report.unknown_layers.is_empty() {
         s.echo(format!("Unknown layers: {}", report.unknown_layers.join(", ")));
     }
+    if !report.unassociated_hatches.is_empty() {
+        s.echo(format!("Hatches not associative: {}", report.unassociated_hatches.len()));
+    }
+    if !report.unknown_patterns.is_empty() {
+        s.echo(format!("Unknown patterns: {}", report.unknown_patterns.join(", ")));
+    }
     Ok(json!({
         "views": views,
         "entities": entities,

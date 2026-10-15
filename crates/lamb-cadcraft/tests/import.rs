@@ -3,10 +3,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Once;
 
-use cadcraft_doc::{DimKind, Dimension, Drawing, EntityKind, Handle};
+use cadcraft_doc::{DimKind, Dimension, Drawing, EntityKind, Handle, Space};
+use cadcraft_engine::{Session, register_command_provider};
 use lamb_cadcraft::convert::apply_corners;
-use lamb_cadcraft::{DrawingProject, Flattened, IdMap, ImportReport, project_to_drawing, read_entity_data, view_block_name};
+use lamb_cadcraft::{DrawingProject, Flattened, IdMap, ImportReport, commands, project_to_drawing, read_entity_data, view_block_name};
 use lamb_core::derivation::issues::find_issues;
 use lamb_core::derivation::markers::{Marker, compute_markers_for_view};
 use lamb_core::derivation::read::ProjectRead;
@@ -14,8 +16,9 @@ use lamb_core::geometry::dimension::{Axis, Dimension2, resolve_dimension};
 use lamb_core::geometry::polyline::{CornerEntry, VirtualCornerEntry, virtual_corner_entries};
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::geometry::{Point2, PolySegment, Polyline2};
-use lamb_core::model::{AnyView, DrawingEntity, EntityGeometry, Id, LineRole, Placement, Project};
+use lamb_core::model::{AnyView, DrawingEntity, EntityGeometry, HatchGeometry, HatchLoop, Id, LineRole, Placement, Project};
 use lamb_core::persistence::files_to_project;
+use serde_json::json;
 
 type R = Result<(), Box<dyn std::error::Error>>;
 
@@ -352,5 +355,120 @@ fn a_link_to_a_dimension_is_kept_and_nothing_is_skipped() -> R {
     // The legacy circle became a CADCraft circle.
     let c = d.entity(Handle(mapped(&map, Id(9_000_004))?.0)).ok_or("circle missing")?;
     assert!(matches!(c.kind, EntityKind::Circle(_)), "{:?}", c.kind);
+    Ok(())
+}
+
+static REGISTER: Once = Once::new();
+
+fn register() {
+    REGISTER.call_once(|| register_command_provider(commands).expect("register LAMB commands"));
+}
+
+fn seg(x: f64, y: f64, bulge: f64) -> PolySegment {
+    PolySegment { to: pt(x, y), bulge, corner_at_to: None }
+}
+
+/// A closed square, side `s`, lower-left at (`x`, `y`).
+fn square(x: f64, y: f64, s: f64) -> Polyline2 {
+    Polyline2 { start: pt(x, y), segments: vec![seg(x + s, y, 0.0), seg(x + s, y + s, 0.0), seg(x, y + s, 0.0), seg(x, y, 0.0)], closed: true }
+}
+
+fn hatch(loops: Vec<(Polyline2, Vec<Id>)>, pattern: &str, angle: f64, scale: f64) -> EntityGeometry {
+    let loops = loops.into_iter().map(|(polyline, entity_ids)| HatchLoop { polyline, entity_ids }).collect();
+    EntityGeometry::Hatch(HatchGeometry { boundary: None, boundary_entity_id: None, loops: Some(loops), pattern: pattern.into(), scale, angle })
+}
+
+fn hatch_of(e: &cadcraft_doc::Entity) -> Result<&cadcraft_doc::Hatch, String> {
+    match &e.kind {
+        EntityKind::Hatch(h) => Ok(h),
+        other => Err(format!("not a hatch: {other:?}")),
+    }
+}
+
+const RECT: Id = Id(9_200_001);
+const HATCH: Id = Id(9_200_002);
+
+/// The u-wall project with a 1000 mm square at (50000, 50000) and an ANSI31 hatch naming it; the
+/// hatch first in the plan's list when `hatch_first`. Returns the project and the plan's id.
+fn hatched_project(hatch_first: bool) -> Result<(Project, Id), Box<dyn std::error::Error>> {
+    let mut p = load("u-wall-two-sections")?;
+    let rect = (RECT, LineRole::Annotation, EntityGeometry::Polyline { geometry: square(50_000.0, 50_000.0, 1000.0) });
+    let h = (HATCH, LineRole::Annotation, hatch(vec![(square(50_000.0, 50_000.0, 1000.0), vec![RECT])], "ansi31", 45.0, 2.0));
+    let plan = add_to_plan(&mut p, if hatch_first { vec![h, rect] } else { vec![rect, h] })?;
+    Ok((p, plan))
+}
+
+#[test]
+fn a_hatch_imports_associative_to_its_boundary_in_either_order() -> R {
+    for hatch_first in [false, true] {
+        let (p, plan) = hatched_project(hatch_first)?;
+        let (d, map, report) = project_to_drawing(&p)?;
+        assert!(report.skipped.is_empty() && report.unassociated_hatches.is_empty() && report.unknown_patterns.is_empty(), "{report:?}");
+        let e = imported(&d, &map, plan, HATCH)?;
+        let h = hatch_of(e)?;
+        assert!(h.associative && !h.solid, "hatch_first {hatch_first}");
+        assert_eq!((h.pattern.as_str(), h.scale, h.style), ("ANSI31", 2.0, 0));
+        assert!((h.angle - std::f64::consts::FRAC_PI_4).abs() < 1e-12, "{}", h.angle);
+        assert_eq!(h.loops.len(), 1);
+        assert!(h.loops[0].outer);
+        assert_eq!(h.loops[0].sources, vec![Handle(mapped(&map, RECT)?.0)]);
+        assert_eq!(h.loops[0].vertices.len(), 4);
+        let layer = p.layers.iter().find(|l| l.id == "layer-annotation").ok_or("no annotation layer")?;
+        assert_eq!(e.common.layer, layer.name);
+        assert_eq!(read_entity_data(&e.common)?.role, LineRole::Annotation);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_holed_hatch_keeps_its_bulges_and_a_lost_boundary_is_reported() -> R {
+    let mut p = load("u-wall-two-sections")?;
+    let (outer, circle, holed, lost) = (Id(9_300_001), Id(9_300_003), Id(9_300_004), Id(9_300_005));
+    // Outer: a square; hole: a two-arc circle (a CADCraft Circle as an entity, vertices in the loop).
+    let hole = Polyline2 { start: pt(400.0, 500.0), segments: vec![seg(600.0, 500.0, 1.0), seg(400.0, 500.0, 1.0)], closed: true };
+    let holed_hatch = hatch(vec![(square(0.0, 0.0, 1000.0), vec![outer]), (hole.clone(), vec![circle])], "ansi31", 0.0, 1.0);
+    let lost_hatch = hatch(vec![(square(0.0, 0.0, 10.0), vec![Id(9_399_999)])], "my-own", 0.0, 1.0);
+    let plan = add_to_plan(
+        &mut p,
+        vec![
+            (outer, LineRole::Annotation, EntityGeometry::Polyline { geometry: square(0.0, 0.0, 1000.0) }),
+            (circle, LineRole::Annotation, EntityGeometry::Polyline { geometry: hole }),
+            (holed, LineRole::Annotation, holed_hatch),
+            (lost, LineRole::Annotation, lost_hatch),
+        ],
+    )?;
+    let (d, map, report) = project_to_drawing(&p)?;
+    assert!(matches!(d.entity(Handle(mapped(&map, circle)?.0)).ok_or("no circle")?.kind, EntityKind::Circle(_)));
+
+    let h = hatch_of(imported(&d, &map, plan, holed)?)?;
+    assert!(h.associative);
+    assert_eq!(h.loops.iter().map(|l| l.outer).collect::<Vec<_>>(), vec![true, false]);
+    let bulges: Vec<f64> = h.loops[1].vertices.iter().map(|v| v.bulge).collect();
+    assert_eq!(bulges, vec![1.0, 1.0], "{:?}", h.loops[1].vertices);
+    assert_eq!(h.loops[1].sources, vec![Handle(mapped(&map, circle)?.0)]);
+
+    let l = hatch_of(imported(&d, &map, plan, lost)?)?;
+    assert!(!l.associative && l.loops.iter().all(|x| x.sources.is_empty()));
+    assert_eq!(l.pattern, "MY-OWN");
+    assert_eq!(report.unassociated_hatches, vec![lost]);
+    assert_eq!(report.unknown_patterns, vec!["MY-OWN".to_owned()]);
+    Ok(())
+}
+
+#[test]
+fn an_imported_hatch_refills_when_its_boundary_is_stretched_in_the_view() -> R {
+    register();
+    let (p, plan) = hatched_project(false)?;
+    let (d, map, _) = project_to_drawing(&p)?;
+    let mut s = Session::new();
+    s.open_drawing(d, "hatched", None);
+    s.execute("editview", &json!({"viewId": mapped(&map, plan)?.0}))?;
+    assert_eq!(s.space(), Space::Block(view_block_name(mapped(&map, plan)?)));
+    s.script("STRETCH\nC\n51200,49900\n50800,51100\n\n0,0\n500,0\n")?;
+    assert!(s.running.is_none(), "{}", s.prompt_text());
+    let h = hatch_of(s.doc()?.entity(Handle(mapped(&map, HATCH)?.0)).ok_or("hatch gone")?)?;
+    assert!(h.associative);
+    let max_x = h.loops[0].vertices.iter().map(|v| v.p.x).fold(f64::MIN, f64::max);
+    assert!((max_x - 51_500.0).abs() < 1e-6, "hatch did not refill: {:?}", h.loops[0].vertices);
     Ok(())
 }

@@ -17,22 +17,30 @@
 //! Polylines (and legacy circles, through `circle_as_polyline`) import as polylines/circles, text
 //! as TEXT (left-baseline, rotation in radians as both sides store it) and dimensions as
 //! non-associative DIMENSIONs in the drawing's current dimension style, their points mapped onto
-//! the DXF definition points. Hatches are skipped and listed in the [`ImportReport`], and a link to
-//! a skipped entity is dropped and listed.
+//! the DXF definition points. A link to a skipped entity is dropped and listed.
+//!
+//! Hatches import last, once every other entity has its handle, as HATCHes in their own view's
+//! block, associative to their imported boundary entities (each loop's `sources`). A hatch with a
+//! loop naming no entity, or one that was not imported, goes in non-associative with no sources and
+//! is listed in [`ImportReport::unassociated_hatches`]. Fill is even-odd (style 0), the pattern name
+//! upper-cased (an unknown one listed in [`ImportReport::unknown_patterns`]), degrees to radians.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use cadcraft_doc::color::{Color, Rgb};
 use cadcraft_doc::geom::Vec3;
-use cadcraft_doc::{Common, DimKind, Dimension, Drawing, EntityKind, HAlign, Lineweight, Space, Text, VAlign};
+use cadcraft_doc::geom::{PolyVertex, Vec2};
+use cadcraft_doc::{Common, DimKind, Dimension, Drawing, EntityKind, HAlign, Handle, Hatch, HatchLoop, Lineweight, Space, Text, VAlign};
 use lamb_core::derivation::proposals::remap_slot_key;
 use lamb_core::geometry::Point2;
+use lamb_core::geometry::Polyline2;
 use lamb_core::geometry::circle_fit::{CircleFit, circle_as_polyline};
 use lamb_core::geometry::dimension::{Axis, Dimension2};
 use lamb_core::geometry::polyline::CornerEntry;
 use lamb_core::geometry::polyline::virtual_corner_entries;
-use lamb_core::model::{AnyView, DrawingLayer, EntityGeometry, Id, Placement, Project};
+use lamb_core::geometry::tolerance::TOLERANCE;
+use lamb_core::model::{AnyView, DrawingEntity, DrawingLayer, EntityGeometry, HatchGeometry, Id, Placement, Project, hatch_loops};
 
 use crate::convert::{Flattened, from_polyline};
 use crate::schema::{EntityData, LayerData, SchemaError, read_document, set_entity_data, set_layer_data, view_block_name, write_document};
@@ -60,6 +68,10 @@ pub struct ImportReport {
     pub dropped_links: Vec<Id>,
     /// Entity `layer_id`s naming no project layer; those entities went on layer `0`.
     pub unknown_layers: Vec<String>,
+    /// Hatches (old id) imported non-associative: a loop names no entity, or one not imported.
+    pub unassociated_hatches: Vec<Id>,
+    /// Hatch pattern names (upper-cased) the pattern library does not know, each listed once.
+    pub unknown_patterns: Vec<String>,
 }
 
 /// Why an import failed.
@@ -154,7 +166,7 @@ fn v3(p: Point2) -> Vec3 {
 }
 
 /// A polyline's kind, corner tags (only an LwPolyline carries them) and flattening warnings.
-fn polyline_kind(geometry: &lamb_core::geometry::Polyline2) -> (EntityKind, Vec<CornerEntry>, Vec<Flattened>) {
+fn polyline_kind(geometry: &Polyline2) -> (EntityKind, Vec<CornerEntry>, Vec<Flattened>) {
     let (kind, mut warnings) = from_polyline(geometry);
     let corners = if matches!(kind, EntityKind::LwPolyline(_)) {
         warnings.retain(|w| *w != Flattened::VirtualCorner);
@@ -221,7 +233,77 @@ fn dimension_kind(dim: &Dimension2, style: &str) -> EntityKind {
     })
 }
 
-/// What `g` imports as — kind, corner tags, flattening warnings — or `None` if it is skipped.
+/// A hatch loop's vertices: the LwPolyline `from_polyline` makes (bulges kept), or — for a loop it
+/// turns into another kind, e.g. a two-arc circle — the polyline's own segments as vertices.
+fn loop_vertices(p: &Polyline2) -> Vec<PolyVertex> {
+    if let (EntityKind::LwPolyline(lw), _) = from_polyline(p) {
+        return lw.vertices;
+    }
+    let mut vertices = vec![PolyVertex::new(Vec2::new(p.start.x, p.start.y))];
+    for s in &p.segments {
+        if let Some(prev) = vertices.last_mut() {
+            prev.bulge = s.bulge;
+        }
+        vertices.push(PolyVertex::new(Vec2::new(s.to.x, s.to.y)));
+    }
+    let closes = p.segments.last().is_some_and(|s| (s.to.x - p.start.x).hypot(s.to.y - p.start.y) <= TOLERANCE.coincidence_mm);
+    if vertices.len() > 2 && closes {
+        vertices.pop();
+    }
+    vertices
+}
+
+/// `h` as a CADCraft HATCH, its loops' sources mapped through `map`, and whether it is associative:
+/// only when every loop names at least one entity and all of them were imported. Otherwise no loop
+/// keeps sources (a half-associative hatch would refill wrongly).
+fn hatch_kind(h: &HatchGeometry, map: &IdMap) -> (EntityKind, bool) {
+    let src = hatch_loops(h);
+    let mut loops: Vec<HatchLoop> = src
+        .iter()
+        .enumerate()
+        .map(|(i, l)| HatchLoop {
+            vertices: loop_vertices(&l.polyline),
+            outer: i == 0,
+            sources: l.entity_ids.iter().filter_map(|id| map.get(*id)).map(|id| Handle(id.0)).collect(),
+        })
+        .collect();
+    let associative = !src.is_empty() && src.iter().zip(&loops).all(|(s, l)| !s.entity_ids.is_empty() && l.sources.len() == s.entity_ids.len());
+    if !associative {
+        loops.iter_mut().for_each(|l| l.sources.clear());
+    }
+    let pattern = h.pattern.to_uppercase();
+    let hatch = Hatch {
+        solid: pattern == "SOLID",
+        pattern,
+        loops,
+        scale: h.scale,
+        angle: h.angle.to_radians(),
+        associative,
+        style: 0,
+        elevation: 0.0,
+        gradient: None,
+        origin: Vec2::default(),
+        background: None,
+        pattern_lines: Vec::new(),
+    };
+    (EntityKind::Hatch(hatch), associative)
+}
+
+/// The drawing layer for `e`: its project layer's name, else `0` with the layer id reported.
+fn entity_layer(e: &DrawingEntity, layer_names: &HashMap<&str, &str>, report: &mut ImportReport) -> String {
+    match layer_names.get(e.layer_id.as_str()) {
+        Some(n) => (*n).to_owned(),
+        None => {
+            if !report.unknown_layers.contains(&e.layer_id) {
+                report.unknown_layers.push(e.layer_id.clone());
+            }
+            "0".to_owned()
+        }
+    }
+}
+
+/// What `g` imports as — kind, corner tags, flattening warnings — or `None` if it is skipped (a
+/// hatch is added in a later pass, by [`hatch_kind`]).
 fn entity_kind(g: &EntityGeometry, dim_style: &str) -> Option<(EntityKind, Vec<CornerEntry>, Vec<Flattened>)> {
     match g {
         EntityGeometry::Polyline { geometry } => Some(polyline_kind(geometry)),
@@ -279,46 +361,69 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
     // and the ids inside its slot key are rewritten onto handles (T355).
     let mut pending_origin = Vec::new();
     let dim_style = d.header.str("DIMSTYLE", "Standard");
+    let mut add = |d: &mut Drawing,
+                   map: &mut IdMap,
+                   report: &mut ImportReport,
+                   space: &Space,
+                   e: &DrawingEntity,
+                   kind: EntityKind,
+                   corners: Vec<CornerEntry>|
+     -> Result<(), ImportError> {
+        let mut common = Common { layer: entity_layer(e, &layer_names, report), ..Common::default() };
+        let data = EntityData {
+            role: e.role,
+            ai_origin: e.ai_origin.clone(),
+            view_id: None,
+            corners,
+            detail_tag: None,
+            detail_ref: None,
+            repeat: None,
+            outside: false,
+        };
+        let deferred = data.ai_origin.is_some();
+        if !deferred {
+            set_entity_data(&mut common, &data)?;
+        }
+        let h = d.add(space, common, kind)?;
+        map.0.insert(e.id, Id(h.0));
+        if deferred {
+            pending_origin.push((h, data));
+        }
+        Ok(())
+    };
+    // Hatches go in after every other entity has its handle: a boundary may come later in its view.
+    let mut hatches = Vec::new();
     for v in &project.views {
         let Some(view_id) = map.get(v.id()) else { continue };
         let space = Space::Block(view_block_name(view_id));
         for e in v.entities() {
+            if let EntityGeometry::Hatch(h) = &e.geometry {
+                hatches.push((space.clone(), e, h));
+                continue;
+            }
             let Some((kind, corners, warnings)) = entity_kind(&e.geometry, &dim_style) else {
                 report.skipped.push((e.id, geometry_kind(&e.geometry)));
                 continue;
             };
             report.flattened.extend(warnings.into_iter().map(|w| (e.id, w)));
-            let layer = match layer_names.get(e.layer_id.as_str()) {
-                Some(n) => (*n).to_owned(),
-                None => {
-                    if !report.unknown_layers.contains(&e.layer_id) {
-                        report.unknown_layers.push(e.layer_id.clone());
-                    }
-                    "0".to_owned()
-                }
-            };
-            let mut common = Common { layer, ..Common::default() };
-            let data = EntityData {
-                role: e.role,
-                ai_origin: e.ai_origin.clone(),
-                view_id: None,
-                corners,
-                detail_tag: None,
-                detail_ref: None,
-                repeat: None,
-                outside: false,
-            };
-            let deferred = data.ai_origin.is_some();
-            if !deferred {
-                set_entity_data(&mut common, &data)?;
-            }
-            let h = d.add(&space, common, kind)?;
-            map.0.insert(e.id, Id(h.0));
-            if deferred {
-                pending_origin.push((h, data));
-            }
+            add(&mut d, &mut map, &mut report, &space, e, kind, corners)?;
         }
     }
+    for (space, e, h) in hatches {
+        let (kind, associative) = hatch_kind(h, &map);
+        if !associative {
+            report.unassociated_hatches.push(e.id);
+        }
+        if let EntityKind::Hatch(x) = &kind
+            && !x.solid
+            && cadcraft_doc::library::pattern(&x.pattern).is_none()
+            && !report.unknown_patterns.contains(&x.pattern)
+        {
+            report.unknown_patterns.push(x.pattern.clone());
+        }
+        add(&mut d, &mut map, &mut report, &space, e, kind, Vec::new())?;
+    }
+    drop(add);
     for (h, mut data) in pending_origin {
         if let Some(o) = data.ai_origin.as_mut() {
             if let Some(src) = o.source_entity_id
