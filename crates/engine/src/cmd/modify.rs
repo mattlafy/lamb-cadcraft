@@ -1352,6 +1352,8 @@ pub(crate) fn explode_kind(d: &cadcraft_doc::Drawing, e: &Entity) -> Option<Vec<
                             style: m.style.clone(),
                             halign: Default::default(),
                             valign: Default::default(),
+                            backwards: false,
+                            upside_down: false,
                         }),
                     }
                 })
