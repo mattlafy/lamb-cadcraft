@@ -45,6 +45,17 @@ fn script_mtext_takes_lines_until_an_empty_line() {
     assert_eq!(mtexts(&s), vec!["Hello world".to_string()]);
 }
 
+/// A point on a letter of the only TEXT (text is picked on its letters, not between them): the
+/// middle of the first line of its first stroke, as typed at a prompt.
+fn on_letter(s: &Session) -> String {
+    let d = s.doc().unwrap();
+    let t = d.model.iter().find_map(|e| if let EntityKind::Text(t) = &e.kind { Some(t.clone()) } else { None }).unwrap();
+    let (shaped, _) = cadcraft_engine::render::place_text_entity(d, &t, &t.value);
+    let l = shaped.strokes.iter().find(|l| l.len() >= 2).unwrap();
+    let p = (l[0] + l[1]) * 0.5;
+    format!("{},{}", p.x, p.y)
+}
+
 #[test]
 fn textedit_prompt_mode_and_undo() {
     let mut s = Session::new();
@@ -54,7 +65,7 @@ fn textedit_prompt_mode_and_undo() {
     let p = s.prompt_text();
     assert!(!p.contains("or or"), "{p}");
     // Edit, then Undo restores the old text.
-    s.cmdline("0.5,0.5").unwrap();
+    s.cmdline(&on_letter(&s)).unwrap();
     s.cmdline("new").unwrap();
     assert_eq!(texts(&s), vec!["new".to_string()]);
     s.cmdline("u").unwrap();
@@ -62,7 +73,7 @@ fn textedit_prompt_mode_and_undo() {
     // Mode Single: the command ends after one edit.
     s.cmdline("m").unwrap();
     s.cmdline("s").unwrap();
-    s.cmdline("0.5,0.5").unwrap();
+    s.cmdline(&on_letter(&s)).unwrap();
     s.cmdline("once").unwrap();
     assert!(s.running.is_none(), "{}", s.prompt_text());
     assert_eq!(texts(&s), vec!["once".to_string()]);
