@@ -50,10 +50,24 @@ fn text_at(h: &Harness<'_, CadApp>, i: usize) -> String {
     }
 }
 
+/// A point on a letter of text `i` (text is picked on its letters, not between them): the middle
+/// of the first line of its first stroke.
+fn on_letter(h: &Harness<'_, CadApp>, i: usize) -> Vec2 {
+    let d = h.state().session.doc().unwrap();
+    let strokes = match &d.model.iter().nth(i).unwrap().kind {
+        EntityKind::Text(t) => cadcraft_engine::render::place_text_entity(d, t, &t.value).0.strokes,
+        EntityKind::MText(t) => cadcraft_engine::render::layout_mtext_entity(d, t).strokes,
+        k => panic!("not text: {}", k.type_name()),
+    };
+    let l = strokes.iter().find(|l| l.len() >= 2).unwrap();
+    (l[0] + l[1]) * 0.5
+}
+
 #[test]
 fn double_click_on_text_starts_textedit_for_that_object() {
-    for (i, at, old, new) in [(0, Vec2::new(4.0, 1.2), "HELLO", "HELLO WORLD"), (1, Vec2::new(3.0, 18.8), "first\nsecond", "edited")] {
+    for (i, old, new) in [(0, "HELLO", "HELLO WORLD"), (1, "first\nsecond", "edited")] {
         let mut h = harness();
+        let at = on_letter(&h, i);
         double_click(&mut h, at);
         let s = &h.state().session;
         assert_eq!(s.running.as_ref().map(|r| r.id.as_str()), Some("textedit"), "object {i}");
