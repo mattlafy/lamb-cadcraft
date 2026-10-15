@@ -1,6 +1,6 @@
 # UI parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (animation effects follow the operating system's setting) · **Target:** Autodesk AutoCAD 2027 for Mac (26.0)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-14 · **Change:** minor (smoother screen strokes and stronger lineweight display) · **Target:** Autodesk AutoCAD 2027 for Mac (26.0)
 
 How CADCraft's interaction compares with AutoCAD's: point entry, object snaps, tracking, dynamic
 input, grips, selection, the command line, chrome and navigation. A drafter's speed in AutoCAD
@@ -182,6 +182,7 @@ down-arrow options menu (DYNPROMPT), and DYNDIM.
 | Named views (VIEW) | yes | **no** (VIEW table not read or written) |
 | Tiled model-space viewports (VPORTS) | yes | not confirmed: VPORTS maps to paper-space MVIEW |
 | 3D orbit, ViewCube drag, SteeringWheels | yes | no (M11) |
+| Screen stroke quality and lineweight display | smooth curves and distinct weights | GPU hairlines and wide strokes use analytic coverage; main-view tessellation tolerance 0.15 screen points; LWDISPLAY uses 8 screen points/mm, clamped to 1–12; stored weights and plotting are unchanged (`canvas.rs`, `gpu.rs`) |
 
 ## Keyboard and context menus (≈ 25%)
 

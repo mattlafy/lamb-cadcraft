@@ -6,8 +6,8 @@
 //! a per-build origin so large world coordinates keep their precision; at deep zoom the origin
 //! follows the view (see [`choose_origin`]).
 //!
-//! Batches: filled triangles (TriangleList), 1-px hairlines (LineList), and instanced screen-space
-//! quads for wide lineweights and point markers. Fills are drawn first, then lines on top. A
+//! Batches: filled triangles (TriangleList) and instanced screen-space quads with analytic
+//! coverage for hairlines, wide lineweights and point markers. Fills are drawn first. A
 //! wipeout starts a new draw-order group (see [`MeshData::breaks`]): its background-coloured mask
 //! is drawn after everything before it and under everything after it. The shader only uses
 //! vertex buffers and one uniform buffer, so it runs on WebGPU and WebGL2.
@@ -184,10 +184,11 @@ fn push_instance(out: &mut Vec<u8>, a: [f32; 2], b: [f32; 2], c: [u8; 4], width:
 
 /// Lineweight in screen points for a primitive (as on the CPU path), or `None` for a hairline.
 pub fn wide_width(lw: f32, lwdisplay: bool) -> Option<f32> {
-    if !lwdisplay || lw <= 0.0 {
+    if !lwdisplay || !lw.is_finite() || lw <= 0.0 {
         return None;
     }
-    let w = (lw * 3.78).clamp(1.0, 12.0);
+    // Screen emphasis, independent of zoom; stored millimetres and plot output are unchanged.
+    let w = (lw * 8.0).clamp(1.0, 12.0);
     (w > 1.0).then_some(w)
 }
 
@@ -200,9 +201,9 @@ fn premultiplied(c: Rgb, a: u8) -> [u8; 4] {
 /// Convert a display list into vertex data relative to `origin`, colours resolved against `bg`.
 pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) -> MeshData {
     let mut m = MeshData {
-        lines: Vec::with_capacity(list.segment_count().saturating_mul(2 * VERTEX_SIZE)),
+        lines: Vec::new(),
         tris: Vec::with_capacity(list.tris.len().saturating_mul(VERTEX_SIZE)),
-        quads: Vec::new(),
+        quads: Vec::with_capacity(list.segment_count().saturating_mul(INSTANCE_SIZE)),
         breaks: Vec::new(),
         uploaded: None,
         parts: Vec::new(),
@@ -211,23 +212,15 @@ pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) ->
         let col = premultiplied(prim.display_rgb(bg), prim.alpha());
         let pts = list.points(prim);
         match prim.kind {
-            Kind::Polyline => match wide_width(prim.lw, lwdisplay) {
-                Some(w) => {
-                    for s in pts.windows(2) {
-                        if let [a, b] = s {
-                            push_instance(&mut m.quads, rel(*a, origin), rel(*b, origin), col, w, 0.0);
-                        }
+            Kind::Polyline => {
+                // Hairlines also use the coverage shader: hardware LineList has jagged edges.
+                let w = wide_width(prim.lw, lwdisplay).unwrap_or(1.0);
+                for s in pts.windows(2) {
+                    if let [a, b] = s {
+                        push_instance(&mut m.quads, rel(*a, origin), rel(*b, origin), col, w, 0.0);
                     }
                 }
-                None => {
-                    for s in pts.windows(2) {
-                        if let [a, b] = s {
-                            push_vertex(&mut m.lines, rel(*a, origin), col);
-                            push_vertex(&mut m.lines, rel(*b, origin), col);
-                        }
-                    }
-                }
-            },
+            }
             Kind::Tris => {
                 for t in pts.as_chunks::<3>().0 {
                     for q in t {
@@ -471,6 +464,8 @@ struct VOut {
     @location(0) color: vec4<f32>,
     // Device pixels along a wide line from its start (dashing).
     @location(1) along: f32,
+    @location(2) local: vec2<f32>,
+    @location(3) @interpolate(flat) shape: vec2<f32>, // length, half width; negative width = fill
 };
 
 fn to_px(p: vec2<f32>) -> vec2<f32> {
@@ -500,6 +495,8 @@ fn vs_line(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>) -> VOut {
     o.pos = px_to_clip(to_px(pos));
     o.color = out_color(color);
     o.along = 0.0;
+    o.local = vec2<f32>(0.0);
+    o.shape = vec2<f32>(0.0, -1.0);
     return o;
 }
 
@@ -525,11 +522,15 @@ fn vs_quad(
     let hw = 0.5 * width * view.c.x;
     let t = select(0.0, 1.0, vi == 1u || vi == 4u || vi == 5u);
     let s = select(-1.0, 1.0, vi == 2u || vi == 3u || vi == 5u);
-    let along = mix(pa - dir * hw, pb + dir * hw, t);
+    // One device pixel of coverage fringe, including rounded end caps and joins.
+    let extent = hw + 1.0;
+    let x = mix(-extent, len + extent, t);
     var o: VOut;
-    o.pos = px_to_clip(along + n * hw * s);
+    o.pos = px_to_clip(pa + dir * x + n * extent * s);
     o.color = out_color(color);
-    o.along = start * view.a.z + mix(-hw, len + hw, t);
+    o.along = start * view.a.z + x;
+    o.local = vec2<f32>(x, extent * s);
+    o.shape = vec2<f32>(len, hw);
     return o;
 }
 
@@ -541,7 +542,13 @@ fn fs_main(v: VOut) -> @location(0) vec4<f32> {
             discard;
         }
     }
-    return v.color;
+    if (v.shape.y < 0.0) {
+        return v.color;
+    }
+    let nearest = vec2<f32>(clamp(v.local.x, 0.0, v.shape.x), 0.0);
+    let distance = length(v.local - nearest) - v.shape.y;
+    let coverage = clamp(0.5 - distance, 0.0, 1.0);
+    return v.color * coverage;
 }
 "#;
 
@@ -945,14 +952,14 @@ mod tests {
         let l = list();
         let origin = Vec2::new(1e6, 1e6);
         let m = build_mesh(&l, origin, Rgb(255, 255, 255), false);
-        assert_eq!(m.line_vertices(), 4, "two segments");
+        assert_eq!(m.line_vertices(), 0, "hairlines use the coverage shader");
         assert_eq!(m.tri_vertices(), 3);
-        assert_eq!(m.quad_instances(), 1, "the point marker");
+        assert_eq!(m.quad_instances(), 3, "two segments and the point marker");
         // First vertex is stored relative to the origin, so it's exactly zero.
-        assert_eq!(&m.lines[0..8], &[0u8; 8]);
+        assert_eq!(&m.quads[0..8], &[0u8; 8]);
         // Colour 7 on a white background inverts to black (display_rgb).
-        assert_eq!(&m.lines[8..12], &[0, 0, 0, 255]);
-        let x = f32::from_le_bytes([m.lines[12], m.lines[13], m.lines[14], m.lines[15]]);
+        assert_eq!(&m.quads[16..20], &[0, 0, 0, 255]);
+        let x = f32::from_le_bytes([m.quads[8], m.quads[9], m.quads[10], m.quads[11]]);
         assert_eq!(x, 1.0);
     }
 
@@ -998,7 +1005,7 @@ mod tests {
         }
         // Colour 7 on a black background is white: half of it, premultiplied.
         let m = build_mesh(&l, Vec2::ZERO, Rgb(0, 0, 0), false);
-        assert_eq!(&m.lines[8..12], &[128, 128, 128, 128]);
+        assert_eq!(&m.quads[16..20], &[128, 128, 128, 128]);
         assert_eq!(&m.tris[8..12], &[128, 128, 128, 128]);
         // A wipeout's mask stays opaque.
         if let Some(p) = l.prims.get_mut(1) {
@@ -1018,7 +1025,10 @@ mod tests {
         let m = build_mesh(&l, Vec2::ZERO, Rgb(0, 0, 0), true);
         assert_eq!(m.line_vertices(), 0);
         assert_eq!(m.quad_instances(), 3);
-        assert_eq!(wide_width(0.25, true), None, "thin lineweights stay hairlines");
+        assert_eq!(wide_width(0.25, true), Some(2.0));
+        assert_eq!(wide_width(0.5, true), Some(4.0));
+        assert_eq!(wide_width(f32::NAN, true), None);
+        assert_eq!(wide_width(f32::INFINITY, true), None);
         assert_eq!(wide_width(0.7, false), None);
     }
 
@@ -1059,10 +1069,10 @@ mod tests {
         let bg = Rgb(10, 20, 30);
         let m = build_mesh(&l, Vec2::ZERO, bg, false);
         // The polyline's two segments come before the mask; the point marker after it.
-        assert_eq!(m.breaks, vec![[0, 4, 0]]);
+        assert_eq!(m.breaks, vec![[0, 0, 2]]);
         assert_eq!(m.tri_vertices(), 3);
         assert_eq!(&m.tris[8..12], &[10, 20, 30, 255], "the mask takes the background colour");
-        assert_eq!(m.quad_instances(), 1);
+        assert_eq!(m.quad_instances(), 3);
     }
 
     #[test]

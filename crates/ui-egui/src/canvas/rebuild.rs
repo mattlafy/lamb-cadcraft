@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(built.list.verts, sync.verts);
         let Some(mesh) = built.mesh else { panic!("no mesh") };
         assert_eq!(mesh.bg, Rgb(0, 0, 0));
-        assert!(mesh.data.line_vertices() >= 2);
+        assert!(mesh.data.quad_instances() >= 1);
     }
 
     #[test]
