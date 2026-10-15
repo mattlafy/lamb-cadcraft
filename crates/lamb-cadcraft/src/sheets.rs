@@ -157,6 +157,47 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
     Ok(handles)
 }
 
+/// Every view's sheet reference at once: `(view, n, layout)` for each view some single-view
+/// viewport shows, `n` that viewport's 1-based position (by viewport `id`) among its layout's
+/// single-view viewports, the first layout by name winning. `view_blocks` is every LAMB view with
+/// its block name. A viewport shows exactly one view when exactly one view block is absent from its
+/// `frozen_layers` (how [`create_sheet`] builds them); assembly viewports freeze every view and
+/// take no number.
+pub fn sheet_refs(d: &Drawing, view_blocks: &[(Id, String)]) -> Vec<(Id, usize, String)> {
+    let mut layouts: Vec<&Layout> = d.layouts.iter().collect();
+    layouts.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out: Vec<(Id, usize, String)> = Vec::new();
+    for l in layouts {
+        let mut vps: Vec<&Viewport> = l
+            .entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Viewport(vp) => Some(vp),
+                _ => None,
+            })
+            .collect();
+        vps.sort_by_key(|vp| vp.id);
+        let mut n = 0;
+        for vp in vps {
+            let mut shown = view_blocks.iter().filter(|(_, b)| !vp.frozen_layers.iter().any(|f| f.eq_ignore_ascii_case(b)));
+            let (Some((view, _)), None) = (shown.next(), shown.next()) else { continue };
+            n += 1;
+            if !out.iter().any(|(v, _, _)| v == view) {
+                out.push((*view, n, l.name.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// The sheet showing `view`: `(n, layout)` as [`sheet_refs`] numbers it, `None` when no sheet
+/// (or an unreadable LAMB document) shows it.
+pub fn view_sheet_ref(d: &Drawing, view: Id) -> Option<(usize, String)> {
+    let doc = read_document(d).ok()?;
+    let blocks: Vec<(Id, String)> = doc.views.iter().map(|v| (v.id(), view_block_name(v.id()))).collect();
+    sheet_refs(d, &blocks).into_iter().find(|(v, _, _)| *v == view).map(|(_, n, l)| (n, l))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +264,25 @@ mod tests {
         check(s.doc()?)?;
         let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes())?;
         check(&back)?;
+        Ok(())
+    }
+
+    #[test]
+    fn view_sheet_ref_numbers_single_view_viewports_and_skips_assembly_ones() -> R {
+        let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
+        let detail = views(&s)?.iter().find(|v| !v.1).ok_or("no detail")?.0;
+        assert_eq!(view_sheet_ref(s.doc()?, detail), None, "on no sheet");
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        s.execute("newsheet", &json!({ "name": "S2", "assemblyIds": [plan.0] }))?;
+        assert_eq!((view_sheet_ref(s.doc()?, detail), view_sheet_ref(s.doc()?, plan)), (None, None), "assembly viewports show no view");
+
+        s.execute("newsheet", &json!({ "name": "S3", "viewIds": [plan.0, detail.0], "assemblyIds": [plan.0] }))?;
+        assert_eq!(view_sheet_ref(s.doc()?, plan), Some((1, "S3".to_owned())));
+        assert_eq!(view_sheet_ref(s.doc()?, detail), Some((2, "S3".to_owned())));
+        // An earlier name wins; numbering is per layout.
+        s.execute("newsheet", &json!({ "name": "S1", "viewIds": [detail.0] }))?;
+        assert_eq!(view_sheet_ref(s.doc()?, detail), Some((1, "S1".to_owned())));
+        assert_eq!(view_sheet_ref(s.doc()?, plan), Some((1, "S3".to_owned())));
         Ok(())
     }
 }

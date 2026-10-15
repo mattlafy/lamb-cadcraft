@@ -1,7 +1,8 @@
 //! Detail-tag bubbles (LAMB's `docs/07-architecture/cadcraft-integration.md` §9, LAMB T395): a
 //! detail tag is a leader ([`crate::detailtags`]) plus a bubble — an `Insert` of the shared block
 //! [`BUBBLE_BLOCK`] at the leader's last vertex, on the leader's layer, with a `DETAIL` attribute
-//! holding the detail view's name (`?` when that view is gone) and a `SHEET` attribute (empty).
+//! holding the detail view's name (`?` when that view is gone) and a `SHEET` attribute naming the
+//! sheet that shows the detail (`<n>/<layout>`, [`crate::sheets::sheet_refs`]; empty when none).
 //! DXF/DWG see an ordinary callout.
 //!
 //! Nothing links a bubble to its leader: a bubble belongs to the tag leader whose last vertex
@@ -15,9 +16,10 @@ use cadcraft_doc::{Attrib, Block, Circle, Common, Drawing, Entity, EntityKind, H
 use cadcraft_engine::Session;
 use cadcraft_geom::Vec3;
 use lamb_core::geometry::tolerance::TOLERANCE;
-use lamb_core::model::AnyView;
+use lamb_core::model::{AnyView, Id};
 
 use crate::schema::{read_document, read_entity_data, view_block_name};
+use crate::sheets::sheet_refs;
 
 /// The bubble block's name; one definition per drawing.
 pub const BUBBLE_BLOCK: &str = "LAMB_DTAG";
@@ -113,6 +115,9 @@ type Plan = Vec<(String, Vec<Handle>, Vec<Wanted>)>;
 fn plan(d: &Drawing) -> Result<Plan, String> {
     let doc = read_document(d).map_err(|e| e.to_string())?;
     let name_of = |id| doc.views.iter().find(|v| matches!(v, AnyView::Detail(_)) && v.id() == id).map(|v| v.name().to_owned());
+    let blocks: Vec<(Id, String)> = doc.views.iter().map(|v| (v.id(), view_block_name(v.id()))).collect();
+    let refs = sheet_refs(d, &blocks);
+    let sheet_of = |id: Id| refs.iter().find(|(v, _, _)| *v == id).map_or_else(String::new, |(_, n, l)| format!("{n}/{l}"));
     let mut out = Vec::new();
     for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_))) {
         let block_name = view_block_name(v.id());
@@ -123,7 +128,8 @@ fn plan(d: &Drawing) -> Result<Plan, String> {
             let Some(tag) = read_entity_data(&e.common).map_err(|e| e.to_string())?.detail_tag else { continue };
             let Some(&at) = l.vertices.last() else { continue };
             let detail = name_of(tag.detail_view_id).unwrap_or_else(|| "?".into());
-            wanted.push(Wanted { at, layer: e.common.layer.clone(), detail, sheet: String::new() });
+            let sheet = sheet_of(tag.detail_view_id);
+            wanted.push(Wanted { at, layer: e.common.layer.clone(), detail, sheet });
         }
         let mut remove = Vec::new();
         for e in block.entities.iter() {
@@ -338,6 +344,33 @@ mod tests {
             })
             .collect();
         assert_eq!(ins, [("D1".to_owned(), String::new())]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_sheet_attribute_names_the_sheet_showing_the_detail() -> R {
+        let (mut s, plan, detail) = room()?;
+        tag(&mut s, detail, (2500.0, 0.0))?;
+        let sheet = |s: &Session| -> T<Vec<String>> { Ok(bubbles(s, plan)?.into_iter().map(|b| b.4).collect()) };
+
+        let n = undo_len(&s)?;
+        s.execute("newsheet", &json!({ "name": "A501", "viewIds": [plan.0, detail.0] }))?;
+        assert_eq!((sheet(&s)?, undo_len(&s)?), (vec!["2/A501".to_owned()], n + 1), "in NEWSHEET's own undo step");
+        s.undo()?;
+        assert_eq!(sheet(&s)?, [""]);
+        s.redo()?;
+        assert_eq!(sheet(&s)?, ["2/A501"]);
+
+        let out = s.execute("newsheet", &json!({ "name": "A100", "viewIds": [detail.0] }))?;
+        assert_eq!(sheet(&s)?, ["1/A100"], "name order wins");
+        let vp = out["viewports"][0].as_str().ok_or("no viewport")?.to_owned();
+        s.execute("erase", &json!({ "handles": [vp] }))?;
+        assert_eq!(sheet(&s)?, ["2/A501"], "falls back when A100's viewport goes");
+
+        let before = bubbles(&s, plan)?;
+        let n = undo_len(&s)?;
+        s.execute("line", &json!({ "points": [[9000, 9000], [9500, 9000]] }))?;
+        assert_eq!((bubbles(&s, plan)?, undo_len(&s)?), (before, n + 1), "an unrelated command changes no bubble");
         Ok(())
     }
 
