@@ -285,4 +285,130 @@ mod tests {
         assert_eq!(view_sheet_ref(s.doc()?, plan), Some((1, "S3".to_owned())));
         Ok(())
     }
+
+    /// The objects of an uncompressed PDF by number (`crates/io/tests/pdf_layers.rs`'s helper).
+    fn pdf_objects(bytes: &[u8]) -> T<Vec<(usize, String)>> {
+        assert!(bytes.starts_with(b"%PDF-1."), "not a PDF");
+        let text: String = bytes.iter().map(|b| if b.is_ascii() { char::from(*b) } else { '?' }).collect();
+        let sx = text
+            .rfind(
+                "startxref
+",
+            )
+            .ok_or("no startxref")?;
+        let xref: usize = text[sx + 10..].lines().next().ok_or("no xref offset")?.trim().parse()?;
+        let mut lines = text[xref..].lines().skip(1);
+        let count: usize = lines.next().ok_or("no xref")?.split_whitespace().nth(1).ok_or("no count")?.parse()?;
+        let mut out = Vec::new();
+        for (i, e) in lines.take(count).enumerate().skip(1) {
+            let off: usize = e[..10].parse()?;
+            let body = &text[off
+                + format!(
+                    "{i} 0 obj
+"
+                )
+                .len()..];
+            out.push((
+                i,
+                body[..body
+                    .find(
+                        "
+endobj
+",
+                    )
+                    .ok_or("no endobj")?]
+                    .to_owned(),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Plots layout `sheet` uncompressed and returns, per optional content group (by layer name)
+    /// whose marked content holds a path operator, the number of path operators.
+    fn plotted_groups(d: &Drawing, sheet: &str) -> T<Vec<(String, usize)>> {
+        let bytes = cadcraft_io::plot(d, &Space::Paper(sheet.into()), &json!({ "compress": false }))?;
+        let objs = pdf_objects(&bytes)?;
+        let object = |n: usize| objs.iter().find(|(i, _)| *i == n).map(|(_, b)| b.as_str()).ok_or("no object");
+        let reference = |dict: &str, key: &str| -> T<usize> {
+            let i = dict.find(&format!("{key} ")).ok_or("no key")? + key.len() + 1;
+            Ok(dict[i..].split_whitespace().next().ok_or("no ref")?.parse()?)
+        };
+        let page = objs.iter().find(|(_, b)| b.starts_with("<< /Type /Page ")).ok_or("no page")?.1.as_str();
+        let content = object(reference(page, "/Contents")?)?;
+        let mut out: Vec<(String, usize)> = Vec::new();
+        let mut group: Option<String> = None;
+        for line in content.lines() {
+            if let Some(tag) = line.strip_prefix("/OC /").and_then(|r| r.strip_suffix(" BDC")) {
+                let ocg = object(reference(page, &format!("/{tag}"))?)?;
+                let name = ocg.strip_prefix("<< /Type /OCG /Name (").and_then(|r| r.strip_suffix(") >>")).ok_or("not an OCG")?;
+                group = Some(name.to_owned());
+            } else if line == "EMC" {
+                group = None;
+            } else if let Some(g) = &group
+                && matches!(line.rsplit(' ').next(), Some("m" | "l" | "c"))
+            {
+                match out.iter_mut().find(|(n, _)| n == g) {
+                    Some((_, k)) => *k += 1,
+                    None => out.push((g.clone(), 1)),
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn phase_9_gate_assembly_sheet_plots_and_wallfit_clears_the_conflict() -> R {
+        let (mut s, plan) = room_with("exterior_face", true, 210.0)?;
+        crate::maintain::install(&mut s);
+        let conflicts = |s: &mut Session| -> T<usize> {
+            Ok(s.execute("wallconflicts", &json!({ "viewId": plan.0 }))?["conflicts"].as_array().ok_or("no list")?.len())
+        };
+        assert!(conflicts(&mut s)? >= 1, "a 210 mm wall against a 200 mm detail");
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        s.execute("newsheet", &json!({ "name": "A501", "assemblyIds": [plan.0] }))?;
+        // The assembly block's lines keep their own layers, so they plot in the bands' groups;
+        // the sheet's viewport freezes every view block, so only the assembly can supply them.
+        // Four runs: one CLAD and two GYP lines each (a move and a line apiece).
+        let bands = |d: &Drawing| -> T<(usize, usize)> {
+            let g = plotted_groups(d, "A501")?;
+            let n = |name: &str| g.iter().find(|(n, _)| n == name).map_or(0, |(_, k)| *k);
+            Ok((n("CLAD"), n("GYP")))
+        };
+        assert_eq!(bands(s.doc()?)?, (8, 16));
+        // The block's lines, and what the plan derives now: the observer keeps them equal.
+        let block = |s: &Session| -> T<Vec<[f64; 4]>> {
+            let b = s.doc()?.block(&assembly_block_name(plan)).ok_or("no assembly block")?;
+            let mut v: Vec<[f64; 4]> = b
+                .entities
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    EntityKind::Line(l) => Some([l.a.x, l.a.y, l.b.x, l.b.y]),
+                    _ => None,
+                })
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            Ok(v)
+        };
+        let derived = |s: &Session| -> T<Vec<[f64; 4]>> {
+            let runs = crate::assembly::assembly_lines(s.doc()?, plan)?;
+            let mut v: Vec<[f64; 4]> = runs.iter().flat_map(|r| r.lines.iter().map(|l| [l.from.x, l.from.y, l.to.x, l.to.y])).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            Ok(v)
+        };
+        assert_eq!(block(&s)?, derived(&s)?);
+        let before = block(&s)?;
+
+        let n = undo_len(&s)?;
+        s.execute("wallfit", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "WALLFIT is one undo step");
+        assert_eq!(conflicts(&mut s)?, 0);
+        assert_eq!(block(&s)?, derived(&s)?, "the assembly block follows the fitted plan");
+        assert_ne!(block(&s)?, before, "the bands now span the fitted runs");
+        assert_eq!(bands(s.doc()?)?, (8, 16));
+
+        s.execute("undo", &json!({}))?;
+        assert!(conflicts(&mut s)? >= 1, "undo brings the conflict back");
+        assert_eq!(block(&s)?, before);
+        Ok(())
+    }
 }
