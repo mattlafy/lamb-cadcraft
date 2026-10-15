@@ -201,3 +201,44 @@ fn json_forms_take_fence_crossing_edge_mode_and_mode() {
     assert_eq!(r["extended"], 1);
     assert_eq!(lines(&s), vec![((0.0, 0.0), (10.0, 0.0)), ((10.0, -5.0), (10.0, 5.0))]);
 }
+
+/// The horizontal line at height `y`.
+fn line_at(s: &Session, y: f64) -> cadcraft_engine::doc::Handle {
+    s.doc().unwrap().model.iter().find(|e| matches!(&e.kind, EntityKind::Line(l) if l.a.y == y && l.b.y == y)).unwrap().handle
+}
+
+/// What the rollover highlight shows of `h` with the cursor at `at`, as lines.
+fn highlight(s: &Session, h: cadcraft_engine::doc::Handle, at: (f64, f64)) -> Option<Vec<Seg>> {
+    let ents = s.highlight(h, cadcraft_engine::geom::Vec2::new(at.0, at.1))?;
+    Some(
+        ents.iter()
+            .filter_map(|e| if let EntityKind::Line(l) = &e.kind { Some(((r(l.a.x), r(l.a.y)), (r(l.b.x), r(l.b.y)))) } else { None })
+            .map(|(a, b)| if (a.0, a.1) <= (b.0, b.1) { (a, b) } else { (b, a) })
+            .collect(),
+    )
+}
+
+#[test]
+fn trim_highlights_only_the_piece_a_pick_removes() {
+    // #1118: the rollover highlight at "Select object to trim" shows what a click there removes.
+    let mut s = ladder();
+    s.cmdline("LINE 20,20 25,20").unwrap();
+    s.cmdline("").unwrap();
+    s.cmdline("TRIM").unwrap();
+    let before = lines(&s);
+    let h = line_at(&s, 0.0);
+    assert_eq!(highlight(&s, h, (12.0, 0.0)), Some(vec![((10.0, 0.0), (15.0, 0.0))]));
+    assert_eq!(highlight(&s, h, (5.0, 0.0)), Some(vec![((0.0, 0.0), (10.0, 0.0))]));
+    // No cutting edge crosses it: Quick mode erases the whole object.
+    let lone = line_at(&s, 20.0);
+    assert_eq!(highlight(&s, lone, (22.0, 20.0)), Some(vec![((20.0, 20.0), (25.0, 20.0))]));
+    assert_eq!(lines(&s), before, "the highlight leaves the drawing alone");
+    // EXTEND shows the object as the click leaves it.
+    let mut s = session(&["10,-5 10,5", "0,0 4,0"]);
+    s.cmdline("EXTEND").unwrap();
+    let h = line_at(&s, 0.0);
+    assert_eq!(highlight(&s, h, (3.0, 0.0)), Some(vec![((0.0, 0.0), (10.0, 0.0))]));
+    // Elsewhere the whole object is highlighted, as before.
+    s.cmdline("").unwrap();
+    assert_eq!(highlight(&s, h, (3.0, 0.0)), None);
+}
