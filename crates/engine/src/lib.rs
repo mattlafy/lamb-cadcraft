@@ -1420,6 +1420,15 @@ impl Session {
         kinds.into_iter().map(|k| Entity { handle: Handle(0), common: common.clone(), kind: k }).collect()
     }
 
+    /// What the rollover highlight shows of the object `h` under the cursor, with its
+    /// properties, when the active command highlights a part of it (see
+    /// [`Interactive::highlight`]); `None`: the whole object.
+    pub fn highlight(&self, h: Handle, cursor: Vec2) -> Option<Vec<Entity>> {
+        let kinds = self.running.as_ref()?.machine.highlight(self, h, cursor)?;
+        let common = self.doc().ok()?.entity(h)?.common.clone();
+        Some(kinds.into_iter().map(|k| Entity { handle: h, common: common.clone(), kind: k }).collect())
+    }
+
     /// The active command's preview as a transform of existing objects (see
     /// [`Interactive::drag`]), with its extra rubber-band geometry as entities.
     pub fn drag(&self, cursor: Vec2) -> Option<(Drag, Vec<Entity>)> {

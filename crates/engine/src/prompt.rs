@@ -209,6 +209,11 @@ pub trait Interactive: Send {
     fn preview(&self, _s: &Session, _cursor: Vec2) -> Vec<EntityKind> {
         Vec::new()
     }
+    /// What the rollover highlight shows of the object `h` under the cursor, when it is not the
+    /// whole object (TRIM: the piece a click there removes). `None`: the whole object.
+    fn highlight(&self, _s: &Session, _h: Handle, _cursor: Vec2) -> Option<Vec<EntityKind>> {
+        None
+    }
     /// The preview as existing objects under one transform, when it is that (MOVE, COPY,
     /// ROTATE, SCALE). The UI then draws them from geometry uploaded once instead of rebuilding
     /// the transformed copies every frame; `None` falls back to [`Interactive::preview`].
