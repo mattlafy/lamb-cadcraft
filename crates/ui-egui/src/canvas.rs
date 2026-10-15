@@ -12,6 +12,10 @@ use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
 use crate::CadApp;
 use crate::theme::Tokens;
 
+/// How far (screen points) the mouse may travel between button down and up for the press to
+/// still count as a click rather than the start of a selection window (about PICKBOX).
+const CLICK_SLOP_PX: f32 = 10.0;
+
 /// World ↔ screen transform for the canvas rect.
 #[derive(Clone, Copy, Debug)]
 pub struct Xf {
@@ -1587,6 +1591,19 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         if app.session.pending_window.is_some()
             && let Some(end) = ui.input(|i| i.pointer.interact_pos())
         {
+            // A button that comes up within CLICK_SLOP_PX of where it went down is a click made
+            // while the mouse was still moving (egui calls anything past ~6 px a drag): pick at
+            // the spot where the button went down instead of closing a window the size of a
+            // smudge (#1001). The window's corner is where the button went down (egui has
+            // cleared `press_origin` by now).
+            let origin = app.session.pending_window.as_ref().map(|w| w.corner);
+            let end = match origin {
+                Some(o) if (end - xf.to_screen(o)).length() <= CLICK_SLOP_PX => {
+                    app.session.pending_window = None;
+                    xf.to_screen(o)
+                }
+                _ => end,
+            };
             let end = xf.to_world(end);
             let done = if app.session.prompting() { app.session.input(Input::Point(end)) } else { app.session.idle_click(end, mods.shift) };
             if let Err(e) = done {
