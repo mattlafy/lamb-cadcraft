@@ -326,7 +326,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     app.canvas.job = None;
     let t0 = crate::now_ms();
     let opts = cadcraft_render::Options {
-        tolerance: 2f64.powi(band(px)) * 0.5,
+        tolerance: 2f64.powi(band(px)) * 0.15,
         // Two pixels at the band's finest zoom: the list serves every zoom in the band, so its
         // level of detail must hold at the finest one.
         min_dash: 2f64.powi(lod_band) * 2.0,
@@ -814,7 +814,7 @@ pub(crate) fn draw_list(p: &egui::Painter, xf: &Xf, list: &DisplayList, bg: Rgb,
                 if !bb.intersects(&vis) {
                     continue;
                 }
-                let w = if lwdisplay && prim.lw > 0.0 { (prim.lw * 3.78).clamp(1.0, 12.0) } else { 1.0 };
+                let w = crate::gpu::wide_width(prim.lw, lwdisplay).unwrap_or(1.0);
                 // Skip sub-pixel objects except as a dot.
                 if bb.width() < px && bb.height() < px {
                     shapes.push(Shape::rect_filled(Rect::from_center_size(xf.to_screen(bb.center()), vec2(1.0, 1.0)), 0.0, col));
@@ -2536,8 +2536,8 @@ pub(crate) mod tests {
         let mut alpha = |transparency: bool| {
             draw_drag_gpu(&mut c, &painter, &xf, &d, &drag, (&[], 0), Rgb(0, 0, 0), transparency);
             let mesh = c.drag_slot.lock().unwrap().take().unwrap();
-            // The first line vertex's colour alpha (after its 2 × f32 position).
-            mesh.lines[11]
+            // The first stroke instance's colour alpha (after its two 2 × f32 endpoints).
+            mesh.quads[19]
         };
         assert_eq!(alpha(true), 128);
         assert_eq!(alpha(false), 255);

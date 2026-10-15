@@ -68,3 +68,10 @@ Generated-in-code assets are original and have no file to list:
 | `crates/ui-egui/src/i18n/it.tsv` | Emanuele Bottelli (AI-assisted) | Original Italian translations of CADCraft English strings | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) | No proprietary localization resources copied |
 | `crates/ui-egui/src/i18n/ko.tsv` | @huk082 (AI-assisted) | Original Korean translations of CADCraft English strings | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) | No proprietary localization resources copied; no font assets added |
 | `crates/ui-egui/src/i18n/ar.tsv` | @hasan-sdaif | Original Arabic translations of CADCraft English strings | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) | No proprietary localization resources copied |
+
+## Rendering review screenshots
+
+| Asset | Author | Source | Licence | Notes |
+|---|---|---|---|---|
+| `docs/screenshots/screen-strokes-before.png` | CADCraft contributors; @Blade-Punisher (capture) | Native CADCraft GPU screenshot via its control API, main e707ab4 | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) | Original synthetic drawing; no proprietary assets |
+| `docs/screenshots/screen-strokes-after.png` | CADCraft contributors; @Blade-Punisher (capture) | Native CADCraft GPU screenshot via its control API, proposed screen-stroke changes | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) | Same original synthetic drawing and view as before |
