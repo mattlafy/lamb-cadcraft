@@ -205,6 +205,9 @@ pub struct Options {
     pub min_dash: f64,
     /// Draw text (off for very coarse previews).
     pub text: bool,
+    /// Draw lines with their linetypes; off, every line is drawn whole and continuous (as
+    /// picking sees it).
+    pub linetypes: bool,
     /// Highlighted (selected) handles are not special here; the canvas overlays them.
     pub fill: bool,
     pub lineweights: bool,
@@ -242,6 +245,7 @@ impl Default for Options {
             tolerance: 0.001,
             min_dash: 0.0,
             text: true,
+            linetypes: true,
             fill: true,
             lineweights: false,
             view_height: 0.0,
@@ -1065,7 +1069,7 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     let tol = b.opts.tolerance / ctx.xf.scale_factor().max(1e-12);
     let lw = if b.opts.lineweights { lw } else { 0.0 };
     // Stroke a polyline with the entity's linetype.
-    let stroke = |b: &mut Builder, pts: &[Vec2]| match &lt {
+    let stroke = |b: &mut Builder, pts: &[Vec2]| match lt.as_ref().filter(|_| b.opts.linetypes) {
         Some(lt) => {
             let min = b.opts.min_dash / ctx.xf.scale_factor().max(1e-12);
             for dash in linetype::apply(pts, lt, ltscale, min) {
@@ -1124,7 +1128,7 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
         EntityKind::MLine(m) => mline::draw(b, ctx, e, m, rgb, lw, tol),
         EntityKind::LwPolyline(p) if p.const_width > 0.0 || p.vertices.iter().any(|v| v.start_width > 0.0 || v.end_width > 0.0) => {
             if b.opts.fill && ctx.d.header.i64("FILLMODE", 1) != 0 {
-                match &lt {
+                match lt.as_ref().filter(|_| b.opts.linetypes) {
                     // Dashed: each dash a filled piece of the band; dots a line across it.
                     Some(lt) => {
                         let min = b.opts.min_dash / ctx.xf.scale_factor().max(1e-12);
@@ -1367,7 +1371,7 @@ pub fn dimension_in(d: &Drawing, dm: &cadcraft_doc::Dimension) -> DimGeometry {
 
 /// Draw a polyline with a linetype (None: continuous).
 fn stroke_with(b: &mut Builder, ctx: &Ctx, rgb: Ink, lw: f32, lt: Option<&cadcraft_doc::Linetype>, ltscale: f64, pts: &[Vec2]) {
-    match lt {
+    match lt.filter(|_| b.opts.linetypes) {
         Some(lt) => {
             let min = b.opts.min_dash / ctx.xf.scale_factor().max(1e-12);
             for dash in linetype::apply(pts, lt, ltscale, min) {
