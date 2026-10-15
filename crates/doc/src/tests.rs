@@ -96,6 +96,8 @@ fn visible_attributes_of_a_missing_block_still_count() {
             style: "Standard".into(),
             halign: HAlign::Left,
             valign: VAlign::Baseline,
+            backwards: false,
+            upside_down: false,
         },
         invisible,
         constant: false,
@@ -434,6 +436,8 @@ fn attdef_in_block_is_ignored_in_insert_extents() {
                 style: "Standard".into(),
                 halign: HAlign::Left,
                 valign: VAlign::Baseline,
+                backwards: false,
+                upside_down: false,
             },
             invisible: false,
             constant: false,
@@ -459,6 +463,8 @@ fn text_kind(value: &str) -> EntityKind {
         style: "Standard".into(),
         halign: HAlign::Left,
         valign: VAlign::Baseline,
+        backwards: false,
+        upside_down: false,
     })
 }
 

@@ -591,6 +591,8 @@ fn sample(d: &Drawing, style: &TextStyle, w: u32, h: u32, dark: bool) -> Option<
             style: "Preview".into(),
             halign: Default::default(),
             valign: Default::default(),
+            backwards: style.backwards,
+            upside_down: style.upside_down,
         };
         doc.add(&Space::Model, Common::default(), EntityKind::Text(text)).ok()?;
     }
