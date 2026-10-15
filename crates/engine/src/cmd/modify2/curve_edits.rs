@@ -10,6 +10,7 @@ use cadcraft_geom::{
 };
 
 use super::{LenMode, curves, ellipse_kind, ellipse_of, other, set_kind};
+use crate::cmd::modify::Trimmed;
 use crate::{Result, Session};
 
 /// EXTEND a spline's end nearest `pick` along its end tangent to the nearest boundary edge.
@@ -36,7 +37,7 @@ pub(super) fn extend_spline(sp: &Spline, cut: &[Segment], pick: Vec2) -> Result<
 
 /// TRIM a closed spline at the hits `ts` (sorted parameters) around the pick parameter `tp`:
 /// the piece between the two hits around the pick goes, the rest stays as one open spline.
-pub(super) fn trim_closed_spline(sp: &Spline, ts: &[f64], tp: f64) -> Result<Vec<EntityKind>> {
+pub(super) fn trim_closed_spline(sp: &Spline, ts: &[f64], tp: f64) -> Result<Trimmed> {
     let (Some(&first), Some(&last)) = (ts.first(), ts.last()) else {
         return Err(other("Spline must intersect cutting edges at two or more points."));
     };
@@ -45,19 +46,22 @@ pub(super) fn trim_closed_spline(sp: &Spline, ts: &[f64], tp: f64) -> Result<Vec
     }
     let fail = || other("Cannot trim that spline.");
     let (lo_d, hi_d) = sp.domain();
-    let kept = if tp > first && tp < last {
+    let (kept, gone) = if tp > first && tp < last {
         // The removed piece lies inside the domain: keep the run from the next hit round the
         // seam to the previous one.
         let lo = ts.iter().copied().filter(|t| *t < tp).fold(first, f64::max);
         let hi = ts.iter().copied().filter(|t| *t > tp).fold(last, f64::min);
         let tail = sp.clamped().and_then(|c| c.sub_between(hi, hi_d)).ok_or_else(fail)?;
         let head = sp.clamped().and_then(|c| c.sub_between(lo_d, lo)).ok_or_else(fail)?;
-        tail.joined(&head).ok_or_else(fail)?
+        (tail.joined(&head).ok_or_else(fail)?, sp.sub_between(lo, hi))
     } else {
         // The removed piece crosses the seam.
-        sp.sub_between(first, last).ok_or_else(fail)?
+        let tail = sp.clamped().and_then(|c| c.sub_between(last, hi_d));
+        let head = sp.clamped().and_then(|c| c.sub_between(lo_d, first));
+        (sp.sub_between(first, last).ok_or_else(fail)?, tail.zip(head).and_then(|(t, h)| t.joined(&h)))
     };
-    Ok(vec![EntityKind::Spline(Spline { closed: false, ..kept })])
+    let gone = gone.map(|g| EntityKind::Spline(Spline { closed: false, ..g })).into_iter().collect();
+    Ok(Trimmed { keep: vec![EntityKind::Spline(Spline { closed: false, ..kept })], gone })
 }
 
 fn too_short() -> crate::EngineError {

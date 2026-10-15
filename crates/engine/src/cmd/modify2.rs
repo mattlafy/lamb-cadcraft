@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use super::curves::{self, Chain, MAX_GEN, TanObj};
 use super::helpers::*;
 use super::machines::{SelOutcome, SelectPhase, number};
+use super::modify::Trimmed;
 use super::*;
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
 
@@ -1920,7 +1921,7 @@ fn ellipse_samples(ge: &Ellipse) -> Vec<f64> {
 }
 
 /// Trim objects that modify.rs does not handle itself (ellipses and splines).
-pub(crate) fn trim_other(k: &EntityKind, cut: &[Segment], pick: Vec2) -> Result<Vec<EntityKind>> {
+pub(crate) fn trim_other(k: &EntityKind, cut: &[Segment], pick: Vec2) -> Result<Trimmed> {
     let none = || other("Object does not intersect a cutting edge.");
     match k {
         EntityKind::Ellipse(e) => {
@@ -1940,7 +1941,10 @@ pub(crate) fn trim_other(k: &EntityKind, cut: &[Segment], pick: Vec2) -> Result<
                 for i in 0..n {
                     let (Some(a0), Some(a1)) = (ps.get(i).copied(), ps.get((i + 1) % n).copied()) else { continue };
                     if cadcraft_geom::angle_in_sweep(tp, a0, a1) {
-                        return Ok(vec![ellipse_kind(&Ellipse { start: a1, end: a0, ..ge })]);
+                        return Ok(Trimmed {
+                            keep: vec![ellipse_kind(&Ellipse { start: a1, end: a0, ..ge })],
+                            gone: vec![ellipse_kind(&Ellipse { start: a0, end: a1, ..ge })],
+                        });
                     }
                 }
                 return Err(none());
@@ -1962,7 +1966,8 @@ pub(crate) fn trim_other(k: &EntityKind, cut: &[Segment], pick: Vec2) -> Result<
             if hi < sweep {
                 v.push(ellipse_kind(&Ellipse { start: norm_angle(ge.start + hi), ..ge }));
             }
-            Ok(v)
+            let gone = ellipse_kind(&Ellipse { start: norm_angle(ge.start + lo), end: norm_angle(ge.start + hi), ..ge });
+            Ok(Trimmed { keep: v, gone: vec![gone] })
         }
         EntityKind::Spline(sp) => {
             if !sp.is_valid() {
@@ -1996,7 +2001,7 @@ pub(crate) fn trim_other(k: &EntityKind, cut: &[Segment], pick: Vec2) -> Result<
             {
                 v.push(EntityKind::Spline(b));
             }
-            Ok(v)
+            Ok(Trimmed { keep: v, gone: curves::sub_spline(sp, lo, hi).map(EntityKind::Spline).into_iter().collect() })
         }
         _ => Err(other("Cannot trim that object.")),
     }

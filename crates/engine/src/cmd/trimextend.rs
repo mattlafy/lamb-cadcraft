@@ -9,7 +9,7 @@ use cadcraft_geom::{Bounds2, Line, Vec2, line_line};
 use serde_json::{Value, json};
 
 use super::helpers::{line, lwpoly, rect_vertices};
-use super::modify::{Edges, extend, trim};
+use super::modify::{Edges, extend, extended, trim, trimmed};
 use super::{bad, point_param, points_param};
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
 
@@ -48,6 +48,20 @@ fn apply(s: &mut Session, h: Handle, at: Vec2, extending: bool, edges: Edges, qu
             Ok(Vec::new())
         }
         r => r,
+    }
+}
+
+/// What a pick at `at` does to `h`, without doing it: the piece a trim removes (the whole object
+/// when a Quick-mode trim erases it), or the object as an extend leaves it. The rollover highlight
+/// shows it.
+fn change(s: &Session, h: Handle, at: Vec2, extending: bool, edges: Edges, quick: bool) -> Result<Vec<EntityKind>> {
+    if extending {
+        return Ok(vec![extended(s, h, at, edges)?]);
+    }
+    match trimmed(s, h, at, edges) {
+        Ok((_, t)) => Ok(t.gone),
+        Err(e) if quick && misses_edges(&e) => Ok(s.doc()?.entity(h).map(|e| e.kind.clone()).into_iter().collect()),
+        Err(e) => Err(e),
     }
 }
 
@@ -516,6 +530,16 @@ impl Interactive for TrimM {
                 _ => Ok(Step::Continue),
             },
         }
+    }
+    fn highlight(&self, s: &Session, h: Handle, cursor: Vec2) -> Option<Vec<EntityKind>> {
+        if self.stage != Stage::Pick {
+            return None;
+        }
+        let quick = quick_mode(s);
+        // Shift-select does the other one, as the click will.
+        let extending = self.extend != s.shift_pick;
+        let part = change(s, h, cursor, extending, self.edges(quick, edge_mode(s)), quick).ok()?;
+        (!part.is_empty()).then_some(part)
     }
     fn preview(&self, _s: &Session, c: Vec2) -> Vec<EntityKind> {
         match &self.stage {

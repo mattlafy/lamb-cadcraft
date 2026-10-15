@@ -857,14 +857,20 @@ fn prim_to_segments(p: &Prim) -> Vec<Segment> {
     }
 }
 
-/// Trim `h` at the piece containing `pick`. Returns the handles that replace it.
-pub(crate) fn trim(s: &mut Session, h: Handle, pick: Vec2, edges: Edges) -> Result<Vec<Handle>> {
+/// What a trim keeps of an object and what it removes.
+pub(crate) struct Trimmed {
+    pub keep: Vec<EntityKind>,
+    pub gone: Vec<EntityKind>,
+}
+
+/// The pieces a trim of `h` at `pick` keeps and removes, without changing the drawing.
+pub(crate) fn trimmed(s: &Session, h: Handle, pick: Vec2, edges: Edges) -> Result<(Entity, Trimmed)> {
     if super::curves::is_locked(s, h) {
         return Err(EngineError::Other("The object is on a locked layer.".into()));
     }
     let e = s.doc()?.entity(h).map(|e| (**e).clone()).ok_or_else(|| EngineError::Other("no such object".into()))?;
     let cut = edge_segments(s, edges, h)?;
-    let pieces: Vec<EntityKind> = match &e.kind {
+    let pieces = match &e.kind {
         EntityKind::Line(l) => {
             let ln = Line::new(l.a.xy(), l.b.xy());
             let mut ts: Vec<f64> = cut
@@ -887,7 +893,7 @@ pub(crate) fn trim(s: &mut Session, h: Handle, pick: Vec2, edges: Edges) -> Resu
             if hi < 1.0 {
                 v.push(line(ln.at(hi), ln.b));
             }
-            v
+            Trimmed { keep: v, gone: vec![line(ln.at(lo), ln.at(hi))] }
         }
         EntityKind::Arc(a) => {
             let ga = Arc::new(a.center.xy(), a.radius, a.start, a.end);
@@ -910,7 +916,7 @@ pub(crate) fn trim(s: &mut Session, h: Handle, pick: Vec2, edges: Edges) -> Resu
             if hi < sweep {
                 v.push(arc(&Arc::new(ga.center, ga.radius, ga.start + hi, ga.end)));
             }
-            v
+            Trimmed { keep: v, gone: vec![arc(&Arc::new(ga.center, ga.radius, ga.start + lo, ga.start + hi))] }
         }
         EntityKind::Circle(c) => {
             let full = Segment::Arc { arc: Arc { center: c.center.xy(), radius: c.radius, start: 0.0, end: TAU - 1e-12 }, ccw: true };
@@ -923,25 +929,34 @@ pub(crate) fn trim(s: &mut Session, h: Handle, pick: Vec2, edges: Edges) -> Resu
             let ap = c.center.xy().angle_to(pick);
             // The removed arc runs between the two intersections around the pick.
             let n = angs.len();
-            let mut keep = None;
+            let mut out = Trimmed { keep: Vec::new(), gone: Vec::new() };
             for i in 0..n {
                 let a0 = angs[i];
                 let a1 = angs[(i + 1) % n];
                 if angle_in_sweep(ap, a0, a1) {
-                    keep = Some(arc(&Arc::new(c.center.xy(), c.radius, a1, a0)));
+                    out = Trimmed {
+                        keep: vec![arc(&Arc::new(c.center.xy(), c.radius, a1, a0))],
+                        gone: vec![arc(&Arc::new(c.center.xy(), c.radius, a0, a1))],
+                    };
                 }
             }
-            keep.into_iter().collect()
+            out
         }
         EntityKind::LwPolyline(p) => trim_polyline(p, &cut, pick)?,
         k => super::modify2::trim_other(k, &cut, pick)?,
     };
+    Ok((e, pieces))
+}
+
+/// Trim `h` at the piece containing `pick`. Returns the handles that replace it.
+pub(crate) fn trim(s: &mut Session, h: Handle, pick: Vec2, edges: Edges) -> Result<Vec<Handle>> {
+    let (e, pieces) = trimmed(s, h, pick, edges)?;
     let common = e.common.clone();
     let space = s.space();
     let d = s.doc_mut()?;
     d.remove_entity(h);
     let mut out = Vec::new();
-    for k in pieces {
+    for k in pieces.keep {
         let nh = d.new_handle();
         if let Some(st) = d.space_mut(&space) {
             st.push(Entity { handle: nh, common: common.clone(), kind: k });
@@ -983,7 +998,7 @@ fn sub_polyline(segs: &[Segment], a: f64, b: f64) -> Vec<PolyVertex> {
     out
 }
 
-fn trim_polyline(p: &cadcraft_doc::LwPolyline, cut: &[Segment], pick: Vec2) -> Result<Vec<EntityKind>> {
+fn trim_polyline(p: &cadcraft_doc::LwPolyline, cut: &[Segment], pick: Vec2) -> Result<Trimmed> {
     let pl = Polyline { vertices: p.vertices.clone(), closed: p.closed };
     let segs = pl.segments();
     let total: f64 = segs.iter().map(Segment::len).sum();
@@ -1012,6 +1027,7 @@ fn trim_polyline(p: &cadcraft_doc::LwPolyline, cut: &[Segment], pick: Vec2) -> R
     let hi = ts.iter().copied().filter(|t| *t > tp).fold(f64::INFINITY, f64::min);
     let mk = |vs: Vec<PolyVertex>| lwpoly(vs, false);
     let mut out = Vec::new();
+    let mut gone = Vec::new();
     if p.closed {
         // Keep the complementary run from hi around to lo.
         // The pick lies before the first cut or after the last: the piece wraps past the start
@@ -1025,6 +1041,9 @@ fn trim_polyline(p: &cadcraft_doc::LwPolyline, cut: &[Segment], pick: Vec2) -> R
         // A single cut leaves the whole outline, opened there.
         if b <= a + 1e-9 {
             b += total;
+        } else {
+            let (g0, g1) = if lo < 0.0 { (lo + total, hi + total) } else { (lo, hi) };
+            gone.push(mk(sub_polyline(&doubled, g0, g1)));
         }
         out.push(mk(sub_polyline(&doubled, a, b)));
     } else {
@@ -1034,8 +1053,10 @@ fn trim_polyline(p: &cadcraft_doc::LwPolyline, cut: &[Segment], pick: Vec2) -> R
         if hi.is_finite() {
             out.push(mk(sub_polyline(&segs, hi, total)));
         }
+        gone.push(mk(sub_polyline(&segs, if lo.is_finite() { lo } else { 0.0 }, if hi.is_finite() { hi } else { total })));
     }
-    Ok(out.into_iter().filter(|k| matches!(k, EntityKind::LwPolyline(l) if l.vertices.len() >= 2)).collect())
+    let real = |v: Vec<EntityKind>| v.into_iter().filter(|k| matches!(k, EntityKind::LwPolyline(l) if l.vertices.len() >= 2)).collect();
+    Ok(Trimmed { keep: real(out), gone: real(gone) })
 }
 
 fn param_on(s: &Segment, p: Vec2) -> f64 {
@@ -1051,6 +1072,13 @@ fn param_on(s: &Segment, p: Vec2) -> f64 {
 
 /// Extend the end of `h` nearest `pick` to the nearest boundary edge.
 pub(crate) fn extend(s: &mut Session, h: Handle, pick: Vec2, edges: Edges) -> Result<()> {
+    let new_kind = extended(s, h, pick, edges)?;
+    s.doc_mut()?.modify_entity(h, |e| e.kind = new_kind)?;
+    Ok(())
+}
+
+/// The object `h` as an extend at `pick` leaves it, without changing the drawing.
+pub(crate) fn extended(s: &Session, h: Handle, pick: Vec2, edges: Edges) -> Result<EntityKind> {
     if super::curves::is_locked(s, h) {
         return Err(EngineError::Other("The object is on a locked layer.".into()));
     }
@@ -1107,8 +1135,7 @@ pub(crate) fn extend(s: &mut Session, h: Handle, pick: Vec2, edges: Edges) -> Re
         }
         k => super::modify2::extend_other(k, &cut, pick)?,
     };
-    s.doc_mut()?.modify_entity(h, |e| e.kind = new_kind)?;
-    Ok(())
+    Ok(new_kind)
 }
 
 // ---------------- fillet / chamfer ----------------
