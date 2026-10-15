@@ -19,7 +19,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-// module -> [doc line, items]; an item is a name or [first, last] (every item in between, inclusive).
+// module -> [doc line, items]; an item is a name, '?name' (optional: moved if present, else skipped),
+// or [first, last] (every item in between, inclusive).
 const MANIFEST = {
   list: [
     'The display list: building it for the view, and its primitives indexed by entity.',
@@ -141,6 +142,9 @@ for (const [mod, [, list]] of Object.entries(MANIFEST)) {
       for (let k = byName.get(a); k <= byName.get(b); k++) {
         if (items[k].kind !== 'impl') moduleOf.set(k, mod);
       }
+    } else if (entry.startsWith('?')) {
+      // Optional: an item only some trees have (a pending upstream PR adds it); skipped when absent.
+      if (byName.has(entry.slice(1))) moduleOf.set(byName.get(entry.slice(1)), mod);
     } else if (!byName.has(entry)) missing.push(entry);
     else moduleOf.set(byName.get(entry), mod);
   }
