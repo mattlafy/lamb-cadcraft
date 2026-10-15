@@ -642,6 +642,9 @@ pub struct Session {
     pub cursor_deferred: Option<snap::Deferred>,
     /// Origin of the point currently being fed by `input_snapped`; never reused by typed points.
     picked_viewport: Option<snap::ViewportPoint>,
+    /// Shift is held with the point being given ([`Session::with_shift`]): TRIM's
+    /// "shift-select to extend" and EXTEND's "shift-select to trim".
+    shift_pick: bool,
     /// The last drawing comparison (COMPARE), drawn over the drawing it was made for.
     pub compare: Option<cmd::file::compare::Comparison>,
     /// Object snap tracking: acquired points and the path under the cursor (from the UI's
@@ -703,6 +706,7 @@ impl Session {
             cursor: Vec2::ZERO,
             cursor_deferred: None,
             picked_viewport: None,
+            shift_pick: false,
             compare: None,
             tracking: snap::tracking::Tracker::default(),
             viewport_px: (1200.0, 800.0),
@@ -1023,6 +1027,15 @@ impl Session {
         let result = self.input(hit.input());
         self.picked_viewport = previous;
         result
+    }
+
+    /// Run `f` (which gives the running command its inputs) with Shift held or not, as a click
+    /// made with Shift.
+    pub fn with_shift<R>(&mut self, shift: bool, f: impl FnOnce(&mut Session) -> R) -> R {
+        let previous = std::mem::replace(&mut self.shift_pick, shift);
+        let r = f(self);
+        self.shift_pick = previous;
+        r
     }
 
     /// Give an input to the running command. With no command running, `Enter` repeats the last
