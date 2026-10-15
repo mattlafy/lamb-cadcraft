@@ -96,3 +96,56 @@ fn a_click_made_while_the_mouse_moves_still_places_the_point() {
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(got[0].1.near(h.state().canvas.xf.unwrap().to_world(up), 1e-4), "{got:?}");
 }
+
+/// A model-space line from (20,20) to (60,20) to click on.
+fn with_line(h: &mut Harness<'_, CadApp>) {
+    h.state_mut().session.execute("line", &json!({"points": [[20, 20], [60, 20]]})).unwrap();
+    h.run_steps(2);
+}
+
+/// Press on `at`, let the hand travel `dx` screen pixels, release there (#1001).
+fn press_move_release(h: &mut Harness<'_, CadApp>, at: Pos2, dx: f32) {
+    button(h, at, true);
+    h.run_steps(1);
+    button(h, at + vec2(dx, 0.0), false);
+    h.run_steps(2);
+}
+
+#[test]
+fn a_pick_made_while_the_mouse_moves_selects_the_object() {
+    let mut h = harness();
+    with_line(&mut h);
+    let on_line = screen(&h, Vec2::new(40.0, 20.0));
+    press_move_release(&mut h, on_line, 9.0);
+    assert_eq!(h.state().session.selection().len(), 1, "no command running");
+    assert!(h.state().session.pending_window.is_none());
+}
+
+#[test]
+fn an_object_pick_made_while_the_mouse_moves_counts_in_a_selection_prompt() {
+    let mut h = harness();
+    with_line(&mut h);
+    h.state_mut().start("erase");
+    h.run_steps(2);
+    let on_line = screen(&h, Vec2::new(40.0, 20.0));
+    press_move_release(&mut h, on_line, 9.0);
+    h.state_mut().session.input(cadcraft_engine::prompt::Input::Enter).unwrap();
+    h.run_steps(2);
+    assert!(lines(&h).is_empty(), "the line was picked and erased");
+}
+
+#[test]
+fn a_real_drag_still_selects_with_a_window() {
+    let mut h = harness();
+    with_line(&mut h);
+    // A window from lower left to upper right, 400 px wide, takes in the whole line.
+    let from = screen(&h, Vec2::new(10.0, 10.0));
+    let to = screen(&h, Vec2::new(70.0, 30.0));
+    button(&mut h, from, true);
+    h.run_steps(1);
+    h.event(Event::PointerMoved(from + (to - from) * 0.5));
+    h.run_steps(1);
+    button(&mut h, to, false);
+    h.run_steps(2);
+    assert_eq!(h.state().session.selection().len(), 1);
+}
