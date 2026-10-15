@@ -21,6 +21,7 @@ pub mod lisp;
 pub mod mtext_edit;
 pub mod pointmod;
 pub mod prompt;
+pub mod properties;
 mod recent;
 pub mod sample;
 pub mod select;
@@ -1407,6 +1408,17 @@ impl Session {
             Some(r) => format!("{} {}", r.id.to_ascii_uppercase(), r.machine.prompt(self).display()),
             None => "Command:".into(),
         }
+    }
+
+    /// What the running command would place for `typed`, the line being typed at its text
+    /// prompt ([`Interactive::typing`]), with the current properties.
+    pub fn typing_preview(&self, typed: &str) -> Vec<Entity> {
+        let Some(r) = self.running.as_ref() else { return Vec::new() };
+        if typed.is_empty() || self.lisp_prompt().is_some() {
+            return Vec::new();
+        }
+        let common = self.current_common();
+        r.machine.typing(self, typed).into_iter().map(|k| Entity { handle: Handle(0), common: common.clone(), kind: k }).collect()
     }
 
     /// Rubber-band preview entities for the cursor.
