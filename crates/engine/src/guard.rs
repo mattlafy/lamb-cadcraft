@@ -10,7 +10,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use cadcraft_doc::EntityKind;
+use cadcraft_doc::{EntityKind, Handle};
 use cadcraft_geom::Vec2;
 
 use crate::cmd::Factory;
@@ -73,6 +73,15 @@ impl Interactive for Guarded {
         catch_unwind(AssertUnwindSafe(|| self.inner.preview(s, cursor))).unwrap_or_else(|_| {
             self.broken.set(Some("panic in preview"));
             Vec::new()
+        })
+    }
+    fn highlight(&self, s: &Session, h: Handle, cursor: Vec2) -> Option<Vec<EntityKind>> {
+        if self.broken.get().is_some() {
+            return None;
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.highlight(s, h, cursor))).unwrap_or_else(|_| {
+            self.broken.set(Some("panic in preview"));
+            None
         })
     }
     fn drag(&self, s: &Session, cursor: Vec2) -> Option<crate::prompt::Drag> {
