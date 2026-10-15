@@ -1967,7 +1967,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         // Hide the OS cursor under the drawn crosshair, unless assistive tech needs it (#39).
         ui.ctx().set_cursor_icon(if app.ui.system_cursor { egui::CursorIcon::Crosshair } else { egui::CursorIcon::None });
         if let Some(hp) = hover_pos {
-            draw_crosshair(app, &painter, rect, hp, selecting);
+            draw_crosshair(app, &painter, rect, hp);
         }
         if app.session.settings.dynmode
             && let Some(hp) = hover_pos
@@ -2121,11 +2121,21 @@ fn pickbox_half(pickbox: f64) -> Option<f32> {
     (half.is_finite() && half >= 1.0).then_some(half)
 }
 
-fn draw_crosshair(app: &CadApp, p: &egui::Painter, rect: Rect, at: Pos2, pickbox: bool) {
+/// The cursor says what a click does, as in AutoCAD: with no command running the crosshair
+/// carries the pick box, a prompt asking for objects shows the pick box alone and a prompt
+/// asking for a point the crosshair alone (#1241).
+fn draw_crosshair(app: &CadApp, p: &egui::Painter, rect: Rect, at: Pos2) {
     let st = Stroke::new(1.0, Tokens::get().crosshair);
     let len = (rect.height() * app.session.settings.cursorsize as f32 / 100.0).max(12.0);
-    let pb = if pickbox { pickbox_half(app.session.settings.pickbox) } else { None };
+    let pb = if app.session.picking_objects() { pickbox_half(app.session.settings.pickbox) } else { None };
     let gap = pb.unwrap_or(0.0);
+    if let Some(pb) = pb {
+        p.rect_stroke(Rect::from_center_size(at, vec2(pb * 2.0, pb * 2.0)), 0.0, st, egui::StrokeKind::Middle);
+        // Without a box (PICKBOX 0) the arms stay, so the pointer never disappears.
+        if app.session.current_prompt().is_some() {
+            return;
+        }
+    }
     // Along the isometric plane's axes in isometric drafting.
     if app.session.settings.isodraft {
         for a in cadcraft_engine::snap::iso::cursor_axes(&app.session.settings) {
@@ -2138,9 +2148,6 @@ fn draw_crosshair(app: &CadApp, p: &egui::Painter, rect: Rect, at: Pos2, pickbox
         p.line_segment([pos2(at.x + gap, at.y), pos2(at.x + len, at.y)], st);
         p.line_segment([pos2(at.x, at.y - len), pos2(at.x, at.y - gap)], st);
         p.line_segment([pos2(at.x, at.y + gap), pos2(at.x, at.y + len)], st);
-    }
-    if let Some(pb) = pb {
-        p.rect_stroke(Rect::from_center_size(at, vec2(pb * 2.0, pb * 2.0)), 0.0, st, egui::StrokeKind::Middle);
     }
 }
 
