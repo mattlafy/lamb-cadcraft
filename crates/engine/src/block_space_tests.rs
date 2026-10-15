@@ -101,3 +101,72 @@ fn undoing_the_block_while_inside_it_returns_to_model() {
     assert_eq!(s.space(), Space::Model);
     assert_eq!(s.state().unwrap().mspace, None);
 }
+
+fn hatch_in(s: &Session, h: Handle) -> cadcraft_doc::Hatch {
+    match &s.doc().unwrap().entity(h).unwrap().kind {
+        EntityKind::Hatch(x) => x.clone(),
+        k => panic!("not a hatch: {}", k.type_name()),
+    }
+}
+
+fn hatch_area(h: &cadcraft_doc::Hatch) -> f64 {
+    h.loops
+        .iter()
+        .map(|l| {
+            let pts = cadcraft_geom::Polyline { vertices: l.vertices.clone(), closed: true }.tessellate(1e-4);
+            cadcraft_geom::shoelace(&pts).abs() * if l.outer { 1.0 } else { -1.0 }
+        })
+        .sum()
+}
+
+#[test]
+fn associative_hatch_in_block_space_follows_a_stretch() {
+    let (mut s, _) = session_with_block();
+    enter(&mut s, "V");
+    s.execute("rectang", &json!({ "p1": [0, 0], "p2": [10, 10] })).unwrap();
+    let r = s.execute("hatch", &json!({ "points": [[5, 5]] })).unwrap();
+    let h = Handle::parse_hex(r["handle"].as_str().unwrap()).unwrap();
+    assert_eq!(s.doc().unwrap().space_of(h), Some(Space::Block("V".into())));
+    s.script("STRETCH\nC\n12,-1\n8,11\n\n0,0\n5,0\n").unwrap();
+    assert!(s.running.is_none(), "{}", s.prompt_text());
+    assert_eq!(s.doc().unwrap().space_of(h), Some(Space::Block("V".into())), "the hatch stays in V");
+    let hh = hatch_in(&s, h);
+    assert!(hh.associative);
+    assert!((hatch_area(&hh) - 150.0).abs() < 1e-6, "area {}", hatch_area(&hh));
+}
+
+#[test]
+fn associative_dimension_in_block_space_follows_a_move() {
+    let (mut s, member) = session_with_block();
+    enter(&mut s, "V");
+    let r = s.execute("dimlinear", &json!({ "p1": [0, 0], "p2": [10, 0], "at": [0, 5] })).unwrap();
+    let dh = Handle::parse_hex(r["handle"].as_str().unwrap()).unwrap();
+    let dim = |s: &Session| match &s.doc().unwrap().entity(dh).unwrap().kind {
+        EntityKind::Dimension(d) => d.clone(),
+        k => panic!("not a dimension: {}", k.type_name()),
+    };
+    assert!(!dim(&s).assoc.is_empty(), "the dimension is associated with the block member");
+    s.execute("move", &json!({ "handles": [member.hex()], "delta": [3, 4] })).unwrap();
+    let d = dim(&s);
+    assert!((d.p13.x - 3.0).abs() < 1e-9 && (d.p13.y - 4.0).abs() < 1e-9, "{:?}", d.p13);
+    assert!((d.p14.x - 13.0).abs() < 1e-9 && (d.p14.y - 4.0).abs() < 1e-9, "{:?}", d.p14);
+}
+
+#[test]
+fn associativity_skips_xref_and_anonymous_blocks() {
+    let (mut s, _) = session_with_block();
+    s.execute("line", &json!({"points": [[0, 20], [10, 20]]})).unwrap();
+    let st = s.state_mut().unwrap();
+    let d = Arc::make_mut(&mut st.doc);
+    for (name, xref) in [("X", true), ("*U1", false)] {
+        let mut b = cadcraft_doc::Block::new(name);
+        if xref {
+            b.xref_path = Some("other.dwg".into());
+        }
+        d.blocks.insert(name.into(), Arc::new(b));
+    }
+    let d: &Drawing = s.doc().unwrap();
+    let n = crate::assoc::assoc_stores(d).count();
+    // Model, the layouts, then block V; X (an xref) and *U1 (anonymous) are skipped.
+    assert_eq!(n, 2 + d.layouts.len());
+}

@@ -291,14 +291,22 @@ pub fn recompute(dm: &Dimension, prev: Option<&Dimension>, before: &Drawing, aft
     nd
 }
 
+/// The entity stores the associativity passes scan: model space, the layouts, then every block
+/// definition (LAMB views live in blocks) except xrefs, whose objects belong to another file,
+/// and anonymous blocks, which are generated geometry.
+pub(crate) fn assoc_stores(d: &Drawing) -> impl Iterator<Item = &cadcraft_doc::EntityStore> {
+    std::iter::once(&d.model)
+        .chain(d.layouts.iter().map(|l| &l.entities))
+        .chain(d.blocks.values().filter(|b| b.xref_path.is_none() && !b.anonymous).map(|b| &b.entities))
+}
+
 /// After a change: update every associative dimension whose objects changed.
 /// Returns the number of dimensions updated.
 pub fn update(after: &mut Arc<Drawing>, before: &Drawing) -> usize {
     let mut changes: Vec<(Handle, Dimension)> = Vec::new();
     {
         let d: &Drawing = after;
-        let stores = std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities));
-        for store in stores {
+        for store in assoc_stores(d) {
             for e in store.iter() {
                 let EntityKind::Dimension(dm) = &e.kind else { continue };
                 if dm.assoc.is_empty() {

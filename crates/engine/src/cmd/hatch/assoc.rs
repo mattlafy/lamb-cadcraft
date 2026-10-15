@@ -211,7 +211,7 @@ pub fn update(after: &mut Arc<Drawing>, before: &Drawing) -> Vec<String> {
     {
         let d: &Drawing = after;
         let mut checked = 0;
-        for store in std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities)) {
+        for store in crate::assoc::assoc_stores(d) {
             for e in store.iter() {
                 let EntityKind::Hatch(h) = &e.kind else { continue };
                 if !h.associative || h.loops.iter().all(|l| l.sources.is_empty()) {
