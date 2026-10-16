@@ -139,3 +139,29 @@ fn viewport_ids_survive_dwg_and_the_paper_viewport_stays_implicit() {
     assert!(!text.contains("PAPERVIEW"));
     assert_eq!(viewport_ids(&cadcraft_io::read_dxf(text.as_bytes()).unwrap().layouts[0]), [1, 2]);
 }
+
+/// A viewport's frozen layers are written into the DWG VIEWPORT object as its frozen-layer
+/// handle list (DXF group 331 or 341), pointing at the LAYER records, so other DWG readers hide
+/// those layers in that viewport without the CADCraft xdata.
+#[test]
+fn dwg_viewport_keeps_frozen_layers_as_layer_handles() {
+    let mut d = Drawing::new_metric();
+    d.layers.push(Layer { name: "Walls".into(), ..Layer::default() });
+    d.layers.push(Layer { name: "A B".into(), ..Layer::default() });
+    let paper = Space::Paper(d.layouts[0].name.clone());
+    let EntityKind::Viewport(mut vp) = viewport(2) else { unreachable!() };
+    vp.frozen_layers = vec!["Walls".into(), "A B".into()];
+    d.add(&paper, Common::default(), EntityKind::Viewport(vp)).unwrap();
+
+    let dwg = cadcraft_io::write(&d, "x.dwg").unwrap();
+    let text = String::from_utf8_lossy(&cadcraft_dwg::dwg_to_dxf(&dwg).unwrap()).into_owned();
+    let layer_handle = |name: &str| -> String {
+        let layers = records(&text, "LAYER");
+        let rec = layers.iter().find(|r| group(r, "2") == Some(name)).unwrap_or_else(|| panic!("no LAYER {name}"));
+        group(rec, "5").unwrap().to_string()
+    };
+    let vps = records(&text, "VIEWPORT");
+    let vp = vps.iter().find(|r| group(r, "69") == Some("2")).unwrap_or_else(|| panic!("no VIEWPORT 2 in {vps:?}"));
+    let frozen: Vec<&str> = vp.iter().filter(|(c, _)| c == "331" || c == "341").map(|(_, v)| v.as_str()).collect();
+    assert_eq!(frozen, vec![layer_handle("Walls"), layer_handle("A B")]);
+}

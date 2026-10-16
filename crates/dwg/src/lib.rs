@@ -303,6 +303,37 @@ mod native {
         unwritable.len() + objects.len()
     }
 
+    /// VIEWPORT frozen-layer handles under group 331, the code acadrust 0.6.4 reads (and
+    /// writes). The DXF format allows 331 or 341 for them and CADCraft's DXF writer uses 341,
+    /// which acadrust skips, so without this a DWG viewport would freeze no layers for programs
+    /// that don't read CADCraft's xdata. Only VIEWPORT records change; binary DXF is returned
+    /// unchanged.
+    fn viewport_frozen_331(dxf: Vec<u8>) -> Vec<u8> {
+        if dxf.get(..22).is_some_and(|head| head.windows(10).any(|w| w == b"Binary DXF")) {
+            return dxf;
+        }
+        let mut out = Vec::with_capacity(dxf.len());
+        let mut viewport = false;
+        let mut lines = dxf.split_inclusive(|&b| b == b'\n');
+        while let Some(code) = lines.next() {
+            let value = lines.next().unwrap_or_default();
+            let c = code.trim_ascii();
+            if c == b"0" {
+                viewport = value.trim_ascii() == b"VIEWPORT";
+            }
+            if viewport && c == b"341" {
+                let at = code.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or_default();
+                out.extend_from_slice(code.get(..at).unwrap_or_default());
+                out.extend_from_slice(b"331");
+                out.extend_from_slice(code.get(at + 3..).unwrap_or_default());
+            } else {
+                out.extend_from_slice(code);
+            }
+            out.extend_from_slice(value);
+        }
+        out
+    }
+
     /// Header variables the DWG reader fills in but acadrust's DXF writer (0.6.3) leaves out of
     /// the HEADER section: (name, group code, value).
     fn unwritten_header_vars(h: &acadrust::document::HeaderVariables) -> [(&'static str, i32, String); 7] {
@@ -386,7 +417,7 @@ mod native {
     }
 
     fn convert(dxf: &[u8], version: Option<acadrust::DxfVersion>) -> Result<Vec<u8>, String> {
-        let data = dxf.to_vec();
+        let data = viewport_frozen_331(dxf.to_vec());
         let mut doc = std::panic::catch_unwind(move || acadrust::DxfReader::from_reader(Cursor::new(data)).and_then(|r| r.read()))
             .map_err(|_| "the DXF→DWG conversion failed".to_string())?
             .map_err(|e| format!("DXF: {e}"))?;
