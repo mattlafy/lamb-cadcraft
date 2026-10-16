@@ -242,18 +242,17 @@ fn lamb_chat_step(r: serde_json::Value) -> Result<cadcraft_ui_egui::chatpane::Ch
         return Ok(ChatStep::Ask { turn: r["turn"].clone(), messages: ask.clone() });
     }
     let d = r.get("done").ok_or_else(|| format!("unexpected assistant step: {r}"))?;
-    let count = |v: &serde_json::Value| v.as_array().map_or_else(|| v.as_u64().unwrap_or(0), |a| a.len() as u64);
+    if d["kind"] == "applied" && d["result"]["dryRun"] == serde_json::json!(true) {
+        let res = &d["result"];
+        let summary = res["summary"].as_str().unwrap_or_default().to_string();
+        return Ok(ChatStep::Done {
+            text: format!("Candidate ready: {summary} — Use candidate applies it."),
+            candidate: Some(serde_json::json!({ "steps": res["steps"].clone(), "summary": summary })),
+        });
+    }
     let text = match d["kind"].as_str() {
         Some("noScript") => d["text"].as_str().unwrap_or_default().to_string(),
-        Some("applied") => {
-            let res = &d["result"];
-            format!(
-                "Applied: {} created, {} modified (proposal {}) — ACCEPT keeps it, U undoes it.",
-                count(&res["created"]),
-                count(&res["modified"]),
-                res["proposalId"].as_str().unwrap_or("?")
-            )
-        }
+        Some("applied") => lamb_applied_line(&d["result"]),
         Some("failed") => format!(
             "No change — the script failed after {} attempt(s): {}",
             d["attempts"].as_u64().unwrap_or(0),
@@ -261,11 +260,39 @@ fn lamb_chat_step(r: serde_json::Value) -> Result<cadcraft_ui_egui::chatpane::Ch
         ),
         _ => return Err(format!("unexpected assistant outcome: {d}")),
     };
-    Ok(ChatStep::Done { text })
+    Ok(ChatStep::Done { text, candidate: None })
+}
+
+/// The transcript line for an `assistant.apply` result.
+fn lamb_applied_line(res: &serde_json::Value) -> String {
+    let count = |v: &serde_json::Value| v.as_array().map_or_else(|| v.as_u64().unwrap_or(0), |a| a.len() as u64);
+    format!(
+        "Applied: {} created, {} modified (proposal {}) — ACCEPT keeps it, U undoes it.",
+        count(&res["created"]),
+        count(&res["modified"]),
+        res["proposalId"].as_str().unwrap_or("?")
+    )
+}
+
+/// A candidate row's text: its `summary`.
+fn lamb_chat_label(c: &serde_json::Value) -> String {
+    c["summary"].as_str().unwrap_or_default().to_string()
+}
+
+/// Ghost a candidate's steps on the canvas, or clear the ghost.
+fn lamb_chat_preview(s: &mut Session, c: Option<&serde_json::Value>) -> Result<(), String> {
+    let p = c.map_or_else(|| serde_json::json!({}), |c| serde_json::json!({ "steps": c["steps"].clone() }));
+    s.execute(lamb_cadcraft::assistant::GHOST_ID, &p).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Apply a candidate for real (tentative, one undo step).
+fn lamb_chat_take(s: &mut Session, c: &serde_json::Value) -> Result<String, String> {
+    let r = s.execute(lamb_cadcraft::assistant::ID, &serde_json::json!({ "steps": c["steps"].clone() })).map_err(|e| e.to_string())?;
+    Ok(lamb_applied_line(&r))
 }
 
 fn lamb_chat_start(s: &mut Session, text: &str) -> Result<cadcraft_ui_egui::chatpane::ChatStep, String> {
-    let r = s.execute(lamb_cadcraft::assistant::START_ID, &serde_json::json!({ "message": text })).map_err(|e| e.to_string())?;
+    let r = s.execute(lamb_cadcraft::assistant::START_ID, &serde_json::json!({ "message": text, "dryRun": true })).map_err(|e| e.to_string())?;
     lamb_chat_step(r)
 }
 
@@ -286,6 +313,9 @@ const LAMB_CHAT: cadcraft_ui_egui::chatpane::ChatBackend = cadcraft_ui_egui::cha
     resume: lamb_chat_resume,
     send: lamb_chat_send,
     models: lamb_cadcraft::provider::list_models,
+    label: lamb_chat_label,
+    preview: lamb_chat_preview,
+    take: lamb_chat_take,
 };
 
 fn lamb_status_toggles(s: &cadcraft_engine::Session) -> Vec<cadcraft_ui_egui::chrome::statusext::StatusToggle> {

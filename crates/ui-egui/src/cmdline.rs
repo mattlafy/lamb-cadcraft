@@ -80,6 +80,10 @@ fn tab(app: &mut CadApp) {
     if crate::grip_dyn::tab(app) {
         return;
     }
+    // The Assistant palette's candidates (fork, LAMB T427): Tab moves the highlight.
+    if crate::chatpane::tab(app) {
+        return;
+    }
     // Over a snap marker with nothing typed, Tab cycles the candidate snaps.
     if app.cmd.buffer.is_empty() && app.canvas.snap.is_some() {
         app.canvas.snap_tab = true;
