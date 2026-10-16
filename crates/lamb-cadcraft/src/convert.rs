@@ -157,7 +157,7 @@ pub fn to_polyline(e: &Entity) -> Result<Converted, Unsupported> {
     Ok(Converted { polyline, warnings })
 }
 
-fn lw_to_polyline(lw: &LwPolyline, flip: bool, warnings: &mut Vec<Flattened>) -> Option<Polyline2> {
+pub(crate) fn lw_to_polyline(lw: &LwPolyline, flip: bool, warnings: &mut Vec<Flattened>) -> Option<Polyline2> {
     if lw.elevation != 0.0 {
         push_once(warnings, Flattened::Elevation);
     }

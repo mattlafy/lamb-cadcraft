@@ -44,7 +44,8 @@
 //!   Import DXF as View): a DXF/DWG file's line work as a new unplaced plan view — see
 //!   [`crate::dxfimport`]. `lambopen {path}` (View ▸ LAMB ▸ Open LAMB Project): a TS-app `.lamb`
 //!   project (directory or its JSON file form) opened as a new document tab — see
-//!   [`crate::lambopen`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
+//!   [`crate::lambopen`]. `lambsave {path}` (View ▸ LAMB ▸ Save LAMB Project): the open drawing
+//!   written as a `.lamb` project directory — see [`crate::lambopen`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
 //!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's laid
 //!   detail bands written into its block `LAMB_ASSEMBLY_<id>`, `mitre` turning the plan's mitring
 //!   of undetailed corners on or off — see [`crate::assembly`]; interactive on the edited plan:
@@ -767,6 +768,11 @@ pub fn commands() -> Vec<CommandSpec> {
             .noundo()
             .menu(MENU)
             .interactive(crate::lambopen::lambopen_machine),
+        CommandSpec::new("lambsave", "Save LAMB Project", crate::lambopen::lambsave)
+            .params("{path} → {views, entities, skipped: {kind: n}, droppedTags, unknownPatterns, path}")
+            .noundo()
+            .menu(MENU)
+            .interactive(crate::lambopen::lambsave_machine),
         CommandSpec::new("outsidepoint", "Outside Point", crate::outside::outsidepoint)
             .params("{point:{x,y}}")
             .menu(MENU)
@@ -888,6 +894,7 @@ mod tests {
             "wallrun",
             "dxfimport",
             "lambopen",
+            "lambsave",
             "detailref",
             "accept",
             "setrole",

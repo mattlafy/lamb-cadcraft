@@ -8,6 +8,17 @@
 //!   and, when non-empty, what the import skipped, the links it dropped and unknown layers.
 //!   Returns `{views, entities, skipped: {kind: n}, droppedLinks, unknownLayers, document}`.
 //! - Interactive: `Enter .lamb project path`. The path is typed; a picker is a later GUI slice.
+//!
+//! LAMBSAVE: the open drawing written as a TS-app `.lamb` **directory**.
+//!
+//! - `lambsave {path}` (View ▸ LAMB ▸ Save LAMB Project): exports the drawing with
+//!   [`crate::export::drawing_to_project`] and writes it with `lamb_core::persistence::write_lamb_dir`.
+//!   Refuses a path that is an existing file, or an existing non-empty directory with no
+//!   `manifest.json`. Leaves the document's path, title and undo alone (QSAVE still writes DWG).
+//!   Echoes `Saved "<name>" to <path>: <v> views, <e> entities` and, when non-empty, what the export
+//!   skipped, the fork-only tags it dropped and unknown patterns. Returns
+//!   `{views, entities, skipped: {kind: n}, droppedTags, unknownPatterns, path}`.
+//! - Interactive: `Enter .lamb project path`, typed, quotes trimmed.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,6 +30,7 @@ use serde_json::{Value, json};
 use crate::commands::{bad, other};
 
 const CMD: &str = "lambopen";
+const SAVE: &str = "lambsave";
 
 /// The project at `path`: a `.lamb` directory, or a file holding the `{relative path: content}` JSON.
 fn read_project(path: &str) -> std::result::Result<Project, String> {
@@ -105,6 +117,85 @@ impl Interactive for LambOpenM {
 
 pub(crate) fn lambopen_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::new(LambOpenM))
+}
+
+/// Why `dir` cannot take a `.lamb` project, if it cannot.
+fn refuse_target(dir: &Path) -> Option<&'static str> {
+    if dir.is_file() {
+        return Some("it is a file, not a directory");
+    }
+    if dir.is_dir() && !dir.join("manifest.json").is_file() && std::fs::read_dir(dir).ok().is_some_and(|mut r| r.next().is_some()) {
+        return Some("the directory is not empty and has no manifest.json");
+    }
+    None
+}
+
+/// LAMBSAVE's JSON form. Every refusal comes before anything is written.
+pub(crate) fn lambsave(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = p.get("path").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad(SAVE, "`path` is required"))?;
+    let refuse = |e: String| other(format!("Cannot save {path}: {e}"));
+    let dir = Path::new(path);
+    if let Some(why) = refuse_target(dir) {
+        return Err(refuse(why.to_owned()));
+    }
+    let (project, report) = crate::export::drawing_to_project(s.doc()?).map_err(|e| refuse(e.to_string()))?;
+    lamb_core::persistence::write_lamb_dir(&project, dir).map_err(|e| refuse(e.to_string()))?;
+
+    let views = project.views.len();
+    let entities: usize = project.views.iter().map(|v| v.entities().len()).sum();
+    let mut skipped: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, kind) in &report.skipped {
+        *skipped.entry(kind).or_default() += 1;
+    }
+    s.echo(format!("Saved \"{}\" to {path}: {views} views, {entities} entities", project.name));
+    if !skipped.is_empty() {
+        let kinds: Vec<String> = skipped.iter().map(|(k, n)| format!("{k} ×{n}")).collect();
+        s.echo(format!("Skipped {} ({})", report.skipped.len(), kinds.join(", ")));
+    }
+    if !report.dropped_tags.is_empty() {
+        s.echo(format!("Dropped tags: {}", report.dropped_tags.len()));
+    }
+    if !report.unknown_patterns.is_empty() {
+        s.echo(format!("Unknown patterns: {}", report.unknown_patterns.join(", ")));
+    }
+    Ok(json!({
+        "views": views,
+        "entities": entities,
+        "skipped": skipped,
+        "droppedTags": report.dropped_tags.len(),
+        "unknownPatterns": report.unknown_patterns,
+        "path": path,
+    }))
+}
+
+/// LAMBSAVE interactively: one typed path, then save (or echo the refusal).
+struct LambSaveM;
+
+impl Interactive for LambSaveM {
+    fn name(&self) -> &'static str {
+        SAVE
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Enter .lamb project path", Accept::TEXT)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let (Input::Text(t) | Input::Keyword(t)) = i else { return Ok(Step::Continue) };
+        let t = t.trim().trim_matches('"').trim();
+        if t.is_empty() {
+            return Ok(Step::Continue);
+        }
+        if let Err(e) = lambsave(s, &json!({ "path": t })) {
+            s.echo(e.to_string());
+        }
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn lambsave_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(LambSaveM))
 }
 
 #[cfg(test)]
@@ -216,6 +307,93 @@ mod tests {
         assert_eq!(s.docs.len(), before + 1);
         assert_eq!(s.active, before);
         assert!(!read_document(s.doc()?)?.views.is_empty());
+        Ok(())
+    }
+
+    fn named(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../lamb-core/tests/lamb/{name}.lamb.json"))
+    }
+
+    fn corner_tags(p: &Project) -> usize {
+        p.views
+            .iter()
+            .flat_map(|v| v.entities())
+            .filter_map(|e| match &e.geometry {
+                lamb_core::model::EntityGeometry::Polyline { geometry } => {
+                    Some(geometry.segments.iter().filter(|s| s.corner_at_to.is_some()).count())
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn every_fixture_saves_back_with_its_views_entities_links_and_corners() -> R {
+        for name in ["filleted-corners", "dimensioned-u-wall", "t76-rotated-section"] {
+            let src = read_project(&named(name).to_string_lossy())?;
+            let (_, _, report) = crate::import::project_to_drawing(&src)?;
+            let lost_corners: usize = report.flattened.iter().filter(|(_, w)| *w == crate::convert::Flattened::VirtualCorner).count();
+            let mut s = session()?;
+            s.execute(CMD, &json!({ "path": named(name).to_string_lossy() }))?;
+            let out = temp_dir("save")?.join(format!("{name}.lamb"));
+            let r = s.execute(SAVE, &json!({ "path": out.to_string_lossy() }))?;
+            let back = lamb_core::persistence::read_lamb_dir(&out).map_err(|e| format!("{e:?}"))?;
+            assert_eq!(r["views"], back.views.len(), "{name}");
+            let mut want: Vec<(String, usize)> = src
+                .views
+                .iter()
+                .map(|v| (v.name().to_owned(), v.entities().iter().filter(|e| !report.skipped.iter().any(|(id, _)| *id == e.id)).count()))
+                .collect();
+            let mut got: Vec<(String, usize)> = back.views.iter().map(|v| (v.name().to_owned(), v.entities().len())).collect();
+            want.sort();
+            got.sort();
+            assert_eq!(got, want, "{name}");
+            assert_eq!(back.links.len(), src.links.len() - report.dropped_links.len(), "{name}");
+            assert_eq!(corner_tags(&back), corner_tags(&src) - lost_corners, "{name}");
+            assert!(corner_tags(&back) > 0 || name != "filleted-corners");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lambsave_leaves_the_document_path_and_undo_alone() -> R {
+        let mut s = session()?;
+        s.execute(CMD, &json!({ "path": fixture().to_string_lossy() }))?;
+        let (path, title, undo) = (s.state()?.path.clone(), s.state()?.title.clone(), s.state()?.undo.len());
+        let out = temp_dir("keep")?.join("u.lamb");
+        s.execute(SAVE, &json!({ "path": out.to_string_lossy() }))?;
+        assert!(out.join("manifest.json").is_file());
+        assert_eq!((s.state()?.path.clone(), s.state()?.title.clone(), s.state()?.undo.len()), (path, title, undo));
+        // Saving again over its own output is allowed.
+        s.execute(SAVE, &json!({ "path": out.to_string_lossy() }))?;
+        Ok(())
+    }
+
+    #[test]
+    fn lambsave_refuses_a_file_and_a_foreign_non_empty_directory() -> R {
+        let mut s = session()?;
+        s.execute(CMD, &json!({ "path": fixture().to_string_lossy() }))?;
+        let e = s.execute(SAVE, &json!({ "path": fixture().to_string_lossy() })).err().ok_or("no refusal")?;
+        assert!(e.to_string().contains("Cannot save") && e.to_string().contains("file"), "{e}");
+        let foreign = temp_dir("foreign")?;
+        std::fs::write(foreign.join("notes.txt"), "keep me")?;
+        let e = s.execute(SAVE, &json!({ "path": foreign.to_string_lossy() })).err().ok_or("no refusal")?;
+        assert!(e.to_string().contains("manifest.json"), "{e}");
+        assert!(!foreign.join("views").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_form_saves_it() -> R {
+        let mut s = session()?;
+        s.execute(CMD, &json!({ "path": fixture().to_string_lossy() }))?;
+        let out = temp_dir("interactive")?.join("i.lamb");
+        s.start(SAVE)?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter .lamb project path:"));
+        s.input(Input::Text(format!("\"{}\"", out.to_string_lossy())))?;
+        assert!(s.current_prompt().is_none());
+        let back = lamb_core::persistence::read_lamb_dir(&out).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(back.views.len(), project()?.views.len());
         Ok(())
     }
 }
