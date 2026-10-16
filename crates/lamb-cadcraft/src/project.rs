@@ -77,6 +77,7 @@ pub(crate) fn layer_of(l: &Layer) -> Result<DrawingLayer, SchemaError> {
         visible: l.visible(),
         locked: l.locked,
         default_role: data.default_role,
+        extra: Default::default(),
     })
 }
 

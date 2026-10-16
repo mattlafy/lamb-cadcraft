@@ -222,17 +222,21 @@ fn first_diff(a: &str, b: &str) -> String {
 
 #[test]
 fn t76_writes_byte_identical_to_the_ts_writer() {
-    let mut fixture = fixture_map("t76-rotated-section");
-    // The fixture's layers carry a legacy `printable` key the TS model no longer has; the TS reader
-    // passes it through and the TS writer writes it back, but `DrawingLayer` drops unknown keys.
-    // Carrying it needs a field on `DrawingLayer` and its constructors outside lamb-core (LAMB T415).
-    let project_json = fixture.get_mut("project.json").unwrap();
-    *project_json = project_json.lines().filter(|l| !l.trim_start().starts_with("\"printable\"")).map(|l| format!("{l}\n")).collect();
+    let fixture = fixture_map("t76-rotated-section");
     let written = write(&load("t76-rotated-section"));
     assert_eq!(written.keys().collect::<Vec<_>>(), fixture.keys().collect::<Vec<_>>());
     for (path, text) in &fixture {
         assert!(written[path] == *text, "{path}: {}", first_diff(&written[path], text));
     }
+}
+
+#[test]
+fn unknown_layer_keys_round_trip() {
+    let raw = json!({ "id": "layer-0", "name": "0", "color": "#d0d0d0", "lineweight": 0.25, "visible": true,
+        "locked": false, "defaultRole": "cut", "printable": false });
+    let layer: lamb_core::model::DrawingLayer = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(layer.extra.get("printable"), Some(&json!(false)));
+    assert_eq!(serde_json::to_value(&layer).unwrap(), raw);
 }
 
 #[test]

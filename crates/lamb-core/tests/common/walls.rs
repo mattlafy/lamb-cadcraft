@@ -60,6 +60,7 @@ pub fn add_layer(p: &mut Project, name: &str) -> String {
         visible: true,
         locked: false,
         default_role: LineRole::Cut,
+        extra: Default::default(),
     });
     id
 }

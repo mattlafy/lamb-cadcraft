@@ -149,6 +149,9 @@ pub struct DrawingLayer {
     pub locked: bool,
     /// The concrete role a `Bylayer` entity on this layer resolves to (never `Bylayer` itself).
     pub default_role: LineRole,
+    /// Keys this model does not know, written back unchanged.
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 pub fn default_layers() -> Vec<DrawingLayer> {
@@ -160,6 +163,7 @@ pub fn default_layers() -> Vec<DrawingLayer> {
         visible: true,
         locked,
         default_role,
+        extra: Default::default(),
     };
     vec![
         layer("layer-0", "0", "#d0d0d0", 0.25, false, LineRole::Cut),
