@@ -37,6 +37,14 @@
 //! `assistant.start {message}` → `{turn, ask}` and `assistant.resume {turn, reply}` →
 //! `{turn, ask}` or `{done: <outcome>}` (no menu, no undo step of their own) carry the [`Turn`] as
 //! JSON; an applied script is still its own `assistant.apply` undo step.
+//!
+//! Candidates (TS `apps/desktop/src/commandline/candidatePreview.ts`): `assistant.start {message,
+//! dryRun: true}` makes a turn whose would-apply script is [`dry_run`] instead -- applied, diffed
+//! and rolled back, so the drawing `Arc` and the undo stack are untouched -- ending `applied` with
+//! `result = {dryRun: true, steps, created, modified, erased, summary}` (handles; `summary` as TS
+//! `summarizeDiff`). Taking the candidate is `assistant.apply {steps}`. `assistant.ghost {steps?}`
+//! dry-runs `steps` and shows the would-be created and modified entities as the green ghost
+//! overlay (`overlays::halo`); with no steps it clears it. Session UI state, never saved.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -56,6 +64,7 @@ pub const ID: &str = "assistant.apply";
 pub const PROMPT_ID: &str = "assistant.prompt";
 pub const START_ID: &str = "assistant.start";
 pub const RESUME_ID: &str = "assistant.resume";
+pub const GHOST_ID: &str = "assistant.ghost";
 
 /// How many read-only rounds one turn may take before it must answer or edit.
 pub const MAX_READ_ROUNDS: usize = 2;
@@ -99,13 +108,96 @@ pub fn script_steps(script: &Value) -> Option<&Vec<Value>> {
     }
 }
 
-/// Every entity in a LAMB view block, by handle.
-fn view_entities(d: &Drawing) -> BTreeMap<Handle, Arc<Entity>> {
+/// Every entity in a LAMB view block, by handle, with its block's name.
+fn view_entries(d: &Drawing) -> BTreeMap<Handle, (&str, Arc<Entity>)> {
     d.blocks
         .iter()
         .filter(|(name, _)| name.strip_prefix("LAMB_VIEW_").is_some_and(|n| n.parse::<u64>().is_ok()))
-        .flat_map(|(_, b)| b.entities.iter().map(|e| (e.handle, e.clone())))
+        .flat_map(|(name, b)| b.entities.iter().map(move |e| (e.handle, (name.as_str(), e.clone()))))
         .collect()
+}
+
+/// Every entity in a LAMB view block, by handle.
+fn view_entities(d: &Drawing) -> BTreeMap<Handle, Arc<Entity>> {
+    view_entries(d).into_iter().map(|(h, (_, e))| (h, e)).collect()
+}
+
+/// TS `summarizeDiff`: `"3 new, 2 modified, 1 erased"`, zero parts left out, `"no changes"`.
+fn summarize(created: usize, modified: usize, erased: usize) -> String {
+    let parts: Vec<String> =
+        [(created, "new"), (modified, "modified"), (erased, "erased")].into_iter().filter(|(n, _)| *n > 0).map(|(n, w)| format!("{n} {w}")).collect();
+    if parts.is_empty() { "no changes".to_owned() } else { parts.join(", ") }
+}
+
+/// What a script would do, found by applying it and putting everything back.
+pub(crate) struct DryRun {
+    /// The would-be created and modified entities, with their view block's name.
+    pub created: Vec<(String, Entity)>,
+    pub modified: Vec<(String, Entity)>,
+    pub erased: Vec<Handle>,
+}
+
+impl DryRun {
+    fn to_json(&self, steps: &[Value]) -> Value {
+        let hs = |v: &[(String, Entity)]| v.iter().map(|(_, e)| e.handle.0).collect::<Vec<_>>();
+        json!({
+            "dryRun": true,
+            "steps": steps,
+            "created": hs(&self.created),
+            "modified": hs(&self.modified),
+            "erased": self.erased.iter().map(|h| h.0).collect::<Vec<_>>(),
+            "summary": summarize(self.created.len(), self.modified.len(), self.erased.len()),
+        })
+    }
+}
+
+/// Applies `steps` through [`apply`] (never `execute`, so no undo step), diffs the view blocks,
+/// then always puts the drawing `Arc` and the selection back. Errs as `apply` does.
+pub(crate) fn dry_run(s: &mut Session, steps: &[Value]) -> Result<DryRun> {
+    let snapshot = Arc::clone(&s.state()?.doc);
+    let selection = s.selection();
+    let applied = apply(s, &json!({ "steps": steps }));
+    let after = Arc::clone(&s.state()?.doc);
+    s.state_mut()?.doc = Arc::clone(&snapshot);
+    s.set_selection(selection);
+    applied?;
+    let before = view_entries(&snapshot);
+    let after = view_entries(&after);
+    let mut out = DryRun { created: Vec::new(), modified: Vec::new(), erased: Vec::new() };
+    for (h, (block, e)) in &after {
+        match before.get(h) {
+            None => out.created.push(((*block).to_owned(), (**e).clone())),
+            Some((_, old)) if !Arc::ptr_eq(old, e) && **old != **e => out.modified.push(((*block).to_owned(), (**e).clone())),
+            Some(_) => {}
+        }
+    }
+    out.erased = before.keys().filter(|h| !after.contains_key(h)).copied().collect();
+    Ok(out)
+}
+
+/// `assistant.ghost {steps?}`: dry-runs `steps` and ghosts what they would create or modify;
+/// none or null clears the ghost. A failing script clears it too, and errs.
+pub(crate) fn ghost_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let steps = match p.get("steps") {
+        None | Some(Value::Null) => {
+            crate::overlays::halo::set_ghost(None);
+            return Ok(json!({ "shown": 0 }));
+        }
+        Some(Value::Array(a)) => a.clone(),
+        Some(_) => return Err(bad(GHOST_ID, "`steps` must be an array of {command, params}")),
+    };
+    match dry_run(s, &steps) {
+        Ok(d) => {
+            let ghost: Vec<(String, Entity)> = d.created.into_iter().chain(d.modified).collect();
+            let shown = ghost.len();
+            crate::overlays::halo::set_ghost(Some(ghost));
+            Ok(json!({ "shown": shown }))
+        }
+        Err(e) => {
+            crate::overlays::halo::set_ghost(None);
+            Err(e)
+        }
+    }
 }
 
 /// `a<n>` one past the highest `a<n>` proposal id in the drawing.
@@ -357,6 +449,9 @@ pub struct Turn {
     attempts: usize,
     rounds: usize,
     last: Option<(Stage, String, String)>,
+    /// A would-apply script is [`dry_run`] instead of applied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    dry_run: bool,
 }
 
 /// What a turn needs next: another model call with these messages, or nothing — it ended.
@@ -371,7 +466,7 @@ impl Turn {
     pub fn start(s: &Session, user: &str) -> Result<(Turn, Vec<Message>)> {
         let base = prompt(s, user)?;
         let ask = base.clone();
-        Ok((Turn { base, reply: None, attempts: 1, rounds: 0, last: None }, ask))
+        Ok((Turn { base, reply: None, attempts: 1, rounds: 0, last: None, dry_run: false }, ask))
     }
 
     /// The base prompt, then the reply being answered, then the follow-up user message.
@@ -425,7 +520,8 @@ impl Turn {
                     );
                     return Ok(Step::Ask(self.re_ask(&reply, msg)));
                 }
-                match s.execute(ID, &json!({ "steps": steps })) {
+                let applied = if self.dry_run { dry_run(s, steps).map(|d| d.to_json(steps)) } else { s.execute(ID, &json!({ "steps": steps })) };
+                match applied {
                     Ok(result) => return Ok(Step::Done(TurnOutcome::Applied { attempts: self.attempts, result })),
                     Err(e) => (Stage::Apply, e.to_string()),
                 }
@@ -459,7 +555,13 @@ pub fn run_turn(s: &mut Session, user: &str, ask: &mut AskFn) -> Result<TurnOutc
 
 pub(crate) fn start_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     let message = p.get("message").and_then(Value::as_str).ok_or_else(|| bad(START_ID, "`message` must be a string"))?;
-    let (turn, ask) = Turn::start(s, message)?;
+    let dry_run = match p.get("dryRun") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad(START_ID, "`dryRun` must be a boolean")),
+    };
+    let (mut turn, ask) = Turn::start(s, message)?;
+    turn.dry_run = dry_run;
     Ok(json!({ "turn": turn, "ask": ask }))
 }
 
@@ -875,6 +977,58 @@ mod tests {
             assert!(e.contains("`turn` is not an assistant turn"), "{e}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_dry_run_turn_retries_then_ends_applied_without_touching_the_drawing() -> R {
+        for round_trip in [false, true] {
+            let mut s = session()?;
+            let (n, snapshot, before) = (undo_len(&s)?, Arc::clone(&s.state()?.doc), handles(&s)?);
+            let r = s.execute(START_ID, &json!({ "message": "draw it", "dryRun": true }))?;
+            assert_eq!(r["turn"]["dryRun"], json!(true), "{r}");
+            let r1 = resume_via(&mut s, &r["turn"], BAD, round_trip)?;
+            assert!(last_ask(&r1)?.starts_with("That script failed"), "{r1}");
+            let r2 = resume_via(&mut s, &r1["turn"], GOOD, round_trip)?;
+            let d = &r2["done"];
+            assert_eq!((d["kind"].clone(), d["attempts"].clone(), d["result"]["dryRun"].clone()), (json!("applied"), json!(2), json!(true)), "{r2}");
+            assert_eq!(d["result"]["created"].as_array().map(Vec::len), Some(1), "{r2}");
+            assert!(d["result"]["created"][0].as_u64().is_some_and(|h| !before.contains(&Handle(h))), "{r2}");
+            assert_eq!(d["result"]["summary"], json!("1 new"));
+            assert!(d["result"]["steps"].is_array(), "{r2}");
+            assert!(Arc::ptr_eq(&s.state()?.doc, &snapshot), "drawing untouched");
+            assert_eq!(undo_len(&s)?, n, "no undo step");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_start_serialises_no_dry_run_key() -> R {
+        let mut s = session()?;
+        let r = s.execute(START_ID, &json!({ "message": "draw it" }))?;
+        assert!(r["turn"].get("dryRun").is_none(), "{r}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_erase_only_script_dry_runs_to_erased() -> R {
+        let mut s = session()?;
+        let before = handles(&s)?;
+        s.execute("line", &json!({ "points": [[0, 0], [1000, 0]] }))?;
+        let h = *handles(&s)?.difference(&before).next().ok_or("no line")?;
+        let (n, snapshot) = (undo_len(&s)?, Arc::clone(&s.state()?.doc));
+        let steps = vec![json!({ "command": "erase", "params": { "handles": [h.hex()] } })];
+        let j = dry_run(&mut s, &steps)?.to_json(&steps);
+        assert_eq!((j["erased"].clone(), j["summary"].clone(), j["created"].clone()), (json!([h.0]), json!("1 erased"), json!([])), "{j}");
+        assert!(Arc::ptr_eq(&s.state()?.doc, &snapshot));
+        assert_eq!(undo_len(&s)?, n);
+        Ok(())
+    }
+
+    #[test]
+    fn summary_matches_summarize_diff() {
+        assert_eq!(summarize(3, 2, 1), "3 new, 2 modified, 1 erased");
+        assert_eq!(summarize(0, 2, 0), "2 modified");
+        assert_eq!(summarize(0, 0, 0), "no changes");
     }
 
     #[test]

@@ -5,7 +5,11 @@
 //! translucent and at least [`HALO_MIN_LW`] wide; CADCraft's renderer is unchanged. An entity in
 //! both draws the attention halo only (the TS rule).
 //!
-//! The attention state is session UI state, never saved; every change bumps
+//! The assistant's candidate ghost ([`set_ghost`], `assistant.ghost`): clones of the entities a
+//! dry-run script would create or modify, keyed by view block, drawn last, solid in
+//! [`ADDED_COLOR`] (TS `HALO_COLOR.added`).
+//!
+//! The attention and ghost states are session UI state, never saved; every change bumps
 //! [`cadcraft_render::bump_overlays`], since the drawing's revision doesn't move.
 
 use std::sync::Mutex;
@@ -35,6 +39,23 @@ fn attention() -> std::sync::MutexGuard<'static, Option<(String, Vec<Handle>)>> 
 /// Halo `handles` in block `block` (RESOLVE's current issue), or nothing with `None`.
 pub(crate) fn set_attention(to: Option<(String, Vec<Handle>)>) {
     *attention() = to;
+    cadcraft_render::bump_overlays();
+}
+
+/// TS `HALO_COLOR.added` (`#4caf50`): the assistant candidate ghost.
+pub(crate) const ADDED_COLOR: Rgb = Rgb(0x4c, 0xaf, 0x50);
+const GHOST_TRANSPARENCY: u8 = 40;
+
+/// The candidate ghost: entity clones, each with its view block's name.
+static GHOST: Mutex<Option<Vec<(String, Entity)>>> = Mutex::new(None);
+
+fn ghost() -> std::sync::MutexGuard<'static, Option<Vec<(String, Entity)>>> {
+    GHOST.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Ghost these entities (a dry-run candidate), or nothing with `None`.
+pub(crate) fn set_ghost(to: Option<Vec<(String, Entity)>>) {
+    *ghost() = to;
     cadcraft_render::bump_overlays();
 }
 
@@ -92,6 +113,12 @@ pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     if !haloed.is_empty() {
         let ents: Vec<&Entity> = block.entities.iter().map(|e| &**e).filter(|e| haloed.contains(&e.handle)).collect();
         append(&mut out, &cadcraft_render::build_entities(d, ents, &opts), Some(ATTENTION_COLOR), ATTENTION_TRANSPARENCY);
+    }
+    if let Some(g) = &*ghost() {
+        let ents: Vec<&Entity> = g.iter().filter(|(b, _)| b == name).map(|(_, e)| e).collect();
+        if !ents.is_empty() {
+            append(&mut out, &cadcraft_render::build_entities(d, ents, &opts), Some(ADDED_COLOR), GHOST_TRANSPARENCY);
+        }
     }
     out
 }
@@ -163,6 +190,48 @@ mod tests {
 
         mark_ai(&mut s, h, true)?;
         assert_eq!(lamb_overlay(s.doc()?, &space, &Options::default()).prims.len(), base, "accepted: no glow");
+        Ok(())
+    }
+
+    #[test]
+    fn the_assistant_ghost_draws_a_candidate_in_added_green_and_clears() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        set_attention(None);
+        set_ghost(None);
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("lambproject", &json!({}))?["viewId"].as_u64().ok_or("no plan")?);
+        let space = Space::Block(view_block_name(plan));
+        let green = |s: &Session| -> std::result::Result<usize, Box<dyn std::error::Error>> {
+            Ok(draw(s.doc()?, &space, &Options::default()).prims.iter().filter(|p| p.color == ADDED_COLOR).count())
+        };
+        assert_eq!(green(&s)?, 0);
+        let snapshot = std::sync::Arc::clone(&s.state()?.doc);
+        let g0 = cadcraft_render::overlays_generation();
+        let r = s.execute(
+            crate::assistant::GHOST_ID,
+            &json!({ "steps": [
+                { "command": "line", "params": { "points": [[0, 0], [1000, 0]] } },
+                { "command": "line", "params": { "points": [[0, 500], [1000, 500]] } },
+            ] }),
+        )?;
+        assert_eq!(r, json!({ "shown": 2 }));
+        let g1 = cadcraft_render::overlays_generation();
+        assert!(g1 > g0, "generation bumped");
+        assert!(green(&s)? >= 2, "ghost prims in ADDED_COLOR");
+        assert!(std::sync::Arc::ptr_eq(&s.state()?.doc, &snapshot), "the drawing is untouched");
+
+        let bad = s.execute(crate::assistant::GHOST_ID, &json!({ "steps": [{ "command": "circle", "params": {} }] }));
+        assert!(bad.is_err_and(|e| e.to_string().contains("step 1 (circle)")));
+        assert_eq!(green(&s)?, 0, "a failing script clears the ghost");
+
+        s.execute(crate::assistant::GHOST_ID, &json!({ "steps": [{ "command": "line", "params": { "points": [[0, 0], [10, 0]] } }] }))?;
+        assert!(green(&s)? >= 1);
+        let g2 = cadcraft_render::overlays_generation();
+        assert_eq!(s.execute(crate::assistant::GHOST_ID, &json!({}))?, json!({ "shown": 0 }));
+        assert!(cadcraft_render::overlays_generation() > g2, "clearing bumps too");
+        assert_eq!(green(&s)?, 0, "cleared");
         Ok(())
     }
 }

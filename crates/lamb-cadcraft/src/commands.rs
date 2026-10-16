@@ -803,8 +803,9 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("repeat", "Repeat", crate::repeats::repeat).params("{dimension?, handles?: [handle], copies?: [handle]}").menu(MENU),
         CommandSpec::new(crate::assistant::ID, "Apply Assistant Script", crate::assistant::apply).params("{steps:[{command, params}], proposalId?}"),
         CommandSpec::new(crate::assistant::PROMPT_ID, "Assistant Prompt", crate::assistant::prompt_cmd).params("{message}").noundo(),
-        CommandSpec::new(crate::assistant::START_ID, "Assistant Start", crate::assistant::start_cmd).params("{message}").noundo(),
+        CommandSpec::new(crate::assistant::START_ID, "Assistant Start", crate::assistant::start_cmd).params("{message, dryRun?}").noundo(),
         CommandSpec::new(crate::assistant::RESUME_ID, "Assistant Resume", crate::assistant::resume_cmd).params("{turn, reply}").noundo(),
+        CommandSpec::new(crate::assistant::GHOST_ID, "Assistant Ghost", crate::assistant::ghost_cmd).params("{steps?}").noundo(),
         CommandSpec::new("accept", "Accept AI Line", crate::entitycmds::accept)
             .alias(&["acc"])
             .params("{handles?}")
