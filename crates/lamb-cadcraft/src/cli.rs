@@ -114,7 +114,7 @@ pub(crate) fn apply(s: &mut Session, records: &[Record]) -> Vec<Value> {
 }
 
 /// The path grammar of TS `getPath`: `key[0][1].key`; anything else is `None`.
-fn get_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+pub(crate) fn get_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = root;
     for segment in path.split('.') {
         let (key, mut rest) = segment.split_at(segment.find('[').unwrap_or(segment.len()));
@@ -151,7 +151,7 @@ fn report(s: &Session, results: Vec<Value>, synth: bool) -> Result<Value, String
     Ok(Value::Object(r))
 }
 
-fn write_out(s: &Session, path: &str) -> Result<(), String> {
+pub(crate) fn write_out(s: &Session, path: &str) -> Result<(), String> {
     let d = s.doc().map_err(|e| e.to_string())?;
     let text = if path.to_ascii_lowercase().ends_with(".dxf") {
         cadcraft_io::write_dxf(d)
