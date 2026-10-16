@@ -1,5 +1,5 @@
 //! The assistant's script, applied (TS `packages/command-engine/src/assistantTurn.ts`
-//! `runAssistantTurn`, without the model call or the retry loop).
+//! `runAssistantTurn`, without the check call; the model call is the caller's `ask`).
 //!
 //! - [`extract_last_script`]: the last ```` ```json ```` fenced block of a model reply (or a bare
 //!   ```` ``` ```` fence whose body parses as JSON), parsed.
@@ -21,6 +21,15 @@
 //! drawings: the cache prefix), [`header`] (system, per turn: views, layers, counts, active view,
 //! current layer, selection), then the user's text. `assistant.prompt {message}` (no menu, not an
 //! undo step) returns them as `{messages: [{role, content}]}`.
+//!
+//! The turn loop: [`run_turn`] asks through a caller-given [`AskFn`] (no provider here), then
+//! loops on the reply. No script → [`TurnOutcome::NoScript`]. A script of only `query`/`showlinks`
+//! is a read round (≤ [`MAX_READ_ROUNDS`], not counted as attempts): each step runs through
+//! `execute`, the values go back as `Query result(s)…` and the model is re-asked. Any other script
+//! goes through `execute("assistant.apply")` — one undo step. A script with no steps array
+//! (Parse) or one that fails to apply (Apply) is retried, at most [`MAX_ATTEMPTS`] scripts in all,
+//! the re-ask carrying only that failing reply and its error. A retry with no script, or the
+//! attempts or read rounds spent, ends as [`TurnOutcome::Failed`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -302,6 +311,104 @@ pub(crate) fn prompt_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "messages": prompt(s, message)? }))
 }
 
+/// How many scripts one turn may try (the first and two retries).
+pub const MAX_ATTEMPTS: usize = 3;
+
+/// Where a failed script failed: its shape, or applying it.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Stage {
+    Parse,
+    Apply,
+}
+
+/// How one assistant turn ended.
+#[derive(Debug, PartialEq)]
+pub enum TurnOutcome {
+    /// The reply held no script: a prose answer, nothing changed.
+    NoScript { text: String },
+    /// No script applied; `errors` holds the last error, `last_script` the last script tried.
+    Failed { stage: Stage, attempts: usize, errors: Vec<String>, last_script: String },
+    /// A script applied as one undo step; `result` is `assistant.apply`'s return value.
+    Applied { attempts: usize, result: Value },
+}
+
+/// The model call: the messages so far in, the reply text out.
+pub type AskFn<'a> = dyn FnMut(&[Message]) -> std::result::Result<String, String> + 'a;
+
+fn ask_with(ask: &mut AskFn, base: &[Message], reply: &str, user: String) -> Result<String> {
+    let mut m = base.to_vec();
+    m.push(Message::new("assistant", reply));
+    m.push(Message::new("user", user));
+    ask(&m).map_err(|e| EngineError::Other(format!("assistant: {e}")))
+}
+
+/// One assistant turn: ask, then read rounds (≤ [`MAX_READ_ROUNDS`], not attempts) and retries
+/// (≤ [`MAX_ATTEMPTS`] scripts) until a script applies, the reply is prose, or the budget is spent.
+/// A retry's re-ask carries only the failing reply and its error. Errs only when `ask` errs or
+/// there is no drawing.
+pub fn run_turn(s: &mut Session, user: &str, ask: &mut AskFn) -> Result<TurnOutcome> {
+    let base = prompt(s, user)?;
+    let mut reply = ask(&base).map_err(|e| EngineError::Other(format!("assistant: {e}")))?;
+    let (mut attempts, mut rounds) = (1, 0);
+    let mut last: Option<(Stage, String, String)> = None;
+    loop {
+        let Some(script) = extract_last_script(&reply) else {
+            return Ok(match last {
+                None => TurnOutcome::NoScript { text: reply },
+                Some((stage, error, last_script)) => TurnOutcome::Failed { stage, attempts: attempts - 1, errors: vec![error], last_script },
+            });
+        };
+        let last_script = serde_json::to_string(&script).unwrap_or_default();
+        let failure = match script_steps(&script) {
+            None => (Stage::Parse, "a script must be {\"steps\": [{command, params}]} or an array of steps".to_owned()),
+            Some(steps) => {
+                let read_only =
+                    !steps.is_empty() && steps.iter().all(|st| st.get("command").and_then(Value::as_str).is_some_and(|c| READ_ONLY.contains(&c)));
+                if read_only {
+                    if rounds >= MAX_READ_ROUNDS {
+                        return Ok(TurnOutcome::Failed {
+                            stage: Stage::Apply,
+                            attempts,
+                            errors: vec!["read-round budget spent with no edit".to_owned()],
+                            last_script,
+                        });
+                    }
+                    rounds += 1;
+                    let mut lines = Vec::new();
+                    for (i, st) in steps.iter().enumerate() {
+                        let id = st.get("command").and_then(Value::as_str).unwrap_or_default();
+                        let params = st.get("params").cloned().unwrap_or_else(|| json!({}));
+                        let value = match s.execute(id, &params) {
+                            Ok(v) => v.to_string(),
+                            Err(e) => format!("error: {e}"),
+                        };
+                        lines.push(format!("- read {} {id}({params}): {value}", i + 1));
+                    }
+                    let msg = format!(
+                        "Query result(s), in call order:\n{}\nContinue: reply with prose if this answers the request, \
+                         or another script per the contract above.",
+                        lines.join("\n")
+                    );
+                    reply = ask_with(ask, &base, &reply, msg)?;
+                    continue;
+                }
+                match s.execute(ID, &json!({ "steps": steps })) {
+                    Ok(result) => return Ok(TurnOutcome::Applied { attempts, result }),
+                    Err(e) => (Stage::Apply, e.to_string()),
+                }
+            }
+        };
+        let (stage, error) = failure;
+        if attempts >= MAX_ATTEMPTS {
+            return Ok(TurnOutcome::Failed { stage, attempts, errors: vec![error], last_script });
+        }
+        let msg = format!("That script failed: {error}\nReturn one corrected script per the contract above, and nothing else.");
+        reply = ask_with(ask, &base, &reply, msg)?;
+        attempts += 1;
+        last = Some((stage, error, last_script));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +606,121 @@ mod tests {
         let r = s.execute(PROMPT_ID, &json!({ "message": "hi" }))?;
         assert_eq!(undo_len(&s)?, n);
         assert_eq!(r["messages"][2], json!({ "role": "user", "content": "hi" }));
+        Ok(())
+    }
+
+    /// Runs a turn against canned replies, returning the outcome and every message list asked.
+    fn turn(s: &mut Session, replies: &[&str]) -> E<(TurnOutcome, Vec<Vec<Message>>)> {
+        let mut left: std::collections::VecDeque<String> = replies.iter().map(|r| (*r).to_owned()).collect();
+        let mut asked: Vec<Vec<Message>> = Vec::new();
+        let mut ask = |m: &[Message]| {
+            asked.push(m.to_vec());
+            left.pop_front().ok_or_else(|| "out of canned replies".to_owned())
+        };
+        let out = run_turn(s, "draw it", &mut ask)?;
+        Ok((out, asked))
+    }
+
+    const GOOD: &str = "Here:\n```json\n{\"steps\":[{\"command\":\"line\",\"params\":{\"points\":[[0,0],[1000,0]]}}]}\n```";
+    const BAD: &str = "Here:\n```json\n{\"steps\":[{\"command\":\"circle\",\"params\":{}}]}\n```";
+    const READ: &str = "Let me look.\n```json\n{\"steps\":[{\"command\":\"query\",\"params\":{}}]}\n```";
+
+    fn last(asked: &[Vec<Message>], i: usize) -> E<&Message> {
+        Ok(asked.get(i).and_then(|m| m.last()).ok_or("no such ask")?)
+    }
+
+    #[test]
+    fn a_prose_reply_changes_nothing() -> R {
+        let mut s = session()?;
+        let before = s.doc()?.clone();
+        let (out, asked) = turn(&mut s, &["Walls are 200 thick."])?;
+        assert_eq!(out, TurnOutcome::NoScript { text: "Walls are 200 thick.".into() });
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].len(), 3, "the bare prompt");
+        assert!(*s.doc()? == before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_good_script_applies_as_one_stamped_undo_step() -> R {
+        let mut s = session()?;
+        let n = undo_len(&s)?;
+        let (out, asked) = turn(&mut s, &[GOOD])?;
+        let TurnOutcome::Applied { attempts, result } = out else { return Err(format!("{out:?}").into()) };
+        assert_eq!((attempts, asked.len(), undo_len(&s)?), (1, 1, n + 1));
+        let h = *stamped(&result).first().ok_or("nothing stamped")?;
+        assert_eq!(origin(&s, h)?.ok_or("unstamped")?.producer, Some(AiProducer::Assistant));
+        Ok(())
+    }
+
+    #[test]
+    fn a_bad_script_is_retried_with_only_its_error() -> R {
+        let mut s = session()?;
+        let (out, asked) = turn(&mut s, &[BAD, GOOD])?;
+        assert!(matches!(out, TurnOutcome::Applied { attempts: 2, .. }), "{out:?}");
+        assert_eq!(asked.len(), 2);
+        let m = &asked[1];
+        assert_eq!(m.len(), 5, "prompt + the failed reply + the error");
+        assert_eq!((m[3].role.as_str(), m[3].content.as_str()), ("assistant", BAD));
+        assert!(m[4].content.starts_with("That script failed: ") && m[4].content.contains("step 1 (circle)"), "{}", m[4].content);
+        Ok(())
+    }
+
+    #[test]
+    fn three_bad_scripts_fail_and_change_nothing() -> R {
+        let mut s = session()?;
+        let (n, before) = (undo_len(&s)?, s.doc()?.clone());
+        let (out, asked) = turn(&mut s, &[BAD, BAD, BAD, GOOD])?;
+        let TurnOutcome::Failed { stage, attempts, errors, last_script } = out else { return Err(format!("{out:?}").into()) };
+        assert_eq!((stage, attempts, asked.len()), (Stage::Apply, 3, 3));
+        assert!(errors.len() == 1 && errors[0].contains("step 1 (circle)"), "{errors:?}");
+        assert!(last_script.contains("circle"));
+        assert_eq!(last(&asked, 2)?.content.matches("That script failed").count(), 1, "only the latest error");
+        assert_eq!(asked[2].len(), 5, "earlier attempts are not carried");
+        assert!(*s.doc()? == before);
+        assert_eq!(undo_len(&s)?, n);
+        Ok(())
+    }
+
+    #[test]
+    fn a_query_round_feeds_back_then_the_edit_applies() -> R {
+        let mut s = session()?;
+        let n = undo_len(&s)?;
+        let (out, asked) = turn(&mut s, &[READ, GOOD])?;
+        assert!(matches!(out, TurnOutcome::Applied { attempts: 1, .. }), "{out:?}");
+        assert_eq!(undo_len(&s)?, n + 1, "the read added no undo step");
+        let q = &last(&asked, 1)?.content;
+        assert!(q.starts_with("Query result(s)") && q.contains("- read 1 query({}): {"), "{q}");
+        assert!(q.contains("\"views\""), "the query's JSON: {q}");
+        Ok(())
+    }
+
+    #[test]
+    fn read_rounds_run_out() -> R {
+        let mut s = session()?;
+        let (out, asked) = turn(&mut s, &[READ, READ, READ, GOOD])?;
+        let TurnOutcome::Failed { errors, .. } = out else { return Err(format!("{out:?}").into()) };
+        assert_eq!(errors, vec!["read-round budget spent with no edit".to_owned()]);
+        assert_eq!(asked.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_retry_without_a_script_fails_with_the_previous_error() -> R {
+        let mut s = session()?;
+        let (out, _) = turn(&mut s, &[BAD, "sorry, I cannot"])?;
+        assert!(matches!(&out, TurnOutcome::Failed { stage: Stage::Apply, attempts: 1, errors, .. } if errors[0].contains("circle")), "{out:?}");
+        let (out, _) = turn(&mut s, &["```json\n{\"nope\": 1}\n```", GOOD])?;
+        assert!(matches!(out, TurnOutcome::Applied { attempts: 2, .. }), "a script of the wrong shape is a Parse attempt: {out:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_ask_error_is_a_turn_error() -> R {
+        let mut s = session()?;
+        let mut ask = |_: &[Message]| Err::<String, String>("offline".into());
+        let e = run_turn(&mut s, "hi", &mut ask).err().ok_or("should err")?.to_string();
+        assert!(e.contains("assistant: offline"), "{e}");
         Ok(())
     }
 
