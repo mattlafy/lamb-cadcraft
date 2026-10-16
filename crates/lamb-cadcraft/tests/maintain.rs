@@ -627,3 +627,118 @@ fn corner_tag_follows_a_vertex_insert() -> R {
     assert_eq!(index(&s)?, vec![1]);
     Ok(())
 }
+
+/// The stored `EntityData.role` of `h` (the slot as written, not resolved).
+fn stored_role(s: &Session, h: Handle) -> Result<lamb_core::model::LineRole, Box<dyn std::error::Error>> {
+    let e = s.doc()?.entity(h).ok_or("entity missing")?;
+    Ok(lamb_cadcraft::read_entity_data(&e.common)?.role)
+}
+
+/// Draws a LINE on `layer` in `view` and returns its handle.
+fn draw_on(s: &mut Session, view: Id, layer: &str, from: [f64; 2], to: [f64; 2]) -> Result<Handle, Box<dyn std::error::Error>> {
+    let before = block_handles(s.doc()?, view);
+    s.execute("editview", &json!({"viewId": view.0}))?;
+    s.execute("layer.current", &json!({"name": layer}))?;
+    s.execute("line", &json!({"points": [from, to]}))?;
+    Ok(block_handles(s.doc()?, view).into_iter().find(|h| !before.contains(h)).ok_or("line not drawn")?)
+}
+
+/// The fixture's first plan view and first non-plan (section) view.
+fn plan_and_section(d: &Drawing) -> Result<(Id, Id), Box<dyn std::error::Error>> {
+    let doc = read_document(d)?;
+    let plan = doc.views.iter().find(|v| matches!(v, AnyView::Plan(_))).ok_or("no plan")?.id();
+    let sec = doc.views.iter().find(|v| matches!(v, AnyView::Vertical(_))).ok_or("no section")?.id();
+    Ok((plan, sec))
+}
+
+/// TS T256: a line on a cut-default layer is stored `cut` in a plan and `seen` in a section; any
+/// other layer default stores nothing; one undo takes the line and its stamp together.
+#[test]
+fn new_lines_on_cut_layers_get_a_concrete_role() -> R {
+    use lamb_core::model::LineRole;
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let (plan, sec) = plan_and_section(&d)?;
+    let mut s = Session::new();
+    s.open_drawing(d, "u-wall", None);
+    install_link_maintenance(&mut s);
+
+    let far = |k: f64| -> ([f64; 2], [f64; 2]) { ([-90000.0, -90000.0 + k], [-85000.0, -90000.0 + k]) };
+    let (a, b) = far(0.0);
+    let in_plan = draw_on(&mut s, plan, "WALL-EXT", a, b)?;
+    assert_eq!(stored_role(&s, in_plan)?, LineRole::Cut, "cut layer in a plan → cut");
+    let in_sec = draw_on(&mut s, sec, "WALL-EXT", a, b)?;
+    assert_eq!(stored_role(&s, in_sec)?, LineRole::Seen, "cut layer in a section → seen");
+    // The stamp rides in the LINE's own undo step: one undo takes both, redo restores both.
+    s.undo()?;
+    assert!(s.doc()?.entity(in_sec).is_none(), "one undo removes the line");
+    s.redo()?;
+    assert_eq!(stored_role(&s, in_sec)?, LineRole::Seen, "redo brings line and stamp back together");
+    let (a, b) = far(1000.0);
+    let grid = draw_on(&mut s, sec, "GRID", a, b)?;
+    assert_eq!(stored_role(&s, grid)?, LineRole::Bylayer, "datum layer → no slot written");
+    let note = draw_on(&mut s, plan, "ANNOTATION", a, b)?;
+    assert_eq!(stored_role(&s, note)?, LineRole::Bylayer, "annotation layer → no slot written");
+
+    Ok(())
+}
+
+/// TS T113: a line whose resolved role is reference never auto-links; the same line on a cut
+/// layer does.
+#[test]
+fn reference_lines_never_auto_link() -> R {
+    use lamb_core::model::LineRole;
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let original = read_document(&d)?.links;
+    let mut s = Session::new();
+    s.open_drawing(d, "u-wall", None);
+    install_link_maintenance(&mut s);
+
+    // Hollow a section marker by erasing a linked section line.
+    let (sec_end, sec_view) = {
+        let d = s.doc()?;
+        let mut found = None;
+        for l in &original {
+            for e in [l.a.entity_id, l.b.entity_id] {
+                let v = view_of(d, e)?;
+                if found.is_none() && !is_plan(d, v)? {
+                    found = Some((e, v));
+                }
+            }
+        }
+        found.ok_or("no section-side link end")?
+    };
+    s.execute("editview", &json!({"viewId": sec_view.0}))?;
+    s.execute("erase", &json!({"handles": [hex(sec_end)]}))?;
+    let marker = {
+        let p = DrawingProject::new(s.doc()?)?;
+        compute_markers_for_view(&p, sec_view)?.into_iter().find(|m| !m.filled).ok_or("no hollow marker")?
+    };
+    let layer = {
+        let p = DrawingProject::new(s.doc()?)?;
+        p.entity(marker.source_entity_id).ok_or("marker source missing")?.layer_id.to_owned()
+    };
+    // The source keeps a concrete role, so its marker survives the layer becoming reference.
+    s.execute("setrole", &json!({"handles": [hex(marker.source_entity_id)], "role": "cut"}))?;
+    s.execute("layerrole", &json!({"layer": layer, "role": "reference"}))?;
+    {
+        let p = DrawingProject::new(s.doc()?)?;
+        let still = compute_markers_for_view(&p, sec_view)?;
+        assert!(still.iter().any(|m| !m.filled && m.source_entity_id == marker.source_entity_id), "the hollow marker survives");
+    }
+    let (x, y) = (marker.position.x, marker.position.y);
+    let through = ([x - 500.0, y - 500.0], [x + 500.0, y + 500.0]);
+    let before = links(&s)?;
+    let refline = draw_on(&mut s, sec_view, &layer, through.0, through.1)?;
+    assert_eq!(stored_role(&s, refline)?, LineRole::Bylayer, "reference layer: nothing stamped");
+    assert_eq!(links(&s)?, before, "a reference line forms no link");
+
+    s.execute("erase", &json!({"handles": [refline.hex()]}))?;
+    s.execute("layerrole", &json!({"layer": layer, "role": "cut"}))?;
+    let cutline = draw_on(&mut s, sec_view, &layer, through.0, through.1)?;
+    let created: Vec<LinkRecord> = links(&s)?.into_iter().filter(|l| !before.iter().any(|b| b.id == l.id)).collect();
+    assert_eq!(created.len(), 1, "the same line on a cut layer links: {created:?}");
+    assert!(on(&created[0], Id(cutline.0)));
+    Ok(())
+}

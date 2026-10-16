@@ -28,9 +28,12 @@
 //!    `link_still_coincides`: a broken crossing is flagged `stale: Some(true)`, a restored one is
 //!    cleared back to `None` — a moved line is flagged, never dropped, because a flag is visible and
 //!    reversible (`link-maintenance.md`: "visible flags beat silent resolution");
+//!    Then, 2b, stamps each entity new to a view block whose stored role is `Bylayer` and whose layer's
+//!    default is `Cut` with a concrete role: `Cut` in a plan, `Seen` in a vertical or detail view
+//!    (TS T256 `createEntity.ts` `pushEntity`), so later layer-role edits leave it alone;
 //! 3. auto-links each entity new to a view block through its view's hollow markers, skipping a
 //!    pair of segments some link already joins (a re-anchored piece crosses the marker its own link
-//!    fills).
+//!    fills) and any entity whose resolved role is `Reference` (TS T113).
 //!
 //! [`install`] registers [`link_observer`] on a `Session`, so all of this lands in the command's own
 //! undo step. Out of scope: travel or erase cascading past the first partner, Tier 2 declarations.
@@ -42,11 +45,12 @@ use cadcraft_doc::{Drawing, EntityKind, Handle};
 use cadcraft_engine::Session;
 use lamb_core::derivation::linking::{find_auto_links, link_still_coincides};
 use lamb_core::derivation::read::ProjectRead;
+use lamb_core::derivation::read::ViewKind;
 use lamb_core::derivation::travel::travel_segment_move;
 use lamb_core::geometry::polyline::{ResolvedSegment, closest_point_on_segment, point_at_param, resolved_segments, virtual_corner_entries};
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::geometry::{Point2, Polyline2};
-use lamb_core::model::{Actor, AnyView, Id, LinkAnchor, LinkRecord};
+use lamb_core::model::{Actor, AnyView, Id, LineRole, LinkAnchor, LinkRecord, resolve_entity_role};
 
 use crate::convert::from_polyline;
 
@@ -70,6 +74,8 @@ pub struct MaintenanceReport {
     pub reanchored: Vec<Id>,
     /// Partner entities (not links) erased with an erased entity across a travel-set link.
     pub erased: Vec<Id>,
+    /// New entities (not links) given a concrete `Cut`/`Seen` role from a cut-default layer.
+    pub stamped: Vec<Id>,
 }
 
 impl MaintenanceReport {
@@ -81,6 +87,7 @@ impl MaintenanceReport {
             && self.travelled.is_empty()
             && self.reanchored.is_empty()
             && self.erased.is_empty()
+            && self.stamped.is_empty()
     }
 }
 
@@ -298,6 +305,47 @@ fn erase_partners(before_entities: &EntityMap, after: &mut Drawing, travel_set: 
     Ok(erased)
 }
 
+/// Step 2b, creation-time role (TS T256 `pushEntity`): each of `new_entities` stored as `Bylayer`
+/// on a layer whose default is `Cut` gets `Cut` in a plan view and `Seen` in a vertical or detail
+/// view, written into its `EntityData`. Any other layer default, or a concrete stored role, is left.
+fn stamp_roles(after: &mut Drawing, new_entities: &[Id]) -> Result<Vec<Id>, SchemaError> {
+    let writes: Vec<(Id, LineRole)> = {
+        let p = DrawingProject::new(after)?;
+        new_entities
+            .iter()
+            .filter_map(|id| {
+                let e = p.entity(*id)?;
+                if e.role != LineRole::Bylayer {
+                    return None;
+                }
+                let layer = p.layers().iter().find(|l| l.id == e.layer_id)?;
+                if layer.default_role != LineRole::Cut {
+                    return None;
+                }
+                let role = if p.view(e.view_id)?.kind == ViewKind::Plan { LineRole::Cut } else { LineRole::Seen };
+                Some((*id, role))
+            })
+            .collect()
+    };
+    for (id, role) in &writes {
+        let mut err = None;
+        after
+            .modify_entity(Handle(id.0), |e| {
+                err = read_entity_data(&e.common)
+                    .and_then(|mut data| {
+                        data.role = *role;
+                        set_entity_data(&mut e.common, &data)
+                    })
+                    .err();
+            })
+            .map_err(|e| derivation_error(e.to_string()))?;
+        if let Some(e) = err {
+            return Err(e);
+        }
+    }
+    Ok(writes.into_iter().map(|(id, _)| id).collect())
+}
+
 /// Some link already joins segment `a` to segment `b`, either way round.
 fn already_joined(links: &[LinkRecord], r: &LinkRecord) -> bool {
     let key = |x: &LinkAnchor| (x.entity_id, x.segment_index);
@@ -367,12 +415,19 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
         write_document(after, &doc)?;
     }
 
+    // 2b: stamp a concrete role on new entities of cut-default layers, before markers and links read it.
+    report.stamped = stamp_roles(after, &new_entities)?;
+
     // 3: auto-link each new entity, in handle order, each seeing the links of the ones before it.
     let actor = Actor::User { user_id: "local".into() };
     for id in new_entities {
         let mut records: Vec<LinkRecord> = {
             let p = DrawingProject::new(after)?;
             let Some(entity) = p.entity(id) else { continue };
+            // TS T113: a reference line never auto-links.
+            if resolve_entity_role(p.layers(), entity.role, entity.layer_id) == LineRole::Reference {
+                continue;
+            }
             let mut placeholder = 0u64;
             let mut mint = || {
                 placeholder += 1;
