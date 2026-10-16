@@ -41,7 +41,7 @@ struct Opts {
 
 /// One stdin line.
 #[derive(Debug, Clone, PartialEq)]
-enum Record {
+pub(crate) enum Record {
     Command { id: String, params: Value },
     Undo,
     Redo,
@@ -64,7 +64,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 
-fn parse_records(stdin: &str) -> Result<Vec<Record>, String> {
+pub(crate) fn parse_records(stdin: &str) -> Result<Vec<Record>, String> {
     let mut records = Vec::new();
     for (i, line) in stdin.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
         let bad = |why: &str| format!("stdin line {}: {why}: {}", i + 1, line.trim());
@@ -84,7 +84,7 @@ fn parse_records(stdin: &str) -> Result<Vec<Record>, String> {
 
 /// The loaded session with no undo history, so `"!undo"` never reaches past the loaded drawing
 /// (a fresh project's own LAMBPROJECT included).
-fn baseline(file: Option<&str>) -> Result<Session, String> {
+pub(crate) fn baseline(file: Option<&str>) -> Result<Session, String> {
     let mut s = load(file)?;
     let st = s.state_mut().map_err(|e| e.to_string())?;
     st.undo.clear();
@@ -93,7 +93,7 @@ fn baseline(file: Option<&str>) -> Result<Session, String> {
 }
 
 /// Applies each record in order, one result per record; a failure does not stop the rest.
-fn apply(s: &mut Session, records: &[Record]) -> Vec<Value> {
+pub(crate) fn apply(s: &mut Session, records: &[Record]) -> Vec<Value> {
     records
         .iter()
         .map(|r| match r {

@@ -63,6 +63,7 @@ pub mod rounding;
 pub mod scene;
 pub mod schema;
 pub mod sheets;
+pub mod solids_cli;
 pub mod sweeps;
 mod viewlife;
 pub mod viewpick;
