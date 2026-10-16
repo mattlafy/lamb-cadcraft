@@ -17,7 +17,7 @@ pub use entities::{
     AiOrigin, AiProducer, DrawingEntity, DrawingLayer, EntityGeometry, HatchGeometry, HatchLoop, LineRole, default_layers, hatch_loops,
     is_layer_editable, is_layer_rendered, is_layer_selectable, is_layer_snappable, is_line_like, resolve_entity_role,
 };
-pub use id::{INTERNED_BASE, Id, with_string_ids};
+pub use id::{INTERNED_BASE, Id, IdStrings, with_string_ids, with_string_ids_seeded};
 pub use views::{
     AnyView, CURRENT_SCHEMA_VERSION, CutDirection, DEFAULT_CUT_HEIGHT_MM, DEFAULT_FLOOR_TO_FLOOR_MM, DetailView, Level, Placement, PlanView, Project,
     ProjectDefaults, Units, VerticalIntent, VerticalView, default_project_defaults, empty_project, find_layer, find_level, find_view, is_placed,

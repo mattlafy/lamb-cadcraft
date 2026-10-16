@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::entities::{DrawingEntity, DrawingLayer, default_layers};
-use super::{Field, Id, LinkRecord};
+use super::{Field, Id, IdStrings, LinkRecord};
 use crate::geometry::hatch_pattern::PatternDefinition;
 use crate::geometry::{Polyline2, Transform2D};
 
@@ -202,6 +202,10 @@ pub struct Project {
     /// `aiOrigin.proposalId` slots an unaccepted AI line was erased from; the sweep skips them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppressed_proposals: Option<Vec<String>>,
+    /// Original string of each interned id, filled by the `.lamb` reader; empty for a project
+    /// built in memory.
+    #[serde(skip)]
+    pub id_strings: IdStrings,
 }
 
 /// `name` defaults to `"Untitled Project"`.
@@ -217,6 +221,7 @@ pub fn empty_project(name: Option<&str>) -> Project {
         command_log: Vec::new(),
         patterns: BTreeMap::new(),
         suppressed_proposals: None,
+        id_strings: IdStrings::default(),
     }
 }
 

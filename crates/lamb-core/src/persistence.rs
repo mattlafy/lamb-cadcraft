@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 use crate::derivation::proposals::remap_slot_key;
 use crate::geometry::Point2;
 use crate::geometry::circle_fit::{CircleFit, circle_as_polyline};
-use crate::model::{AnyView, CURRENT_SCHEMA_VERSION, Id, LinkRecord, Project, default_project_defaults, with_string_ids};
+use crate::model::{AnyView, CURRENT_SCHEMA_VERSION, Id, IdStrings, LinkRecord, Project, default_project_defaults, with_string_ids_seeded};
 
 pub const MANIFEST_PATH: &str = "manifest.json";
 pub const PROJECT_PATH: &str = "project.json";
@@ -104,7 +104,7 @@ fn migrate_circles(views: &mut [Value]) {
     }
 }
 
-/// Inside the [`with_string_ids`] scope: rewrites every `ai_origin.proposal_id` from the TS string
+/// Inside the [`with_string_ids`](crate::model::with_string_ids) scope: rewrites every `ai_origin.proposal_id` from the TS string
 /// ids it was saved with onto the interned ids' decimals — what `Id`'s `Display` gives outside the
 /// scope, so lamb-core's sweeps find the saved slots (T355).
 fn rewrite_proposal_ids(views: &mut [AnyView]) {
@@ -176,7 +176,7 @@ pub fn files_to_project(files: &BTreeMap<String, String>) -> Result<Project, Loa
         p => p,
     };
 
-    with_string_ids(|| {
+    let (project, id_strings) = with_string_ids_seeded(&IdStrings::default(), || {
         let mut views = view_paths.iter().zip(views).map(|(path, v)| decode::<AnyView>(path, v)).collect::<Result<Vec<_>, _>>()?;
         rewrite_proposal_ids(&mut views);
         Ok(Project {
@@ -190,8 +190,10 @@ pub fn files_to_project(files: &BTreeMap<String, String>) -> Result<Project, Loa
             command_log: decode(COMMAND_LOG_PATH, command_log)?,
             patterns: decode(PROJECT_PATH, patterns)?,
             suppressed_proposals: None,
+            id_strings: IdStrings::default(),
         })
-    })
+    });
+    project.map(|p| Project { id_strings, ..p })
 }
 
 /// Reads a `.lamb` directory from disk into the map [`files_to_project`] takes, and decodes it.

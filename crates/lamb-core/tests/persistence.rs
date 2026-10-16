@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use lamb_core::model::{CURRENT_SCHEMA_VERSION, EntityGeometry, Project};
+use lamb_core::model::{CURRENT_SCHEMA_VERSION, EntityGeometry, Project, with_string_ids_seeded};
 use lamb_core::persistence::{LoadError, files_to_project};
 use serde_json::{Value, json};
 
@@ -78,6 +78,28 @@ fn t76_rotated_section_schema_3() {
     assert_eq!(entity_counts(&p), [1, 0]);
     assert_eq!((p.links.len(), p.layers.len()), (0, 7));
     assert_links_resolve(&p);
+}
+
+#[test]
+fn loaded_id_strings_outlive_the_read() {
+    let p = load("t76-rotated-section");
+    let ids =
+        p.views.iter().map(|v| v.id()).chain(p.views.iter().flat_map(|v| v.entities().iter().map(|e| e.id))).chain(p.links.iter().map(|l| l.id));
+    for id in ids {
+        assert!(p.id_strings.0.contains_key(&id.0), "id {id:?} has no original string");
+    }
+    let files = fixture_map("t76-rotated-section");
+    let mut fixture_ids: Vec<String> = files
+        .iter()
+        .filter(|(path, _)| path.starts_with("views/"))
+        .map(|(_, text)| serde_json::from_str::<Value>(text).unwrap()["id"].as_str().unwrap().to_owned())
+        .collect();
+    let (views, _) = with_string_ids_seeded(&p.id_strings, || serde_json::to_value(&p.views).unwrap());
+    let mut loaded_ids: Vec<String> = views.as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap().to_owned()).collect();
+    fixture_ids.sort();
+    loaded_ids.sort();
+    assert_eq!(loaded_ids, fixture_ids);
+    assert_eq!(loaded_ids.len(), p.views.len());
 }
 
 /// A minimal valid map: one plan view holding one closed 4-segment polyline.

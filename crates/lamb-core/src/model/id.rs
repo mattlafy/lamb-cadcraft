@@ -7,7 +7,7 @@
 //! never saw serializes as `lamb-{n:08x}-0`, the shape of a TS `generateId` result.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use serde::de::{self, Visitor};
@@ -21,21 +21,44 @@ pub struct Id(pub u64);
 /// port mints itself.
 pub const INTERNED_BASE: u64 = 1 << 48;
 
+/// The original string of each interned id, keyed by id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdStrings(pub BTreeMap<u64, String>);
+
 #[derive(Default)]
 struct Interner {
     by_str: HashMap<String, u64>,
     by_id: HashMap<u64, String>,
+    /// One past the largest id held, or 0 when empty.
+    next_after_max: u64,
 }
 
 impl Interner {
+    fn seeded(seed: &IdStrings) -> Interner {
+        let mut int = Interner::default();
+        for (&n, s) in &seed.0 {
+            int.insert(s, n);
+        }
+        int
+    }
+
+    fn insert(&mut self, s: &str, n: u64) {
+        self.by_str.insert(s.to_owned(), n);
+        self.by_id.insert(n, s.to_owned());
+        self.next_after_max = self.next_after_max.max(n + 1);
+    }
+
     fn intern(&mut self, s: &str) -> u64 {
         if let Some(&n) = self.by_str.get(s) {
             return n;
         }
-        let n = INTERNED_BASE + self.by_str.len() as u64;
-        self.by_str.insert(s.to_owned(), n);
-        self.by_id.insert(n, s.to_owned());
+        let n = (INTERNED_BASE + self.by_str.len() as u64).max(self.next_after_max);
+        self.insert(s, n);
         n
+    }
+
+    fn table(&self) -> IdStrings {
+        IdStrings(self.by_id.iter().map(|(&n, s)| (n, s.clone())).collect())
     }
 }
 
@@ -56,9 +79,18 @@ impl Drop for Restore {
 /// Runs `f` with a fresh string-id interner installed on this thread (see the module docs),
 /// restoring whatever was installed before afterwards.
 pub fn with_string_ids<R>(f: impl FnOnce() -> R) -> R {
-    let prev = INTERNER.with(|i| i.borrow_mut().replace(Interner::default()));
+    with_string_ids_seeded(&IdStrings::default(), f).0
+}
+
+/// Like [`with_string_ids`], but the interner starts pre-filled from `seed`, and the table it ends
+/// with (`seed` plus everything interned inside `f`) is returned alongside `f`'s result. A new
+/// string gets an id past every seeded one, so a sparse seed cannot collide.
+pub fn with_string_ids_seeded<R>(seed: &IdStrings, f: impl FnOnce() -> R) -> (R, IdStrings) {
+    let prev = INTERNER.with(|i| i.borrow_mut().replace(Interner::seeded(seed)));
     let _restore = Restore(prev);
-    f()
+    let r = f();
+    let table = INTERNER.with(|i| i.borrow().as_ref().map(Interner::table).unwrap_or_default());
+    (r, table)
 }
 
 impl Id {
@@ -173,6 +205,41 @@ mod tests {
                 assert_eq!(serde_json::to_value(a).unwrap(), json!(format!("lamb-{:08x}-0", a.0)));
             });
             assert_eq!(serde_json::to_value(a).unwrap(), json!("outer"));
+        });
+    }
+
+    #[test]
+    fn seeded_scope_serializes_seed_and_interns_past_it() {
+        let seed = IdStrings(BTreeMap::from([(INTERNED_BASE, "plan-1".to_owned())]));
+        let ((), table) = with_string_ids_seeded(&seed, || {
+            assert_eq!(serde_json::to_value(Id(INTERNED_BASE)).unwrap(), json!("plan-1"));
+            let again: Id = serde_json::from_value(json!("plan-1")).unwrap();
+            assert_eq!(again, Id(INTERNED_BASE));
+            let b: Id = serde_json::from_value(json!("b")).unwrap();
+            assert_eq!(b, Id(INTERNED_BASE + 1));
+        });
+        assert_eq!(table, IdStrings(BTreeMap::from([(INTERNED_BASE, "plan-1".to_owned()), (INTERNED_BASE + 1, "b".to_owned())])));
+    }
+
+    #[test]
+    fn sparse_seed_cannot_collide() {
+        let seed = IdStrings(BTreeMap::from([(INTERNED_BASE + 5, "x".to_owned())]));
+        let (id, table) = with_string_ids_seeded(&seed, || serde_json::from_value::<Id>(json!("y")).unwrap());
+        assert_eq!(id, Id(INTERNED_BASE + 6));
+        assert_eq!(table.0.len(), 2);
+        assert_eq!(table.0.get(&(INTERNED_BASE + 5)).map(String::as_str), Some("x"));
+    }
+
+    #[test]
+    fn nested_seeded_scope_restores_outer_interner() {
+        with_string_ids(|| {
+            let a: Id = serde_json::from_value(json!("outer")).unwrap();
+            let seed = IdStrings(BTreeMap::from([(INTERNED_BASE + 9, "inner".to_owned())]));
+            let ((), _) = with_string_ids_seeded(&seed, || {
+                assert_eq!(serde_json::to_value(Id(INTERNED_BASE + 9)).unwrap(), json!("inner"));
+            });
+            assert_eq!(serde_json::to_value(a).unwrap(), json!("outer"));
+            assert_eq!(serde_json::to_value(Id(INTERNED_BASE + 9)).unwrap(), json!(format!("lamb-{:08x}-0", INTERNED_BASE + 9)));
         });
     }
 }
