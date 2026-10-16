@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 pub mod assembly;
+pub mod assistant;
 pub mod bubbles;
 pub mod commands;
 pub mod convert;
