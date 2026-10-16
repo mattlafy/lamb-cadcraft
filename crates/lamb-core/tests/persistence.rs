@@ -200,3 +200,161 @@ fn ai_slot_keys_name_the_loaded_ids_and_the_first_sweep_is_a_no_op() {
     .unwrap();
     assert_eq!((r.created_entities.len(), r.removed_entities.len()), (0, 0), "the first sweep re-proposes nothing");
 }
+
+// ---- the writer (LAMB T412) ----
+
+use lamb_core::persistence::{project_to_files, read_lamb_dir, stable_stringify, write_lamb_dir};
+
+const FIXTURES: [&str; 4] = ["u-wall-two-sections", "dimensioned-u-wall", "filleted-corners", "t76-rotated-section"];
+
+fn write(p: &Project) -> BTreeMap<String, String> {
+    project_to_files(p).into_iter().collect()
+}
+
+/// The first line that differs, for a readable failure.
+fn first_diff(a: &str, b: &str) -> String {
+    a.lines()
+        .zip(b.lines())
+        .enumerate()
+        .find(|(_, (x, y))| x != y)
+        .map_or_else(|| "lengths differ".to_owned(), |(i, (x, y))| format!("line {}: {x:?} vs {y:?}", i + 1))
+}
+
+#[test]
+fn t76_writes_byte_identical_to_the_ts_writer() {
+    let mut fixture = fixture_map("t76-rotated-section");
+    // The fixture's layers carry a legacy `printable` key the TS model no longer has; the TS reader
+    // passes it through and the TS writer writes it back, but `DrawingLayer` drops unknown keys.
+    // Carrying it needs a field on `DrawingLayer` and its constructors outside lamb-core (LAMB T415).
+    let project_json = fixture.get_mut("project.json").unwrap();
+    *project_json = project_json.lines().filter(|l| !l.trim_start().starts_with("\"printable\"")).map(|l| format!("{l}\n")).collect();
+    let written = write(&load("t76-rotated-section"));
+    assert_eq!(written.keys().collect::<Vec<_>>(), fixture.keys().collect::<Vec<_>>());
+    for (path, text) in &fixture {
+        assert!(written[path] == *text, "{path}: {}", first_diff(&written[path], text));
+    }
+}
+
+#[test]
+fn every_fixture_rewrites_stably() {
+    for name in FIXTURES {
+        let once = write(&load(name));
+        let twice = write(&files_to_project(&once).unwrap());
+        for (path, text) in &once {
+            assert!(twice.get(path) == Some(text), "{name} {path}: {}", first_diff(twice.get(path).map_or("", String::as_str), text));
+        }
+        assert_eq!(once.len(), twice.len(), "{name}");
+        let manifest: Value = serde_json::from_str(&once["manifest.json"]).unwrap();
+        assert_eq!(manifest["schemaVersion"], json!(CURRENT_SCHEMA_VERSION), "{name}");
+    }
+    let p = load("t76-rotated-section");
+    assert_eq!(files_to_project(&write(&p)).unwrap(), p);
+}
+
+#[test]
+fn stable_stringify_matches_json_stringify() {
+    let s = |v: Value| stable_stringify(&v);
+    assert_eq!(s(json!(1500.0)), "1500\n");
+    assert_eq!(s(json!(0.1)), "0.1\n");
+    assert_eq!(s(json!(-0.0)), "0\n");
+    assert_eq!(s(json!(1e-7)), "1e-7\n");
+    assert_eq!(s(json!(1e-6)), "0.000001\n");
+    assert_eq!(s(json!(1.5e21)), "1.5e+21\n");
+    assert_eq!(s(json!(1e20)), "100000000000000000000\n");
+    assert_eq!(s(json!(123_456_789_012.5)), "123456789012.5\n");
+    assert_eq!(s(json!(-3)), "-3\n");
+    assert_eq!(s(json!({"b": 1, "10": 2, "2": 3, "a": 4, "02": 5})), "{\n  \"2\": 3,\n  \"10\": 2,\n  \"02\": 5,\n  \"a\": 4,\n  \"b\": 1\n}\n");
+    assert_eq!(
+        s(json!({"a": [], "b": {}, "c": [{}, [1, null, true]]})),
+        "{\n  \"a\": [],\n  \"b\": {},\n  \"c\": [\n    {},\n    [\n      1,\n      null,\n      true\n    ]\n  ]\n}\n"
+    );
+    assert_eq!(s(json!("q\"b\\\né\u{1}")), concat!(r#""q\"b\\\né\u0001""#, "\n"));
+}
+
+#[test]
+fn minted_ids_write_as_strings_and_slot_keys_map_back() {
+    use lamb_core::derivation::proposals::ai_proposal_slot_key;
+    use lamb_core::model::{AnyView, Id};
+    let mut p = load("u-wall-two-sections");
+    let template = p.views.iter().flat_map(|v| v.entities()).find(|e| e.ai_origin.is_some()).unwrap().clone();
+    let (source, view) = (p.views[0].entities()[0].id, p.views[0].id());
+    let mut minted = template;
+    minted.id = Id(7);
+    assert!(!p.id_strings.0.contains_key(&7));
+    let key = ai_proposal_slot_key(source, 0, view);
+    minted.ai_origin.as_mut().unwrap().proposal_id = key.clone();
+    match &mut p.views[0] {
+        AnyView::Plan(v) => v.entities.push(minted),
+        AnyView::Vertical(v) => v.entities.push(minted),
+        AnyView::Detail(v) => v.entities.push(minted),
+    }
+    let files = write(&p);
+    let view_file = files.iter().find(|(_, t)| t.contains("lamb-00000007-0")).map(|(_, t)| t).expect("the minted entity is written by its string id");
+    let v: Value = serde_json::from_str(view_file).unwrap();
+    let original = |id: Id| p.id_strings.0[&id.0].clone();
+    let written_key = format!("{}:0:{}", original(source), original(view));
+    assert!(v["entities"].as_array().unwrap().iter().any(|e| e["id"] == "lamb-00000007-0" && e["aiOrigin"]["proposalId"] == written_key.as_str()));
+    // No bare decimal anywhere an id is written.
+    let ids: Vec<String> = files
+        .values()
+        .flat_map(|t| {
+            let v: Value = serde_json::from_str(t).unwrap();
+            let mut out = Vec::new();
+            collect_ids(&v, &mut out);
+            out
+        })
+        .collect();
+    assert!(ids.iter().all(|s| s.parse::<u64>().is_err()), "a bare decimal id was written: {ids:?}");
+    let back = files_to_project(&files).unwrap();
+    assert_eq!(entity_counts(&back), entity_counts(&p));
+    let by_string = |s: &str| Id(*back.id_strings.0.iter().find(|(_, v)| v.as_str() == s).unwrap().0);
+    let readback = back.views.iter().flat_map(|v| v.entities()).find(|e| e.id == by_string("lamb-00000007-0")).unwrap();
+    let expected = ai_proposal_slot_key(by_string(&original(source)), 0, by_string(&original(view)));
+    assert_eq!(readback.ai_origin.as_ref().unwrap().proposal_id, expected);
+}
+
+fn collect_ids(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                if (k == "id" || k.ends_with("Id")) && x.is_string() {
+                    out.push(x.as_str().unwrap().to_owned());
+                }
+                collect_ids(x, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_ids(x, out)),
+        _ => {}
+    }
+}
+
+#[test]
+fn write_lamb_dir_round_trips_and_prunes_stale_views() {
+    let dir = std::env::temp_dir().join(format!("lamb-core-write-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("views")).unwrap();
+    std::fs::write(dir.join("views/old--x.json"), "{}").unwrap();
+    std::fs::write(dir.join("notes.txt"), "keep me").unwrap();
+    let p = load("t76-rotated-section");
+    write_lamb_dir(&p, &dir).unwrap();
+    assert!(!dir.join("views/old--x.json").exists());
+    assert_eq!(std::fs::read_to_string(dir.join("notes.txt")).unwrap(), "keep me");
+    std::fs::remove_file(dir.join("notes.txt")).unwrap();
+    assert_eq!(read_lamb_dir(&dir).unwrap(), p);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+#[ignore = "debug: LAMB_DUMP=<dir> writes each fixture and its rewrite side by side, for diff -r"]
+fn dump_written_vs_fixtures() {
+    let out = std::path::PathBuf::from(std::env::var("LAMB_DUMP").unwrap());
+    for name in FIXTURES {
+        for (tag, files) in [("fixture", fixture_map(name)), ("written", write(&load(name)))] {
+            for (path, text) in files {
+                let p = out.join(name).join(tag).join(path);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, text).unwrap();
+            }
+        }
+    }
+}

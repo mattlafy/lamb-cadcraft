@@ -1,18 +1,20 @@
 //! Reading a `.lamb` project directory: a port of LAMB's `packages/persistence/src/layout.ts`
-//! `filesToProject`, with its two schema migrations and its defaults merge. Read-only; there is no
-//! Rust writer yet.
+//! `filesToProject`, with its two schema migrations and its defaults merge; and writing one: a port
+//! of `projectToFiles` + `serialize.ts` `stableStringify`, byte-identical to what the TS app writes.
 //!
 //! The input is the directory's files as a `/`-separated relative path -> UTF-8 content map (the
 //! shape of LAMB's `tools/fixtures/*.lamb.json`): `manifest.json`, `project.json`,
 //! `views/<slug>--<id>.json` (listed in `project.json`'s `views[]`), and the optional
 //! `links/links.json` and `command-log.json`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::derivation::proposals::remap_slot_key;
 use crate::geometry::Point2;
@@ -214,4 +216,195 @@ pub fn read_lamb_dir(path: &Path) -> Result<Project, LoadError> {
     let mut files = BTreeMap::new();
     walk(path, path, &mut files)?;
     files_to_project(&files)
+}
+
+/// True for a key JS orders as an array index: canonical decimal, below 2^32 - 1.
+fn is_array_index(k: &str) -> bool {
+    !k.is_empty()
+        && k.bytes().all(|b| b.is_ascii_digit())
+        && (k == "0" || !k.starts_with('0'))
+        && k.parse::<u64>().is_ok_and(|n| n < u64::from(u32::MAX))
+}
+
+/// The order of a JS object's own keys once `Object.keys(..).sort()` re-inserts them: array
+/// indices first, numerically, then the rest by UTF-16 code unit.
+fn js_key_order(a: &str, b: &str) -> Ordering {
+    match (is_array_index(a), is_array_index(b)) {
+        (true, true) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a.encode_utf16().cmp(b.encode_utf16()),
+    }
+}
+
+/// A number as JS `Number.prototype.toString` prints it.
+fn js_number(n: &serde_json::Number) -> String {
+    if n.is_u64() || n.is_i64() {
+        return n.to_string();
+    }
+    let x = n.as_f64().unwrap_or(0.0);
+    if x == 0.0 {
+        return "0".to_owned();
+    }
+    if (1e-6..1e21).contains(&x.abs()) {
+        // Display prints the shortest round-trip digits as a plain decimal, with no `.0`.
+        return format!("{x}");
+    }
+    let e = format!("{x:e}");
+    match e.split_once('e') {
+        Some((mantissa, exp)) if !exp.starts_with('-') => format!("{mantissa}e+{exp}"),
+        _ => e,
+    }
+}
+
+fn json_string(s: &str) -> String {
+    Value::String(s.to_owned()).to_string()
+}
+
+fn stringify_into(v: &Value, indent: usize, out: &mut String) {
+    fn open(out: &mut String, i: usize, indent: usize) {
+        out.push_str(if i == 0 { "\n" } else { ",\n" });
+        out.push_str(&"  ".repeat(indent + 1));
+    }
+    fn close(out: &mut String, indent: usize, bracket: char) {
+        out.push('\n');
+        out.push_str(&"  ".repeat(indent));
+        out.push(bracket);
+    }
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => out.push_str(&js_number(n)),
+        Value::String(s) => out.push_str(&json_string(s)),
+        Value::Array(items) if items.is_empty() => out.push_str("[]"),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                open(out, i, indent);
+                stringify_into(item, indent + 1, out);
+            }
+            close(out, indent, ']');
+        }
+        Value::Object(map) if map.is_empty() => out.push_str("{}"),
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| js_key_order(a.0, b.0));
+            out.push('{');
+            for (i, (key, value)) in entries.into_iter().enumerate() {
+                open(out, i, indent);
+                out.push_str(&json_string(key));
+                out.push_str(": ");
+                stringify_into(value, indent + 1, out);
+            }
+            close(out, indent, '}');
+        }
+    }
+}
+
+/// TS `stableStringify`: keys sorted, 2-space indent, a trailing newline, numbers as JS prints them.
+pub fn stable_stringify(v: &Value) -> String {
+    let mut out = String::new();
+    stringify_into(v, 0, &mut out);
+    out.push('\n');
+    out
+}
+
+/// TS `slugify`, for a view's file name.
+fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    for c in name.to_lowercase().trim().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            slug.push(c);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    match slug.trim_matches('-') {
+        "" => "view".to_owned(),
+        s => s.to_owned(),
+    }
+}
+
+fn id_of(v: &Value) -> &str {
+    v.get("id").and_then(Value::as_str).unwrap_or("")
+}
+
+fn to_value<T: Serialize>(v: &T) -> Value {
+    serde_json::to_value(v).unwrap_or(Value::Null)
+}
+
+fn sorted_by_id(v: Value) -> Value {
+    match v {
+        Value::Array(mut items) => {
+            items.sort_by(|a, b| id_of(a).cmp(id_of(b)));
+            Value::Array(items)
+        }
+        other => other,
+    }
+}
+
+/// Serialize a [`Project`] into the `.lamb` directory's files, in TS `projectToFiles` order. Ids are
+/// written as the strings they were loaded with (`lamb-{n:08x}-0` for an id minted since), and AI
+/// slot keys are mapped back from decimals onto those strings. Like the TS writer, it does not
+/// write `suppressed_proposals`.
+pub fn project_to_files(p: &Project) -> Vec<(String, String)> {
+    let (files, _) = with_string_ids_seeded(&p.id_strings, || {
+        let mut views = p.views.clone();
+        for v in views.iter_mut() {
+            let entities = match v {
+                AnyView::Plan(v) => &mut v.entities,
+                AnyView::Vertical(v) => &mut v.entities,
+                AnyView::Detail(v) => &mut v.entities,
+            };
+            for o in entities.iter_mut().filter_map(|e| e.ai_origin.as_mut()) {
+                o.proposal_id = remap_slot_key(&o.proposal_id, |s| s.parse::<u64>().ok().map(|n| Id(n).to_string()));
+            }
+        }
+        let mut views: Vec<(String, Value)> = views
+            .iter()
+            .map(|v| {
+                let mut value = to_value(v);
+                if let Some(entities) = value.get_mut("entities") {
+                    *entities = sorted_by_id(entities.take());
+                }
+                (format!("views/{}--{}.json", slugify(v.name()), v.id()), value)
+            })
+            .collect();
+        views.sort_by(|a, b| id_of(&a.1).cmp(id_of(&b.1)));
+
+        let manifest = json!({ "schemaVersion": p.schema_version, "name": p.name });
+        let project = json!({
+            "defaults": to_value(&p.defaults),
+            "levels": sorted_by_id(to_value(&p.levels)),
+            "layers": sorted_by_id(to_value(&p.layers)),
+            "views": views.iter().map(|(path, v)| json!({ "id": id_of(v), "path": path })).collect::<Vec<_>>(),
+            "patterns": to_value(&p.patterns),
+        });
+        let mut files = vec![(MANIFEST_PATH.to_owned(), stable_stringify(&manifest)), (PROJECT_PATH.to_owned(), stable_stringify(&project))];
+        files.extend(views.into_iter().map(|(path, v)| (path, stable_stringify(&v))));
+        files.push((LINKS_PATH.to_owned(), stable_stringify(&sorted_by_id(to_value(&p.links)))));
+        files.push((COMMAND_LOG_PATH.to_owned(), stable_stringify(&to_value(&p.command_log))));
+        files
+    });
+    files
+}
+
+/// Writes [`project_to_files`] into `dir`, creating `views/` and `links/`, and removes any
+/// `views/*.json` the project no longer lists. Other files in `dir` are left alone.
+pub fn write_lamb_dir(p: &Project, dir: &Path) -> std::io::Result<()> {
+    let files = project_to_files(p);
+    std::fs::create_dir_all(dir.join("views"))?;
+    std::fs::create_dir_all(dir.join("links"))?;
+    for (path, content) in &files {
+        std::fs::write(dir.join(path), content)?;
+    }
+    let listed: HashSet<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+    for entry in std::fs::read_dir(dir.join("views"))? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if path.is_file() && name.ends_with(".json") && !listed.contains(format!("views/{name}").as_str()) {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
