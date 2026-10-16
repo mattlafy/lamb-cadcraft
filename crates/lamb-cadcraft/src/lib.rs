@@ -43,6 +43,7 @@ mod dxfimport;
 mod entitycmds;
 pub mod export;
 pub mod fillet;
+pub mod fillet_matrix;
 pub mod import;
 mod lambopen;
 mod linkcmds;
