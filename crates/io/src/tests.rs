@@ -727,6 +727,22 @@ fn viewport_frozen_layers_read_from_341_without_xdata() {
 }
 
 #[test]
+fn viewport_frozen_layers_read_from_331_without_xdata() {
+    let (_, p) = frozen_vp_dxf();
+    let r = vp_record(&p, "2");
+    // Strip the CADCraft xdata and carry the frozen layer handles in group 331.
+    let x = p[r.clone()].iter().position(|(c, _)| c == "1001").unwrap() + r.start;
+    let head: Vec<(String, String)> =
+        p[r.start..x].iter().map(|(c, v)| (if c == "341" { "331".to_string() } else { c.clone() }, v.clone())).collect();
+    assert_eq!(head.iter().filter(|(c, _)| c == "331").count(), 2);
+    let mut q: Vec<(String, String)> = p[..r.start].to_vec();
+    q.extend(head);
+    q.extend(p[r.end..].iter().cloned());
+    let back = read_dxf(join(&q).as_bytes()).unwrap();
+    assert_eq!(viewport_frozen(&back, 2), vec!["Walls".to_string(), "A B".to_string()]);
+}
+
+#[test]
 fn viewport_frozen_xdata_wins_over_341() {
     let (_, p) = frozen_vp_dxf();
     let r = vp_record(&p, "2");

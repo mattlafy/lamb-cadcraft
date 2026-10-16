@@ -165,3 +165,48 @@ fn dwg_viewport_keeps_frozen_layers_as_layer_handles() {
     let frozen: Vec<&str> = vp.iter().filter(|(c, _)| c == "331" || c == "341").map(|(_, v)| v.as_str()).collect();
     assert_eq!(frozen, vec![layer_handle("Walls"), layer_handle("A B")]);
 }
+
+/// A DWG whose VIEWPORT carries frozen layers only as layer handles (no CADCraft xdata) opens with
+/// those layers frozen in that viewport: the converted DXF carries them in group 331.
+#[test]
+fn dwg_viewport_frozen_layer_handles_open_without_xdata() {
+    let mut d = Drawing::new_metric();
+    d.layers.push(Layer { name: "Walls".into(), ..Layer::default() });
+    d.layers.push(Layer { name: "A B".into(), ..Layer::default() });
+    let paper = Space::Paper(d.layouts[0].name.clone());
+    let EntityKind::Viewport(mut vp) = viewport(2) else { unreachable!() };
+    vp.frozen_layers = vec!["Walls".into(), "A B".into()];
+    d.add(&paper, Common::default(), EntityKind::Viewport(vp)).unwrap();
+
+    let dwg = cadcraft_io::write(&d, "x.dwg").unwrap();
+    let text = String::from_utf8_lossy(&cadcraft_dwg::dwg_to_dxf(&dwg).unwrap()).into_owned();
+    // Drop the xdata of every VIEWPORT record, leaving only the layer handles.
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::new();
+    let (mut in_vp, mut in_xdata) = (false, false);
+    for pair in lines.chunks(2) {
+        let [code, value] = pair else { break };
+        let c = code.trim();
+        if c == "0" {
+            in_vp = value.trim() == "VIEWPORT";
+            in_xdata = false;
+        } else if in_vp && c == "1001" {
+            in_xdata = true;
+        }
+        if !(in_vp && in_xdata) {
+            out.push_str(&format!("{code}\n{value}\n"));
+        }
+    }
+    assert!(!out.contains("VPFROZEN"));
+    let back = cadcraft_io::read_dxf(out.as_bytes()).unwrap();
+    let frozen = back
+        .layouts
+        .iter()
+        .flat_map(|l| l.entities.iter())
+        .find_map(|e| match &e.kind {
+            EntityKind::Viewport(v) if v.id == 2 => Some(v.frozen_layers.clone()),
+            _ => None,
+        })
+        .expect("viewport 2");
+    assert_eq!(frozen, vec!["Walls".to_string(), "A B".to_string()]);
+}
