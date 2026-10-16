@@ -29,6 +29,7 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("ui.panel.layers", "Layers Palette", &["Window", "Layers Palette"], None),
     ("ui.panel.views", "Views Palette", &["Window", "Views Palette"], None),
     ("ui.panel.scene3d", "3D View", &["Window", "3D View"], None),
+    ("ui.panel.assistant", "Assistant Palette", &["Window", "Assistant Palette"], None),
     ("ui.panel.quickcalc", "QuickCalc", &["Window", "QuickCalc"], Some("Cmd+8")),
     ("ui.toggle.systemcursor", "Show System Cursor", &["View", "Accessibility", "Show System Cursor"], None),
     ("ui.animations.system", "Use System Setting", &["View", "Accessibility", "Animation Effects", "Use System Setting"], None),
@@ -100,11 +101,12 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
     if matches!(id, "ui.dock" | "ui.dock.reset") {
         return Some(crate::docking::command(app, id == "ui.dock.reset", params));
     }
-    if matches!(id, "ui.panel.properties" | "ui.panel.layers" | "ui.panel.views" | "ui.panel.scene3d") {
+    if matches!(id, "ui.panel.properties" | "ui.panel.layers" | "ui.panel.views" | "ui.panel.scene3d" | "ui.panel.assistant") {
         let panel = match id {
             "ui.panel.properties" => "properties",
             "ui.panel.views" => "views",
             "ui.panel.scene3d" => "scene3d",
+            "ui.panel.assistant" => "assistant",
             _ => "layers",
         };
         return Some(crate::docking::command(app, false, &json!({"operation":"open", "panel":panel})));

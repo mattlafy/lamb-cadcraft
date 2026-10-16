@@ -234,6 +234,60 @@ fn lamb_view_rows(d: &cadcraft_engine::doc::Drawing, edit: &cadcraft_engine::doc
         .collect()
 }
 
+/// The Assistant palette's backend (fork, LAMB T425): turn steps are `assistant.start` /
+/// `assistant.resume` on the session; the model call and model list go over plain HTTP.
+fn lamb_chat_step(r: serde_json::Value) -> Result<cadcraft_ui_egui::chatpane::ChatStep, String> {
+    use cadcraft_ui_egui::chatpane::ChatStep;
+    if let Some(ask) = r.get("ask") {
+        return Ok(ChatStep::Ask { turn: r["turn"].clone(), messages: ask.clone() });
+    }
+    let d = r.get("done").ok_or_else(|| format!("unexpected assistant step: {r}"))?;
+    let count = |v: &serde_json::Value| v.as_array().map_or_else(|| v.as_u64().unwrap_or(0), |a| a.len() as u64);
+    let text = match d["kind"].as_str() {
+        Some("noScript") => d["text"].as_str().unwrap_or_default().to_string(),
+        Some("applied") => {
+            let res = &d["result"];
+            format!(
+                "Applied: {} created, {} modified (proposal {}) — ACCEPT keeps it, U undoes it.",
+                count(&res["created"]),
+                count(&res["modified"]),
+                res["proposalId"].as_str().unwrap_or("?")
+            )
+        }
+        Some("failed") => format!(
+            "No change — the script failed after {} attempt(s): {}",
+            d["attempts"].as_u64().unwrap_or(0),
+            d["errors"][0].as_str().unwrap_or("unknown error")
+        ),
+        _ => return Err(format!("unexpected assistant outcome: {d}")),
+    };
+    Ok(ChatStep::Done { text })
+}
+
+fn lamb_chat_start(s: &mut Session, text: &str) -> Result<cadcraft_ui_egui::chatpane::ChatStep, String> {
+    let r = s.execute(lamb_cadcraft::assistant::START_ID, &serde_json::json!({ "message": text })).map_err(|e| e.to_string())?;
+    lamb_chat_step(r)
+}
+
+fn lamb_chat_resume(s: &mut Session, turn: &serde_json::Value, reply: String) -> Result<cadcraft_ui_egui::chatpane::ChatStep, String> {
+    let r = s.execute(lamb_cadcraft::assistant::RESUME_ID, &serde_json::json!({ "turn": turn, "reply": reply })).map_err(|e| e.to_string())?;
+    lamb_chat_step(r)
+}
+
+fn lamb_chat_send(base: &str, model: &str, messages: &serde_json::Value) -> Result<String, String> {
+    let messages: Vec<lamb_cadcraft::assistant::Message> = serde_json::from_value(messages.clone()).map_err(|e| format!("bad messages: {e}"))?;
+    let cfg = lamb_cadcraft::provider::ProviderConfig { base_url: base.to_string(), model: model.to_string(), read_timeout: None };
+    lamb_cadcraft::provider::complete(&cfg, &messages)
+}
+
+const LAMB_CHAT: cadcraft_ui_egui::chatpane::ChatBackend = cadcraft_ui_egui::chatpane::ChatBackend {
+    default_base_url: lamb_cadcraft::provider::DEFAULT_BASE_URL,
+    start: lamb_chat_start,
+    resume: lamb_chat_resume,
+    send: lamb_chat_send,
+    models: lamb_cadcraft::provider::list_models,
+};
+
 fn lamb_status_toggles(s: &cadcraft_engine::Session) -> Vec<cadcraft_ui_egui::chrome::statusext::StatusToggle> {
     lamb_cadcraft::commands::status_toggles(s)
         .into_iter()
@@ -293,6 +347,9 @@ fn main() -> eframe::Result {
     }
     if let Err(e) = cadcraft_ui_egui::viewlist::register_row_source(lamb_view_rows) {
         log::warn!("LAMB Views palette not installed: {e}");
+    }
+    if let Err(e) = cadcraft_ui_egui::chatpane::register_backend(LAMB_CHAT) {
+        log::warn!("LAMB Assistant palette not installed: {e}");
     }
     if let Err(e) = cadcraft_ui_egui::chrome::statusext::register_status_toggles(lamb_status_toggles) {
         log::warn!("LAMB status toggles not installed: {e}");

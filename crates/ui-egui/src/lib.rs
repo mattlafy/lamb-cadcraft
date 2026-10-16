@@ -27,6 +27,7 @@ pub mod spacemouse;
 // The External References palette.
 pub mod xrefs;
 
+pub mod chatpane;
 pub mod dyngrips;
 pub mod dyninput;
 pub mod gpu;
@@ -247,6 +248,8 @@ pub struct CadApp {
     pub bedit: bedit::State,
     /// The 3D pane's scene cache and camera (fork-only, [`scene3d`]).
     pub scene3d: scene3d::Scene3dState,
+    /// The Assistant palette's transcript and in-flight turn (fork-only, [`chatpane`]).
+    pub chat: chatpane::ChatState,
 }
 
 impl CadApp {
@@ -286,6 +289,7 @@ impl CadApp {
             hatch_dlg: None,
             bedit: bedit::State::default(),
             scene3d: scene3d::Scene3dState::default(),
+            chat: chatpane::ChatState::default(),
         }
     }
 
@@ -568,6 +572,9 @@ impl CadApp {
         }
         self.drain_control(ctx);
         self.finish_opening();
+        if chatpane::poll(self) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         self.opening.show(ctx);
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
