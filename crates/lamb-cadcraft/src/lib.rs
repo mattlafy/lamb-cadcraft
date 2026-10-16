@@ -29,6 +29,7 @@
 
 pub mod assembly;
 pub mod assistant;
+pub mod assistant_cli;
 pub mod bubbles;
 pub mod commands;
 pub mod convert;

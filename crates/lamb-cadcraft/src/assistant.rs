@@ -469,6 +469,11 @@ impl Turn {
         Ok((Turn { base, reply: None, attempts: 1, rounds: 0, last: None, dry_run: false }, ask))
     }
 
+    /// Makes a would-apply script [`dry_run`] instead of applied.
+    pub fn set_dry_run(&mut self, on: bool) {
+        self.dry_run = on;
+    }
+
     /// The base prompt, then the reply being answered, then the follow-up user message.
     fn re_ask(&self, reply: &str, user: String) -> Vec<Message> {
         let mut m = self.base.clone();
