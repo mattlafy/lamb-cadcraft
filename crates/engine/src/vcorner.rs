@@ -2,11 +2,15 @@
 //! adjacent segments of one polyline asks a registered adapter first. When the adapter takes the
 //! corner (`Ok(true)`) the vertex is left where it is and the adapter records the rounding its own
 //! way (LAMB tags the vertex and draws the rounding live); `Ok(false)` falls through to CADCraft's
-//! baked arc or chamfer line. Unregistered, CADCraft is unchanged.
+//! baked arc or chamfer line. A second, independent hook checks the two picks of a two-entity
+//! FILLET on lines, arcs and circles before any fillet is attempted: `Err` refuses the command (LAMB
+//! refuses two clicks nearer different corners of a curved pair). Unregistered, CADCraft is
+//! unchanged.
 
 use std::sync::OnceLock;
 
-use cadcraft_doc::Handle;
+use cadcraft_doc::{Entity, Handle};
+use cadcraft_geom::Vec2;
 
 use crate::{Result, Session};
 
@@ -31,4 +35,19 @@ pub fn register_virtual_corner_hook(f: VirtualCornerHook) -> std::result::Result
 /// The registered virtual corner hook, if any.
 pub fn virtual_corner_hook() -> Option<VirtualCornerHook> {
     HOOK.get().copied()
+}
+
+/// `(session, first entity, first pick, second entity, second pick)` — `Err` refuses the fillet.
+pub type CornerPickCheck = fn(&Session, &Entity, Vec2, &Entity, Vec2) -> Result<()>;
+
+static PICK_CHECK: OnceLock<CornerPickCheck> = OnceLock::new();
+
+/// Register the two-entity FILLET pick check. Once per process; a second call is an error.
+pub fn register_corner_pick_check(f: CornerPickCheck) -> std::result::Result<(), &'static str> {
+    PICK_CHECK.set(f).map_err(|_| "corner pick check already registered")
+}
+
+/// The registered two-entity FILLET pick check, if any.
+pub fn corner_pick_check() -> Option<CornerPickCheck> {
+    PICK_CHECK.get().copied()
 }

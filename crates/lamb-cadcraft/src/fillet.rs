@@ -3,12 +3,19 @@
 //! corners), registered as CADCraft's virtual corner hook (`cadcraft_engine::vcorner`, fork patch
 //! 10). A polyline with width keeps CADCraft's baked arc. Radius 0 (or both chamfer distances 0)
 //! removes a tag at that vertex.
+//!
+//! Also registered: the two-entity FILLET pick check (same patch). A line/arc pair with at least one
+//! arc whose two clicks are nearer different apparent intersections is refused, as TS `corner.ts`
+//! refuses it; every other pair is left to CADCraft.
 
 use cadcraft_doc::Handle;
-use cadcraft_engine::vcorner::{CornerOp, register_virtual_corner_hook};
+use cadcraft_doc::{Entity, EntityKind};
+use cadcraft_engine::vcorner::{CornerOp, register_corner_pick_check, register_virtual_corner_hook};
 use cadcraft_engine::{EngineError, Result, Session};
+use cadcraft_geom::Vec2;
 use lamb_core::geometry::VirtualCornerEntry;
-use lamb_core::geometry::fillet::resolve_virtual_corner;
+use lamb_core::geometry::fillet::{apparent_curve_intersections, bulge_for_arc, choose_shared_corner, curve_from_edge, resolve_virtual_corner};
+use lamb_core::geometry::point::Point2;
 use lamb_core::geometry::polyline::{CornerEntry, virtual_corner_entries};
 
 use crate::convert::{apply_corners, to_polyline};
@@ -58,9 +65,38 @@ fn virtual_corner(s: &mut Session, h: Handle, vertex: usize, op: CornerOp) -> Re
     Ok(true)
 }
 
-/// Register the hook with CADCraft. Once per process; a second call is an error.
+/// A line or arc as lamb-core's `(p0, p1, bulge)`; `None` for anything else.
+fn edge(e: &Entity) -> Option<(Point2, Point2, f64)> {
+    match &e.kind {
+        EntityKind::Line(l) => Some((Point2 { x: l.a.x, y: l.a.y }, Point2 { x: l.b.x, y: l.b.y }, 0.0)),
+        EntityKind::Arc(a) => {
+            let c = Point2 { x: a.center.x, y: a.center.y };
+            let at = |t: f64| Point2 { x: c.x + a.radius * t.cos(), y: c.y + a.radius * t.sin() };
+            let (p0, p1) = (at(a.start), at(a.end));
+            Some((p0, p1, bulge_for_arc(c, true, p0, p1)))
+        }
+        _ => None,
+    }
+}
+
+/// The pick check: refuse a line/arc pair (at least one arc) whose clicks name different corners.
+fn corner_pick(_s: &Session, e1: &Entity, p1: Vec2, e2: &Entity, p2: Vec2) -> Result<()> {
+    if !matches!(e1.kind, EntityKind::Arc(_)) && !matches!(e2.kind, EntityKind::Arc(_)) {
+        return Ok(());
+    }
+    let (Some((a0, a1, ab)), Some((b0, b1, bb))) = (edge(e1), edge(e2)) else { return Ok(()) };
+    let pts = apparent_curve_intersections(&curve_from_edge(a0, a1, ab), &curve_from_edge(b0, b1, bb));
+    let (c1, c2) = (Point2 { x: p1.x, y: p1.y }, Point2 { x: p2.x, y: p2.y });
+    if !pts.is_empty() && choose_shared_corner(&pts, a0, a1, ab, c1, b0, b1, bb, c2).is_none() {
+        return Err(other("Those two clicks don't agree on the same corner."));
+    }
+    Ok(())
+}
+
+/// Register both hooks with CADCraft. Once per process; a second call is an error.
 pub fn register() -> std::result::Result<(), &'static str> {
-    register_virtual_corner_hook(virtual_corner)
+    register_virtual_corner_hook(virtual_corner)?;
+    register_corner_pick_check(corner_pick)
 }
 
 #[cfg(test)]
@@ -83,7 +119,7 @@ mod tests {
     }
 
     fn handle(r: &Value) -> Res<String> {
-        Ok(r["handle"].as_str().ok_or("no handle")?.to_owned())
+        Ok(r["handle"].as_str().or_else(|| r["handles"][0].as_str()).ok_or("no handle")?.to_owned())
     }
 
     fn hnd(h: &str) -> Res<Handle> {
@@ -153,6 +189,78 @@ mod tests {
         assert_eq!(vertex_count(&s, &p)?, 3);
         // Radius 0 with no tag there is still a success.
         s.execute("fillet", &json!({"h1": p, "p1": [50, 0], "h2": p, "p2": [100, 40], "radius": 0}))?;
+        Ok(())
+    }
+
+    /// The matrix's arc x arc pair (crossings at (3, -4) and (3, 4)): `(arc a, arc b)` handles.
+    fn two_arcs(s: &mut Session) -> Res<(String, String)> {
+        let a = handle(&s.execute("arc", &json!({"center": [0, 0], "radius": 5, "start": -110, "end": 190}))?)?;
+        let b = handle(&s.execute("arc", &json!({"center": [6, 0], "radius": 5, "start": 60, "end": 300}))?)?;
+        Ok((a, b))
+    }
+
+    fn on(c: (f64, f64), r: f64, deg: f64) -> [f64; 2] {
+        let t = deg.to_radians();
+        [c.0 + r * t.cos(), c.1 + r * t.sin()]
+    }
+
+    fn entity_count(s: &Session) -> Res<usize> {
+        Ok(s.doc()?.entity_count())
+    }
+
+    #[test]
+    fn curved_picks_on_different_corners_are_refused() -> R {
+        let mut s = session()?;
+        let (a, b) = two_arcs(&mut s)?;
+        let kinds = |s: &Session| -> Res<(usize, Vec<EntityKind>)> {
+            let d = s.doc()?;
+            let k = [&a, &b].iter().map(|h| Ok(d.entity(hnd(h)?).ok_or("no entity")?.kind.clone())).collect::<Res<Vec<_>>>()?;
+            Ok((d.entity_count(), k))
+        };
+        let before = kinds(&s)?;
+        // Arc a clicked near (3, -4) (at -60 deg), arc b clicked near (3, 4) (at 120 deg).
+        let err = s
+            .execute("fillet", &json!({"h1": a, "p1": on((0.0, 0.0), 5.0, -60.0), "h2": b, "p2": on((6.0, 0.0), 5.0, 120.0), "radius": 2}))
+            .err()
+            .ok_or("fillet succeeded")?;
+        assert!(err.to_string().contains("Those two clicks don't agree on the same corner."), "{err}");
+        assert_eq!(before, kinds(&s)?);
+        // Radius 0 is checked too.
+        assert!(
+            s.execute("fillet", &json!({"h1": a, "p1": on((0.0, 0.0), 5.0, -60.0), "h2": b, "p2": on((6.0, 0.0), 5.0, 120.0), "radius": 0})).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn curved_picks_on_one_corner_fillet_there() -> R {
+        let mut s = session()?;
+        let (a, b) = two_arcs(&mut s)?;
+        // Both clicks near (3, 4): arc a at 60 deg, arc b at 120 deg.
+        let r = s.execute("fillet", &json!({"h1": a, "p1": on((0.0, 0.0), 5.0, 60.0), "h2": b, "p2": on((6.0, 0.0), 5.0, 120.0), "radius": 2}))?;
+        let arc = hnd(r["arc"].as_str().ok_or("no arc")?)?;
+        let e = s.doc()?.entity(arc).cloned().ok_or("no fillet arc")?;
+        let EntityKind::Arc(f) = &e.kind else { return Err("fillet is not an arc".into()) };
+        assert!(f.center.y > 0.0, "fillet at the upper corner: {f:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn line_line_still_fillets_and_line_circle_is_not_checked() -> R {
+        let mut s = session()?;
+        let l1 = handle(&s.execute("line", &json!({"points": [[0, 0], [100, 0]]}))?)?;
+        let l2 = handle(&s.execute("line", &json!({"points": [[50, -50], [50, 50]]}))?)?;
+        let r = s.execute("fillet", &json!({"h1": l1, "p1": [20, 0], "h2": l2, "p2": [50, 20], "radius": 8}))?;
+        assert!(r["arc"].as_str().is_some(), "{r}");
+        let n = entity_count(&s)?;
+        // A line through a circle, clicked near different crossings: the check leaves it to CADCraft.
+        let l = handle(&s.execute("line", &json!({"points": [[200, 3], [220, 3]]}))?)?;
+        let c = handle(&s.execute("circle", &json!({"center": [210, 0], "radius": 5}))?)?;
+        assert_eq!(entity_count(&s)?, n + 2);
+        let ccw: Entity = (*s.doc()?.entity(hnd(&c)?).cloned().ok_or("no circle")?).clone();
+        let line: Entity = (*s.doc()?.entity(hnd(&l)?).cloned().ok_or("no line")?).clone();
+        assert!(corner_pick(&s, &line, Vec2::new(201.0, 3.0), &ccw, Vec2::new(214.0, 3.0)).is_ok());
+        assert!(corner_pick(&s, &ccw, Vec2::new(214.0, 3.0), &line, Vec2::new(201.0, 3.0)).is_ok());
         Ok(())
     }
 

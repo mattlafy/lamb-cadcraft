@@ -1,8 +1,8 @@
 //! The 9-click-region FILLET matrix (TS `tools/fillet-matrix.ts`): for curve pairs whose full
-//! curves cross, runs CADCraft's own two-entity `fillet {h1, p1, h2, p2, radius}` for every
-//! combination of click region and prints beside each run what LAMB's corner rule
-//! (`choose_shared_corner` / `resolve_ends_keeps`) says should happen. A report only — it changes
-//! no fillet behaviour.
+//! curves cross, runs the fork's two-entity `fillet {h1, p1, h2, p2, radius}` (CADCraft's FILLET
+//! with LAMB's corner pick check registered, as shipped) for every combination of click region and
+//! prints beside each run what LAMB's corner rule (`choose_shared_corner` / `resolve_ends_keeps`)
+//! says should happen.
 //!
 //! ```text
 //! cargo run -p lamb-cadcraft --example lamb_fillet_matrix -- [--json]
@@ -181,6 +181,10 @@ struct Cad {
 
 fn run_cadcraft(pair: &Pair, click_a: Point2, click_b: Point2, radius: f64, pts: &[Point2]) -> Cad {
     let mut cad = Cad { corner: None, center: None, radius: None, error: None, ends_a: None, ends_b: None };
+    if let Err(e) = crate::overlays::register_providers() {
+        cad.error = Some(e.to_owned());
+        return cad;
+    }
     let mut s = Session::new();
     let handles = pair.a.create(&mut s).and_then(|ha| Ok((ha, pair.b.create(&mut s)?)));
     let (ha, hb) = match handles {

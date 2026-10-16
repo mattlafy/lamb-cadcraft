@@ -1735,6 +1735,9 @@ pub(crate) fn fillet_curves(s: &mut Session, h1: Handle, p1: Vec2, h2: Handle, p
     if h1 == h2 {
         return Err(other("Cannot fillet an object to itself."));
     }
+    if let Some(f) = crate::vcorner::corner_pick_check() {
+        f(s, &e1, p1, &e2, p2)?;
+    }
     let (t1, t2, fc) = if r <= 1e-12 {
         // Sharp corner: the intersection nearest the picks.
         let hits: Vec<Vec2> = match (o1, o2) {
