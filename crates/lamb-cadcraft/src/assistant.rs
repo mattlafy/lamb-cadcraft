@@ -30,6 +30,13 @@
 //! (Parse) or one that fails to apply (Apply) is retried, at most [`MAX_ATTEMPTS`] scripts in all,
 //! the re-ask carrying only that failing reply and its error. A retry with no script, or the
 //! attempts or read rounds spent, ends as [`TurnOutcome::Failed`].
+//!
+//! The same loop as resumable steps, for a caller that makes the model call elsewhere:
+//! [`Turn::start`] gives the first messages, [`Turn::resume`] takes one reply and returns the next
+//! messages ([`Step::Ask`]) or the outcome ([`Step::Done`]); `run_turn` is a loop over them.
+//! `assistant.start {message}` → `{turn, ask}` and `assistant.resume {turn, reply}` →
+//! `{turn, ask}` or `{done: <outcome>}` (no menu, no undo step of their own) carry the [`Turn`] as
+//! JSON; an applied script is still its own `assistant.apply` undo step.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -38,7 +45,7 @@ use cadcraft_doc::{Drawing, Entity, Handle, entity_bounds};
 use cadcraft_engine::cmd::command_specs;
 use cadcraft_engine::{EngineError, Result, Session, find_command};
 use lamb_core::model::{AiOrigin, AiProducer};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::commands::{bad, edited_view, other};
@@ -47,6 +54,8 @@ use crate::schema::{EXT_KEY, read_entity_data, set_entity_data};
 
 pub const ID: &str = "assistant.apply";
 pub const PROMPT_ID: &str = "assistant.prompt";
+pub const START_ID: &str = "assistant.start";
+pub const RESUME_ID: &str = "assistant.resume";
 
 /// How many read-only rounds one turn may take before it must answer or edit.
 pub const MAX_READ_ROUNDS: usize = 2;
@@ -184,7 +193,7 @@ pub(crate) fn apply(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// One chat message; `role` is `"system"`, `"user"` or `"assistant"`.
-#[derive(Serialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Message {
     pub role: String,
     pub content: String,
@@ -315,14 +324,16 @@ pub(crate) fn prompt_cmd(s: &mut Session, p: &Value) -> Result<Value> {
 pub const MAX_ATTEMPTS: usize = 3;
 
 /// Where a failed script failed: its shape, or applying it.
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Stage {
     Parse,
     Apply,
 }
 
 /// How one assistant turn ended.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum TurnOutcome {
     /// The reply held no script: a prose answer, nothing changed.
     NoScript { text: String },
@@ -335,45 +346,68 @@ pub enum TurnOutcome {
 /// The model call: the messages so far in, the reply text out.
 pub type AskFn<'a> = dyn FnMut(&[Message]) -> std::result::Result<String, String> + 'a;
 
-fn ask_with(ask: &mut AskFn, base: &[Message], reply: &str, user: String) -> Result<String> {
-    let mut m = base.to_vec();
-    m.push(Message::new("assistant", reply));
-    m.push(Message::new("user", user));
-    ask(&m).map_err(|e| EngineError::Other(format!("assistant: {e}")))
+/// One assistant turn in flight, between model calls. Serialisable, so it can cross the command
+/// boundary as JSON (`assistant.start` / `assistant.resume`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Turn {
+    base: Vec<Message>,
+    /// The last reply fed to [`Turn::resume`].
+    reply: Option<String>,
+    attempts: usize,
+    rounds: usize,
+    last: Option<(Stage, String, String)>,
 }
 
-/// One assistant turn: ask, then read rounds (≤ [`MAX_READ_ROUNDS`], not attempts) and retries
-/// (≤ [`MAX_ATTEMPTS`] scripts) until a script applies, the reply is prose, or the budget is spent.
-/// A retry's re-ask carries only the failing reply and its error. Errs only when `ask` errs or
-/// there is no drawing.
-pub fn run_turn(s: &mut Session, user: &str, ask: &mut AskFn) -> Result<TurnOutcome> {
-    let base = prompt(s, user)?;
-    let mut reply = ask(&base).map_err(|e| EngineError::Other(format!("assistant: {e}")))?;
-    let (mut attempts, mut rounds) = (1, 0);
-    let mut last: Option<(Stage, String, String)> = None;
-    loop {
+/// What a turn needs next: another model call with these messages, or nothing — it ended.
+#[derive(Debug, PartialEq)]
+pub enum Step {
+    Ask(Vec<Message>),
+    Done(TurnOutcome),
+}
+
+impl Turn {
+    /// A new turn and the messages of its first model call ([`prompt`]).
+    pub fn start(s: &Session, user: &str) -> Result<(Turn, Vec<Message>)> {
+        let base = prompt(s, user)?;
+        let ask = base.clone();
+        Ok((Turn { base, reply: None, attempts: 1, rounds: 0, last: None }, ask))
+    }
+
+    /// The base prompt, then the reply being answered, then the follow-up user message.
+    fn re_ask(&self, reply: &str, user: String) -> Vec<Message> {
+        let mut m = self.base.clone();
+        m.push(Message::new("assistant", reply));
+        m.push(Message::new("user", user));
+        m
+    }
+
+    /// Feeds one model reply in: a read round or a retry asks again, otherwise the turn ends.
+    /// Errs only when there is no drawing.
+    pub fn resume(&mut self, s: &mut Session, reply: String) -> Result<Step> {
+        self.reply = Some(reply.clone());
         let Some(script) = extract_last_script(&reply) else {
-            return Ok(match last {
+            return Ok(Step::Done(match self.last.take() {
                 None => TurnOutcome::NoScript { text: reply },
-                Some((stage, error, last_script)) => TurnOutcome::Failed { stage, attempts: attempts - 1, errors: vec![error], last_script },
-            });
+                Some((stage, error, last_script)) => TurnOutcome::Failed { stage, attempts: self.attempts - 1, errors: vec![error], last_script },
+            }));
         };
         let last_script = serde_json::to_string(&script).unwrap_or_default();
-        let failure = match script_steps(&script) {
+        let (stage, error) = match script_steps(&script) {
             None => (Stage::Parse, "a script must be {\"steps\": [{command, params}]} or an array of steps".to_owned()),
             Some(steps) => {
                 let read_only =
                     !steps.is_empty() && steps.iter().all(|st| st.get("command").and_then(Value::as_str).is_some_and(|c| READ_ONLY.contains(&c)));
                 if read_only {
-                    if rounds >= MAX_READ_ROUNDS {
-                        return Ok(TurnOutcome::Failed {
+                    if self.rounds >= MAX_READ_ROUNDS {
+                        return Ok(Step::Done(TurnOutcome::Failed {
                             stage: Stage::Apply,
-                            attempts,
+                            attempts: self.attempts,
                             errors: vec!["read-round budget spent with no edit".to_owned()],
                             last_script,
-                        });
+                        }));
                     }
-                    rounds += 1;
+                    self.rounds += 1;
                     let mut lines = Vec::new();
                     for (i, st) in steps.iter().enumerate() {
                         let id = st.get("command").and_then(Value::as_str).unwrap_or_default();
@@ -389,24 +423,54 @@ pub fn run_turn(s: &mut Session, user: &str, ask: &mut AskFn) -> Result<TurnOutc
                          or another script per the contract above.",
                         lines.join("\n")
                     );
-                    reply = ask_with(ask, &base, &reply, msg)?;
-                    continue;
+                    return Ok(Step::Ask(self.re_ask(&reply, msg)));
                 }
                 match s.execute(ID, &json!({ "steps": steps })) {
-                    Ok(result) => return Ok(TurnOutcome::Applied { attempts, result }),
+                    Ok(result) => return Ok(Step::Done(TurnOutcome::Applied { attempts: self.attempts, result })),
                     Err(e) => (Stage::Apply, e.to_string()),
                 }
             }
         };
-        let (stage, error) = failure;
-        if attempts >= MAX_ATTEMPTS {
-            return Ok(TurnOutcome::Failed { stage, attempts, errors: vec![error], last_script });
+        if self.attempts >= MAX_ATTEMPTS {
+            return Ok(Step::Done(TurnOutcome::Failed { stage, attempts: self.attempts, errors: vec![error], last_script }));
         }
         let msg = format!("That script failed: {error}\nReturn one corrected script per the contract above, and nothing else.");
-        reply = ask_with(ask, &base, &reply, msg)?;
-        attempts += 1;
-        last = Some((stage, error, last_script));
+        let ask = self.re_ask(&reply, msg);
+        self.attempts += 1;
+        self.last = Some((stage, error, last_script));
+        Ok(Step::Ask(ask))
     }
+}
+
+/// One assistant turn: ask, then read rounds (≤ [`MAX_READ_ROUNDS`], not attempts) and retries
+/// (≤ [`MAX_ATTEMPTS`] scripts) until a script applies, the reply is prose, or the budget is spent.
+/// A retry's re-ask carries only the failing reply and its error. Errs only when `ask` errs or
+/// there is no drawing. A loop over [`Turn::start`] and [`Turn::resume`].
+pub fn run_turn(s: &mut Session, user: &str, ask: &mut AskFn) -> Result<TurnOutcome> {
+    let (mut turn, mut messages) = Turn::start(s, user)?;
+    loop {
+        let reply = ask(&messages).map_err(|e| EngineError::Other(format!("assistant: {e}")))?;
+        match turn.resume(s, reply)? {
+            Step::Ask(m) => messages = m,
+            Step::Done(out) => return Ok(out),
+        }
+    }
+}
+
+pub(crate) fn start_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let message = p.get("message").and_then(Value::as_str).ok_or_else(|| bad(START_ID, "`message` must be a string"))?;
+    let (turn, ask) = Turn::start(s, message)?;
+    Ok(json!({ "turn": turn, "ask": ask }))
+}
+
+pub(crate) fn resume_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut turn: Turn =
+        p.get("turn").cloned().and_then(|t| serde_json::from_value(t).ok()).ok_or_else(|| bad(RESUME_ID, "`turn` is not an assistant turn"))?;
+    let reply = p.get("reply").and_then(Value::as_str).ok_or_else(|| bad(RESUME_ID, "`reply` must be a string"))?;
+    Ok(match turn.resume(s, reply.to_owned())? {
+        Step::Ask(ask) => json!({ "turn": turn, "ask": ask }),
+        Step::Done(out) => json!({ "done": out }),
+    })
 }
 
 #[cfg(test)]
@@ -721,6 +785,95 @@ mod tests {
         let mut ask = |_: &[Message]| Err::<String, String>("offline".into());
         let e = run_turn(&mut s, "hi", &mut ask).err().ok_or("should err")?.to_string();
         assert!(e.contains("assistant: offline"), "{e}");
+        Ok(())
+    }
+
+    /// `assistant.resume` with `turn` and `reply`; optionally round-trips `turn` through a string first.
+    fn resume_via(s: &mut Session, turn: &Value, reply: &str, round_trip: bool) -> E<Value> {
+        let turn = if round_trip { serde_json::from_str(&serde_json::to_string(turn)?)? } else { turn.clone() };
+        Ok(s.execute(RESUME_ID, &json!({ "turn": turn, "reply": reply }))?)
+    }
+
+    fn last_ask(r: &Value) -> E<String> {
+        Ok(r["ask"].as_array().and_then(|a| a.last()).and_then(|m| m["content"].as_str()).ok_or("no ask")?.to_owned())
+    }
+
+    #[test]
+    fn start_returns_the_three_prompt_messages_and_no_message_key() -> R {
+        let mut s = session()?;
+        let n = undo_len(&s)?;
+        let r = s.execute(START_ID, &json!({ "message": "draw it" }))?;
+        assert_eq!(r["ask"].as_array().map(Vec::len), Some(3), "{r}");
+        assert_eq!(r["ask"][2], json!({ "role": "user", "content": "draw it" }));
+        assert!(r.get("message").is_none() && r["turn"].is_object(), "{r}");
+        assert_eq!(undo_len(&s)?, n);
+        Ok(())
+    }
+
+    #[test]
+    fn resume_a_prose_reply_is_no_script() -> R {
+        let mut s = session()?;
+        let r = s.execute(START_ID, &json!({ "message": "draw it" }))?;
+        let d = resume_via(&mut s, &r["turn"], "Walls are 200 thick.", false)?;
+        assert_eq!(d, json!({ "done": { "kind": "noScript", "text": "Walls are 200 thick." } }));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_retries_then_applies_as_one_undo_step() -> R {
+        for round_trip in [false, true] {
+            let mut s = session()?;
+            let n = undo_len(&s)?;
+            let r = s.execute(START_ID, &json!({ "message": "draw it" }))?;
+            let r1 = resume_via(&mut s, &r["turn"], BAD, round_trip)?;
+            assert!(last_ask(&r1)?.starts_with("That script failed"), "{r1}");
+            assert_eq!(r1["ask"].as_array().map(Vec::len), Some(5));
+            assert_eq!(undo_len(&s)?, n, "a failed script records nothing");
+            let r2 = resume_via(&mut s, &r1["turn"], GOOD, round_trip)?;
+            assert_eq!((r2["done"]["kind"].clone(), r2["done"]["attempts"].clone()), (json!("applied"), json!(2)), "{r2}");
+            assert!(r2["done"]["result"]["proposalId"].is_string(), "{r2}");
+            assert_eq!(undo_len(&s)?, n + 1, "exactly one undo step");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resume_a_query_asks_again_with_its_results() -> R {
+        let mut s = session()?;
+        let n = undo_len(&s)?;
+        let r = s.execute(START_ID, &json!({ "message": "draw it" }))?;
+        let r1 = resume_via(&mut s, &r["turn"], READ, true)?;
+        assert!(last_ask(&r1)?.starts_with("Query result(s)"), "{r1}");
+        let r2 = resume_via(&mut s, &r1["turn"], GOOD, true)?;
+        assert_eq!((r2["done"]["kind"].clone(), r2["done"]["attempts"].clone()), (json!("applied"), json!(1)), "{r2}");
+        assert_eq!(undo_len(&s)?, n + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn three_bad_resumes_fail_with_the_stage_and_script() -> R {
+        let mut s = session()?;
+        let mut t = s.execute(START_ID, &json!({ "message": "draw it" }))?["turn"].clone();
+        for _ in 0..2 {
+            t = resume_via(&mut s, &t, BAD, true)?["turn"].clone();
+        }
+        let d = resume_via(&mut s, &t, BAD, true)?;
+        assert_eq!(
+            (d["done"]["kind"].clone(), d["done"]["stage"].clone(), d["done"]["attempts"].clone()),
+            (json!("failed"), json!("apply"), json!(3)),
+            "{d}"
+        );
+        assert!(d["done"]["lastScript"].as_str().is_some_and(|l| l.contains("circle")), "{d}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_garbage_turn_errs() -> R {
+        let mut s = session()?;
+        for turn in [json!("nope"), json!({ "base": 3 }), Value::Null] {
+            let e = s.execute(RESUME_ID, &json!({ "turn": turn, "reply": "hi" })).err().ok_or("should err")?.to_string();
+            assert!(e.contains("`turn` is not an assistant turn"), "{e}");
+        }
         Ok(())
     }
 
