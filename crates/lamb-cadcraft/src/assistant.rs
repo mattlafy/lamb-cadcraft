@@ -28,7 +28,8 @@
 //! `execute`, the values go back as `Query result(s)…` and the model is re-asked. Any other script
 //! goes through `execute("assistant.apply")` — one undo step. A script with no steps array
 //! (Parse) or one that fails to apply (Apply) is retried, at most [`MAX_ATTEMPTS`] scripts in all,
-//! the re-ask carrying only that failing reply and its error. A retry with no script, or the
+//! the re-ask carrying only that failing reply, its error and, for a failed apply, that script's
+//! [`crate::assistant_lint`] notes (also kept on `Failed.lint`). A retry with no script, or the
 //! attempts or read rounds spent, ends as [`TurnOutcome::Failed`].
 //!
 //! The same loop as resumable steps, for a caller that makes the model call elsewhere:
@@ -429,8 +430,16 @@ pub enum Stage {
 pub enum TurnOutcome {
     /// The reply held no script: a prose answer, nothing changed.
     NoScript { text: String },
-    /// No script applied; `errors` holds the last error, `last_script` the last script tried.
-    Failed { stage: Stage, attempts: usize, errors: Vec<String>, last_script: String },
+    /// No script applied; `errors` holds the last error, `last_script` the last script tried,
+    /// `lint` that script's [`crate::assistant_lint`] notes as `"step n: message"` (absent when none).
+    Failed {
+        stage: Stage,
+        attempts: usize,
+        errors: Vec<String>,
+        last_script: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lint: Vec<String>,
+    },
     /// A script applied as one undo step; `result` is `assistant.apply`'s return value.
     Applied { attempts: usize, result: Value },
 }
@@ -449,6 +458,9 @@ pub struct Turn {
     attempts: usize,
     rounds: usize,
     last: Option<(Stage, String, String)>,
+    /// The lint notes on `last`'s script, as `"step n: message"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    last_lint: Vec<String>,
     /// A would-apply script is [`dry_run`] instead of applied.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     dry_run: bool,
@@ -466,7 +478,7 @@ impl Turn {
     pub fn start(s: &Session, user: &str) -> Result<(Turn, Vec<Message>)> {
         let base = prompt(s, user)?;
         let ask = base.clone();
-        Ok((Turn { base, reply: None, attempts: 1, rounds: 0, last: None, dry_run: false }, ask))
+        Ok((Turn { base, reply: None, attempts: 1, rounds: 0, last: None, last_lint: Vec::new(), dry_run: false }, ask))
     }
 
     /// Makes a would-apply script [`dry_run`] instead of applied.
@@ -489,12 +501,18 @@ impl Turn {
         let Some(script) = extract_last_script(&reply) else {
             return Ok(Step::Done(match self.last.take() {
                 None => TurnOutcome::NoScript { text: reply },
-                Some((stage, error, last_script)) => TurnOutcome::Failed { stage, attempts: self.attempts - 1, errors: vec![error], last_script },
+                Some((stage, error, last_script)) => TurnOutcome::Failed {
+                    stage,
+                    attempts: self.attempts - 1,
+                    errors: vec![error],
+                    last_script,
+                    lint: std::mem::take(&mut self.last_lint),
+                },
             }));
         };
         let last_script = serde_json::to_string(&script).unwrap_or_default();
-        let (stage, error) = match script_steps(&script) {
-            None => (Stage::Parse, "a script must be {\"steps\": [{command, params}]} or an array of steps".to_owned()),
+        let (stage, error, lint) = match script_steps(&script) {
+            None => (Stage::Parse, "a script must be {\"steps\": [{command, params}]} or an array of steps".to_owned(), Vec::new()),
             Some(steps) => {
                 let read_only =
                     !steps.is_empty() && steps.iter().all(|st| st.get("command").and_then(Value::as_str).is_some_and(|c| READ_ONLY.contains(&c)));
@@ -505,6 +523,7 @@ impl Turn {
                             attempts: self.attempts,
                             errors: vec!["read-round budget spent with no edit".to_owned()],
                             last_script,
+                            lint: Vec::new(),
                         }));
                     }
                     self.rounds += 1;
@@ -528,17 +547,28 @@ impl Turn {
                 let applied = if self.dry_run { dry_run(s, steps).map(|d| d.to_json(steps)) } else { s.execute(ID, &json!({ "steps": steps })) };
                 match applied {
                     Ok(result) => return Ok(Step::Done(TurnOutcome::Applied { attempts: self.attempts, result })),
-                    Err(e) => (Stage::Apply, e.to_string()),
+                    // A failed apply put the drawing back, so this lints against the drawing the script saw.
+                    Err(e) => (
+                        Stage::Apply,
+                        e.to_string(),
+                        crate::assistant_lint::lint(s.doc()?, steps).into_iter().map(|n| format!("step {}: {}", n.step, n.message)).collect(),
+                    ),
                 }
             }
         };
         if self.attempts >= MAX_ATTEMPTS {
-            return Ok(Step::Done(TurnOutcome::Failed { stage, attempts: self.attempts, errors: vec![error], last_script }));
+            return Ok(Step::Done(TurnOutcome::Failed { stage, attempts: self.attempts, errors: vec![error], last_script, lint }));
         }
-        let msg = format!("That script failed: {error}\nReturn one corrected script per the contract above, and nothing else.");
+        let notes = if lint.is_empty() {
+            String::new()
+        } else {
+            format!("Notes on that script:\n{}\n", lint.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n"))
+        };
+        let msg = format!("That script failed: {error}\n{notes}Return one corrected script per the contract above, and nothing else.");
         let ask = self.re_ask(&reply, msg);
         self.attempts += 1;
         self.last = Some((stage, error, last_script));
+        self.last_lint = lint;
         Ok(Step::Ask(ask))
     }
 }
@@ -842,14 +872,40 @@ mod tests {
         let mut s = session()?;
         let (n, before) = (undo_len(&s)?, s.doc()?.clone());
         let (out, asked) = turn(&mut s, &[BAD, BAD, BAD, GOOD])?;
-        let TurnOutcome::Failed { stage, attempts, errors, last_script } = out else { return Err(format!("{out:?}").into()) };
+        let TurnOutcome::Failed { stage, attempts, errors, last_script, lint } = out else { return Err(format!("{out:?}").into()) };
         assert_eq!((stage, attempts, asked.len()), (Stage::Apply, 3, 3));
         assert!(errors.len() == 1 && errors[0].contains("step 1 (circle)"), "{errors:?}");
         assert!(last_script.contains("circle"));
+        assert!(lint.is_empty(), "{lint:?}");
         assert_eq!(last(&asked, 2)?.content.matches("That script failed").count(), 1, "only the latest error");
         assert_eq!(asked[2].len(), 5, "earlier attempts are not carried");
         assert!(*s.doc()? == before);
         assert_eq!(undo_len(&s)?, n);
+        Ok(())
+    }
+
+    /// Moves a handle that is not in the drawing (a silent no-op on its own), then fails on a bare circle.
+    const GHOST: &str = "Moving it.\n```json\n{\"steps\":[{\"command\":\"move\",\"params\":{\"handles\":[\"fffff\"],\"delta\":[0,50]}},{\"command\":\"circle\",\"params\":{}}]}\n```";
+
+    #[test]
+    fn a_retry_carries_lint_notes_and_a_failed_turn_keeps_them() -> R {
+        let mut s = session()?;
+        let (out, asked) = turn(&mut s, &[GHOST, GOOD])?;
+        assert!(matches!(out, TurnOutcome::Applied { attempts: 2, .. }), "{out:?}");
+        let m = &last(&asked, 1)?.content;
+        assert!(m.starts_with("That script failed: "), "{m}");
+        let notes = m.find("\nNotes on that script:\n- step 1: handle `fffff` is not an entity").ok_or(m.clone())?;
+        assert!(notes < m.find("Return one corrected script").ok_or(m.clone())?, "{m}");
+
+        let (out, _) = turn(&mut s, &[GHOST, GHOST, GHOST])?;
+        let TurnOutcome::Failed { lint, .. } = &out else { return Err(format!("{out:?}").into()) };
+        assert!(lint.len() == 1 && lint[0].starts_with("step 1: handle `fffff`"), "{lint:?}");
+        assert!(serde_json::to_value(&out)?["lint"].is_array());
+
+        let (out, _) = turn(&mut s, &[GHOST, "sorry"])?;
+        assert!(matches!(&out, TurnOutcome::Failed { lint, .. } if lint.len() == 1), "a retry with no script keeps the notes: {out:?}");
+        let (out, _) = turn(&mut s, &[BAD, BAD, BAD])?;
+        assert!(serde_json::to_value(&out)?.get("lint").is_none(), "no notes, no key: {out:?}");
         Ok(())
     }
 
