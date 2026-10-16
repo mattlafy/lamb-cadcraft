@@ -219,6 +219,7 @@ fn lambproject(s: &mut Session, _p: &Value) -> Result<Value> {
     let floor_elevation = authored_field(0.0, plan_id, Actor::User { user_id: "local".into() }, &now());
     doc.levels.push(Level { id: level_id, name: "Level 1".into(), order: 0.0, floor_elevation });
     write_document(d, &doc).map_err(other)?;
+    crate::import::apply_annotation_scale(d, &doc.defaults);
     enter_space(s, Space::Block(view_block_name(plan_id)))?;
     Ok(json!({ "viewId": plan_id.0, "levelId": level_id.0 }))
 }
@@ -1028,7 +1029,11 @@ mod tests {
     #[test]
     fn lambproject_starts_one_level_and_a_placed_plan_undoes_and_refuses_twice() -> R {
         let mut s = session()?;
+        let fresh = |s: &Session, v: &str| s.doc().map(|d| d.header.f64(v, -1.0));
+        let (dimscale0, textsize0) = (fresh(&s, "DIMSCALE")?, fresh(&s, "TEXTSIZE")?);
         let r = s.execute("lambproject", &json!({}))?;
+        assert_eq!((fresh(&s, "DIMSCALE")?, fresh(&s, "TEXTSIZE")?), (50.0, 150.0), "sized at 1:50 x 3 mm");
+        assert!(s.doc()?.dim_overrides().is_empty());
         let doc = read_document(s.doc()?)?;
         assert_eq!(doc.levels.len(), 1);
         let level = &doc.levels[0];
@@ -1046,9 +1051,16 @@ mod tests {
         assert!(s.execute("lambproject", &json!({})).is_err_and(|e| e.to_string().contains("Already a LAMB project")));
         assert_eq!(read_document(s.doc()?)?.views.len(), 1, "a refusal changes nothing");
 
+        s.execute("text", &json!({ "at": [0, 0], "text": "A" }))?;
+        let last = s.doc()?.block(&view_block_name(plan.id)).and_then(|b| b.entities.iter().last().cloned()).ok_or("no text")?;
+        let cadcraft_doc::EntityKind::Text(t) = &last.kind else { return Err("not a text".into()) };
+        assert_eq!(t.height, 150.0, "TEXT takes the LAMB default height");
+        s.undo()?;
+
         s.undo()?;
         let doc = read_document(s.doc()?)?;
         assert!(doc.levels.is_empty() && doc.views.is_empty(), "one undo step removes both");
+        assert_eq!((fresh(&s, "DIMSCALE")?, fresh(&s, "TEXTSIZE")?), (dimscale0, textsize0), "and the sizing");
         assert_eq!(space(&s)?, Space::Model);
         Ok(())
     }

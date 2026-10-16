@@ -40,7 +40,7 @@ use lamb_core::geometry::dimension::{Axis, Dimension2};
 use lamb_core::geometry::polyline::CornerEntry;
 use lamb_core::geometry::polyline::virtual_corner_entries;
 use lamb_core::geometry::tolerance::TOLERANCE;
-use lamb_core::model::{AnyView, DrawingEntity, DrawingLayer, EntityGeometry, HatchGeometry, Id, Placement, Project, hatch_loops};
+use lamb_core::model::{AnyView, DrawingEntity, DrawingLayer, EntityGeometry, HatchGeometry, Id, Placement, Project, ProjectDefaults, hatch_loops};
 
 use crate::convert::{Flattened, from_polyline};
 use crate::schema::{EntityData, LayerData, SchemaError, read_document, set_entity_data, set_layer_data, view_block_name, write_document};
@@ -334,6 +334,21 @@ fn remap_token(s: &str, map: &IdMap) -> Option<String> {
     s.parse::<u64>().ok().and_then(|n| map.get(Id(n))).map(|id| id.0.to_string())
 }
 
+/// Sizes annotation as LAMB does: dimension text is `dim_text_height_paper_mm` on paper, scaled to
+/// the model by `plot_scale` (DIMSCALE, on the header and the current dimension style), and TEXT's
+/// default height is that model height. Leaves no dimension-variable overrides.
+pub(crate) fn apply_annotation_scale(d: &mut Drawing, defaults: &ProjectDefaults) {
+    let name = d.header.str("DIMSTYLE", "Standard");
+    if let Some(st) = d.dim_styles.iter_mut().find(|st| st.name.eq_ignore_ascii_case(&name)) {
+        st.text_height = defaults.dim_text_height_paper_mm;
+        // The style's DIMSCALE wins over the header's, and syncing copies it there.
+        st.scale = defaults.plot_scale;
+    }
+    d.header.set_f64("DIMSCALE", defaults.plot_scale);
+    d.sync_dim_vars();
+    d.header.set_f64("TEXTSIZE", defaults.plot_scale * defaults.dim_text_height_paper_mm);
+}
+
 /// Imports `project` into a new metric drawing. See the module docs for what is mapped how.
 pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportReport), ImportError> {
     let mut d = Drawing::new_metric();
@@ -351,6 +366,7 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
     doc.levels = project.levels.clone();
     doc.suppressed_proposals = project.suppressed_proposals.clone().unwrap_or_default();
     write_document(&mut d, &doc)?;
+    apply_annotation_scale(&mut d, &doc.defaults);
 
     for v in &project.views {
         let id = create_view(&mut d, without_entities(v))?;
@@ -465,4 +481,38 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
     }
     write_document(&mut d, &doc)?;
     Ok((d, map, report))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use super::*;
+
+    type R = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn a_lamb_drawing_sizes_dimensions_and_text_by_plot_scale() -> R {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamb-core/tests/lamb/dimensioned-u-wall.lamb.json");
+        let files: BTreeMap<String, String> = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let project = lamb_core::persistence::files_to_project(&files).map_err(|e| format!("{e:?}"))?;
+        assert_eq!((project.defaults.plot_scale, project.defaults.dim_text_height_paper_mm), (50.0, 3.0));
+        let (d, _, _) = project_to_drawing(&project)?;
+        assert_eq!(d.header.f64("DIMSCALE", 0.0), 50.0);
+        assert_eq!(d.header.f64("TEXTSIZE", 0.0), 150.0);
+        assert!(d.dim_overrides().is_empty(), "no overrides: {:?}", d.dim_overrides());
+        let mut kinds = Vec::new();
+        for b in d.blocks.values() {
+            for e in b.entities.iter() {
+                if let EntityKind::Dimension(dm) = &e.kind {
+                    let h = cadcraft_render::dimension_in(&d, dm).text_height;
+                    assert!((h - 150.0).abs() < 1e-9, "{:?} text height {h}", dm.kind);
+                    kinds.push(format!("{:?}", dm.kind));
+                }
+            }
+        }
+        assert!(!kinds.is_empty(), "the fixture has dimensions");
+        Ok(())
+    }
 }
