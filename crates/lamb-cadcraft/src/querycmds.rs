@@ -178,7 +178,7 @@ fn layer_param(cmd: &str, layers: &[DrawingLayer], p: &Value) -> Result<Option<S
     Ok(Some(find_layer(layers, name).ok_or_else(|| other(format!("No such layer: {name}")))?.id.clone()))
 }
 
-fn index(dp: &DrawingProject<'_>) -> Value {
+pub(crate) fn index(dp: &DrawingProject<'_>) -> Value {
     let views: Vec<Value> = dp.views().map(|v| json!({ "id": v.id.0, "name": v.name, "kind": view_kind(v.kind) })).collect();
     let layers: Vec<Value> =
         dp.layers().iter().map(|l| json!({ "id": l.id, "name": l.name, "defaultRole": l.default_role, "locked": l.locked })).collect();

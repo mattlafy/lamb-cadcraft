@@ -15,19 +15,35 @@
 //! Steps that are not undoable (UNDO, REDO, EDITVIEW...) and a nested `assistant.apply` are refused.
 //! The after-command observers (link sweep, assembly regeneration) run once, after the whole
 //! script, so their side effects are not stamped.
+//!
+//! The prompt (TS `packages/command-engine/src/assistantPrompt.ts` `assembleAssistantPrompt`):
+//! [`prompt`] returns three [`Message`]s — [`role`] + [`catalogue`] (system, byte-identical across
+//! drawings: the cache prefix), [`header`] (system, per turn: views, layers, counts, active view,
+//! current layer, selection), then the user's text. `assistant.prompt {message}` (no menu, not an
+//! undo step) returns them as `{messages: [{role, content}]}`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use cadcraft_doc::{Drawing, Entity, Handle};
+use cadcraft_doc::{Drawing, Entity, Handle, entity_bounds};
+use cadcraft_engine::cmd::command_specs;
 use cadcraft_engine::{EngineError, Result, Session, find_command};
 use lamb_core::model::{AiOrigin, AiProducer};
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::commands::{bad, other};
-use crate::schema::{read_entity_data, set_entity_data};
+use crate::commands::{bad, edited_view, other};
+use crate::project::DrawingProject;
+use crate::schema::{EXT_KEY, read_entity_data, set_entity_data};
 
 pub const ID: &str = "assistant.apply";
+pub const PROMPT_ID: &str = "assistant.prompt";
+
+/// How many read-only rounds one turn may take before it must answer or edit.
+pub const MAX_READ_ROUNDS: usize = 2;
+
+/// The commands a script may run that change nothing; a script of only these is a read round.
+pub const READ_ONLY: [&str; 2] = ["query", "showlinks"];
 
 /// The last fenced JSON script in `reply`, or `None` when there is none or it does not parse.
 pub fn extract_last_script(reply: &str) -> Option<Value> {
@@ -158,6 +174,134 @@ pub(crate) fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// One chat message; `role` is `"system"`, `"user"` or `"assistant"`.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+impl Message {
+    pub fn new(role: &str, content: impl Into<String>) -> Self {
+        Message { role: role.to_owned(), content: content.into() }
+    }
+}
+
+/// System message #1, first part: who the assistant is and the script contract. Stable text.
+pub fn role() -> String {
+    let lines = [
+        "You are the drafting assistant built into LAMB, an architectural CAD application running on CADCraft.".to_owned(),
+        String::new(),
+        "A reply in plain prose is a complete reply: answer questions in prose and change nothing.".to_owned(),
+        "All lengths are millimetres.".to_owned(),
+        String::new(),
+        "To change the drawing, end your reply with ONE ```json fenced block holding a script:".to_owned(),
+        r#"{"steps":[{"command": "<command id>", "params": {...}}]}"#.to_owned(),
+        "The script is applied as one undo step. If any step fails, the whole script fails and nothing changes.".to_owned(),
+        "Use only the commands listed below, with the params shown for each.".to_owned(),
+        String::new(),
+        "Rules:".to_owned(),
+        "- Never name an existing entity by an id that did not come back from `query`. Write ids exactly as query prints them.".to_owned(),
+        "- Never edit an entity on a LOCKED layer.".to_owned(),
+        "- Answer questions about what is in the drawing from `query`, not from the header's entity counts.".to_owned(),
+        format!(
+            "- A script whose steps are all read-only ({}) is a read round: its results come back to you in the next message, \
+             and you then answer or edit. At most {MAX_READ_ROUNDS} read rounds per turn.",
+            READ_ONLY.join(", ")
+        ),
+        "- Read-only steps cannot be mixed with edits in one script.".to_owned(),
+        String::new(),
+        "Commands (id params):".to_owned(),
+    ];
+    lines.join("\n")
+}
+
+/// System message #1, second part: one `id params` line per scriptable command, sorted by id.
+pub fn catalogue() -> String {
+    let mut rows: Vec<(&str, String)> = command_specs()
+        .iter()
+        .filter(|c| c.id != ID && c.id != PROMPT_ID)
+        .filter_map(|c| {
+            if READ_ONLY.contains(&c.id) {
+                Some((c.id, format!("{} {} (read-only)", c.id, c.params)))
+            } else if c.undoable && !c.params.is_empty() {
+                Some((c.id, format!("{} {}", c.id, c.params)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    rows.dedup_by(|a, b| a.0 == b.0);
+    rows.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n")
+}
+
+/// ` "name"` when a view or layer's name differs from its id, else nothing.
+fn name_suffix(id: &str, name: &str) -> String {
+    if id == name { String::new() } else { format!(" \"{name}\"") }
+}
+
+fn text(v: &Value) -> String {
+    match v {
+        Value::String(t) => t.clone(),
+        Value::Null => String::new(),
+        v => v.to_string(),
+    }
+}
+
+/// System message #2: the drawing as it is this turn. A plain CADCraft drawing (no LAMB document)
+/// gets only the active view, current layer and selection lines.
+pub fn header(s: &Session) -> Result<String> {
+    let d = s.doc()?;
+    let mut lines: Vec<String> = Vec::new();
+    if d.ext.contains_key(EXT_KEY) {
+        let dp = DrawingProject::new(d).map_err(other)?;
+        let ix = crate::querycmds::index(&dp);
+        let mut section = |title: &str, key: &str, line: &dyn Fn(&Value) -> String| {
+            lines.push(title.to_owned());
+            let rows = ix[key].as_array().cloned().unwrap_or_default();
+            if rows.is_empty() {
+                lines.push("  (none)".to_owned());
+            }
+            lines.extend(rows.iter().map(|r| format!("  {}", line(r))));
+        };
+        section("Views:", "views", &|v| {
+            let id = text(&v["id"]);
+            format!("{id}{} ({})", name_suffix(&id, &text(&v["name"])), text(&v["kind"]))
+        });
+        section("Layers:", "layers", &|l| {
+            let id = text(&l["id"]);
+            let locked = if l["locked"].as_bool() == Some(true) { " LOCKED" } else { "" };
+            format!("{id}{} role={}{locked}", name_suffix(&id, &text(&l["name"])), text(&l["defaultRole"]))
+        });
+        section("Entity counts (view/layer):", "counts", &|c| format!("{}/{}: {}", text(&c["viewId"]), text(&c["layerId"]), text(&c["n"])));
+    }
+    lines.push(format!("Active view: {}", edited_view(s).map_or_else(|| "(none)".to_owned(), |id| id.0.to_string())));
+    lines.push(format!("Current layer: {}", d.header.str("CLAYER", "0")));
+    let sel = s.selection();
+    lines.push(format!("Selection: {} entities", sel.len()));
+    for h in sel {
+        let Some(e) = d.entity(h) else {
+            lines.push(format!("  {} (not found)", h.hex()));
+            continue;
+        };
+        let b = entity_bounds(d, e, 0);
+        let bbox = if b.is_empty() { String::new() } else { format!(", bbox [{},{}]-[{},{}]", b.min.x, b.min.y, b.max.x, b.max.y) };
+        lines.push(format!("  {} ({}{bbox})", h.hex(), e.kind.type_name()));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// The three messages of one turn: role + catalogue, header, the user's text.
+pub fn prompt(s: &Session, user: &str) -> Result<Vec<Message>> {
+    Ok(vec![Message::new("system", format!("{}\n\n{}", role(), catalogue())), Message::new("system", header(s)?), Message::new("user", user)])
+}
+
+pub(crate) fn prompt_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let message = p.get("message").and_then(Value::as_str).ok_or_else(|| bad(PROMPT_ID, "`message` must be a string"))?;
+    Ok(json!({ "messages": prompt(s, message)? }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +424,81 @@ mod tests {
         let a = s.execute("accept", &json!({ "handles": [h.hex()] }))?;
         assert_eq!(a["accepted"], json!(1), "{a}");
         assert!(origin(&s, h)?.ok_or("unstamped")?.accepted);
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_is_three_messages_with_a_stable_first() -> R {
+        let a = session()?;
+        install_app()?;
+        let mut b = Session::new();
+        b.new_drawing(true);
+        let pa = prompt(&a, "draw a wall")?;
+        let pb = prompt(&b, "something else")?;
+        assert_eq!(pa.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(), ["system", "system", "user"]);
+        assert_eq!(pa[2].content, "draw a wall");
+        assert_eq!(pa[0], pb[0], "message 1 is byte-identical across drawings");
+        assert_ne!(pa[1], pb[1]);
+        assert!(pa[0].content.contains(&format!("At most {MAX_READ_ROUNDS} read rounds")));
+        Ok(())
+    }
+
+    #[test]
+    fn catalogue_lists_scriptable_commands_sorted() {
+        let c = catalogue();
+        let ids: Vec<&str> = c.lines().map(|l| l.split(' ').next().unwrap_or("")).collect();
+        for want in ["line", "circle", "move", "setrole"] {
+            assert!(ids.contains(&want), "{want} missing");
+        }
+        assert!(c.lines().any(|l| l.starts_with("query ") && l.ends_with(" (read-only)")));
+        assert!(c.lines().any(|l| l.starts_with("showlinks ") && l.ends_with(" (read-only)")));
+        for gone in ["undo", ID, PROMPT_ID] {
+            assert!(!ids.contains(&gone), "{gone} listed");
+        }
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+        println!("catalogue: {} lines, {} bytes", ids.len(), c.len());
+    }
+
+    #[test]
+    fn header_shows_views_locked_layer_counts_active_view_and_selection() -> R {
+        let mut s = session()?;
+        let before = handles(&s)?;
+        s.execute("line", &json!({ "points": [[0, 0], [1000, 250]] }))?;
+        let h = *handles(&s)?.difference(&before).next().ok_or("no line")?;
+        let layer = s.doc()?.entity(h).ok_or("no entity")?.common.layer.clone();
+        s.doc_mut()?.layer_mut(&layer).ok_or("no layer")?.locked = true;
+        s.set_selection(vec![h]);
+        let view = edited_view(&s).ok_or("not editing a view")?;
+        let t = header(&s)?;
+        assert!(t.contains(&format!("Views:\n  {}", view.0)), "{t}");
+        assert!(t.contains(&format!("  {layer}")) && t.contains(" LOCKED"), "{t}");
+        assert!(t.contains(&format!("  {}/{layer}: 1", view.0)), "{t}");
+        assert!(t.contains(&format!("Active view: {}", view.0)), "{t}");
+        assert!(t.contains("Selection: 1 entities"), "{t}");
+        assert!(t.contains(&format!("  {} (", h.hex())) && t.contains("bbox [0,0]-[1000,250]"), "{t}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_drawing_has_a_header() -> R {
+        install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let t = header(&s)?;
+        assert!(!t.contains("Views:"), "{t}");
+        assert!(t.contains("Active view: (none)") && t.contains("Current layer: 0") && t.contains("Selection: 0 entities"), "{t}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_prompt_command_records_no_undo_step() -> R {
+        let mut s = session()?;
+        let n = undo_len(&s)?;
+        let r = s.execute(PROMPT_ID, &json!({ "message": "hi" }))?;
+        assert_eq!(undo_len(&s)?, n);
+        assert_eq!(r["messages"][2], json!({ "role": "user", "content": "hi" }));
         Ok(())
     }
 
