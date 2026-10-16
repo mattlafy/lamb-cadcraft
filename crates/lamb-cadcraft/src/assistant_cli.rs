@@ -121,7 +121,7 @@ fn run_inner(args: &[String], ask: Option<&mut AskFn>, out: &mut dyn Write, err:
 }
 
 /// The session a turn runs in: FILE opened, or a fresh LAMB project.
-fn load(file: Option<&str>) -> Result<Session, String> {
+pub(crate) fn load(file: Option<&str>) -> Result<Session, String> {
     install_app()?;
     let mut s = Session::new();
     match file {

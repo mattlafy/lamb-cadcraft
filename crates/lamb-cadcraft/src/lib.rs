@@ -32,6 +32,7 @@ pub mod assistant;
 pub mod assistant_cli;
 pub mod assistant_lint;
 pub mod bubbles;
+pub mod cli;
 pub mod commands;
 pub mod convert;
 pub mod corners;
