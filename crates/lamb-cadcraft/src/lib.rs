@@ -48,6 +48,7 @@ mod lambopen;
 mod linkcmds;
 pub mod maintain;
 mod newviews;
+pub mod oneclick_cli;
 mod outside;
 pub mod overlays;
 pub mod panes;
