@@ -120,10 +120,12 @@ fn run_inner(args: &[String], ask: Option<&mut AskFn>, out: &mut dyn Write, err:
     })
 }
 
-/// The session a turn runs in: FILE opened, or a fresh LAMB project.
+/// The session a turn runs in: FILE opened, or a fresh LAMB project, with the LAMB after-command
+/// observers installed as on the app's startup session.
 pub(crate) fn load(file: Option<&str>) -> Result<Session, String> {
     install_app()?;
     let mut s = Session::new();
+    crate::maintain::install(&mut s);
     match file {
         None => {
             s.new_drawing(true);

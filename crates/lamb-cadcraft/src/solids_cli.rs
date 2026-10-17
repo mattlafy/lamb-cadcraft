@@ -166,6 +166,8 @@ fn run_inner(args: &[String], stdin: &str, out: &mut dyn Write, err: &mut dyn Wr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lamb_core::derivation::markers::SOLID_CUT_PROPOSAL_PREFIX;
+    use serde_json::json;
 
     fn fixture() -> String {
         format!("{}/../lamb-core/tests/lamb/u-wall-two-sections.lamb.json", env!("CARGO_MANIFEST_DIR"))
@@ -216,6 +218,48 @@ mod tests {
         assert_eq!(code, 1);
         assert!(err.starts_with("FAILED nosuchcommand: "), "{err}");
         assert!(out.starts_with("1 solid(s), "), "{out}");
+    }
+
+    type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    /// T447's repro: a 2000x8000 WALL-EXT outline in a plan placed at 1200, then a section across
+    /// y=4000 and one along x=1000. The level and plan ids come from a first pass over a fresh
+    /// project, which mints the same ids every time.
+    fn repro() -> R<String> {
+        let mut s = baseline(None)?;
+        let level = s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].clone();
+        let plan = s.execute("newplan", &json!({ "name": "P" }))?["viewId"].clone();
+        let lines = [
+            json!({ "command": "level", "params": { "mode": "create", "name": "L1", "floorElevationMm": 0 } }),
+            json!({ "command": "newplan", "params": { "name": "P" } }),
+            json!({ "command": "placeview", "params": { "viewId": plan, "kind": "plan", "levelId": level, "cutElevation": 1200,
+                "transform": { "originX": 0, "originY": 0, "rotation": 0 } } }),
+            json!({ "command": "editview", "params": { "viewId": plan } }),
+            json!({ "command": "layer.new", "params": { "name": "WALL-EXT", "current": true } }),
+            json!({ "command": "pline", "params": { "vertices": [[0, 0], [2000, 0], [2000, 8000], [0, 8000]], "closed": true } }),
+            json!({ "command": "newsectionline", "params": { "name": "A", "hostViewId": plan, "cutFrom": { "x": -1000, "y": 4000 }, "cutTo": { "x": 3000, "y": 4000 } } }),
+            json!({ "command": "newsectionline", "params": { "name": "B", "hostViewId": plan, "cutFrom": { "x": 1000, "y": -1000 }, "cutTo": { "x": 1000, "y": 9000 } } }),
+        ];
+        Ok(lines.iter().map(|l| format!("{l}\n")).collect())
+    }
+
+    #[test]
+    fn the_solid_cut_sweep_runs_headlessly_and_its_proposals_add_no_solid() -> R {
+        let records = repro()?;
+        let mut s = baseline(None)?;
+        let results = apply(&mut s, &parse_records(&records)?);
+        assert!(results.iter().all(|r| r["ok"] == json!(true)), "{results:?}");
+        let read = DrawingProject::new(s.doc()?).map_err(|e| format!("{e:?}"))?;
+        let proposals = read
+            .views()
+            .flat_map(|v| read.entities(v.id))
+            .filter(|e| e.ai_origin.as_ref().is_some_and(|o| !o.accepted && o.proposal_id.starts_with(SOLID_CUT_PROPOSAL_PREFIX)))
+            .count();
+        assert!(proposals > 0, "the solid-cut sweep never ran");
+        let (code, out, err) = go(&[], &records);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.starts_with("1 solid(s), "), "{out}");
+        Ok(())
     }
 
     #[test]

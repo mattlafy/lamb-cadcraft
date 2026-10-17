@@ -257,6 +257,14 @@ mod tests {
     }
 
     #[test]
+    fn baseline_installs_the_after_command_sweeps() -> R {
+        let s = baseline(None)?;
+        let sweep: cadcraft_engine::AfterCommand = crate::sweeps::sweep_observer;
+        assert!(s.observers.iter().any(|o| std::ptr::fn_addr_eq(*o, sweep)));
+        Ok(())
+    }
+
+    #[test]
     fn undo_on_a_fresh_project_exits_2() -> R {
         let (code, out, err) = go(&["--query", "results[0].ok"], "\"!undo\"\n");
         assert_eq!(code, 2, "{out} {err}");
