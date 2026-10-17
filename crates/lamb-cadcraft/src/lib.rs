@@ -64,6 +64,7 @@ mod resolvecmd;
 pub mod rounding;
 pub mod scene;
 pub mod schema;
+pub mod script_cli;
 pub mod session_cli;
 pub mod sheets;
 pub mod solids_cli;

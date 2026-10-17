@@ -139,7 +139,7 @@ pub(crate) struct DryRun {
 }
 
 impl DryRun {
-    fn to_json(&self, steps: &[Value]) -> Value {
+    pub(crate) fn to_json(&self, steps: &[Value]) -> Value {
         let hs = |v: &[(String, Entity)]| v.iter().map(|(_, e)| e.handle.0).collect::<Vec<_>>();
         json!({
             "dryRun": true,
