@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use super::markers::SOLID_CUT_PROPOSAL_PREFIX;
 use super::projection::plan_local_to_global_xy;
 use super::read::{EntityRef, ProjectRead, ViewKind, ViewRef};
 use super::resolve::{ProvenanceKind, ResolvedSpan, VerticalExtent, resolve_cut_segment, resolve_seen_z};
@@ -206,6 +207,10 @@ fn sample_closed_loop(segs: &[ResolvedSegment]) -> Vec<Point2> {
 fn closed_cut_loop(doc: &impl ProjectRead, entity: &EntityRef<'_>) -> Option<Vec<ResolvedSegment>> {
     let poly = entity.polyline.as_deref().filter(|p| p.closed)?;
     if doc.role_of(entity) != LineRole::Cut {
+        return None;
+    }
+    // An unaccepted solid-cut proposal is a slice of an existing solid, not a solid source.
+    if entity.ai_origin.is_some_and(|o| !o.accepted && o.proposal_id.starts_with(SOLID_CUT_PROPOSAL_PREFIX)) {
         return None;
     }
     let segs = resolved_segments(poly);
