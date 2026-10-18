@@ -38,8 +38,10 @@
 //! - `lambproject` (View ▸ LAMB ▸ Start Project): `Level 1` and a placed `Ground Floor` plan on
 //!   it, then edit the plan; refused ("Already a LAMB project") once the drawing has views.
 //!
-//! - `newdetail {name}` (View ▸ LAMB ▸ New Detail): a floating detail view, entered; `detailtag`
-//!   (`dtag`) / `detailtags`: detail tags in a plan view and their resolution report — see
+//! - `newdetail {name, cutDirection?}` (View ▸ LAMB ▸ New Detail): a floating detail view drawn in
+//!   `plan` (default) or `vertical` (section), entered; interactively `Enter detail name or
+//!   [Plan/Section] <Detail N>:`. `detailtag` (`dtag`) / `detailtags`: detail tags in a plan or
+//!   section view and their resolution report — see
 //!   [`crate::detailtags`]. `dxfimport {path | data, fileName?, name?, unitScale?}` (View ▸ LAMB ▸
 //!   Import DXF as View): a DXF/DWG file's line work as a new unplaced plan view — see
 //!   [`crate::dxfimport`]. `lambopen {path}` (View ▸ LAMB ▸ Open LAMB Project): a TS-app `.lamb`
@@ -144,9 +146,15 @@ fn newplan(s: &mut Session, p: &Value) -> Result<Value> {
     create(s, AnyView::Plan(PlanView { id: Id(0), name, entities: Vec::new(), placement: None }))
 }
 
-/// NEWDETAIL: a floating detail view (plan cut direction, no condition or hosts yet).
+/// NEWDETAIL: a floating detail view (`cutDirection` plan — the default — or vertical; no
+/// condition or hosts yet).
 fn newdetail(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_param("newdetail", p, "name")?.to_owned();
+    let cut_direction = match p.get("cutDirection").filter(|v| !v.is_null()).map(Value::as_str) {
+        None | Some(Some("plan")) => CutDirection::Plan,
+        Some(Some("vertical")) => CutDirection::Vertical,
+        Some(_) => return Err(bad("newdetail", "`cutDirection` must be plan or vertical")),
+    };
     create(
         s,
         AnyView::Detail(DetailView {
@@ -156,7 +164,7 @@ fn newdetail(s: &mut Session, p: &Value) -> Result<Value> {
             placement: None,
             condition_type: String::new(),
             host_element_ids: Vec::new(),
-            cut_direction: CutDirection::Plan,
+            cut_direction,
         }),
     )
 }
@@ -396,10 +404,13 @@ pub(crate) fn enter_space(s: &mut Session, space: Space) -> Result<()> {
 }
 
 /// NEWPLAN: `Enter plan name <Plan N>:`, then edit inside the new plan. NEWDETAIL the same with
-/// `Enter detail name <Detail N>:`.
+/// `Enter detail name or [Plan/Section] <Detail N>:`, where `P` / `S` set the detail's cut direction
+/// and ask the name again.
 struct NewPlan {
     default: String,
     detail: bool,
+    /// NEWDETAIL's cut direction.
+    direction: CutDirection,
 }
 
 impl Interactive for NewPlan {
@@ -407,16 +418,31 @@ impl Interactive for NewPlan {
         if self.detail { "newdetail" } else { "newplan" }
     }
     fn prompt(&self, _s: &Session) -> Prompt {
-        let msg = if self.detail { "Enter detail name" } else { "Enter plan name" };
-        Prompt::new(msg, Accept::TEXT).default(self.default.clone())
+        if !self.detail {
+            return Prompt::new("Enter plan name", Accept::TEXT).default(self.default.clone());
+        }
+        Prompt::new("Enter detail name", Accept::TEXT).kw(&["Plan", "Section"]).default(self.default.clone())
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         if i == Input::Cancel {
             return Ok(Step::Cancel);
         }
         let Some(name) = name_input(i, &self.default) else { return Ok(Step::Continue) };
+        if self.detail {
+            let dir = match name.to_ascii_lowercase().as_str() {
+                "p" | "plan" => Some((CutDirection::Plan, "<Plan detail>")),
+                "s" | "section" => Some((CutDirection::Vertical, "<Section detail>")),
+                _ => None,
+            };
+            if let Some((d, echo)) = dir {
+                self.direction = d;
+                s.echo(echo);
+                return Ok(Step::Continue);
+            }
+        }
+        let dir = if self.direction == CutDirection::Vertical { "vertical" } else { "plan" };
         let (run, word): (fn(&mut Session, &Value) -> Result<Value>, &str) = if self.detail { (newdetail, "Detail") } else { (newplan, "Plan") };
-        match run(s, &json!({ "name": name })) {
+        match run(s, &json!({ "name": name, "cutDirection": dir })) {
             Ok(r) => {
                 if let Some(id) = echo_created(s, word, &name, &r) {
                     enter_space(s, Space::Block(view_block_name(id)))?;
@@ -429,11 +455,11 @@ impl Interactive for NewPlan {
 }
 
 fn newplan_machine(s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(NewPlan { default: next_name(s, "Plan", is_plan_view), detail: false }))
+    Ok(Box::new(NewPlan { default: next_name(s, "Plan", is_plan_view), detail: false, direction: CutDirection::Plan }))
 }
 
 fn newdetail_machine(s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(NewPlan { default: next_name(s, "Detail", |v| matches!(v, AnyView::Detail(_))), detail: true }))
+    Ok(Box::new(NewPlan { default: next_name(s, "Detail", |v| matches!(v, AnyView::Detail(_))), detail: true, direction: CutDirection::Plan }))
 }
 
 /// NEWSECTIONLINE / NEWELEVATIONLINE: two points of the cut line in the edited view, then a name.
@@ -754,7 +780,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{mode: rename|cutElevation|intent|flip, viewId, name | cutElevation | intent: section|elevation | flipped}")
             .menu(MENU)
             .interactive(crate::viewprops::viewprops_machine),
-        CommandSpec::new("newdetail", "New Detail", newdetail).params("{name}").menu(MENU).interactive(newdetail_machine),
+        CommandSpec::new("newdetail", "New Detail", newdetail).params("{name, cutDirection?}").menu(MENU).interactive(newdetail_machine),
         CommandSpec::new("detailtag", "Detail Tag", crate::detailtags::detailtag)
             .alias(&["dtag"])
             .params("{detailViewId, corner?: bool, tip:{x,y}, bubble:{x,y}}")

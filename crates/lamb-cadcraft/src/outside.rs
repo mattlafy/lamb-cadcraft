@@ -1,12 +1,12 @@
 //! Outside pick points (LAMB's `docs/07-architecture/cadcraft-integration.md` §8 "Inside and
-//! outside", override 1): a CADCraft `Point` in a plan view's block carrying
+//! outside", override 1): a CADCraft `Point` in a plan or section view's block carrying
 //! [`EntityData::outside`] marks the region around it outside the building. Every such point feeds
 //! [`SideParams::outside_points`](lamb_core::derivation::wall_spaces::SideParams) through
 //! [`crate::detailtags::graph_and_sides`], so detail-tag resolution, ASSEMBLYPLAN, WALLCONFLICTS and
 //! WALLFIT all see it. DXF/DWG see a plain point.
 //!
 //! - `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): one tagged point, on the current
-//!   layer, in the edited plan view; one undo step. Returns `{"handle": <hex>}`. Interactive:
+//!   layer, in the edited plan or section view; one undo step. Returns `{"handle": <hex>}`. Interactive:
 //!   `Specify a point outside the building:`.
 
 use cadcraft_doc::{Drawing, EntityKind, Point};
@@ -17,7 +17,7 @@ use lamb_core::model::Id;
 use serde_json::{Value, json};
 
 use crate::commands::{other, point_param};
-use crate::detailtags::edited_plan;
+use crate::detailtags::edited_wall_view;
 use crate::schema::{EntityData, read_entity_data, set_entity_data, view_block_name};
 
 /// Every outside pick point in `view`'s block; a point with malformed LAMB data is skipped.
@@ -33,11 +33,11 @@ pub(crate) fn outside_points(d: &Drawing, view: Id) -> Vec<Point2> {
         .collect()
 }
 
-/// OUTSIDEPOINT's JSON form: a tagged point at `point` in the edited plan view.
+/// OUTSIDEPOINT's JSON form: a tagged point at `point` in the edited plan or section view.
 pub(crate) fn outsidepoint(s: &mut Session, p: &Value) -> Result<Value> {
     let at = point_param("outsidepoint", p, "point")?;
     // Every refusal before `doc_mut`, so a refusal records nothing.
-    edited_plan(s).map_err(other)?;
+    edited_wall_view(s).map_err(other)?;
     let mut common = s.current_common();
     set_entity_data(&mut common, &EntityData { outside: true, ..EntityData::default() }).map_err(other)?;
     let space = s.space();
@@ -56,7 +56,7 @@ impl Interactive for OutsidePointM {
         Prompt::new("Specify a point outside the building", Accept::POINT)
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        if let Err(e) = edited_plan(s) {
+        if let Err(e) = edited_wall_view(s) {
             s.echo(e);
             return Ok(Step::Done);
         }
@@ -172,20 +172,20 @@ mod tests {
     }
 
     #[test]
-    fn outside_a_plan_view_it_refuses_and_adds_nothing() -> R {
+    fn outside_a_plan_or_section_view_it_refuses_and_adds_nothing() -> R {
         let (mut s, _plan, detail) = room()?;
         s.execute("editview", &json!({}))?;
         let n = s.doc()?.model.len();
-        assert!(mark(&mut s, 2500.0, 2000.0).is_err_and(|e| e.to_string().contains("Edit a plan view first")));
+        assert!(mark(&mut s, 2500.0, 2000.0).is_err_and(|e| e.to_string().contains("Edit a plan or section view first")));
         s.execute("editview", &json!({ "viewId": detail.0 }))?;
-        assert!(mark(&mut s, 2500.0, 2000.0).is_err_and(|e| e.to_string().contains("plan view")));
+        assert!(mark(&mut s, 2500.0, 2000.0).is_err_and(|e| e.to_string().contains("Detail tags live in plan and section views")));
         assert_eq!(s.doc()?.model.len(), n);
         assert!(s.doc()?.block(&view_block_name(detail)).ok_or("no block")?.entities.is_empty());
 
         s.execute("editview", &json!({}))?;
         s.start("outsidepoint")?;
         assert!(s.running.is_none(), "refused at once");
-        assert!(s.log.iter().any(|l| l == "Edit a plan view first (EDITVIEW)"), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l == "Edit a plan or section view first (EDITVIEW)"), "{:?}", s.log);
         Ok(())
     }
 

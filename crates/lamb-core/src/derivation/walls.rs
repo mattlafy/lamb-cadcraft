@@ -47,6 +47,19 @@ impl WallRunParams {
             opening_layer_ids: ids(&|n| starts(n, b"WINDOW") || starts(n, b"DOOR")),
         }
     }
+
+    /// [`Self::defaults`] for a vertical (section/elevation) view: wall layers are those whose name
+    /// starts with `WALL`, `FLOOR`, `ROOF` or `SLAB` (ASCII case-insensitive) — walls, floors and
+    /// roofs the cut passes through. Opening layers as in `defaults`.
+    pub fn for_vertical(layers: &[DrawingLayer]) -> Self {
+        let starts = |name: &str, prefix: &[u8]| name.len() >= prefix.len() && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix);
+        let wall_layer_ids = layers
+            .iter()
+            .filter(|l| [b"WALL".as_slice(), b"FLOOR", b"ROOF", b"SLAB"].iter().any(|p| starts(&l.name, p)))
+            .map(|l| l.id.clone())
+            .collect();
+        WallRunParams { wall_layer_ids, ..Self::defaults(layers) }
+    }
 }
 
 /// A run's centreline, in the view's local coordinates.

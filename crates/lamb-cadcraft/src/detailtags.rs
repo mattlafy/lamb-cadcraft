@@ -1,18 +1,20 @@
 //! Detail tags (LAMB's `docs/07-architecture/cadcraft-integration.md` §9 "Detail tags are the
-//! assignment", phase 8, LAMB T349): a tag is an ordinary CADCraft `Leader` in a plan view's block,
+//! assignment", phase 8, LAMB T349): a tag is an ordinary CADCraft `Leader` in a plan or section
+//! view's block (LAMB T456: §8 "Not only plans" — plan details tag plan views, section details
+//! vertical views, whose runs come from cut faces on `WALL*`, `FLOOR*`, `ROOF*` and `SLAB*`),
 //! its tip `vertices[0]`, carrying [`EntityData::detail_tag`] — the detail view it names and whether
 //! it tags a junction (corner) or a run (edge). DXF/DWG see a plain leader.
 //!
 //! - `detailtag {detailViewId, corner?, tip:{x,y}, bubble:{x,y}}` (`dtag`): one tag, on the current
-//!   layer, in the edited plan view; one undo step. Returns `{"handle": <hex>}`. Interactive:
+//!   layer, in the edited plan or section view; one undo step; the detail's cut direction must match. Returns `{"handle": <hex>}`. Interactive:
 //!   `Enter detail name or [Corner/?]:` → `Specify tag point:` → `Specify bubble point:`.
-//! - `detailtags {viewId?}`: the resolution report for a plan view (default: the edited one) —
+//! - `detailtags {viewId?}`: the resolution report for a plan or section view (default: the edited one) —
 //!   `<12 runs: 3 tagged, 7 spread, 2 untyped; 4 junctions: 4 spread>`, echoed and returned.
 //!
 //! Reading tags back ([`view_detail_tags`]): an edge tag's tip attaches to the run whose centreline
 //! is nearest, if within `width / 2 + TOLERANCE.grouping_mm`; a corner tag's tip to the nearest
 //! junction within `max arm width / 2 + TOLERANCE.grouping_mm`. Anything else — a tip in open
-//! space, a detail view that no longer exists — is `unattached`. [`resolve_view_details`] then runs
+//! space, a detail view that no longer exists or is drawn in the other direction — is `unattached`. [`resolve_view_details`] then runs
 //! lamb-core's greedy resolution (edges and corners). Computed on demand, never stored.
 
 use cadcraft_doc::{Drawing, EntityKind, Handle, Leader, Line};
@@ -25,7 +27,7 @@ use lamb_core::derivation::wall_spaces::{SideParams, WallSides, wall_sides};
 use lamb_core::derivation::walls::{RunCurve, WallRunParams};
 use lamb_core::geometry::Point2;
 use lamb_core::geometry::tolerance::TOLERANCE;
-use lamb_core::model::{AnyView, Id};
+use lamb_core::model::{AnyView, CutDirection, Id};
 use serde_json::{Value, json};
 
 use crate::commands::{bad, edited_view, id_value, other, point_param};
@@ -98,10 +100,23 @@ fn attach_junction(graph: &WallGraph, tip: Point2) -> Option<usize> {
 /// The view's wall graph and sides, with `WALL-EXT*` layers exterior and the view's outside pick
 /// points ([`crate::outside::outside_points`]) marking their regions outside.
 pub(crate) fn graph_and_sides(p: &DrawingProject<'_>, view: Id) -> (WallGraph, WallSides) {
-    let graph = wall_graph(p, view, &WallRunParams::defaults(p.layers()));
+    let graph = wall_graph(p, view, &wall_params(p, view));
     let exterior_layer_ids = p.layers().iter().filter(|l| starts_with_ci(&l.name, "WALL-EXT")).map(|l| l.id.clone()).collect();
     let sides = wall_sides(p, &graph, &SideParams { outside_points: crate::outside::outside_points(p.drawing(), view), exterior_layer_ids });
     (graph, sides)
+}
+
+/// What counts as a wall face in `view`: [`WallRunParams::for_vertical`] in a vertical view, else
+/// [`WallRunParams::defaults`].
+fn wall_params(p: &DrawingProject<'_>, view: Id) -> WallRunParams {
+    let vertical = read_document(p.drawing()).is_ok_and(|doc| doc.views.iter().any(|v| matches!(v, AnyView::Vertical(_)) && v.id() == view));
+    if vertical { WallRunParams::for_vertical(p.layers()) } else { WallRunParams::defaults(p.layers()) }
+}
+
+/// The cut direction details tagging `view` must have: `Vertical` in a vertical view, else `Plan`.
+fn view_direction(d: &Drawing, view: Id) -> CutDirection {
+    let vertical = read_document(d).is_ok_and(|doc| doc.views.iter().any(|v| matches!(v, AnyView::Vertical(_)) && v.id() == view));
+    if vertical { CutDirection::Vertical } else { CutDirection::Plan }
 }
 
 /// Every tagged leader in `view`'s block: (handle, tip, tag).
@@ -119,7 +134,8 @@ fn tags_in(d: &Drawing, view: Id) -> std::result::Result<Vec<(Handle, Point2, De
 
 fn graph_tags(d: &Drawing, view: Id, graph: &WallGraph) -> std::result::Result<ViewTags, String> {
     let doc = read_document(d).map_err(|e| e.to_string())?;
-    let is_detail = |id: Id| doc.views.iter().any(|v| matches!(v, AnyView::Detail(_)) && v.id() == id);
+    let want = view_direction(d, view);
+    let is_detail = |id: Id| doc.views.iter().any(|v| matches!(v, AnyView::Detail(x) if x.id == id && x.cut_direction == want));
     let mut out = ViewTags::default();
     for (h, tip, tag) in tags_in(d, view)? {
         let detail = tag.detail_view_id.0.to_string();
@@ -137,6 +153,7 @@ fn graph_tags(d: &Drawing, view: Id, graph: &WallGraph) -> std::result::Result<V
     Ok(out)
 }
 
+/// `Ok` for a plan view only — ASSEMBLYPLAN, WALLCONFLICTS, WALLRUN and WALLFIT ([`edited_plan`]).
 fn plan_view(d: &Drawing, view: Id) -> std::result::Result<(), String> {
     let doc = read_document(d).map_err(|e| e.to_string())?;
     match doc.views.iter().find(|v| v.id() == view) {
@@ -146,11 +163,21 @@ fn plan_view(d: &Drawing, view: Id) -> std::result::Result<(), String> {
     }
 }
 
+/// `Ok` for a plan or vertical view — the views with a wall graph.
+fn wall_view(d: &Drawing, view: Id) -> std::result::Result<(), String> {
+    let doc = read_document(d).map_err(|e| e.to_string())?;
+    match doc.views.iter().find(|v| v.id() == view) {
+        Some(AnyView::Plan(_) | AnyView::Vertical(_)) => Ok(()),
+        Some(_) => Err("Detail tags live in plan and section views".into()),
+        None => Err("No such view".into()),
+    }
+}
+
 /// `view`'s detail tags, attached to its wall graph's runs and junctions.
 pub fn view_detail_tags(d: &Drawing, view: Id) -> std::result::Result<ViewTags, String> {
-    plan_view(d, view)?;
+    wall_view(d, view)?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
-    let graph = wall_graph(&p, view, &WallRunParams::defaults(p.layers()));
+    let graph = wall_graph(&p, view, &wall_params(&p, view));
     graph_tags(d, view, &graph)
 }
 
@@ -161,7 +188,7 @@ pub fn resolve_view_details(d: &Drawing, view: Id) -> std::result::Result<(Vec<R
 }
 
 fn resolve_with_tags(d: &Drawing, view: Id) -> std::result::Result<(Vec<RunDetail>, Vec<RunDetail>, ViewTags), String> {
-    plan_view(d, view)?;
+    wall_view(d, view)?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let (graph, sides) = graph_and_sides(&p, view);
     let tags = graph_tags(d, view, &graph)?;
@@ -214,7 +241,7 @@ pub fn report(runs: &[RunDetail], junctions: &[RunDetail], unattached: usize) ->
 pub(crate) fn detailtags(s: &mut Session, p: &Value) -> Result<Value> {
     let view = match p.get("viewId").filter(|v| !v.is_null()) {
         Some(v) => id_value(v).ok_or_else(|| other("No such view"))?,
-        None => edited_view(s).ok_or_else(|| other("Edit a plan view first (EDITVIEW)"))?,
+        None => edited_view(s).ok_or_else(|| other("Edit a plan or section view first (EDITVIEW)"))?,
     };
     let (runs, junctions, tags) = resolve_with_tags(s.doc()?, view).map_err(other)?;
     let message = report(&runs, &junctions, tags.unattached.len());
@@ -234,20 +261,35 @@ pub(crate) fn edited_plan(s: &Session) -> std::result::Result<Id, String> {
     Ok(view)
 }
 
-fn is_detail_view(s: &Session, id: Id) -> bool {
-    s.doc().ok().and_then(|d| read_document(d).ok()).is_some_and(|doc| doc.views.iter().any(|v| matches!(v, AnyView::Detail(_)) && v.id() == id))
+/// The edited view, if it is a plan or vertical view; else the refusal.
+pub(crate) fn edited_wall_view(s: &Session) -> std::result::Result<Id, String> {
+    let view = edited_view(s).ok_or("Edit a plan or section view first (EDITVIEW)")?;
+    wall_view(s.doc().map_err(|e| e.to_string())?, view)?;
+    Ok(view)
 }
 
-/// DETAILTAG's JSON form: a two-vertex leader from `tip` to `bubble` in the edited plan view.
+/// `id`'s cut direction, if it is a detail view.
+fn detail_direction(s: &Session, id: Id) -> Option<CutDirection> {
+    let doc = read_document(s.doc().ok()?).ok()?;
+    doc.views.iter().find_map(|v| match v {
+        AnyView::Detail(x) if x.id == id => Some(x.cut_direction),
+        _ => None,
+    })
+}
+
+/// DETAILTAG's JSON form: a two-vertex leader from `tip` to `bubble` in the edited plan or section view.
 pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
     let detail = p.get("detailViewId").and_then(id_value).ok_or_else(|| bad("detailtag", "`detailViewId` is required"))?;
     let corner = p.get("corner").and_then(Value::as_bool).unwrap_or(false);
     let tip = point_param("detailtag", p, "tip")?;
     let bubble = point_param("detailtag", p, "bubble")?;
     // Every refusal before `doc_mut`, so a refusal records nothing.
-    edited_plan(s).map_err(other)?;
-    if !is_detail_view(s, detail) {
-        return Err(other("No such detail view"));
+    let view = edited_wall_view(s).map_err(other)?;
+    let Some(dir) = detail_direction(s, detail) else { return Err(other("No such detail view")) };
+    match (dir, view_direction(s.doc()?, view)) {
+        (CutDirection::Vertical, CutDirection::Plan) => return Err(other("That detail is drawn in section; tag it in a section view")),
+        (CutDirection::Plan, CutDirection::Vertical) => return Err(other("That detail is drawn in plan; tag it in a plan view")),
+        _ => {}
     }
     let mut common = s.current_common();
     set_entity_data(&mut common, &EntityData { detail_tag: Some(DetailTag { detail_view_id: detail, corner }), ..EntityData::default() })
@@ -312,7 +354,7 @@ impl Interactive for DetailTagM {
         }
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        if let Err(e) = edited_plan(s) {
+        if let Err(e) = edited_wall_view(s) {
             s.echo(e);
             return Ok(Step::Done);
         }
@@ -438,7 +480,7 @@ mod tests {
     fn newdetail_makes_a_floating_detail_view_enters_it_and_lists_it() -> R {
         let mut s = session()?;
         s.start("newdetail")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter detail name <Detail 1>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter detail name or [Plan/Section] <Detail 1>:"));
         s.input(Input::Text("Eaves".into()))?;
         let doc = read_document(s.doc()?)?;
         let AnyView::Detail(d) = &doc.views[0] else { return Err("not a detail".into()) };
@@ -524,16 +566,16 @@ mod tests {
         let (mut s, _plan, detail) = room()?;
         s.execute("editview", &json!({}))?;
         let n = s.doc()?.model.len();
-        assert!(tag(&mut s, detail, false, (2500.0, 0.0)).is_err_and(|e| e.to_string().contains("Edit a plan view first")));
+        assert!(tag(&mut s, detail, false, (2500.0, 0.0)).is_err_and(|e| e.to_string().contains("Edit a plan or section view first")));
         s.execute("editview", &json!({ "viewId": detail.0 }))?;
-        assert!(tag(&mut s, detail, false, (2500.0, 0.0)).is_err_and(|e| e.to_string().contains("Detail tags live in plan views")));
+        assert!(tag(&mut s, detail, false, (2500.0, 0.0)).is_err_and(|e| e.to_string().contains("Detail tags live in plan and section views")));
         assert_eq!(s.doc()?.model.len(), n);
         assert!(s.doc()?.block(&view_block_name(detail)).ok_or("no block")?.entities.is_empty());
 
         s.execute("editview", &json!({}))?;
         s.start("dtag")?;
         assert!(s.running.is_none(), "refused at once");
-        assert!(s.log.iter().any(|l| l == "Edit a plan view first (EDITVIEW)"), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l == "Edit a plan or section view first (EDITVIEW)"), "{:?}", s.log);
         Ok(())
     }
 
@@ -565,6 +607,95 @@ mod tests {
         s.undo()?;
         s.undo()?;
         assert!(leaders(&s, plan)?.is_empty());
+        Ok(())
+    }
+
+    /// A plan with section `A-A` across it, edited, holding two vertical `WALL-EXT` faces 300 apart
+    /// (u 0 and 300, z 0..3000) and two horizontal `FLOOR` faces 250 apart (z 1000 and 1250, u
+    /// 300..4000) meeting the wall, all SETROLE cut; layer `TAGS` current. Returns (session, plan,
+    /// section, plan detail, section detail).
+    fn section_room() -> T<(Session, Id, Id, Id, Id)> {
+        let mut s = session()?;
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let pd = Id(s.execute("newdetail", &json!({ "name": "PD" }))?["viewId"].as_u64().ok_or("no id")?);
+        let sd = Id(s.execute("newdetail", &json!({ "name": "SD", "cutDirection": "vertical" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let r =
+            s.execute("newsectionline", &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 0}, "cutTo": {"x": 5000, "y": 0} }))?;
+        let sec = Id(r["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [0, 3000]] }))?;
+        s.execute("pline", &json!({ "vertices": [[300, 0], [300, 3000]] }))?;
+        s.execute("layer.new", &json!({ "name": "FLOOR", "current": true }))?;
+        s.execute("pline", &json!({ "vertices": [[300, 1000], [4000, 1000]] }))?;
+        s.execute("pline", &json!({ "vertices": [[300, 1250], [4000, 1250]] }))?;
+        let block = s.doc()?.block(&view_block_name(sec)).ok_or("no block")?;
+        let hs: Vec<String> = block.entities.iter().map(|e| format!("{:X}", e.handle.0)).collect();
+        assert_eq!(hs.len(), 4);
+        s.execute("setrole", &json!({ "handles": hs, "role": "cut" }))?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        Ok((s, plan, sec, pd, sd))
+    }
+
+    #[test]
+    fn a_section_s_cut_walls_and_floors_form_runs_and_a_section_detail_tags_them() -> R {
+        let (mut s, _plan, sec, pd, sd) = section_room()?;
+        let r = s.execute("detailtags", &json!({ "viewId": sec.0 }))?;
+        assert_eq!(r["runs"].as_array().map(Vec::len), Some(2), "{r}");
+        assert_eq!(kinds(&resolve_view_details(s.doc()?, sec)?.0), (0, 0, 2));
+
+        // A plan detail is refused in the section and records nothing.
+        let n = s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.len();
+        assert!(tag(&mut s, pd, false, (150.0, 2000.0)).is_err_and(|e| e.to_string() == "That detail is drawn in plan; tag it in a plan view"));
+        assert_eq!(s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.len(), n);
+
+        // The section detail's edge tag on the wall run: that run is tagged.
+        tag(&mut s, sd, false, (150.0, 2000.0))?;
+        let t = view_detail_tags(s.doc()?, sec)?;
+        assert_eq!(t.edges.len(), 1);
+        let (runs, _) = resolve_view_details(s.doc()?, sec)?;
+        assert_eq!(runs[t.edges[0].run], RunDetail::Tagged(sd.0.to_string()));
+        let r = s.execute("detailtags", &json!({}))?;
+        assert_eq!(r["message"], FLOOR_REPORT, "{r}");
+
+        // OUTSIDEPOINT is accepted in the edited section.
+        s.execute("outsidepoint", &json!({ "point": {"x": 2000, "y": 2500} }))?;
+        assert_eq!(crate::outside::outside_points(s.doc()?, sec).len(), 1);
+        Ok(())
+    }
+
+    /// lamb-core's greedy rule, unchanged: the floor abutting the wall's inner face forms no junction
+    /// with it, so the wall tag does not spread to it.
+    const FLOOR_REPORT: &str = "<2 runs: 1 tagged, 1 untyped; 0 junctions>";
+
+    #[test]
+    fn a_section_detail_is_refused_in_a_plan() -> R {
+        let (mut s, plan, _sec, _pd, sd) = section_room()?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        assert!(tag(&mut s, sd, false, (0.0, 0.0)).is_err_and(|e| e.to_string() == "That detail is drawn in section; tag it in a section view"));
+        Ok(())
+    }
+
+    #[test]
+    fn newdetail_section_keyword_makes_a_vertical_detail() -> R {
+        let mut s = session()?;
+        s.start("newdetail")?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter detail name or [Plan/Section] <Detail 1>:"));
+        s.input(Input::Keyword("S".into()))?;
+        assert!(s.log.iter().any(|l| l == "<Section detail>"), "{:?}", s.log);
+        assert!(s.running.is_some(), "asks the name again");
+        s.input(Input::Text("Sill".into()))?;
+        let doc = read_document(s.doc()?)?;
+        let AnyView::Detail(d) = &doc.views[0] else { return Err("not a detail".into()) };
+        assert_eq!((d.name.as_str(), d.cut_direction), ("Sill", CutDirection::Vertical));
+        assert_eq!(s.state()?.space, Space::Block(view_block_name(d.id)));
+        assert!(
+            s.execute("newdetail", &json!({ "name": "X", "cutDirection": "up" }))
+                .is_err_and(|e| e.to_string().contains("`cutDirection` must be plan or vertical"))
+        );
+        s.start("newplan")?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter plan name <Plan 1>:"));
         Ok(())
     }
 }

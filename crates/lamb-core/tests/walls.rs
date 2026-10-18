@@ -5,7 +5,7 @@ use std::f64::consts::PI;
 #[path = "common/walls.rs"]
 mod common;
 
-use common::{VIEW, ent, poly, project, wall};
+use common::{VIEW, add_layer, ent, poly, project, wall};
 use lamb_core::derivation::walls::{RunCurve, WallRun, WallRunParams, wall_runs};
 use lamb_core::model::{DrawingEntity, Id, LineRole, empty_project};
 
@@ -144,4 +144,31 @@ fn defaults_pick_wall_layers_case_insensitively() {
     p.layers[0].name = "wall-misc".into();
     let ids = WallRunParams::defaults(&p.layers).wall_layer_ids;
     assert_eq!(ids, vec!["layer-0", "layer-wall-ext", "layer-wall-int"]);
+}
+
+#[test]
+fn for_vertical_adds_floor_roof_and_slab_layers_and_a_cut_floor_pair_forms_a_run() {
+    let a = || poly(&[(0.0, 0.0), (5000.0, 0.0)], &[]);
+    let b = || poly(&[(0.0, 250.0), (5000.0, 250.0)], &[]);
+    let mut p = project(Vec::new());
+    let floor = add_layer(&mut p, "FLOOR");
+    let roof = add_layer(&mut p, "Roof-Main");
+    let slab = add_layer(&mut p, "slab");
+    let params = WallRunParams::for_vertical(&p.layers);
+    assert_eq!(params.wall_layer_ids, vec!["layer-wall-ext".to_owned(), "layer-wall-int".into(), floor.clone(), roof, slab]);
+    assert!(!WallRunParams::defaults(&p.layers).wall_layer_ids.contains(&floor));
+
+    let with = |role: LineRole| {
+        let mut p = p.clone();
+        let lamb_core::model::AnyView::Plan(v) = &mut p.views[0] else { unreachable!() };
+        v.entities = vec![ent(1, &floor, role, a()), ent(2, &floor, role, b())];
+        p
+    };
+    let cut = with(LineRole::Cut);
+    let r = wall_runs(&cut, VIEW, &WallRunParams::for_vertical(&cut.layers));
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_line_run(&r[0], 250.0, (1, 0, 0.0, 1.0), (2, 0, 0.0, 1.0), (0.0, 125.0), (5000.0, 125.0));
+    assert!(wall_runs(&cut, VIEW, &WallRunParams::defaults(&cut.layers)).is_empty(), "plan params ignore FLOOR");
+    let seen = with(LineRole::Seen);
+    assert!(wall_runs(&seen, VIEW, &WallRunParams::for_vertical(&seen.layers)).is_empty(), "seen faces are not runs");
 }
