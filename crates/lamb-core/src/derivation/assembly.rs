@@ -413,6 +413,57 @@ pub fn mitre_end(line: &mut AssemblyLine, end: RunEnd, point: Point2, bisector: 
     }
 }
 
+/// The unit direction from `j.point` into arm `i`'s straight run (toward its far end), or `None` for
+/// an arc run, a degenerate run or a missing arm.
+pub fn arm_direction(j: &Junction, runs: &[WallRun], i: usize) -> Option<Point2> {
+    let arm = j.arms.get(i)?;
+    let RunCurve::Line { from, to } = runs.get(arm.run)?.centreline else { return None };
+    let (dx, dy) = match arm.end {
+        RunEnd::Start => (to.x - from.x, to.y - from.y),
+        RunEnd::End => (from.x - to.x, from.y - to.y),
+    };
+    let len = dx.hypot(dy);
+    (len > 0.0).then(|| Point2 { x: dx / len, y: dy / len })
+}
+
+/// How far a placed corner detail (§10 step 3, LAMB T462) reaches into each arm of `j`, in arm
+/// order: the farthest along-arm distance, from `j.point` along [`arm_direction`], of any end of
+/// the `corner` lines, floored at 0. An arc arm's reach is 0.
+pub fn corner_reach(j: &Junction, runs: &[WallRun], corner: &[AssemblyLine]) -> Vec<f64> {
+    (0..j.arms.len())
+        .map(|i| {
+            let Some(u) = arm_direction(j, runs, i) else { return 0.0 };
+            corner.iter().flat_map(|l| [l.from, l.to]).map(|p| (p.x - j.point.x) * u.x + (p.y - j.point.y) * u.y).fold(0.0, f64::max)
+        })
+        .collect()
+}
+
+/// Clips `line` to the part at least `reach` along `u` from `node` (`a(x) = (x − node)·u`): both
+/// ends below `reach − TOLERANCE.coincidence_mm` → `false` (drop it); one end below → that end moves
+/// along the line to `a = reach`; otherwise unchanged. An arc line is kept unchanged.
+pub fn trim_to_reach(line: &mut AssemblyLine, node: Point2, u: Point2, reach: f64) -> bool {
+    if line.arc.is_some() {
+        return true;
+    }
+    let a = |p: Point2| (p.x - node.x) * u.x + (p.y - node.y) * u.y;
+    let (af, at) = (a(line.from), a(line.to));
+    let limit = reach - TOLERANCE.coincidence_mm;
+    match (af < limit, at < limit) {
+        (true, true) => false,
+        (false, false) => true,
+        (from_below, _) => {
+            let t = (reach - af) / (at - af);
+            let hit = Point2 { x: line.from.x + (line.to.x - line.from.x) * t, y: line.from.y + (line.to.y - line.from.y) * t };
+            if from_below {
+                line.from = hit;
+            } else {
+                line.to = hit;
+            }
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,5 +851,38 @@ mod tests {
         runs[1] = run(p(100.0, 100.0), p(-5000.0, 100.0), 200.0);
         sides[1] = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
         assert_eq!(place_corner(&j, &runs, &sides, reference, &lines).unwrap_err(), "the corner's arms are parallel");
+    }
+
+    #[test]
+    fn corner_reach_is_the_corner_geometry_s_extent_along_each_arm() {
+        let lines = [l((-1000.0, 200.0), (0.0, 200.0), "GYP"), l((0.0, 0.0), (0.0, 1000.0), "CLAD")];
+        for reversed in [false, true] {
+            let (j, runs, sides) = l_corner(reversed);
+            let placed = place_corner(&j, &runs, &sides, (p(-1000.0, 0.0), p(0.0, 0.0)), &lines).unwrap();
+            assert_eq!(corner_reach(&j, &runs, &placed), vec![900.0, 900.0], "reversed {reversed}");
+            assert_eq!(arm_direction(&j, &runs, 1), Some(p(0.0, 1.0)));
+        }
+        let (j, runs, _) = l_corner(false);
+        let short = [AssemblyLine { from: p(0.0, 0.0), to: p(300.0, 50.0), layer: "A".into(), arc: None }];
+        assert_eq!(corner_reach(&j, &runs, &short), vec![200.0, 0.0]);
+        let mut arc = runs.clone();
+        arc[0].centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
+        assert_eq!(corner_reach(&j, &arc, &short)[0], 0.0);
+    }
+
+    #[test]
+    fn trim_to_reach_clips_a_crossing_line_drops_one_inside_and_keeps_one_outside() {
+        let (node, u) = (p(100.0, 100.0), p(1.0, 0.0));
+        let line = |a: f64, b: f64| AssemblyLine { from: p(a, 0.0), to: p(b, 0.0), layer: "A".into(), arc: None };
+        let mut crossing = line(0.0, 5000.0);
+        assert!(trim_to_reach(&mut crossing, node, u, 900.0));
+        assert_eq!(crossing, line(1000.0, 5000.0));
+        let mut reversed = line(5000.0, 0.0);
+        assert!(trim_to_reach(&mut reversed, node, u, 900.0));
+        assert_eq!(reversed, line(5000.0, 1000.0));
+        assert!(!trim_to_reach(&mut line(0.0, 900.0), node, u, 900.0));
+        let mut outside = line(1000.0, 2000.0);
+        assert!(trim_to_reach(&mut outside, node, u, 900.0));
+        assert_eq!(outside, line(1000.0, 2000.0));
     }
 }

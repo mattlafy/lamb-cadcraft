@@ -22,7 +22,10 @@
 //! pitch is near the grid's on that grid's lines.
 //! At each two-arm junction a corner tag resolves to (§10 step 3, LAMB T461), [`corner_assembly`]
 //! places the corner detail once (lamb-core's [`place_corner`]); the block holds the run lines,
-//! then the corner lines in junction order. Run sweeps are not trimmed at a placed corner.
+//! then the corner lines in junction order. A placed corner owns the region around its junction
+//! (LAMB T462): on each straight arm's run, band lines are clipped to start at the corner's reach
+//! (lamb-core's [`corner_reach`], [`trim_to_reach`]; dropped when wholly inside) and every repeat
+//! copy with a line end inside the reach is dropped whole.
 //! Not the AI-line sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
@@ -31,8 +34,8 @@ use cadcraft_doc::{Arc as ArcEntity, Block, Common, Drawing, Entity, EntityKind,
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
 use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
-    AssemblyLine, FaceRef, WidthConflict, detail_bands, detail_frame, junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner,
-    width_conflict,
+    AssemblyLine, FaceRef, WidthConflict, arm_direction, corner_reach, detail_bands, detail_frame, junction_bisector, lay_bands, lay_repeat,
+    mitre_end, place_corner, trim_to_reach, width_conflict,
 };
 use lamb_core::derivation::detail_tags::RunDetail;
 use lamb_core::derivation::issues::{Issue, IssueKind};
@@ -61,6 +64,9 @@ pub struct RunAssembly {
     pub lines: Vec<AssemblyLine>,
     /// `lines[..bands]` are the continuous bands; the rest are repeat copies.
     pub bands: usize,
+    /// The line count of each repeat copy, in order, after the bands: `bands + copies.iter().sum()
+    /// == lines.len()`.
+    pub copies: Vec<usize>,
     pub skipped: Option<String>,
     /// The detail is thicker or thinner than the drawn wall; `None` when they agree or the run was
     /// skipped.
@@ -108,15 +114,15 @@ fn member_segments(d: &Drawing, detail: Id, members: &[cadcraft_doc::Handle]) ->
     out
 }
 
-/// One run's lines from `detail` (bands, then each repeat's copies), how many of them are bands, and
-/// its width conflict, or why not.
+/// One run's lines from `detail` (bands, then each repeat's copies), how many of them are bands, the
+/// line count of each copy, and its width conflict, or why not.
 fn run_lines(
     d: &Drawing,
     view: Id,
     detail: Id,
     run: &lamb_core::derivation::walls::WallRun,
     sides: &lamb_core::derivation::wall_spaces::RunSides,
-) -> Result<(Vec<AssemblyLine>, usize, Option<WidthConflict>), String> {
+) -> Result<(Vec<AssemblyLine>, usize, Vec<usize>, Option<WidthConflict>), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let face = match r.kind {
         DetailRefKind::ExteriorFace => FaceRef::Exterior,
@@ -129,10 +135,16 @@ fn run_lines(
     let mut laid = lay_bands(run, sides, face, &bands)?;
     let n = laid.len();
     let grid = crate::studgrid::stud_grid(d, view);
+    let mut copies = Vec::new();
     for rep in detail_repeats(d, detail)? {
-        laid.extend(lay_repeat(run, sides, face, &frame, &member_segments(d, detail, &rep.members), rep.pitch, grid.as_ref())?);
+        let members = member_segments(d, detail, &rep.members);
+        let copy = lay_repeat(run, sides, face, &frame, &members, rep.pitch, grid.as_ref())?;
+        if !members.is_empty() {
+            copies.extend(std::iter::repeat_n(members.len(), copy.len() / members.len()));
+        }
+        laid.extend(copy);
     }
-    Ok((laid, n, width_conflict(run, face, &bands)))
+    Ok((laid, n, copies, width_conflict(run, face, &bands)))
 }
 
 /// Every run of `plan`'s wall graph, in graph order, with its detail's bands laid along it — mitred
@@ -154,6 +166,7 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
                 detail,
                 lines: Vec::new(),
                 bands: 0,
+                copies: Vec::new(),
                 skipped: Some(why.into()),
                 conflict: None,
             };
@@ -164,7 +177,7 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             };
             let Ok(detail) = id.parse::<u64>().map(Id) else { return skip("detail id is not a number", None) };
             match run_lines(d, plan, detail, run, side) {
-                Ok((lines, bands, conflict)) => RunAssembly { run: i, detail: Some(detail), lines, bands, skipped: None, conflict },
+                Ok((lines, bands, copies, conflict)) => RunAssembly { run: i, detail: Some(detail), lines, bands, copies, skipped: None, conflict },
                 Err(e) => skip(&e, Some(detail)),
             }
         })
@@ -184,7 +197,35 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             }
         }
     }
+    for c in corner_assembly(d, plan)?.iter().filter(|c| c.skipped.is_none()) {
+        let Some(j) = graph.junctions.get(c.junction) else { continue };
+        for (i, reach) in corner_reach(j, &graph.runs, &c.lines).into_iter().enumerate() {
+            let Some(u) = arm_direction(j, &graph.runs, i).filter(|_| reach > 0.0) else { continue };
+            let Some(r) = runs.get_mut(j.arms[i].run).filter(|r| r.skipped.is_none()) else { continue };
+            trim_run(r, j.point, u, reach);
+        }
+    }
     Ok(runs)
+}
+
+/// Clips `r`'s band lines to `reach` along `u` from `node` ([`trim_to_reach`], dropping those wholly
+/// inside) and drops every repeat copy with a line end inside it.
+fn trim_run(r: &mut RunAssembly, node: Point2, u: Point2, reach: f64) {
+    let limit = reach - TOLERANCE.coincidence_mm;
+    let inside = |p: Point2| (p.x - node.x) * u.x + (p.y - node.y) * u.y < limit;
+    let mut rest = r.lines.split_off(r.bands);
+    r.lines.retain_mut(|l| trim_to_reach(l, node, u, reach));
+    r.bands = r.lines.len();
+    let mut copies = Vec::new();
+    for n in std::mem::take(&mut r.copies) {
+        let copy: Vec<AssemblyLine> = rest.drain(..n.min(rest.len())).collect();
+        if !copy.iter().any(|l| inside(l.from) || inside(l.to)) {
+            r.lines.extend(copy);
+            copies.push(n);
+        }
+    }
+    r.lines.extend(rest);
+    r.copies = copies;
 }
 
 /// One junction's placed corner detail, or why it was not placed.
@@ -1199,7 +1240,7 @@ pub(crate) mod tests {
         };
         let EntityKind::Arc(a) = line_entity(&cw) else { panic!("not an arc") };
         assert_eq!((r6(a.start.to_degrees()), r6(a.end.to_degrees())), (0.0, 90.0));
-        let run = |l: AssemblyLine| RunAssembly { run: 0, detail: None, lines: vec![l], bands: 1, skipped: None, conflict: None };
+        let run = |l: AssemblyLine| RunAssembly { run: 0, detail: None, lines: vec![l], bands: 1, copies: vec![], skipped: None, conflict: None };
         let mut block = Block::new("X");
         block.entities.push(Entity {
             handle: cadcraft_doc::Handle(1),
@@ -1699,6 +1740,12 @@ pub(crate) mod tests {
         let all = corner_xy(&corners);
         assert!(all.contains(&(0.0, 0.0, 1000.0, 0.0, "CRN-A".into())), "{all:?}");
         assert!(all.contains(&(200.0, 1000.0, 200.0, 0.0, "CRN-B".into())), "{all:?}");
+        // Every corner reaches 900 from its node along each arm: the bands start there (T462).
+        assert_trimmed(s.doc()?, plan)?;
+        let runs = assembly_lines(s.doc()?, plan)?;
+        let bottom: Vec<_> = runs.iter().flat_map(|r| &r.lines[..r.bands]).filter(|l| l.from.y == l.to.y && l.from.y < 300.0).collect();
+        assert_eq!(bottom.len(), 3, "{bottom:?}");
+        assert!(bottom.iter().all(|l| r6(l.from.x.min(l.to.x)) == 1000.0 && r6(l.from.x.max(l.to.x)) == 4000.0), "{bottom:?}");
         // The block: the 12 run lines, then the corner lines in junction order.
         let block = block_xy(&s, &assembly_block_name(plan))?;
         assert_eq!(block.len(), 20);
@@ -1724,6 +1771,7 @@ pub(crate) mod tests {
         assert!(block.contains(&(-20.0, 0.0, 980.0, 0.0, "CRN-A".into())), "{block:?}");
         assert!(block.iter().any(|l| l.4 == "CRN-A" && l.0 == 4980.0 && l.1 == 0.0), "{block:?}");
         assert_eq!(block.len(), 20);
+        assert_trimmed(s.doc()?, plan)?;
         assert!(block_matches(
             s.doc()?.block(&assembly_block_name(plan)).ok_or("no block")?,
             &assembly_lines(s.doc()?, plan)?,
@@ -1760,6 +1808,125 @@ pub(crate) mod tests {
         let r = s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
         assert_eq!(r["corners"].as_u64(), Some(placed.len() as u64), "{r}");
         assert_eq!(r["lines"].as_u64(), Some((runs + all.len()) as u64), "{r}");
+        assert_trimmed(s.doc()?, sec)?;
+        assert!(trims_something(s.doc()?, sec)?, "no section band was clipped at a corner");
+
+        // MOVE the outer face: the trimmed block re-lays in that one undo step.
+        crate::maintain::install(&mut s);
+        let outer = s
+            .doc()?
+            .block(&view_block_name(sec))
+            .ok_or("no section block")?
+            .entities
+            .iter()
+            .find(|e| e.common.layer == "WALL-EXT" && to_polyline(e).is_ok_and(|c| c.polyline.start.x == 0.0 && c.polyline.start.y == 0.0))
+            .ok_or("no outer face")?
+            .handle;
+        let n = undo_len(&s)?;
+        s.execute("move", &json!({ "handles": [outer.hex()], "delta": [-20, 0] }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let d = s.doc()?;
+        assert!(block_matches(d.block(&assembly_block_name(sec)).ok_or("no block")?, &assembly_lines(d, sec)?, &corner_assembly(d, sec)?));
+        assert_trimmed(d, sec)?;
+        Ok(())
+    }
+
+    /// The along-arm distances of `l`'s ends from junction `j`'s node into arm `i`, or `None` for an
+    /// arc arm.
+    fn along(j: &lamb_core::derivation::wall_junctions::Junction, runs: &[WallRun], i: usize, l: &AssemblyLine) -> Option<[f64; 2]> {
+        let u = arm_direction(j, runs, i)?;
+        let a = |p: Point2| (p.x - j.point.x) * u.x + (p.y - j.point.y) * u.y;
+        Some([a(l.from), a(l.to)])
+    }
+
+    /// Every placed corner of `view` with each arm's reach: no line end (band or repeat copy) of that
+    /// arm's run lies inside the reach, and each run's `copies` sum to its repeat lines.
+    fn assert_trimmed(d: &Drawing, view: Id) -> R {
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, view);
+        let runs = assembly_lines(d, view)?;
+        for r in &runs {
+            assert_eq!(r.bands + r.copies.iter().sum::<usize>(), r.lines.len(), "run {}", r.run);
+        }
+        for c in corner_assembly(d, view)?.iter().filter(|c| c.skipped.is_none()) {
+            let j = &graph.junctions[c.junction];
+            for (i, reach) in corner_reach(j, &graph.runs, &c.lines).into_iter().enumerate() {
+                for l in &runs[j.arms[i].run].lines {
+                    let Some(a) = along(j, &graph.runs, i, l) else { continue };
+                    assert!(a.iter().all(|a| *a >= reach - TOLERANCE.coincidence_mm), "junction {} arm {i} reach {reach}: {l:?}", c.junction);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether some band end of `view` sits exactly at a placed corner's reach — the trim clipped it.
+    fn trims_something(d: &Drawing, view: Id) -> T<bool> {
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, view);
+        let runs = assembly_lines(d, view)?;
+        for c in corner_assembly(d, view)?.iter().filter(|c| c.skipped.is_none()) {
+            let j = &graph.junctions[c.junction];
+            for (i, reach) in corner_reach(j, &graph.runs, &c.lines).into_iter().enumerate() {
+                let r = &runs[j.arms[i].run];
+                let at_reach = |l: &AssemblyLine| along(j, &graph.runs, i, l).is_some_and(|a| a.iter().any(|a| (a - reach).abs() < 1e-6));
+                if reach > 0.0 && r.lines[..r.bands].iter().any(at_reach) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// `room` with a 38-wide closed stud repeated at `pitch` in its detail (T458's stud room).
+    fn stud_room(pitch: f64) -> T<(Session, Id)> {
+        let (mut s, plan) = room("exterior_face", true)?;
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
+        let before = all_handles(&s)?;
+        s.execute("pline", &json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?;
+        let stud = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no stud")?;
+        let before = all_handles(&s)?;
+        s.execute("dimaligned", &json!({ "p1": [100, 0], "p2": [100.0 + pitch, 0], "at": [300, -300] }))?;
+        let dim = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no dimension")?;
+        s.execute("repeat", &json!({ "dimension": dim.hex(), "handles": [stud.hex()] }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        Ok((s, plan))
+    }
+
+    /// Each run's repeat copies as rounded line tuples, per copy.
+    fn copies_of(runs: &[RunAssembly]) -> Vec<Vec<Vec<(f64, f64, f64, f64)>>> {
+        runs.iter()
+            .map(|r| {
+                let mut at = r.bands;
+                r.copies
+                    .iter()
+                    .map(|n| {
+                        let c = r.lines[at..at + n].iter().map(|l| (r6(l.from.x), r6(l.from.y), r6(l.to.x), r6(l.to.y))).collect();
+                        at += n;
+                        c
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_placed_corner_drops_the_stud_copies_inside_its_reach_and_keeps_the_rest() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        let plain = assembly_lines(s.doc()?, plan)?;
+        assert!(plain.iter().all(|r| r.skipped.is_none() && !r.copies.is_empty() && r.copies.iter().all(|n| *n == 4)), "{plain:?}");
+        corner_detail(&mut s, plan, "exterior_face", false, (0.0, 0.0))?;
+        let d = s.doc()?;
+        assert_trimmed(d, plan)?;
+        // Every corner reaches 900 from its node (100 in from each outer face) along both arms, so a
+        // copy is kept exactly when each of its points has x in 1000..4000 (bottom and top runs) or
+        // y in 1000..3000 (side runs); kept copies are unchanged.
+        let ok = |x: f64, y: f64| (1000.0 - 1e-6..=4000.0 + 1e-6).contains(&x) || (1000.0 - 1e-6..=3000.0 + 1e-6).contains(&y);
+        let want: Vec<Vec<_>> =
+            copies_of(&plain).into_iter().map(|run| run.into_iter().filter(|c| c.iter().all(|v| ok(v.0, v.1) && ok(v.2, v.3))).collect()).collect();
+        let got = copies_of(&assembly_lines(d, plan)?);
+        assert_eq!(got, want);
+        assert!(got.iter().zip(copies_of(&plain)).all(|(g, p)| !g.is_empty() && g.len() < p.len()), "every run lost copies at its corners");
         Ok(())
     }
 }
