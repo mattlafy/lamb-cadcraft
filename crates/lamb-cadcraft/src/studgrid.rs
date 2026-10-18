@@ -39,7 +39,7 @@ use lamb_core::model::Id;
 use serde_json::{Value, json};
 
 use crate::commands::{bad, other, point_param};
-use crate::detailtags::{edited_plan, graph_and_sides};
+use crate::detailtags::{edited_plan, edited_wall_view, graph_and_sides};
 use crate::project::DrawingProject;
 use crate::schema::{EntityData, LambDocument, WallGrid, read_document, read_entity_data, set_entity_data, view_block_name};
 
@@ -76,6 +76,20 @@ fn in_band(run: &WallRun, q: Point2) -> bool {
     let (ux, uy, qx, qy) = (dx / len, dy / len, q.x - from.x, q.y - from.y);
     let t = qx * ux + qy * uy;
     (0.0..=len).contains(&t) && (ux * qy - uy * qx).abs() <= run.width / 2.0 + TOLERANCE.coincidence_mm
+}
+
+/// Every stud-move point of `view`'s block inside `run`'s band, in block order.
+pub(crate) fn stud_moves(d: &Drawing, view: Id, run: &WallRun) -> Vec<Point2> {
+    let Some(block) = d.block(&view_block_name(view)) else { return Vec::new() };
+    block
+        .entities
+        .iter()
+        .filter_map(|e| {
+            let EntityKind::Point(pt) = &e.kind else { return None };
+            let q = Point2 { x: pt.p.x, y: pt.p.y };
+            (read_entity_data(&e.common).ok()?.stud_move && in_band(run, q)).then_some(q)
+        })
+        .collect()
 }
 
 fn find_view(doc: &LambDocument, id: Id) -> Option<ViewRef<'_>> {
@@ -284,6 +298,65 @@ impl Interactive for StudGridM {
 
 pub(crate) fn studgrid_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::new(StudGridM { pitch: DEFAULT_PITCH_MM, asking_pitch: false, wall: None }))
+}
+
+/// STUDMOVE's JSON form: a stud-move point at `point` in the edited plan or section, inside exactly
+/// one run's band.
+pub(crate) fn studmove(s: &mut Session, p: &Value) -> Result<Value> {
+    let at = point_param("studmove", p, "point")?;
+    // Every refusal before `doc_mut`, so a refusal records nothing.
+    let view = edited_wall_view(s).map_err(other)?;
+    {
+        let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?).map_err(other)?, view);
+        let mut holding = graph.runs.iter().filter(|r| in_band(r, at));
+        match (holding.next(), holding.next()) {
+            (None, _) => return Err(other("No wall there")),
+            (Some(_), Some(_)) => return Err(other("That point is inside more than one wall; pick away from the corner")),
+            (Some(_), None) => {}
+        }
+    }
+    let mut common = s.current_common();
+    set_entity_data(&mut common, &EntityData { stud_move: true, ..EntityData::default() }).map_err(other)?;
+    let space = s.space();
+    let h = s.doc_mut()?.add(&space, common, EntityKind::Point(Point { p: Vec2::new(at.x, at.y).to3(0.0), angle: 0.0 }))?;
+    Ok(json!({ "handle": format!("{:X}", h.0) }))
+}
+
+/// STUDMOVE: one point prompt; a refusal echoes and ends.
+struct StudMoveM;
+
+impl Interactive for StudMoveM {
+    fn name(&self) -> &'static str {
+        "studmove"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Specify the stud's new centre", Accept::POINT)
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        match edited_wall_view(s) {
+            Ok(_) => Ok(Step::Continue),
+            Err(e) => {
+                s.echo(e);
+                Ok(Step::Done)
+            }
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        match i {
+            Input::Point(p) => {
+                if let Err(e) = studmove(s, &json!({ "point": {"x": p.x, "y": p.y} })) {
+                    s.echo(e.to_string());
+                }
+                Ok(Step::Done)
+            }
+            Input::Cancel | Input::Enter => Ok(Step::Cancel),
+            _ => Ok(Step::Continue),
+        }
+    }
+}
+
+pub(crate) fn studmove_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(StudMoveM))
 }
 
 #[cfg(test)]
@@ -672,6 +745,104 @@ pub(crate) mod tests {
         let strip = |d: &Drawing| grid_points(d, plan).into_iter().map(|g| (g.1, g.2, g.3)).collect::<Vec<_>>();
         assert_eq!(strip(&back), strip(s.doc()?));
         assert_eq!(stud_xs(&back, plan, 3900.0)?, stud_xs(s.doc()?, plan, 3900.0)?);
+        Ok(())
+    }
+
+    fn with_moved(xs: &[f64], from: &[f64], to: &[f64]) -> Vec<f64> {
+        let mut out: Vec<f64> = xs.iter().copied().filter(|x| !from.contains(x)).chain(to.iter().copied()).collect();
+        out.sort_by(f64::total_cmp);
+        out
+    }
+
+    fn round6(v: f64) -> f64 {
+        (v * 1e6).round() / 1e6
+    }
+
+    #[test]
+    fn a_stud_move_point_moves_one_stud_and_erase_or_move_follow_it() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        crate::maintain::install(&mut s);
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let (south, north) = (stud_xs(s.doc()?, plan, 100.0)?, stud_xs(s.doc()?, plan, 3900.0)?);
+        let x0 = north[north.len() / 2];
+        let block = |s: &Session| -> T<Vec<String>> {
+            let b = s.doc()?.block(&assembly_block_name(plan)).ok_or("no block")?.clone();
+            Ok(b.entities.iter().map(|e| format!("{:?}", e.kind)).collect())
+        };
+        let laid = block(&s)?;
+        let n = undo_len(&s)?;
+        let h = s.execute("studmove", &json!({ "point": {"x": x0 + 50.0, "y": 3850.0} }))?["handle"].as_str().ok_or("no handle")?.to_owned();
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_ne!(block(&s)?, laid, "the observer re-laid the block");
+        assert_eq!(stud_xs(s.doc()?, plan, 3900.0)?, with_moved(&north, &[x0], &[round6(x0 + 50.0)]));
+        assert_eq!(stud_xs(s.doc()?, plan, 100.0)?, south, "the south wall is untouched");
+        s.execute("move", &json!({ "handles": [h], "delta": [-120, 0] }))?;
+        assert_eq!(stud_xs(s.doc()?, plan, 3900.0)?, with_moved(&north, &[x0], &[round6(x0 - 70.0)]));
+        s.execute("erase", &json!({ "handles": [h] }))?;
+        assert_eq!(stud_xs(s.doc()?, plan, 3900.0)?, north, "erasing the point puts the stud back on the grid");
+        assert_eq!(block(&s)?, laid);
+        Ok(())
+    }
+
+    #[test]
+    fn two_stud_move_points_near_one_stud_move_two_copies() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        let north = stud_xs(s.doc()?, plan, 3900.0)?;
+        let i = north.len() / 2;
+        let (x0, prev) = (north[i], north[i - 1]);
+        s.execute("studmove", &json!({ "point": {"x": x0 + 50.0, "y": 3900.0} }))?;
+        s.execute("studmove", &json!({ "point": {"x": x0 - 30.0, "y": 3900.0} }))?;
+        let moved = stud_xs(s.doc()?, plan, 3900.0)?;
+        assert_eq!(moved.len(), north.len());
+        assert_eq!(moved, with_moved(&north, &[x0, prev], &[round6(x0 + 50.0), round6(x0 - 30.0)]));
+        Ok(())
+    }
+
+    #[test]
+    fn studmove_refusals_record_nothing_and_the_interactive_form_places_a_point() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        let n = undo_len(&s)?;
+        let refuse = |s: &mut Session, x: f64, y: f64, msg: &str| {
+            assert!(
+                s.execute("studmove", &json!({ "point": {"x": x, "y": y} })).is_err_and(|e| e.to_string().contains(msg)),
+                "({x}, {y}) should say {msg}"
+            );
+        };
+        refuse(&mut s, 2500.0, 2000.0, "No wall there");
+        refuse(&mut s, 200.0, 200.0, "inside more than one wall");
+        assert_eq!(undo_len(&s)?, n);
+        s.execute("editview", &json!({}))?;
+        let m = undo_len(&s)?;
+        refuse(&mut s, 2500.0, 3900.0, "Edit a plan or section view first");
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let m2 = undo_len(&s)?;
+        assert!(s.execute("studmove", &json!({ "point": {"x": 2500, "y": 3900} })).is_err(), "a detail view is refused");
+        assert_eq!(undo_len(&s)?, m2, "refusals record nothing");
+        assert!(m2 >= m);
+        s.start("studmove")?;
+        assert!(s.running.is_none(), "refused at once outside a plan or section");
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let north = stud_xs(s.doc()?, plan, 3900.0)?;
+        s.start("smv")?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify the stud's new centre:"));
+        s.input(Input::Point(Vec2::new(north[2] + 40.0, 3900.0)))?;
+        assert!(s.running.is_none());
+        assert_eq!(stud_xs(s.doc()?, plan, 3900.0)?, with_moved(&north, &[north[2]], &[round6(north[2] + 40.0)]));
+        Ok(())
+    }
+
+    #[test]
+    fn the_stud_move_tag_survives_dxf() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        let north = stud_xs(s.doc()?, plan, 3900.0)?;
+        s.execute("studmove", &json!({ "point": {"x": north[3] + 25.0, "y": 3900.0} }))?;
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        let moved = stud_xs(s.doc()?, plan, 3900.0)?;
+        assert_ne!(moved, north);
+        assert_eq!(stud_xs(&back, plan, 3900.0)?, moved);
         Ok(())
     }
 }

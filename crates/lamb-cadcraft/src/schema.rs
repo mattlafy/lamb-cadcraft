@@ -162,6 +162,10 @@ pub struct EntityData {
     /// run whose band holds it ([`crate::studgrid`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stud_grid_wall: Option<WallGrid>,
+    /// On a `Point` in a plan or vertical view's block: a stud-move point — the nearest repeat copy
+    /// of the run whose band holds it is laid centred on it ([`crate::studgrid`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stud_move: bool,
 }
 
 /// How a wall-scoped stud-grid point overrules the project grid for its run: `Phase` lays the run's
@@ -217,6 +221,7 @@ impl Default for EntityData {
             outside: false,
             stud_grid: None,
             stud_grid_wall: None,
+            stud_move: false,
         }
     }
 }

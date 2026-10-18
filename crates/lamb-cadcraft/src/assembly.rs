@@ -25,7 +25,8 @@
 //! then the corner lines in junction order. A placed corner owns the region around its junction
 //! (LAMB T462): on each straight arm's run, band lines are clipped to start at the corner's reach
 //! (lamb-core's [`corner_reach`], [`trim_to_reach`]; dropped when wholly inside) and every repeat
-//! copy with a line end inside the reach is dropped whole.
+//! copy with a line end inside the reach is dropped whole. Before that trim, each stud-move point
+//! ([`crate::studgrid`], LAMB T464) shifts its run's nearest repeat copy along the run onto itself.
 //! Not the AI-line sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
@@ -144,7 +145,49 @@ fn run_lines(
         }
         laid.extend(copy);
     }
+    move_studs(&mut laid[n..], &copies, run, &crate::studgrid::stud_moves(d, view, run));
     Ok((laid, n, copies, width_conflict(run, face, &bands)))
+}
+
+/// LAMB T464: each stud-move point, in order, shifts the not-yet-moved repeat copy whose centre
+/// along straight `run` is nearest it (ties → the lower index) so that its centre sits at the point.
+/// `lines` are the copies' lines, `copies` their line counts. Arc runs or no copies: inert.
+fn move_studs(lines: &mut [AssemblyLine], copies: &[usize], run: &WallRun, moves: &[Point2]) {
+    let RunCurve::Line { from, to } = run.centreline else { return };
+    let len = (to.x - from.x).hypot(to.y - from.y);
+    if len <= 0.0 || moves.is_empty() {
+        return;
+    }
+    let u = Point2 { x: (to.x - from.x) / len, y: (to.y - from.y) / len };
+    let along = |p: Point2| (p.x - from.x) * u.x + (p.y - from.y) * u.y;
+    let mut ranges = Vec::with_capacity(copies.len());
+    let mut at = 0;
+    for &c in copies {
+        ranges.push((at.min(lines.len()), (at + c).min(lines.len())));
+        at += c;
+    }
+    let centre = |ls: &[AssemblyLine]| {
+        let ts = ls.iter().flat_map(|l| [along(l.from), along(l.to)]);
+        (ts.clone().fold(f64::INFINITY, f64::min) + ts.fold(f64::NEG_INFINITY, f64::max)) / 2.0
+    };
+    let mut moved = vec![false; ranges.len()];
+    for &q in moves {
+        let t_p = along(q);
+        let best = ranges
+            .iter()
+            .enumerate()
+            .filter(|&(i, &(a, b))| !moved[i] && b > a)
+            .map(|(i, &(a, b))| (i, centre(&lines[a..b])))
+            .min_by(|x, y| (x.1 - t_p).abs().total_cmp(&(y.1 - t_p).abs()).then(x.0.cmp(&y.0)));
+        let Some((i, t_c)) = best else { continue };
+        moved[i] = true;
+        let (dx, dy) = ((t_p - t_c) * u.x, (t_p - t_c) * u.y);
+        let (a, b) = ranges[i];
+        for l in &mut lines[a..b] {
+            l.from = Point2 { x: l.from.x + dx, y: l.from.y + dy };
+            l.to = Point2 { x: l.to.x + dx, y: l.to.y + dy };
+        }
+    }
 }
 
 /// Every run of `plan`'s wall graph, in graph order, with its detail's bands laid along it — mitred
@@ -1650,6 +1693,48 @@ pub(crate) mod tests {
             let m = (u - u0).rem_euclid(pitch);
             assert!(m < 1e-6 || pitch - m < 1e-6, "joist at u {u} off the grid through u {u0}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_stud_move_point_on_a_section_s_floor_run_moves_one_joist() -> R {
+        let (mut s, sec, plan) = joist_section()?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0}, "pitch": 400 }))?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        let centres = |d: &Drawing| -> T<Vec<f64>> {
+            let f = floor_run(d, sec)?;
+            let mut xs: Vec<f64> = f.lines[f.bands..]
+                .chunks(4)
+                .map(|c| {
+                    let xs = c.iter().flat_map(|l| [l.from.x, l.to.x]);
+                    let (lo, hi) = (xs.clone().fold(f64::INFINITY, f64::min), xs.fold(f64::NEG_INFINITY, f64::max));
+                    ((lo + hi) / 2.0 * 1e6).round() / 1e6
+                })
+                .collect();
+            xs.sort_by(f64::total_cmp);
+            Ok(xs)
+        };
+        let before = centres(s.doc()?)?;
+        assert!(before.len() > 2);
+        let y = {
+            let p = DrawingProject::new(s.doc()?)?;
+            let (graph, _) = graph_and_sides(&p, sec);
+            graph
+                .runs
+                .iter()
+                .find_map(|r| match r.centreline {
+                    RunCurve::Line { from, to } if (from.y - to.y).abs() < 1e-9 => Some(from.y),
+                    _ => None,
+                })
+                .ok_or("no floor run")?
+        };
+        let x0 = before[before.len() / 2];
+        s.execute("studmove", &json!({ "point": {"x": x0 + 60.0, "y": y} }))?;
+        let after = centres(s.doc()?)?;
+        let mut want: Vec<f64> = before.iter().copied().filter(|&x| x != x0).chain([((x0 + 60.0) * 1e6).round() / 1e6]).collect();
+        want.sort_by(f64::total_cmp);
+        assert_eq!(after, want);
         Ok(())
     }
 

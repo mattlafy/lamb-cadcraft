@@ -49,7 +49,7 @@
 //!   [`crate::lambopen`]. `lambsave {path}` (View ▸ LAMB ▸ Save LAMB Project): the open drawing
 //!   written as a `.lamb` project directory — see [`crate::lambopen`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
 //!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `studgrid {point:{x,y}, pitch?}` (View ▸ LAMB ▸ Stud Grid): the edited
-//!   the project's stud grid origin (pitch 406.4), at a point of the edited plan, that every view's repeats line up on; with `wall: true` (and `off?`) a point inside one plan wall's band overrules it for that run only — see [`crate::studgrid`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's or section's laid
+//!   the project's stud grid origin (pitch 406.4), at a point of the edited plan, that every view's repeats line up on; with `wall: true` (and `off?`) a point inside one plan wall's band overrules it for that run only; `studmove {point:{x,y}}` (View ▸ LAMB ▸ Move Stud) a point in one plan or section run's band that its nearest stud or joist is laid centred on — see [`crate::studgrid`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's or section's laid
 //!   detail bands, then each two-arm corner's placed corner detail, written into its block
 //!   `LAMB_ASSEMBLY_<id>` (`corners` counts the placed ones), `mitre` turning the plan's mitring
 //!   of undetailed corners on or off — see [`crate::assembly`]; interactive on the edited plan or section:
@@ -810,6 +810,11 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{point:{x,y}, pitch?: mm} → {handle, pitch}")
             .menu(MENU)
             .interactive(crate::studgrid::studgrid_machine),
+        CommandSpec::new("studmove", "Move Stud", crate::studgrid::studmove)
+            .alias(&["smv"])
+            .params("{point:{x,y}} → {handle}")
+            .menu(MENU)
+            .interactive(crate::studgrid::studmove_machine),
         CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU),
         CommandSpec::new("assemblyplan", "Assembly Plan", crate::assembly::assemblyplan)
             .params("{viewId, mitre?: bool}")
@@ -930,6 +935,7 @@ mod tests {
             "detailtag",
             "outsidepoint",
             "studgrid",
+            "studmove",
             "wallrun",
             "dxfimport",
             "lambopen",
