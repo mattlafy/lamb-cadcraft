@@ -18,6 +18,7 @@ mod control_server;
 mod desktop_theme;
 #[cfg(any(target_os = "windows", test))]
 mod graphics;
+mod lamb_toolset;
 mod logging;
 #[cfg(target_os = "macos")]
 mod native_menu;
@@ -392,6 +393,9 @@ fn main() -> eframe::Result {
     }
     if let Err(e) = cadcraft_ui_egui::palettes::props_ext::register_picked_source(lamb_picked_group) {
         log::warn!("LAMB picked-view form not installed: {e}");
+    }
+    if let Err(e) = cadcraft_ui_egui::palettes::register_toolset_tab(lamb_toolset::LAMB_TAB) {
+        log::warn!("LAMB Tool Sets tab not installed: {e}");
     }
     if let Err(e) = cadcraft_ui_egui::palettes::layer_ext::register_layer_cell(lamb_layer_cell) {
         log::warn!("LAMB Layers role column not installed: {e}");

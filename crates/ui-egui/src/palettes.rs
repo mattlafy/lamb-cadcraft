@@ -6,7 +6,7 @@ use egui::{Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};
 
 use crate::CadApp;
-use crate::icons::{self, Icon};
+use crate::icons::{self, Icon, IconDef};
 use crate::theme::Tokens;
 
 /// A registered extra cell per Layers-palette layer row (fork-only, LAMB T362).
@@ -124,6 +124,84 @@ pub const DRAFTING: &[(&str, &[Tool], &[Tool])] = &[
     ),
 ];
 
+/// A tool of a registered Tool Sets tab (fork-only, LAMB T465).
+#[derive(Clone, Copy, Debug)]
+pub struct ExtTool {
+    pub icon: IconDef,
+    pub command: &'static str,
+    pub tip: &'static str,
+}
+
+/// A group of a registered Tool Sets tab: up to four large tools, then small ones.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtGroup {
+    pub name: &'static str,
+    pub large: &'static [ExtTool],
+    pub small: &'static [ExtTool],
+}
+
+/// One extra Tool Sets tab, drawn after Drafting and Modeling (fork-only, LAMB T465). Its group
+/// names share `collapsed_groups` with the built-in tabs, so they must not repeat theirs.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtTab {
+    pub name: &'static str,
+    pub groups: &'static [ExtGroup],
+}
+
+static EXT_TAB: std::sync::OnceLock<ExtTab> = std::sync::OnceLock::new();
+
+/// Register the extra Tool Sets tab; a second registration is an error.
+pub fn register_toolset_tab(t: ExtTab) -> Result<(), &'static str> {
+    EXT_TAB.set(t).map_err(|_| "a Tool Sets tab is already registered")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ToolIcon {
+    Builtin(Icon),
+    Def(IconDef),
+}
+
+/// A tool as the group loop draws it, whichever table it came from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ToolRef {
+    icon: ToolIcon,
+    cmd: &'static str,
+    tip: &'static str,
+}
+
+struct GroupRef {
+    name: &'static str,
+    large: Vec<ToolRef>,
+    small: Vec<ToolRef>,
+}
+
+/// The tab row: Drafting, Modeling, then the registered tab if any.
+fn tab_names(ext: Option<&ExtTab>) -> Vec<&'static str> {
+    let mut v = vec!["Drafting", "Modeling"];
+    v.extend(ext.map(|e| e.name));
+    v
+}
+
+/// The groups of tab `tab`; any name but Drafting or the registered tab shows Modeling.
+fn tab_groups(tab: &str, ext: Option<&ExtTab>) -> Vec<GroupRef> {
+    let builtin = |tools: &[Tool]| tools.iter().map(|&(icon, cmd, tip)| ToolRef { icon: ToolIcon::Builtin(icon), cmd, tip }).collect();
+    let def = |tools: &[ExtTool]| tools.iter().map(|t| ToolRef { icon: ToolIcon::Def(t.icon), cmd: t.command, tip: t.tip }).collect();
+    match ext.filter(|e| e.name == tab) {
+        Some(e) => e.groups.iter().map(|g| GroupRef { name: g.name, large: def(g.large), small: def(g.small) }).collect(),
+        None => {
+            let groups = if tab == "Drafting" { DRAFTING } else { MODELING };
+            groups.iter().map(|&(name, large, small)| GroupRef { name, large: builtin(large), small: builtin(small) }).collect()
+        }
+    }
+}
+
+fn tool_button(ui: &mut egui::Ui, tool: &ToolRef, size: f32) -> egui::Response {
+    match tool.icon {
+        ToolIcon::Builtin(i) => icons::button(ui, i, size, tool.tip, false),
+        ToolIcon::Def(d) => icons::button_def(ui, d, size, tool.tip, false),
+    }
+}
+
 fn command_known(id: &str) -> bool {
     cadcraft_engine::find_command(id).is_some() || crate::menus::is_ui_command(id)
 }
@@ -136,8 +214,11 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
         // Tabs.
         let tab_h = 28.0;
         let mut x = r.left();
-        for name in ["Drafting", "Modeling"] {
-            let w = 92.0;
+        let ext = EXT_TAB.get();
+        let tabs = tab_names(ext);
+        // Up to 92 px each, shrunk so every tab fits left of the collapse chevron.
+        let w = (92.0f32).min((r.width() - 28.0).max(0.0) / tabs.len() as f32);
+        for name in tabs {
             let tr = Rect::from_min_size(pos2(x, r.top()), vec2(w, tab_h));
             let active = app.ui.toolset_tab == name;
             let resp = ui.interact(tr, ui.id().with(("ts", name)), Sense::click());
@@ -171,8 +252,7 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
         ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                let groups: &[(&str, &[Tool], &[Tool])] = if app.ui.toolset_tab == "Drafting" { DRAFTING } else { MODELING };
-                for (name, large, small) in groups {
+                for GroupRef { name, large, small } in tab_groups(&app.ui.toolset_tab, ext) {
                     let collapsed = app.ui.collapsed_groups.iter().any(|g| g == name);
                     // Header.
                     let (hr, hresp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
@@ -202,14 +282,14 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
                     let hidden = |cmd: &str| app.ui.hidden_tools.iter().any(|h| h == cmd);
                     egui::Popup::from_toggle_button_response(&gresp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                         ui.label(crate::tl!("Show in Tool Sets"));
-                        for (_, cmd, tip) in large.iter().chain(small.iter()) {
-                            let mut shown = !hidden(cmd);
-                            if ui.checkbox(&mut shown, *tip).changed() {
-                                tool_visible = Some((cmd.to_string(), shown));
+                        for tool in large.iter().chain(small.iter()) {
+                            let mut shown = !hidden(tool.cmd);
+                            if ui.checkbox(&mut shown, tool.tip).changed() {
+                                tool_visible = Some((tool.cmd.to_string(), shown));
                             }
                         }
                         if ui.selectable_label(false, crate::tl!("Show All")).clicked() {
-                            restore = large.iter().chain(small.iter()).map(|(_, cmd, _)| cmd.to_string()).collect();
+                            restore = large.iter().chain(small.iter()).map(|tool| tool.cmd.to_string()).collect();
                         }
                     });
                     if !collapsed {
@@ -219,29 +299,29 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
                             ui.horizontal(|ui| {
                                 ui.add_space(8.0);
                                 ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
-                                for (icon, cmd, tip) in large.iter() {
-                                    if hidden(cmd) {
+                                for tool in large.iter() {
+                                    if hidden(tool.cmd) {
                                         continue;
                                     }
-                                    ui.add_enabled_ui(command_known(cmd), |ui| {
-                                        if icons::button(ui, *icon, 40.0, tip, false).clicked() {
-                                            clicked = Some(cmd);
+                                    ui.add_enabled_ui(command_known(tool.cmd), |ui| {
+                                        if tool_button(ui, tool, 40.0).clicked() {
+                                            clicked = Some(tool.cmd);
                                         }
                                     });
                                 }
                             });
                         }
                         // Small icons, 8 per row.
-                        let visible: Vec<Tool> = small.iter().copied().filter(|(_, cmd, _)| !hidden(cmd)).collect();
+                        let visible: Vec<ToolRef> = small.iter().copied().filter(|tool| !hidden(tool.cmd)).collect();
                         for row in visible.chunks(8) {
                             ui.add_space(2.0);
                             ui.horizontal(|ui| {
                                 ui.add_space(8.0);
                                 ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
-                                for (icon, cmd, tip) in row.iter() {
-                                    ui.add_enabled_ui(command_known(cmd), |ui| {
-                                        if icons::button(ui, *icon, 23.0, tip, false).clicked() {
-                                            clicked = Some(cmd);
+                                for tool in row.iter() {
+                                    ui.add_enabled_ui(command_known(tool.cmd), |ui| {
+                                        if tool_button(ui, tool, 23.0).clicked() {
+                                            clicked = Some(tool.cmd);
                                         }
                                     });
                                 }
@@ -1117,4 +1197,42 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     // Fork (LAMB T361): a registered extra group under Geometry, multi-selection included.
     props_ext::show(app, ui);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::icons::{IconPath, IconStroke};
+
+    #[test]
+    fn without_a_registered_tab_the_tabs_are_drafting_and_modeling() {
+        assert_eq!(tab_names(None), vec!["Drafting", "Modeling"]);
+    }
+
+    #[test]
+    fn the_shared_loop_lists_drafting_unchanged() {
+        let groups = tab_groups("Drafting", None);
+        assert_eq!(groups.len(), DRAFTING.len());
+        for (g, (name, large, small)) in groups.iter().zip(DRAFTING) {
+            assert_eq!(g.name, *name);
+            let same = |a: &[ToolRef], b: &[Tool]| {
+                a.len() == b.len() && a.iter().zip(b).all(|(t, (i, c, tip))| t.icon == ToolIcon::Builtin(*i) && t.cmd == *c && t.tip == *tip)
+            };
+            assert!(same(&g.large, large) && same(&g.small, small), "{name}");
+        }
+        assert_eq!(tab_groups("Modeling", None).len(), MODELING.len());
+    }
+
+    #[test]
+    fn a_registered_tab_comes_third_and_feeds_the_same_loop() {
+        const DEF: IconDef = &[IconStroke { path: IconPath::Circle(12.0, 12.0, 8.0), accent: false }];
+        const TOOLS: &[ExtTool] = &[ExtTool { icon: DEF, command: "line", tip: "Line" }];
+        let ext = ExtTab { name: "Extra", groups: &[ExtGroup { name: "Things", large: TOOLS, small: &[] }] };
+        assert_eq!(tab_names(Some(&ext)), vec!["Drafting", "Modeling", "Extra"]);
+        let g = tab_groups("Extra", Some(&ext));
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].name, "Things");
+        assert_eq!(g[0].large, vec![ToolRef { icon: ToolIcon::Def(DEF), cmd: "line", tip: "Line" }]);
+        assert_eq!(tab_groups("Drafting", Some(&ext)).len(), DRAFTING.len());
+    }
 }

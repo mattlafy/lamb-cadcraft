@@ -219,11 +219,58 @@ impl Pen<'_> {
     }
 }
 
+impl<'a> Pen<'a> {
+    fn new(p: &'a Painter, rect: Rect, dim: bool) -> Self {
+        let t = Tokens::get();
+        let alpha = |c: Color32| if dim { c.gamma_multiply(0.4) } else { c };
+        Pen { p, r: rect, w: (rect.width() / 16.0).clamp(1.0, 1.6), base: alpha(t.icon), acc: alpha(t.icon_accent), pt: alpha(t.icon_point) }
+    }
+}
+
+/// One stroke of a data-driven icon (fork-only, LAMB T465), on the same 24×24 grid as [`Icon`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IconPath {
+    /// An open polyline.
+    Line(&'static [(f32, f32)]),
+    /// A closed polyline.
+    Loop(&'static [(f32, f32)]),
+    /// A stroked circle: centre x, y, radius.
+    Circle(f32, f32, f32),
+    /// A filled dot in the point colour: centre x, y, radius.
+    Dot(f32, f32, f32),
+    /// An arc: centre x, y, radius, start and end degrees (counter-clockwise, y up visually).
+    Arc(f32, f32, f32, f32, f32),
+}
+
+/// A stroke in the base colour, or the accent colour that marks an icon's "action" part.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IconStroke {
+    pub path: IconPath,
+    pub accent: bool,
+}
+
+/// An icon given as data rather than an [`Icon`] variant.
+pub type IconDef = &'static [IconStroke];
+
+/// Paint a data-driven icon with the same pen, colours and dimming as [`paint`].
+pub fn paint_def(p: &Painter, rect: Rect, def: IconDef, dim: bool) {
+    let pen = Pen::new(p, rect, dim);
+    for s in def {
+        let c = if s.accent { pen.acc } else { pen.base };
+        match s.path {
+            IconPath::Line(pts) => pen.poly(pts, false, c),
+            IconPath::Loop(pts) => pen.poly(pts, true, c),
+            IconPath::Circle(x, y, r) => pen.c(x, y, r, c),
+            IconPath::Dot(x, y, r) => pen.fill_c(x, y, r, pen.pt),
+            IconPath::Arc(x, y, r, a0, a1) => pen.arc(x, y, r, a0, a1, c),
+        }
+    }
+}
+
 /// Paint `icon` into `rect` (square), with `dim` for disabled.
 pub fn paint(p: &Painter, rect: Rect, icon: Icon, dim: bool) {
-    let t = Tokens::get();
     let alpha = |c: Color32| if dim { c.gamma_multiply(0.4) } else { c };
-    let pen = Pen { p, r: rect, w: (rect.width() / 16.0).clamp(1.0, 1.6), base: alpha(t.icon), acc: alpha(t.icon_accent), pt: alpha(t.icon_point) };
+    let pen = Pen::new(p, rect, dim);
     let (b, a) = (pen.base, pen.acc);
     use Icon::*;
     match icon {
@@ -910,6 +957,15 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, dim: bool) {
 
 /// A shared button interaction with CADCraft's original multicolor icon painting.
 pub fn button(ui: &mut egui::Ui, icon: Icon, size: f32, tooltip: &str, selected: bool) -> egui::Response {
+    button_with(ui, size, tooltip, selected, |p, r, dim| paint(p, r, icon, dim))
+}
+
+/// [`button`] for a data-driven icon (fork-only, LAMB T465).
+pub fn button_def(ui: &mut egui::Ui, def: IconDef, size: f32, tooltip: &str, selected: bool) -> egui::Response {
+    button_with(ui, size, tooltip, selected, |p, r, dim| paint_def(p, r, def, dim))
+}
+
+fn button_with(ui: &mut egui::Ui, size: f32, tooltip: &str, selected: bool, paint_icon: impl Fn(&Painter, Rect, bool)) -> egui::Response {
     let t = Tokens::get();
     let visuals = |fill| ButtonVisuals { fill, stroke: Stroke::NONE, icon: t.icon };
     let style = IconButtonStyle {
@@ -923,7 +979,7 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, size: f32, tooltip: &str, selected:
     let resp = IconButton::new(crate::i18n::t(tooltip), egui::vec2(size, size), &style).selected(selected).show(ui, |ui, rect, _| {
         // A single tint would erase the blue geometry and orange picked points. Keep the
         // original painter and its explicit dimming on the same parent-enabled UI.
-        paint(ui.painter(), rect.shrink(size * 0.08), icon, !ui.is_enabled());
+        paint_icon(ui.painter(), rect.shrink(size * 0.08), !ui.is_enabled());
     });
     crate::control::record_widget(ui, &resp, tooltip, "button", Some(selected));
     resp.on_hover_text(crate::i18n::t(tooltip))
