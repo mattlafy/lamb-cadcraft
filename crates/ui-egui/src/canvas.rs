@@ -1106,65 +1106,88 @@ struct PressPick {
     snap: Option<SnapHit>,
 }
 
-/// The primary button held down on the canvas or a tile: where it went down, whether the pointer
-/// has since moved further than a click may (`slop`, in points), and whether the drag has already
-/// had its whole effect (`consumed`). Unlike egui's own click test, holding the button down for a
-/// while doesn't make a press a drag.
+/// How long a press may last and still be a click despite moving (a little), in seconds.
+const CLICK_TIME: f64 = 0.5;
+
+/// The primary button held down on the canvas or a tile: where and when it went down, where the
+/// pointer is now, and whether the press has become a drag (`far`).
 #[derive(Clone, Copy, Debug)]
 struct Press {
     origin: Pos2,
+    since: f64,
+    last: Pos2,
     far: bool,
     pick: Option<PressPick>,
-    consumed: bool,
 }
 
-/// A press let go: where it went down and came up, and whether it moved further than a click may.
+impl Press {
+    /// A press is a drag once the pointer is more than `slop` from where it went down, or once it
+    /// has moved at all and been held longer than [`CLICK_TIME`] (a slow, deliberate little drag).
+    /// Held still, however long, it stays a click.
+    fn drags(&self, at: Pos2, now: f64, slop: f32) -> bool {
+        let d = self.origin.distance(at);
+        d > slop || (now - self.since > CLICK_TIME && d >= 1.0)
+    }
+}
+
+/// A press let go: where it went down and came up, and whether it was a drag.
 #[derive(Clone, Copy, Debug)]
 struct Release {
     origin: Pos2,
     far: bool,
     at: Pos2,
     pick: Option<PressPick>,
-    consumed: bool,
 }
 
 impl Release {
-    /// Where this press counts: where it went down unless it moved further than a click may.
+    /// Where this press counts: where it went down for a click, where it came up for a drag.
     fn tap_at(&self) -> Pos2 {
         if self.far { self.at } else { self.origin }
     }
 }
 
-/// Follow this frame's pointer events: a press that `starts_here` begins a [`Press`]; moving it
-/// past `slop` from its origin (or letting go there) makes it far; letting go ends it. Returns the
-/// origin of a press that became far this frame, and every release, in order.
-fn track_press(press: &mut Option<Press>, events: &[egui::Event], slop: f32, starts_here: impl Fn(Pos2) -> bool) -> (Option<Pos2>, Vec<Release>) {
+/// Follow this frame's pointer events (at time `now`): a press that `starts_here` begins a
+/// [`Press`]; it becomes a drag as [`Press::drags`] says, while held or as it is let go; letting go
+/// ends it. Returns the origin of a press that became a drag this frame, and every release, in
+/// order.
+fn track_press(
+    press: &mut Option<Press>,
+    events: &[egui::Event],
+    now: f64,
+    slop: f32,
+    starts_here: impl Fn(Pos2) -> bool,
+) -> (Option<Pos2>, Vec<Release>) {
     let (mut became_far, mut releases) = (None, Vec::new());
+    let check = |p: &mut Press, at: Pos2, became_far: &mut Option<Pos2>| {
+        p.last = at;
+        if !p.far && p.drags(at, now, slop) {
+            p.far = true;
+            *became_far = Some(p.origin);
+        }
+    };
     for e in events {
         match e {
             egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => {
-                *press = starts_here(*pos).then_some(Press { origin: *pos, far: false, pick: None, consumed: false });
+                *press = starts_here(*pos).then_some(Press { origin: *pos, since: now, last: *pos, far: false, pick: None });
             }
             egui::Event::PointerMoved(pos) => {
-                if let Some(p) = press.as_mut()
-                    && !p.far
-                    && p.origin.distance(*pos) > slop
-                {
-                    p.far = true;
-                    became_far = Some(p.origin);
+                if let Some(p) = press.as_mut() {
+                    check(p, *pos, &mut became_far);
                 }
             }
             egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. } => {
-                if let Some(p) = press.take() {
-                    let far = p.far || p.origin.distance(*pos) > slop;
-                    if far && !p.far {
-                        became_far = Some(p.origin);
-                    }
-                    releases.push(Release { origin: p.origin, far, at: *pos, pick: p.pick, consumed: p.consumed });
+                if let Some(mut p) = press.take() {
+                    check(&mut p, *pos, &mut became_far);
+                    releases.push(Release { origin: p.origin, far: p.far, at: *pos, pick: p.pick });
                 }
             }
             _ => {}
         }
+    }
+    // Held past the click time with the pointer already off its origin: a drag, moving or not.
+    if let Some(p) = press.as_mut() {
+        let at = p.last;
+        check(p, at, &mut became_far);
     }
     (became_far, releases)
 }
@@ -1392,7 +1415,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // click that wanders a few pixels or is held a moment): each one ends as exactly one input.
     let slop = ui.ctx().options(|o| o.input_options.max_click_dist);
     let hovered = resp.hovered();
-    let (became_far, mut releases) = ui.input(|i| track_press(&mut app.canvas.press, &i.events, slop, |p| hovered && full.contains(p)));
+    let (became_far, releases) = ui.input(|i| track_press(&mut app.canvas.press, &i.events, i.time, slop, |p| hovered && full.contains(p)));
     // Which device is scrolling? On macOS, trackpads (and Magic Mouse) report precise point
     // deltas; notched mouse wheels report lines. The answer is sticky because egui spreads a wheel
     // notch over several frames. Elsewhere (browsers, Wayland smooth-scroll mice) ordinary wheels
@@ -1459,7 +1482,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     // A click in another tile makes it current (or answers -VPORTS Join's prompts).
     if !app.canvas.drag_window
-        && let Some(r) = releases.last().filter(|r| !r.consumed)
+        && let Some(r) = releases.last()
         && !rect.contains(r.tap_at())
         && let Some(i) = tiles.iter().position(|(t, _)| t.contains(r.tap_at()))
     {
@@ -1588,12 +1611,12 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         app.canvas.drag_window = false;
     }
 
-    // Every primary press ends as exactly one input, never none. One that moved no further than a
-    // click may, however long it was held, is a click where it went down, with the cursor and snap
-    // as they stood then. One that moved further is a drag: where a drag means something it has
-    // that meaning — a selection window from where it went down to where it comes up (AutoCAD's
-    // PICKDRAG = 2; click-click still works), a grip picked up where it went down and put down
-    // where it comes up, ZOOM Realtime's zoom — and anywhere else it is a click where it comes up.
+    // Every primary press ends as exactly one input, never none. A click (see [`Press::drags`]) counts
+    // where it went down, with the cursor and snap as they stood then. A drag, where a drag means
+    // something, has that meaning: a selection window from where it went down to where it comes up
+    // (AutoCAD's PICKDRAG = 2; click-click still works), a grip edit's grip picked up where it went
+    // down and put down where it comes up, ZOOM Realtime's zoom. Any other drag is a click where it
+    // comes up (a second window corner, a point, a pick, a Shift-toggled grip, a list grip, a tile).
     if let Some(origin) = became_far
         && !middle_down
         && rect.contains(origin)
@@ -1601,36 +1624,23 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         && app.session.pending_window.is_none()
         && !app.session.realtime_zoom_active()
     {
-        let shift = mods.shift;
-        let consumed = if app.session.prompting() {
+        let on_grip = crate::dyngrips::at(app, &xf, Some(origin)).is_some() || grip_at(app, &xf, Some(origin)).is_some();
+        if app.session.prompting() || !on_grip {
             app.canvas.drag_window = app.session.begin_window(xf.to_world(origin));
-            false
-        } else if let Some(g) = crate::dyngrips::at(app, &xf, Some(origin)) {
-            // A list grip's drag is its click: the list opens and the drag has nowhere to go.
-            let list = g.1.shape == cadcraft_engine::doc::dynblock::GripShape::List;
+        } else if !mods.shift
+            && let Some(g) = crate::dyngrips::at(app, &xf, Some(origin)).filter(|g| g.1.shape != cadcraft_engine::doc::dynblock::GripShape::List)
+        {
             crate::dyngrips::click(app, g);
-            list
-        } else if let Some(g) = grip_at(app, &xf, Some(origin)) {
-            // Shift only toggles the grip hot; nothing is picked up to put down.
-            click_grip(app, g, shift);
-            shift
-        } else {
-            app.canvas.drag_window = app.session.begin_window(xf.to_world(origin));
-            false
-        };
-        if consumed {
-            if let Some(p) = app.canvas.press.as_mut() {
-                p.consumed = true;
-            }
-            // Let go in this same frame: nothing more comes of it either.
-            for r in releases.iter_mut().filter(|r| r.origin == origin) {
-                r.consumed = true;
-            }
+        } else if !mods.shift
+            && crate::dyngrips::at(app, &xf, Some(origin)).is_none()
+            && let Some(g) = grip_at(app, &xf, Some(origin))
+        {
+            click_grip(app, g, false);
         }
     }
     let last = releases.len().saturating_sub(1);
     for (k, r) in releases.iter().copied().enumerate() {
-        if r.consumed || middle_down {
+        if middle_down {
             continue;
         }
         if app.canvas.drag_window {

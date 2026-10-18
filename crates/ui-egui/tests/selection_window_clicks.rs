@@ -1,6 +1,7 @@
-//! Click-click selection windows tolerate a shaky hand: a press that wanders a few pixels is still
-//! the first click (at the point where the button went down), and the second click closes the
-//! window where the button comes up, however far the pointer moved while it was down.
+//! Every press on the canvas is one input. A press that moves no more than a few pixels and is let
+//! go quickly (or is held still, however long) is a click where it went down; a longer or slower
+//! one is a drag: a selection window or grip edit where a drag means that, else a click where it
+//! comes up.
 
 use cadcraft_engine::Session;
 use cadcraft_engine::doc::{Common, Drawing, EntityKind, Line, Space};
@@ -21,7 +22,7 @@ fn harness() -> Harness<'static, CadApp> {
     session.settings.orthomode = false;
     let mut app = CadApp::new(session, Services::default());
     app.canvas.zoom_pending = false;
-    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
+    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_ui_state(
         |ui, app: &mut CadApp| {
             app.logic(ui.ctx());
             app.ui(ui);
@@ -164,4 +165,38 @@ fn a_grip_dragged_is_picked_up_where_it_went_down_and_put_down_where_it_comes_up
     click(&mut h, end, &[(to - end) * 0.5, to - end]);
     let got = line_ends(&h);
     assert!(got[0].1.near(world(&h, to), 1e-6), "{got:?}");
+}
+
+#[test]
+fn a_slow_little_drag_draws_a_little_window() {
+    let mut h = harness();
+    let p = screen(&h, Vec2::new(55.0, 35.0));
+    button(&mut h, p, true);
+    h.event(Event::PointerMoved(p + vec2(3.0, 2.0)));
+    h.run_steps(40);
+    button(&mut h, p + vec2(3.0, 2.0), false);
+    h.run_steps(1);
+    assert!(corner(&h).is_none(), "the slow drag opens and closes its own window");
+    assert!(h.state().session.selection().is_empty());
+}
+
+#[test]
+fn a_shift_press_on_a_grip_dragged_away_is_a_shift_click_where_it_comes_up() {
+    let mut h = harness();
+    let mid = screen(&h, Vec2::new(61.0, 41.0));
+    click(&mut h, mid, &[]);
+    assert_eq!(h.state().session.selection().len(), 1);
+    let end = screen(&h, Vec2::new(62.0, 42.0));
+    let to = screen(&h, Vec2::new(80.0, 20.0));
+    let shift = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::SHIFT };
+    h.event(Event::PointerMoved(end));
+    h.event(Event::ModifiersChanged(Modifiers::SHIFT));
+    h.event(shift(end, true));
+    h.event(Event::PointerMoved(to));
+    h.event(shift(to, false));
+    h.run_steps(2);
+    assert!(h.state().session.running.is_none(), "no grip edit");
+    assert!(line_ends(&h)[0].1.near(Vec2::new(62.0, 42.0), 1e-9), "the line is untouched");
+    let c = corner(&h).expect("a Shift-click on empty space opens a window there");
+    assert!(c.near(world(&h, to), 1e-6), "{c:?}");
 }
