@@ -200,3 +200,46 @@ fn a_shift_press_on_a_grip_dragged_away_is_a_shift_click_where_it_comes_up() {
     let c = corner(&h).expect("a Shift-click on empty space opens a window there");
     assert!(c.near(world(&h, to), 1e-6), "{c:?}");
 }
+
+#[test]
+fn a_fast_click_that_moves_under_40_px_is_a_click_where_it_comes_up() {
+    let mut h = harness();
+    let p = screen(&h, Vec2::new(55.0, 35.0));
+    click(&mut h, p, &[vec2(25.0, 10.0)]);
+    let c = corner(&h).expect("the fast click opens a window");
+    assert!(c.near(world(&h, p + vec2(25.0, 10.0)), 1e-6), "{c:?}");
+}
+
+#[test]
+fn a_fast_point_click_that_moves_under_40_px_places_the_point_where_it_comes_up() {
+    let mut h = harness();
+    h.state_mut().start("line");
+    h.run_steps(2);
+    let a = screen(&h, Vec2::new(10.0, 10.0));
+    click(&mut h, a, &[]);
+    let b = screen(&h, Vec2::new(30.0, 20.0));
+    click(&mut h, b, &[vec2(-20.0, 15.0)]);
+    let got = line_ends(&h);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got[1].1.near(world(&h, b + vec2(-20.0, 15.0)), 1e-6), "{got:?}");
+}
+
+#[test]
+fn a_25_px_drag_held_past_the_fast_click_time_is_a_window() {
+    let mut h = harness();
+    let p = screen(&h, Vec2::new(55.0, 35.0));
+    button(&mut h, p, true);
+    h.event(Event::PointerMoved(p + vec2(25.0, 10.0)));
+    h.run_steps(25);
+    button(&mut h, p + vec2(25.0, 10.0), false);
+    h.run_steps(1);
+    assert!(corner(&h).is_none(), "the drag opens and closes its own window");
+}
+
+#[test]
+fn a_fast_drag_over_40_px_is_a_window() {
+    let mut h = harness();
+    let p = screen(&h, Vec2::new(55.0, 35.0));
+    click(&mut h, p, &[vec2(60.0, 10.0)]);
+    assert!(corner(&h).is_none(), "the drag opens and closes its own window");
+}

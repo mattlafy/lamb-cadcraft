@@ -1108,6 +1108,11 @@ struct PressPick {
 
 /// How long a press may last and still be a click despite moving (a little), in seconds.
 const CLICK_TIME: f64 = 0.5;
+/// A press let go faster than this (seconds) is a click unless it moved further than
+/// [`FAST_CLICK_DIST`]: a hand working fast doesn't stop moving to click.
+const FAST_CLICK_TIME: f64 = 0.3;
+/// How far (points) a fast press may move and still be a click, counted where it comes up.
+const FAST_CLICK_DIST: f32 = 40.0;
 
 /// The primary button held down on the canvas or a tile: where and when it went down, where the
 /// pointer is now, and whether the press has become a drag (`far`).
@@ -1121,28 +1126,36 @@ struct Press {
 }
 
 impl Press {
-    /// A press is a drag once the pointer is more than `slop` from where it went down, or once it
-    /// has moved at all and been held longer than [`CLICK_TIME`] (a slow, deliberate little drag).
-    /// Held still, however long, it stays a click.
+    /// A press is a drag once the pointer is more than [`FAST_CLICK_DIST`] from where it went down;
+    /// after [`FAST_CLICK_TIME`], more than `slop`; after [`CLICK_TIME`], any distance at all (a
+    /// slow, deliberate little drag). Held still, however long, it stays a click.
     fn drags(&self, at: Pos2, now: f64, slop: f32) -> bool {
-        let d = self.origin.distance(at);
-        d > slop || (now - self.since > CLICK_TIME && d >= 1.0)
+        let (d, held) = (self.origin.distance(at), now - self.since);
+        d > FAST_CLICK_DIST || (held >= FAST_CLICK_TIME && d > slop) || (held > CLICK_TIME && d >= 1.0)
     }
 }
 
-/// A press let go: where it went down and came up, and whether it was a drag.
+/// A press let go: where it went down and came up, whether it was a drag, and whether it came up
+/// within `slop` of where it went down (`near`).
 #[derive(Clone, Copy, Debug)]
 struct Release {
     origin: Pos2,
     far: bool,
+    near: bool,
     at: Pos2,
     pick: Option<PressPick>,
 }
 
 impl Release {
-    /// Where this press counts: where it went down for a click, where it came up for a drag.
+    /// Where this press counts: where it went down for a click that came up near there, where it
+    /// came up for a fast click that moved further, or for a drag.
     fn tap_at(&self) -> Pos2 {
-        if self.far { self.at } else { self.origin }
+        if self.at_origin() { self.origin } else { self.at }
+    }
+
+    /// Whether it counts where it went down (with the cursor and snap of that moment).
+    fn at_origin(&self) -> bool {
+        !self.far && self.near
     }
 }
 
@@ -1178,7 +1191,7 @@ fn track_press(
             egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. } => {
                 if let Some(mut p) = press.take() {
                     check(&mut p, *pos, &mut became_far);
-                    releases.push(Release { origin: p.origin, far: p.far, at: *pos, pick: p.pick });
+                    releases.push(Release { origin: p.origin, far: p.far, near: p.origin.distance(*pos) <= slop, at: *pos, pick: p.pick });
                 }
             }
             _ => {}
@@ -1612,7 +1625,8 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     }
 
     // Every primary press ends as exactly one input, never none. A click (see [`Press::drags`]) counts
-    // where it went down, with the cursor and snap as they stood then. A drag, where a drag means
+    // where it went down, with the cursor and snap as they stood then, or, a fast one that moved
+    // further than `slop`, where it came up ([`Release::tap_at`]). A drag, where a drag means
     // something, has that meaning: a selection window from where it went down to where it comes up
     // (AutoCAD's PICKDRAG = 2; click-click still works), a grip edit's grip picked up where it went
     // down and put down where it comes up, ZOOM Realtime's zoom. Any other drag is a click where it
@@ -1673,7 +1687,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         }
         // Where it went down, as the cursor stood then; else where it counts now: the cursor for
         // the frame's last release, the point under it (unsnapped) for an earlier one (#815).
-        let pick = match r.pick.filter(|_| !r.far) {
+        let pick = match r.pick.filter(|_| r.at_origin()) {
             Some(pk) => pk,
             None if k == last => PressPick { cursor: app.canvas.cursor, raw: raw_world, snap: app.canvas.snap },
             None => {
