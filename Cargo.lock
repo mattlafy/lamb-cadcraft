@@ -2081,7 +2081,7 @@ dependencies = [
 
 [[package]]
 name = "lamb-cadcraft"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "cadcraft-color",
  "cadcraft-doc",
@@ -2096,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "lamb-core"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
