@@ -1493,6 +1493,11 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     if resp.dragged_by(egui::PointerButton::Primary) && app.session.realtime_zoom_active() {
         let _ = app.session.realtime_zoom(f64::from(resp.drag_delta().y));
     }
+    // PAN (realtime): the drawing follows a left-button drag.
+    if resp.dragged_by(egui::PointerButton::Primary) && app.session.realtime_pan_active() {
+        let d = resp.drag_delta();
+        let _ = app.session.realtime_pan(f64::from(d.x), f64::from(d.y));
+    }
     // A click in another tile makes it current (or answers -VPORTS Join's prompts).
     if !app.canvas.drag_window
         && let Some(r) = releases.last()
@@ -1629,7 +1634,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // further than `slop`, where it came up ([`Release::tap_at`]). A drag, where a drag means
     // something, has that meaning: a selection window from where it went down to where it comes up
     // (AutoCAD's PICKDRAG = 2; click-click still works), a grip edit's grip picked up where it went
-    // down and put down where it comes up, ZOOM Realtime's zoom. Any other drag is a click where it
+    // down and put down where it comes up, ZOOM Realtime's zoom, PAN's realtime pan. Any other drag is a click where it
     // comes up (a second window corner, a point, a pick, a Shift-toggled grip, a list grip, a tile).
     if let Some(origin) = became_far
         && !middle_down
@@ -1637,6 +1642,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         && app.cmd.options.is_none()
         && app.session.pending_window.is_none()
         && !app.session.realtime_zoom_active()
+        && !app.session.realtime_pan_active()
     {
         let on_grip = crate::dyngrips::at(app, &xf, Some(origin)).is_some() || grip_at(app, &xf, Some(origin)).is_some();
         if app.session.prompting() || !on_grip {
@@ -1668,7 +1674,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             }
             continue;
         }
-        if r.far && app.session.realtime_zoom_active() {
+        if r.far && (app.session.realtime_zoom_active() || app.session.realtime_pan_active()) {
             continue;
         }
         let at = r.tap_at();
