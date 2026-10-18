@@ -1,4 +1,4 @@
-//! Assembly lines for a plan view (LAMB's `docs/07-architecture/cadcraft-integration.md` §10
+//! Assembly lines for a plan or section view (LAMB's `docs/07-architecture/cadcraft-integration.md` §10
 //! "Generation", steps 1, 2 and 4; LAMB T369): for each wall run whose edge
 //! detail resolves ([`resolve_view_details`]) to a detail with a face reference
 //! ([`detail_reference`]), that detail's continuous bands laid along the run on its matching face
@@ -40,7 +40,7 @@ use serde_json::{Value, json};
 use crate::commands::{id_value, other};
 use crate::convert::to_polyline;
 use crate::detailref::{DetailRefKind, detail_reference};
-use crate::detailtags::{edited_plan, graph_and_sides, resolve_view_details};
+use crate::detailtags::{edited_wall_view, graph_and_sides, resolve_view_details};
 use crate::project::DrawingProject;
 use crate::repeats::{detail_repeats, repeat_members};
 use crate::schema::{assembly_block_name, read_document, view_block_name, write_document};
@@ -198,14 +198,14 @@ fn face_ids<'a>(runs: impl IntoIterator<Item = &'a WallRun>) -> Vec<Id> {
     ids
 }
 
-/// The assembly plans' own gaps as RESOLVE issues (§10): for every plan view that has an assembly
+/// The assembly plans' own gaps as RESOLVE issues (§10): for every plan or section view that has an assembly
 /// block, in document view order, each laid run's width conflict (by run), then each junction with
-/// no corner detail that has a laid arm (by junction). Locations are plan-local.
+/// no corner detail that has a laid arm (by junction). Locations are view-local.
 pub(crate) fn wall_issues(d: &Drawing) -> Result<Vec<Issue>, String> {
     let doc = read_document(d).map_err(|e| e.to_string())?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_))) {
+    for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_) | AnyView::Vertical(_))) {
         let plan = v.id();
         if d.block(&assembly_block_name(plan)).is_none() {
             continue;
@@ -263,6 +263,17 @@ pub(crate) fn check_plan(d: &Drawing, plan: Id) -> Result<(), String> {
     }
 }
 
+/// `Ok` when `view` names a plan or section view — the views ASSEMBLYPLAN, WALLCONFLICTS and
+/// WALLRUN accept.
+pub(crate) fn check_wall_view(d: &Drawing, view: Id) -> Result<(), String> {
+    let doc = read_document(d).map_err(|e| e.to_string())?;
+    match doc.views.iter().find(|v| v.id() == view) {
+        None => Err("No such view".into()),
+        Some(AnyView::Plan(_) | AnyView::Vertical(_)) => Ok(()),
+        Some(_) => Err("Not a plan or section view".into()),
+    }
+}
+
 /// The entity an assembly line is written as: a LINE, or for an arc line an ARC, counter-clockwise
 /// from `start` to `end` (a clockwise span's ends swapped).
 fn line_entity(l: &AssemblyLine) -> EntityKind {
@@ -313,9 +324,9 @@ fn ensure_assembly_insert(d: &mut Drawing, plan: Id) {
 
 /// Replaces the block [`assembly_block_name`]`(plan)` with one LINE per laid assembly line (an
 /// empty block when every run is skipped), and gives it its model-space INSERT on its own layer
-/// when it has none. `plan` must be a plan view; nothing is touched on error.
+/// when it has none. `plan` must be a plan or section view; nothing is touched on error.
 pub fn write_assembly_block(d: &mut Drawing, plan: Id) -> Result<Vec<RunAssembly>, String> {
-    check_plan(d, plan)?;
+    check_wall_view(d, plan)?;
     let runs = assembly_lines(d, plan)?;
     replace_block(d, plan, &runs)?;
     ensure_assembly_insert(d, plan);
@@ -353,7 +364,7 @@ fn block_matches(block: &Block, runs: &[RunAssembly]) -> bool {
     want.next().is_none()
 }
 
-/// The after-command observer: every plan view whose assembly block exists gets it rewritten when
+/// The after-command observer: every plan or section view whose assembly block exists gets it rewritten when
 /// it no longer equals [`assembly_lines`]; the drawing is written back only when some block
 /// changed. A plan whose derivation fails is echoed and its block left as it was.
 pub fn assembly_observer(s: &mut Session, _before: &Arc<Drawing>) {
@@ -362,7 +373,7 @@ pub fn assembly_observer(s: &mut Session, _before: &Arc<Drawing>) {
     {
         let Ok(d) = s.doc() else { return };
         let Ok(doc) = read_document(d) else { return };
-        for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_))) {
+        for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_) | AnyView::Vertical(_))) {
             let plan = v.id();
             let Some(block) = d.block(&assembly_block_name(plan)) else { continue };
             match assembly_lines(d, plan) {
@@ -407,7 +418,7 @@ pub fn assemblyplan(s: &mut Session, p: &Value) -> EngineResult<Value> {
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => return Err(other("mitre must be true or false")),
     };
-    check_plan(s.doc()?, plan).map_err(other)?;
+    check_wall_view(s.doc()?, plan).map_err(other)?;
     let mut doc = read_document(s.doc()?).map_err(|e| other(e.to_string()))?;
     let flag_changes = mitre.is_some_and(|m| m != doc.mitre_plans.contains(&plan));
     if let (true, Some(m)) = (flag_changes, mitre) {
@@ -432,13 +443,13 @@ pub fn assemblyplan(s: &mut Session, p: &Value) -> EngineResult<Value> {
 pub fn wallconflicts(s: &mut Session, p: &Value) -> EngineResult<Value> {
     let plan = p.get("viewId").and_then(id_value).ok_or_else(|| other("No such view"))?;
     let d = s.doc()?;
-    check_plan(d, plan).map_err(other)?;
+    check_wall_view(d, plan).map_err(other)?;
     let conflicts = conflicts_json(&assembly_lines(d, plan).map_err(other)?);
     s.echo(format!("{} width conflicts", conflicts.len()));
     Ok(json!({ "conflicts": conflicts }))
 }
 
-/// ASSEMBLYPLAN's interactive form, on the edited plan view: one Yes/No prompt for mitring, Enter
+/// ASSEMBLYPLAN's interactive form, on the edited plan or section view: one Yes/No prompt for mitring, Enter
 /// keeping the plan's current setting.
 struct AssemblyPlanM;
 
@@ -451,11 +462,11 @@ impl Interactive for AssemblyPlanM {
         "assemblyplan"
     }
     fn prompt(&self, s: &Session) -> Prompt {
-        let current = edited_plan(s).is_ok_and(|plan| mitred(s, plan));
+        let current = edited_wall_view(s).is_ok_and(|plan| mitred(s, plan));
         Prompt::new("Mitre missing corner details", Accept::TEXT).kw(&["Yes", "No"]).default(if current { "Yes" } else { "No" }.to_owned())
     }
     fn begin(&mut self, s: &mut Session) -> EngineResult<Step> {
-        if let Err(e) = edited_plan(s) {
+        if let Err(e) = edited_wall_view(s) {
             s.echo(e);
             return Ok(Step::Done);
         }
@@ -475,7 +486,7 @@ impl Interactive for AssemblyPlanM {
             },
             _ => return Ok(Step::Continue),
         };
-        let plan = edited_plan(s).map_err(other)?;
+        let plan = edited_wall_view(s).map_err(other)?;
         let mut p = json!({ "viewId": plan.0 });
         if let Some(m) = mitre {
             p["mitre"] = json!(m);
@@ -496,7 +507,7 @@ pub(crate) fn assemblyplan_machine(_s: &Session) -> EngineResult<Box<dyn Interac
     Ok(Box::new(AssemblyPlanM))
 }
 
-/// WALLCONFLICTS' interactive form: no prompt; the edited plan's conflicts, one line each.
+/// WALLCONFLICTS' interactive form: no prompt; the edited view's conflicts, one line each.
 struct WallConflictsM;
 
 impl Interactive for WallConflictsM {
@@ -507,7 +518,7 @@ impl Interactive for WallConflictsM {
         Prompt::new("Wall conflicts", Accept::TEXT)
     }
     fn begin(&mut self, s: &mut Session) -> EngineResult<Step> {
-        let plan = match edited_plan(s) {
+        let plan = match edited_wall_view(s) {
             Ok(plan) => plan,
             Err(e) => {
                 s.echo(e);
@@ -689,7 +700,7 @@ pub(crate) mod tests {
         let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
         let blocks = s.doc()?.blocks.len();
         let e = s.execute("assemblyplan", &json!({ "viewId": detail.0 })).err().ok_or("detail accepted")?;
-        assert!(e.to_string().contains("Not a plan view"), "{e}");
+        assert!(e.to_string().contains("Not a plan or section view"), "{e}");
         let e = s.execute("assemblyplan", &json!({ "viewId": 999_999 })).err().ok_or("unknown accepted")?;
         assert!(e.to_string().contains("No such view"), "{e}");
         assert_eq!(s.doc()?.blocks.len(), blocks);
@@ -947,7 +958,7 @@ pub(crate) mod tests {
         let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
         let n = undo_len(&s)?;
         let e = s.execute("wallconflicts", &json!({ "viewId": detail.0 })).err().ok_or("detail accepted")?;
-        assert!(e.to_string().contains("Not a plan view"), "{e}");
+        assert!(e.to_string().contains("Not a plan or section view"), "{e}");
         let e = s.execute("wallconflicts", &json!({ "viewId": 999_999 })).err().ok_or("unknown accepted")?;
         assert!(e.to_string().contains("No such view"), "{e}");
         assert_eq!(undo_len(&s)?, n);
@@ -1309,10 +1320,13 @@ pub(crate) mod tests {
         for edit in [json!({ "viewId": detail.0 }), json!({})] {
             s.execute("editview", &edit)?;
             if edit == json!({}) {
-                assert_eq!(edited_plan(&s), Err("Edit a plan view first (EDITVIEW)".to_owned()));
+                assert_eq!(crate::detailtags::edited_plan(&s), Err("Edit a plan view first (EDITVIEW)".to_owned()));
+                assert_eq!(edited_wall_view(&s), Err("Edit a plan or section view first (EDITVIEW)".to_owned()));
             }
-            let why = edited_plan(&s).err().ok_or("a plan is edited")?;
             for cmd in ["assemblyplan", "wallconflicts", "wallfit"] {
+                // WALLFIT is plan-only; the other two take a section too.
+                let why = if cmd == "wallfit" { crate::detailtags::edited_plan(&s) } else { edited_wall_view(&s) };
+                let why = why.err().ok_or("a plan is edited")?;
                 let before = s.doc()?.clone();
                 let n = undo_len(&s)?;
                 s.log.clear();
@@ -1323,6 +1337,177 @@ pub(crate) mod tests {
                 assert_eq!(*s.doc()?, before, "{cmd}");
             }
         }
+        Ok(())
+    }
+    /// `detailtags.rs`'s section fixture: a plan with section `A-A`, edited, holding two vertical
+    /// `WALL-EXT` faces (u 0 and `inner`, z 0..3000) and two horizontal `FLOOR` faces (z 1000 and
+    /// 1250, u `inner`..4000), all SETROLE cut; and a vertical detail `SD` with an exterior-face
+    /// reference (0,0)–(1000,0), a `GYP` band at y = 50 and a `STUD` repeat (38 × 150 at x 100, pitch
+    /// 400), edge-tagged on the wall. Returns (session, section).
+    fn section_wall(inner: f64) -> T<(Session, Id)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let sd = Id(s.execute("newdetail", &json!({ "name": "SD", "cutDirection": "vertical" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": sd.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": r.hex(), "kind": "exterior_face" }))?;
+        s.execute("layer.new", &json!({ "name": "GYP", "current": true }))?;
+        line(&mut s, [0.0, 50.0], [1000.0, 50.0])?;
+        line(&mut s, [0.0, 300.0], [1000.0, 300.0])?;
+        s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
+        let before = all_handles(&s)?;
+        s.execute("pline", &json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?;
+        let stud = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no stud")?;
+        let before = all_handles(&s)?;
+        s.execute("dimaligned", &json!({ "p1": [100, 0], "p2": [500, 0], "at": [300, -300] }))?;
+        let pitch = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no dimension")?;
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()] }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let r =
+            s.execute("newsectionline", &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 0}, "cutTo": {"x": 5000, "y": 0} }))?;
+        let sec = Id(r["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
+        s.execute(
+            "pline",
+            &json!({ "vertices": [[inner, 250.0], [4000.0 - inner, 250.0], [4000.0 - inner, 2750.0], [inner, 2750.0]], "closed": true }),
+        )?;
+        let hs: Vec<String> = s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.iter().map(|e| e.handle.hex()).collect();
+        s.execute("setrole", &json!({ "handles": hs, "role": "cut" }))?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        s.execute("outsidepoint", &json!({ "point": {"x": -2000, "y": 2000} }))?;
+        s.execute("detailtag", &json!({ "detailViewId": sd.0, "tip": {"x": inner / 2.0, "y": 2000.0}, "bubble": {"x": -1000.0, "y": 2500.0} }))?;
+        Ok((s, sec))
+    }
+
+    #[test]
+    fn a_section_detail_lays_its_bands_and_repeats_along_the_section_s_cut_wall() -> R {
+        let (mut s, sec) = section_wall(300.0)?;
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, sec);
+        let runs = assembly_lines(d, sec)?;
+        let tagged = section_left_run(&s, sec)?;
+        let r = runs.iter().find(|r| r.run == tagged).ok_or("no tagged run")?;
+        assert_eq!((r.skipped.as_deref(), r.conflict), (None, None), "{r:?}");
+        let RunCurve::Line { from, to } = graph.runs[tagged].centreline else { return Err("arc run".into()) };
+        let len = (to.x - from.x).hypot(to.y - from.y);
+        let copies = ((len - 138.0) / 400.0).floor() as usize + 1;
+        assert_eq!((r.bands, r.lines.len()), (2, 2 + 4 * copies), "{r:?}");
+        // Exterior face at u = 0: the bands at u 50 and 300, along the run's z extent.
+        let mut us: Vec<f64> = r.lines[..2].iter().map(|l| r6(l.from.x)).collect();
+        us.sort_by(f64::total_cmp);
+        assert_eq!(us, [50.0, 300.0]);
+        for l in &r.lines[..2] {
+            assert_eq!((r6(l.from.x), l.layer.as_str()), (r6(l.to.x), "GYP"));
+            let (lo, hi) = (l.from.y.min(l.to.y), l.from.y.max(l.to.y));
+            assert_eq!((r6(lo), r6(hi)), (r6(from.y.min(to.y)), r6(from.y.max(to.y))));
+        }
+        assert!(r.lines[2..].iter().all(|l| l.layer == "STUD"));
+        let total: usize = runs.iter().map(|r| r.lines.len()).sum();
+
+        let n = undo_len(&s)?;
+        let out = s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        assert_eq!(out["lines"].as_u64(), Some(total as u64), "{out}");
+        assert!(total > 0);
+        let name = assembly_block_name(sec);
+        assert_eq!(s.doc()?.block(&name).ok_or("no block")?.entities.len(), total);
+        assert_eq!(model_inserts(s.doc()?, &name).len(), 1);
+        assert_eq!(undo_len(&s)?, n + 1);
+        Ok(())
+    }
+
+    /// The section's run whose centreline is vertical near u = 0 (the tagged wall).
+    fn section_left_run(s: &Session, sec: Id) -> T<usize> {
+        let p = DrawingProject::new(s.doc()?)?;
+        let (graph, _) = graph_and_sides(&p, sec);
+        graph
+            .runs
+            .iter()
+            .position(|r| matches!(r.centreline, RunCurve::Line { from, to } if from.x < 1000.0 && (from.x - to.x).abs() < 1e-9))
+            .ok_or_else(|| "no left wall run".into())
+    }
+
+    #[test]
+    fn moving_a_section_face_rewrites_the_section_s_assembly_block_in_the_same_undo_step() -> R {
+        let (mut s, sec) = section_wall(300.0)?;
+        crate::maintain::install(&mut s);
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let name = assembly_block_name(sec);
+        let before = s.doc()?.block(&name).ok_or("no block")?.clone();
+        let outer = s
+            .doc()?
+            .block(&view_block_name(sec))
+            .ok_or("no section block")?
+            .entities
+            .iter()
+            .find(|e| e.common.layer == "WALL-EXT" && to_polyline(e).is_ok_and(|c| c.polyline.start.x == 0.0 && c.polyline.start.y == 0.0))
+            .ok_or("no outer face")?
+            .handle;
+        let n = undo_len(&s)?;
+        s.execute("move", &json!({ "handles": [outer.hex()], "delta": [-20, 0] }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let d = s.doc()?;
+        let block = d.block(&name).ok_or("no block")?;
+        assert!(!Arc::ptr_eq(&before, block), "rewritten");
+        assert!(block_matches(block, &assembly_lines(d, sec)?));
+        // The exterior face moved to u = −20: the GYP bands sit at u 30 and 280.
+        let mut us: Vec<f64> = block
+            .entities
+            .iter()
+            .filter(|e| e.common.layer == "GYP")
+            .filter_map(|e| if let EntityKind::Line(l) = &e.kind { Some(r6(l.a.x)) } else { None })
+            .collect();
+        us.sort_by(f64::total_cmp);
+        us.dedup();
+        assert!(us.contains(&30.0) && us.contains(&280.0), "{us:?}");
+
+        s.undo()?;
+        assert_eq!(undo_len(&s)?, n);
+        assert!(Arc::ptr_eq(&before, s.doc()?.block(&name).ok_or("no block")?), "undo restores the block");
+        Ok(())
+    }
+
+    #[test]
+    fn wallconflicts_and_resolve_report_a_section_s_width_mismatch() -> R {
+        let (mut s, sec) = section_wall(310.0)?;
+        let left = section_left_run(&s, sec)?;
+        let n = undo_len(&s)?;
+        let r = s.execute("wallconflicts", &json!({ "viewId": sec.0 }))?;
+        assert_eq!(undo_len(&s)?, n, "read-only");
+        let c = r["conflicts"].as_array().ok_or("no conflicts")?;
+        let mine = c.iter().find(|x| x["run"].as_u64() == Some(left as u64)).ok_or("no conflict on the tagged wall")?;
+        assert_eq!(mine["text"], "-10.0mm toward interior", "{r}");
+
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let r = s.execute("resolve", &json!({}))?;
+        let id = format!("width_conflict:{sec}:{left}");
+        let issue = r["issues"].as_array().ok_or("no issues")?.iter().find(|i| i["id"] == json!(id)).ok_or("not in RESOLVE")?;
+        assert_eq!(issue["viewId"], json!(sec.0));
+        assert!(issue["note"].as_str().is_some_and(|n| n.ends_with("-10.0mm toward interior")), "{issue}");
+        Ok(())
+    }
+
+    #[test]
+    fn wallrun_names_a_section_wall_and_wallfit_stays_plan_only() -> R {
+        let (mut s, sec) = section_wall(310.0)?;
+        let left = section_left_run(&s, sec)?;
+        let r = s.execute("wallrun", &json!({ "viewId": sec.0, "point": {"x": 155, "y": 1500} }))?;
+        assert_eq!(r["run"].as_u64(), Some(left as u64), "{r}");
+        assert_eq!((r["detail"]["state"].as_str(), r["detail"]["name"].as_str()), (Some("tagged"), Some("SD")), "{r}");
+        assert_eq!(r["conflict"], "-10.0mm toward interior");
+
+        let n = undo_len(&s)?;
+        let e = s.execute("wallfit", &json!({ "viewId": sec.0 })).err().ok_or("wallfit accepted a section")?;
+        assert!(e.to_string().contains("Not a plan view"), "{e}");
+        s.log.clear();
+        s.start("wallfit")?;
+        assert!(s.running.is_none());
+        assert_eq!(crate::detailtags::edited_plan(&s).err().as_ref().map(|w| s.log.contains(w)), Some(true), "{:?}", s.log);
+        assert_eq!(undo_len(&s)?, n);
         Ok(())
     }
 }

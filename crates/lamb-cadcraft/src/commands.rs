@@ -48,15 +48,15 @@
 //!   project (directory or its JSON file form) opened as a new document tab — see
 //!   [`crate::lambopen`]. `lambsave {path}` (View ▸ LAMB ▸ Save LAMB Project): the open drawing
 //!   written as a `.lamb` project directory — see [`crate::lambopen`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
-//!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's laid
+//!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's or section's laid
 //!   detail bands written into its block `LAMB_ASSEMBLY_<id>`, `mitre` turning the plan's mitring
-//!   of undetailed corners on or off — see [`crate::assembly`]; interactive on the edited plan:
+//!   of undetailed corners on or off — see [`crate::assembly`]; interactive on the edited plan or section:
 //!   `Mitre missing corner details [Yes/No]`, Enter keeping the current setting.
 //!   `wallconflicts {viewId}` (View ▸ LAMB ▸ Wall Conflicts): each run whose detail is thicker or
-//!   thinner than the drawn wall, read-only; interactive, the edited plan's conflicts one per line.
+//!   thinner than the drawn wall, read-only, in a plan or section; interactive, the edited view's conflicts one per line.
 //!   `wallrun {viewId, point:{x,y}}` (View ▸ LAMB ▸ Wall Run): the wall run under a point — its
 //!   resolved detail, faces, width and conflict, read-only — see [`crate::wallrun`]; interactive on
-//!   the edited plan, each pick echoed and its faces haloed.
+//!   the edited plan or section, each pick echoed and its faces haloed.
 //!   `wallfit {viewId, runs?, hold?}` (View ▸ LAMB ▸ Wall Fit): moves each conflicted run's faces to
 //!   its detail's width, holding the reference face, the exterior, the interior or the centre — see
 //!   [`crate::wallfit`]; interactive on the edited plan: `Hold [Reference/Exterior/Interior/Centre]`,

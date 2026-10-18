@@ -1,12 +1,12 @@
 //! WALLRUN (LAMB `docs/07-architecture/cadcraft-integration.md` §10, picking maps back to source):
-//! a point on a wall in a plan view names that wall run — its resolved detail, its two faces, its
+//! a point on a wall in a plan or section view names that wall run — its resolved detail, its two faces, its
 //! width and its width conflict — read-only, no undo step.
 //!
 //! - `wallrun {viewId, point:{x,y}}` (View ▸ LAMB ▸ Wall Run): returns `{run, width,
 //!   faces:[{entityId, segmentIndex}]×2, detail:{state, detailViewId?, name?}, skipped?,
 //!   conflict?}`. `state` is `tagged|spread|gap|conflict|untyped`. Refuses a view that is not a plan
-//!   and a point on no run (`No wall run there`).
-//! - Interactive, on the edited plan: `Select a wall:` repeats; each pick echoes
+//!   or section and a point on no run (`No wall run there`).
+//! - Interactive, on the edited plan or section: `Select a wall:` repeats; each pick echoes
 //!   `Run <i>: <state> <name>, <width>mm wide` and haloes the run's two face entities until the
 //!   command ends.
 
@@ -22,9 +22,9 @@ use lamb_core::model::Id;
 use serde_json::{Map, Value, json};
 use std::f64::consts::TAU;
 
-use crate::assembly::{assembly_lines, check_plan};
+use crate::assembly::{assembly_lines, check_wall_view};
 use crate::commands::{id_value, other, point_param};
-use crate::detailtags::{edited_plan, graph_and_sides, resolve_view_details};
+use crate::detailtags::{edited_wall_view, graph_and_sides, resolve_view_details};
 use crate::overlays::halo::set_attention;
 use crate::project::DrawingProject;
 use crate::schema::{read_document, view_block_name};
@@ -79,7 +79,7 @@ pub(crate) fn wallrun(s: &mut Session, p: &Value) -> Result<Value> {
     let plan = p.get("viewId").and_then(id_value).ok_or_else(|| other("No such view"))?;
     let at = point_param("wallrun", p, "point")?;
     let d = s.doc()?;
-    check_plan(d, plan).map_err(other)?;
+    check_wall_view(d, plan).map_err(other)?;
     let dp = DrawingProject::new(d).map_err(other)?;
     let (graph, _) = graph_and_sides(&dp, plan);
     let i = run_at(&graph, at).ok_or_else(|| other("No wall run there"))?;
@@ -130,7 +130,7 @@ fn line(r: &Value) -> String {
     out
 }
 
-/// WALLRUN's interactive form: repeated point picks on the edited plan.
+/// WALLRUN's interactive form: repeated point picks on the edited plan or section.
 struct WallRunM {
     plan: Option<Id>,
 }
@@ -149,7 +149,7 @@ impl Interactive for WallRunM {
         Prompt::new("Select a wall", Accept::POINT)
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        match edited_plan(s) {
+        match edited_wall_view(s) {
             Ok(plan) => {
                 self.plan = Some(plan);
                 Ok(Step::Continue)
@@ -225,7 +225,7 @@ mod tests {
             assert_eq!(o["detail"]["state"], json!("spread"), "{o}");
         }
         assert!(pick(&mut s, plan, 2500.0, 2000.0).is_err_and(|e| e.to_string().contains("No wall run there")));
-        assert!(pick(&mut s, d1, 2500.0, 105.0).is_err_and(|e| e.to_string().contains("Not a plan view")));
+        assert!(pick(&mut s, d1, 2500.0, 105.0).is_err_and(|e| e.to_string().contains("Not a plan or section view")));
         assert_eq!(s.state()?.undo.len(), undo);
         Ok(())
     }
@@ -268,7 +268,7 @@ mod tests {
         let undo = s.state()?.undo.len();
         s.start("wallrun")?;
         assert!(s.running.is_none());
-        assert!(s.log.iter().any(|l| l == "Edit a plan view first (EDITVIEW)"), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l == "Edit a plan or section view first (EDITVIEW)"), "{:?}", s.log);
         assert_eq!(s.state()?.undo.len(), undo);
         Ok(())
     }
