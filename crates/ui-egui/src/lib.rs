@@ -252,6 +252,8 @@ pub struct CadApp {
     pub scene3d: scene3d::Scene3dState,
     /// The Assistant palette's transcript and in-flight turn (fork-only, [`chatpane`]).
     pub chat: chatpane::ChatState,
+    /// The Blocks window's previews.
+    pub block_previews: dialogs::BlockPreviews,
 }
 
 impl CadApp {
@@ -293,6 +295,7 @@ impl CadApp {
             bedit: bedit::State::default(),
             scene3d: scene3d::Scene3dState::default(),
             chat: chatpane::ChatState::default(),
+            block_previews: dialogs::BlockPreviews::default(),
         }
     }
 
