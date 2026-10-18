@@ -153,6 +153,8 @@ pub struct CanvasState {
     pub param: crate::parametric::Cache,
     /// A selection window opened by a press-and-drag, to close where the button is let go.
     drag_window: bool,
+    /// The primary button held down on the canvas ([`track_press`]).
+    press: Option<Press>,
     /// The right-click that opened the shortcut menu held Shift or Ctrl: it is the object snap
     /// menu ([`crate::context_menu`]).
     pub snap_menu: bool,
@@ -1095,6 +1097,54 @@ pub(crate) fn draw_highlight(p: &egui::Painter, xf: &Xf, list: &DisplayList, pri
     p.extend(shapes);
 }
 
+/// The primary button held down on the canvas: where it went down, and whether the pointer has
+/// since moved further than a click may (`slop`, in points). Unlike egui's own click test, holding
+/// the button down for a while doesn't make a press a drag.
+#[derive(Clone, Copy, Debug)]
+struct Press {
+    origin: Pos2,
+    far: bool,
+}
+
+/// A press let go this frame, and where.
+#[derive(Clone, Copy, Debug)]
+struct Release {
+    origin: Pos2,
+    far: bool,
+    at: Pos2,
+}
+
+/// Follow this frame's pointer events: a press that `starts_here` begins a [`Press`]; moves past
+/// `slop` from its origin make it far; letting go ends it. Returns whether the press became far
+/// this frame, and the last release.
+fn track_press(press: &mut Option<Press>, events: &[egui::Event], slop: f32, starts_here: impl Fn(Pos2) -> bool) -> (bool, Option<Release>) {
+    let (mut became_far, mut release) = (false, None);
+    for e in events {
+        match e {
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => {
+                *press = starts_here(*pos).then_some(Press { origin: *pos, far: false });
+            }
+            egui::Event::PointerMoved(pos) => {
+                if let Some(p) = press.as_mut()
+                    && !p.far
+                    && p.origin.distance(*pos) > slop
+                {
+                    p.far = true;
+                    became_far = true;
+                }
+            }
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. } => {
+                if let Some(p) = press.take() {
+                    let far = p.far || p.origin.distance(*pos) > slop;
+                    release = Some(Release { origin: p.origin, far, at: *pos });
+                }
+            }
+            _ => {}
+        }
+    }
+    (became_far, release)
+}
+
 /// The fill of a selection window or crossing area (SELECTIONAREA, WINDOWAREACOLOR,
 /// CROSSINGAREACOLOR, SELECTIONAREAOPACITY); `None` when areas aren't filled.
 fn selection_area_fill(s: &cadcraft_engine::Settings, crossing: bool) -> Option<Color32> {
@@ -1315,6 +1365,8 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         )
     });
     let inside = hover_pos.is_some_and(|p| rect.contains(p)) && resp.hovered();
+    let slop = ui.ctx().options(|o| o.input_options.max_click_dist);
+    let (became_far, release) = ui.input(|i| track_press(&mut app.canvas.press, &i.events, slop, |p| inside && rect.contains(p)));
     // Which device is scrolling? On macOS, trackpads (and Magic Mouse) report precise point
     // deltas; notched mouse wheels report lines. The answer is sticky because egui spreads a wheel
     // notch over several frames. Elsewhere (browsers, Wayland smooth-scroll mice) ordinary wheels
@@ -1545,12 +1597,20 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         app.session.pending_window = None;
         app.canvas.drag_window = false;
     }
-    let pressed_primary = pressed_primary && !picked && !hatch_dialog && !idle_dbl;
+    // While objects are being selected, a press that wanders less than a click may (or is held
+    // still for a while, which egui counts as a drag) is a click where the button went down, and
+    // the click that closes a selection window counts where the button comes up, however far the
+    // pointer moved while it was down.
+    let selecting = !point_prompt && (app.session.running.is_none() || app.session.current_prompt().is_some_and(|p| p.accept.select));
+    let first_click = selecting && app.session.pending_window.is_none();
+    let slop_click = selecting && release.is_some_and(|r| if first_click { !r.far } else { !app.canvas.drag_window && rect.contains(r.at) });
+    let pressed_primary = (pressed_primary || slop_click) && !picked && !hatch_dialog && !idle_dbl;
+    let press_point = release.filter(|r| first_click && !r.far).map(|r| xf.to_world(r.origin));
     // Clicks.
     if inside
         && pressed_primary
         && !middle_down
-        && let Some(p) = app.canvas.cursor
+        && let Some(p) = press_point.or(app.canvas.cursor)
     {
         if app.session.prompting() {
             // Ctrl held while picking the point of a grip edit makes copies (the Copy option).
@@ -1564,9 +1624,9 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
                 app.cmd.buffer.clear();
             }
             // Preserve a snap's viewport origin for DIST, and its deferred curve where needed.
-            let result = match app.canvas.snap {
-                Some(hit) => app.session.input_snapped(hit),
-                None => app.session.input(Input::Point(p)),
+            let result = match (app.canvas.snap, press_point) {
+                (Some(hit), None) => app.session.input_snapped(hit),
+                _ => app.session.input(Input::Point(p)),
             };
             if let Err(e) = result {
                 app.session.echo(e.to_string());
@@ -1575,28 +1635,31 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             crate::dyngrips::click(app, g);
         } else if let Some(g) = grip_at(app, &xf, hover_pos) {
             click_grip(app, g, mods.shift);
-        } else if let Err(e) = app.session.idle_click(raw_world.unwrap_or(p), mods.shift) {
+        } else if let Err(e) = app.session.idle_click(press_point.or(raw_world).unwrap_or(p), mods.shift) {
             app.session.echo(e.to_string());
         }
     }
-    // Press-and-drag selection window (AutoCAD's PICKDRAG = 2; click-click still works): a drag
-    // that starts while objects are being selected opens a window where the button went down,
-    // and letting go closes it. Drags on grips and drags while drawing are left alone.
-    if resp.drag_started_by(egui::PointerButton::Primary)
+    // Press-and-drag selection window (AutoCAD's PICKDRAG = 2; click-click still works): a press
+    // that moves further than a click may while objects are being selected opens a window where
+    // the button went down, and letting go closes it. Drags on grips and drags while drawing are
+    // left alone.
+    if became_far
         && !middle_down
         && app.session.pending_window.is_none()
-        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
-        && rect.contains(origin)
+        && let Some(origin) = app.canvas.press.map(|p| p.origin).or(release.map(|r| r.origin))
         && grip_at(app, &xf, Some(origin)).is_none()
         && crate::dyngrips::at(app, &xf, Some(origin)).is_none()
     {
         app.canvas.drag_window = app.session.begin_window(xf.to_world(origin));
     }
-    if app.canvas.drag_window && resp.drag_stopped_by(egui::PointerButton::Primary) {
+    let drag_end = release
+        .map(|r| r.at)
+        .or_else(|| resp.drag_stopped_by(egui::PointerButton::Primary).then(|| ui.input(|i| i.pointer.interact_pos())).flatten());
+    if app.canvas.drag_window
+        && let Some(end) = drag_end
+    {
         app.canvas.drag_window = false;
-        if app.session.pending_window.is_some()
-            && let Some(end) = ui.input(|i| i.pointer.interact_pos())
-        {
+        if app.session.pending_window.is_some() {
             let end = xf.to_world(end);
             let done = if app.session.prompting() { app.session.input(Input::Point(end)) } else { app.session.idle_click(end, mods.shift) };
             if let Err(e) = done {
