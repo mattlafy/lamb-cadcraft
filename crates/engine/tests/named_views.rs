@@ -160,7 +160,7 @@ fn pan_realtime_drags_and_enter_ends() {
         s.realtime_pan(80.0, -40.0).unwrap();
         assert!(close(view(&s).center.x, -10.0) && close(view(&s).center.y, -5.0));
         s.execute("zoom.previous", &json!({})).unwrap();
-        assert_eq!(view(&s), View { center: Vec2::ZERO, height: 100.0 });
+        assert_eq!(view(&s), View { center: Vec2::ZERO, height: 100.0, twist: 0.0 });
     }
 }
 
