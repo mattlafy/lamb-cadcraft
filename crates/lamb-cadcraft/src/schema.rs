@@ -158,6 +158,19 @@ pub struct EntityData {
     /// in mm ([`crate::studgrid`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stud_grid: Option<f64>,
+    /// With `stud_grid`: the point is wall-scoped — it overrules the project grid for the one plan
+    /// run whose band holds it ([`crate::studgrid`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stud_grid_wall: Option<WallGrid>,
+}
+
+/// How a wall-scoped stud-grid point overrules the project grid for its run: `Phase` lays the run's
+/// repeats from the point at its pitch, `Off` as if there were no grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WallGrid {
+    Phase,
+    Off,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -203,6 +216,7 @@ impl Default for EntityData {
             repeat: None,
             outside: false,
             stud_grid: None,
+            stud_grid_wall: None,
         }
     }
 }

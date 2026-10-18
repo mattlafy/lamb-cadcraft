@@ -17,6 +17,13 @@
 //!   adds the new one, one undo step; refused in a plan with no placement. Returns
 //!   `{"handle": <hex>, "pitch": P}`. Interactive: `Specify stud grid origin or [Pitch] <406.4>:`,
 //!   `Pitch` asking `Specify stud grid pitch <406.4>:` and then the origin again.
+//! - `studgrid {point, pitch?, wall: true, off?}` (the `Wall` option, T460): a wall-scoped grid point
+//!   ([`EntityData::stud_grid_wall`]) inside exactly one run's band of the edited plan overrules the
+//!   project grid for that run only — `Phase` lays its repeats from the point at its own pitch,
+//!   `Off` as if there were no grid; it replaces any wall point already inside that run, and a
+//!   project STUDGRID leaves wall points alone. Interactive: `Wall` →
+//!   `Specify stud grid origin on the wall or [Pitch/Off] <406.4>:`, `Off` →
+//!   `Specify a point on the wall:`.
 
 use cadcraft_doc::{Drawing, EntityKind, Handle, Point};
 use cadcraft_engine::units::parse_distance;
@@ -32,26 +39,43 @@ use lamb_core::model::Id;
 use serde_json::{Value, json};
 
 use crate::commands::{bad, other, point_param};
-use crate::detailtags::edited_plan;
-use crate::schema::{EntityData, LambDocument, read_document, read_entity_data, set_entity_data, view_block_name};
+use crate::detailtags::{edited_plan, graph_and_sides};
+use crate::project::DrawingProject;
+use crate::schema::{EntityData, LambDocument, WallGrid, read_document, read_entity_data, set_entity_data, view_block_name};
 
 /// 16 inches.
 pub(crate) const DEFAULT_PITCH_MM: f64 = 406.4;
 /// How far a repeat's pitch may be from the grid's and still take the grid ("+/- a few mm").
 pub(crate) const PITCH_TOLERANCE_MM: f64 = 5.0;
 
-/// Every stud-grid point in `view`'s block, as (handle, origin, pitch); malformed data skipped.
-fn grid_points(d: &Drawing, view: Id) -> Vec<(Handle, Point2, f64)> {
+/// Every stud-grid point in `view`'s block, as (handle, origin, pitch, wall scope); malformed data
+/// skipped.
+fn grid_points(d: &Drawing, view: Id) -> Vec<(Handle, Point2, f64, Option<WallGrid>)> {
     let Some(block) = d.block(&view_block_name(view)) else { return Vec::new() };
     block
         .entities
         .iter()
         .filter_map(|e| {
             let EntityKind::Point(pt) = &e.kind else { return None };
-            let pitch = read_entity_data(&e.common).ok()?.stud_grid?;
-            (pitch.is_finite() && pitch > 0.0).then_some((e.handle, Point2 { x: pt.p.x, y: pt.p.y }, pitch))
+            let data = read_entity_data(&e.common).ok()?;
+            let pitch = data.stud_grid?;
+            (pitch.is_finite() && pitch > 0.0).then_some((e.handle, Point2 { x: pt.p.x, y: pt.p.y }, pitch, data.stud_grid_wall))
         })
         .collect()
+}
+
+/// Whether `q` lies inside straight `run`'s band: along its centreline within its length, and no
+/// further from it than half its width. Arc runs hold no point.
+fn in_band(run: &WallRun, q: Point2) -> bool {
+    let RunCurve::Line { from, to } = run.centreline else { return false };
+    let (dx, dy) = (to.x - from.x, to.y - from.y);
+    let len = dx.hypot(dy);
+    if len <= 0.0 {
+        return false;
+    }
+    let (ux, uy, qx, qy) = (dx / len, dy / len, q.x - from.x, q.y - from.y);
+    let t = qx * ux + qy * uy;
+    (0.0..=len).contains(&t) && (ux * qy - uy * qx).abs() <= run.width / 2.0 + TOLERANCE.coincidence_mm
 }
 
 fn find_view(doc: &LambDocument, id: Id) -> Option<ViewRef<'_>> {
@@ -66,7 +90,7 @@ pub(crate) fn project_grid(d: &Drawing) -> Option<(Point2, f64)> {
 
 fn project_grid_of(d: &Drawing, doc: &LambDocument) -> Option<(Point2, f64)> {
     doc.views.iter().map(view_ref).filter(|v| v.kind == ViewKind::Plan && v.transform().is_some()).find_map(|v| {
-        let &(_, local, pitch) = grid_points(d, v.id).first()?;
+        let &(_, local, pitch, _) = grid_points(d, v.id).iter().find(|g| g.3.is_none())?;
         Some((plan_local_to_global_xy(&v, local).ok()?, pitch))
     })
 }
@@ -97,6 +121,11 @@ fn grid_in(d: &Drawing, doc: &LambDocument, v: &ViewRef<'_>) -> Option<RepeatGri
 pub(crate) fn run_grid(d: &Drawing, view: Id, run: &WallRun) -> Option<RepeatGrid> {
     let doc = read_document(d).ok()?;
     let v = find_view(&doc, view)?;
+    if v.kind == ViewKind::Plan
+        && let Some(&(_, origin, pitch, wall)) = grid_points(d, view).iter().find(|g| g.3.is_some() && in_band(run, g.1))
+    {
+        return (wall == Some(WallGrid::Phase)).then_some(RepeatGrid { origin, pitch, pitch_tolerance_mm: PITCH_TOLERANCE_MM });
+    }
     if v.kind == ViewKind::Vertical {
         let RunCurve::Line { from, to } = run.centreline else { return None };
         let (a, b) = (vertical_uz_to_local(&v, Uz { u: 0.0, z: 0.0 }), vertical_uz_to_local(&v, Uz { u: 1.0, z: 0.0 }));
@@ -120,31 +149,58 @@ pub(crate) fn studgrid(s: &mut Session, p: &Value) -> Result<Value> {
     if pitch <= 0.0 {
         return Err(bad("studgrid", "`pitch` must be positive"));
     }
+    let flag = |k: &str| -> Result<bool> {
+        match p.get(k) {
+            None | Some(Value::Null) => Ok(false),
+            Some(v) => v.as_bool().ok_or_else(|| bad("studgrid", &format!("`{k}` must be a boolean"))),
+        }
+    };
+    let (wall, off) = (flag("wall")?, flag("off")?);
+    if off && !wall {
+        return Err(bad("studgrid", "`off` needs `wall`"));
+    }
     // Every refusal before `doc_mut`, so a refusal records nothing.
     let view = edited_plan(s).map_err(other)?;
     let doc = read_document(s.doc()?).map_err(other)?;
-    if find_view(&doc, view).and_then(|v| v.transform()).is_none() {
-        return Err(other("This plan has no placement"));
-    }
-    let old: Vec<Handle> = {
+    let scope = if wall { Some(if off { WallGrid::Off } else { WallGrid::Phase }) } else { None };
+    let old: Vec<Handle> = if wall {
         let d = s.doc()?;
-        doc.views.iter().flat_map(|v| grid_points(d, v.id())).map(|(h, _, _)| h).collect()
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d).map_err(other)?, view);
+        let mut holding = graph.runs.iter().filter(|r| in_band(r, at));
+        let run = match (holding.next(), holding.next()) {
+            (None, _) => return Err(other("No wall there")),
+            (Some(_), Some(_)) => return Err(other("That point is inside more than one wall; pick away from the corner")),
+            (Some(r), None) => r,
+        };
+        grid_points(d, view).into_iter().filter(|g| g.3.is_some() && in_band(run, g.1)).map(|g| g.0).collect()
+    } else {
+        if find_view(&doc, view).and_then(|v| v.transform()).is_none() {
+            return Err(other("This plan has no placement"));
+        }
+        let d = s.doc()?;
+        doc.views.iter().flat_map(|v| grid_points(d, v.id())).filter(|g| g.3.is_none()).map(|g| g.0).collect()
     };
     let mut common = s.current_common();
-    set_entity_data(&mut common, &EntityData { stud_grid: Some(pitch), ..EntityData::default() }).map_err(other)?;
+    set_entity_data(&mut common, &EntityData { stud_grid: Some(pitch), stud_grid_wall: scope, ..EntityData::default() }).map_err(other)?;
     let space = s.space();
     let d = s.doc_mut()?;
     for h in old {
         d.remove_entity(h);
     }
     let h = d.add(&space, common, EntityKind::Point(Point { p: Vec2::new(at.x, at.y).to3(0.0), angle: 0.0 }))?;
-    Ok(json!({ "handle": format!("{:X}", h.0), "pitch": pitch }))
+    let mut out = json!({ "handle": format!("{:X}", h.0), "pitch": pitch });
+    if let Some(w) = scope {
+        out["wall"] = json!(if w == WallGrid::Off { "off" } else { "phase" });
+    }
+    Ok(out)
 }
 
-/// STUDGRID: an origin prompt with a `Pitch` option.
+/// STUDGRID: an origin prompt with `Pitch` and `Wall` options; `Wall` (and then `Off`) scope the
+/// point to the wall it lands in.
 struct StudGridM {
     pitch: f64,
     asking_pitch: bool,
+    wall: Option<WallGrid>,
 }
 
 fn fmt_mm(v: f64) -> String {
@@ -159,7 +215,13 @@ impl Interactive for StudGridM {
         if self.asking_pitch {
             Prompt::new("Specify stud grid pitch", Accept::NUMBER).default(fmt_mm(self.pitch))
         } else {
-            Prompt::new("Specify stud grid origin", Accept::POINT).kw(&["Pitch"]).default(fmt_mm(self.pitch))
+            match self.wall {
+                None => Prompt::new("Specify stud grid origin", Accept::POINT).kw(&["Pitch", "Wall"]).default(fmt_mm(self.pitch)),
+                Some(WallGrid::Phase) => {
+                    Prompt::new("Specify stud grid origin on the wall", Accept::POINT).kw(&["Pitch", "Off"]).default(fmt_mm(self.pitch))
+                }
+                Some(WallGrid::Off) => Prompt::new("Specify a point on the wall", Accept::POINT),
+            }
         }
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
@@ -194,13 +256,24 @@ impl Interactive for StudGridM {
         }
         match i {
             Input::Point(p) => {
-                if let Err(e) = studgrid(s, &json!({ "point": {"x": p.x, "y": p.y}, "pitch": self.pitch })) {
+                let mut args = json!({ "point": {"x": p.x, "y": p.y}, "pitch": self.pitch });
+                if let Some(w) = self.wall {
+                    args["wall"] = json!(true);
+                    args["off"] = json!(w == WallGrid::Off);
+                }
+                if let Err(e) = studgrid(s, &args) {
                     s.echo(e.to_string());
                 }
                 Ok(Step::Done)
             }
-            Input::Text(t) | Input::Keyword(t) if matches!(t.trim().to_ascii_lowercase().as_str(), "p" | "pitch") => {
-                self.asking_pitch = true;
+            Input::Text(t) | Input::Keyword(t) => {
+                match (self.wall, t.trim().to_ascii_lowercase().as_str()) {
+                    (Some(WallGrid::Off), _) => {}
+                    (_, "p" | "pitch") => self.asking_pitch = true,
+                    (None, "w" | "wall") => self.wall = Some(WallGrid::Phase),
+                    (Some(WallGrid::Phase), "o" | "off") => self.wall = Some(WallGrid::Off),
+                    _ => {}
+                }
                 Ok(Step::Continue)
             }
             Input::Cancel | Input::Enter => Ok(Step::Cancel),
@@ -210,7 +283,7 @@ impl Interactive for StudGridM {
 }
 
 pub(crate) fn studgrid_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(StudGridM { pitch: DEFAULT_PITCH_MM, asking_pitch: false }))
+    Ok(Box::new(StudGridM { pitch: DEFAULT_PITCH_MM, asking_pitch: false, wall: None }))
 }
 
 #[cfg(test)]
@@ -375,11 +448,11 @@ pub(crate) mod tests {
     fn the_interactive_form_takes_a_pitch_then_the_origin() -> R {
         let (mut s, plan) = stud_room(406.4)?;
         s.start("studgrid")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid origin or [Pitch] <406.4>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid origin or [Pitch/Wall] <406.4>:"));
         s.input(Input::Text("P".into()))?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid pitch <406.4>:"));
         s.input(Input::Text("600".into()))?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid origin or [Pitch] <600>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid origin or [Pitch/Wall] <600>:"));
         s.input(Input::Point(Vec2::new(13.0, 7.0)))?;
         assert!(s.running.is_none());
         let g = stud_grid(s.doc()?, plan).ok_or("no grid")?;
@@ -484,6 +557,121 @@ pub(crate) mod tests {
         s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0}, "pitch": 400 }))?;
         let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
         assert_eq!(stud_grid(&back, plan), stud_grid(s.doc()?, plan));
+        Ok(())
+    }
+
+    fn on_pitch(xs: &[f64], origin: f64, pitch: f64) -> bool {
+        xs.iter().all(|x| {
+            let m = (x - origin).rem_euclid(pitch);
+            m < 1e-6 || pitch - m < 1e-6
+        })
+    }
+
+    #[test]
+    fn a_wall_point_rephases_or_drops_the_grid_for_its_run_only() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        let free_north = stud_xs(s.doc()?, plan, 3900.0)?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        let (south, north) = (stud_xs(s.doc()?, plan, 100.0)?, stud_xs(s.doc()?, plan, 3900.0)?);
+        assert!(on_pitch(&north, 13.0, 406.4));
+        let at = 13.0 + 100.0 + 406.4 * 5.0;
+        let r = s.execute("studgrid", &json!({ "point": {"x": at, "y": 3850.0}, "wall": true }))?;
+        assert_eq!(r["wall"], "phase");
+        let shifted = stud_xs(s.doc()?, plan, 3900.0)?;
+        assert!(!shifted.is_empty() && shifted != north);
+        assert!(on_pitch(&shifted, 113.0, 406.4), "{shifted:?}");
+        assert_eq!(stud_xs(s.doc()?, plan, 100.0)?, south, "the south wall keeps the project grid");
+        let r = s.execute("studgrid", &json!({ "point": {"x": 2500.0, "y": 3900.0}, "wall": true, "off": true }))?;
+        assert_eq!(r["wall"], "off");
+        assert_eq!(grid_points(s.doc()?, plan).iter().filter(|g| g.3.is_some()).count(), 1, "the Off point replaced the Phase one");
+        assert_eq!(stud_xs(s.doc()?, plan, 3900.0)?, free_north, "Off lays the run as with no grid");
+        assert_eq!(stud_xs(s.doc()?, plan, 100.0)?, south);
+        Ok(())
+    }
+
+    #[test]
+    fn a_wall_point_s_own_pitch_takes_a_repeat_the_project_grid_does_not() -> R {
+        let (mut s, plan) = stud_room(600.0)?;
+        let before_south = stud_xs(s.doc()?, plan, 100.0)?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        let at = 2145.0;
+        s.execute("studgrid", &json!({ "point": {"x": at, "y": 3900.0}, "pitch": 600, "wall": true }))?;
+        let north = stud_xs(s.doc()?, plan, 3900.0)?;
+        assert!(!north.is_empty() && on_pitch(&north, at, 600.0), "{north:?}");
+        assert_eq!(stud_xs(s.doc()?, plan, 100.0)?, before_south, "600 is still not within 5 mm of 406.4 elsewhere");
+        Ok(())
+    }
+
+    #[test]
+    fn wall_point_refusals_record_nothing_and_a_project_studgrid_keeps_wall_points() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        let n = undo_len(&s)?;
+        let refuse = |s: &mut Session, p: Value, msg: &str| {
+            assert!(s.execute("studgrid", &p).is_err_and(|e| e.to_string().contains(msg)), "{p} should say {msg}");
+        };
+        refuse(&mut s, json!({ "point": {"x": 2500, "y": 2000}, "wall": true }), "No wall there");
+        // Runs stop where the corner square starts, so the square itself is in no run's band and
+        // only its edges (here the inner corner) are in two.
+        refuse(&mut s, json!({ "point": {"x": 100, "y": 100}, "wall": true }), "No wall there");
+        refuse(&mut s, json!({ "point": {"x": 200, "y": 200}, "wall": true }), "inside more than one wall");
+        refuse(&mut s, json!({ "point": {"x": 2500, "y": 3900}, "off": true }), "`off` needs `wall`");
+        let r = s.execute(
+            "newsectionline",
+            &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 2000}, "cutTo": {"x": 5000, "y": 2000} }),
+        )?;
+        let sec = Id(r["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        let m = undo_len(&s)?;
+        assert!(m >= n);
+        assert!(s.execute("studgrid", &json!({ "point": {"x": 100, "y": 1000}, "wall": true })).is_err(), "a section is refused");
+        assert_eq!(undo_len(&s)?, m, "refusals record nothing");
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let m = undo_len(&s)?;
+        refuse(&mut s, json!({ "point": {"x": 2500, "y": 2000}, "wall": true }), "No wall there");
+        assert_eq!(undo_len(&s)?, m);
+        s.execute("studgrid", &json!({ "point": {"x": 1000, "y": 3900}, "wall": true }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 3000, "y": 3900}, "wall": true }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 3000, "y": 100}, "wall": true }))?;
+        let walls = |s: &Session| -> T<usize> { Ok(grid_points(s.doc()?, plan).iter().filter(|g| g.3.is_some()).count()) };
+        assert_eq!(walls(&s)?, 2, "one per wall");
+        s.execute("studgrid", &json!({ "point": {"x": 13, "y": 7} }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 20, "y": 7} }))?;
+        assert_eq!(walls(&s)?, 2, "a project STUDGRID keeps wall points");
+        assert_eq!(grid_points(s.doc()?, plan).len(), 3);
+        assert_eq!(project_grid(s.doc()?), Some((Point2 { x: 20.0, y: 7.0 }, 406.4)));
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_wall_option_places_phase_or_off() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        let prompt = |s: &Session| s.current_prompt().map(|p| p.display());
+        s.start("studgrid")?;
+        s.input(Input::Text("W".into()))?;
+        assert_eq!(prompt(&s).as_deref(), Some("Specify stud grid origin on the wall or [Pitch/Off] <406.4>:"));
+        s.input(Input::Point(Vec2::new(2500.0, 3900.0)))?;
+        assert!(s.running.is_none());
+        let wall = |s: &Session| -> T<Vec<Option<WallGrid>>> { Ok(grid_points(s.doc()?, plan).iter().map(|g| g.3).collect()) };
+        assert_eq!(wall(&s)?, vec![Some(WallGrid::Phase)]);
+        s.start("studgrid")?;
+        s.input(Input::Text("W".into()))?;
+        s.input(Input::Text("O".into()))?;
+        assert_eq!(prompt(&s).as_deref(), Some("Specify a point on the wall:"));
+        s.input(Input::Point(Vec2::new(2000.0, 3900.0)))?;
+        assert!(s.running.is_none());
+        assert_eq!(wall(&s)?, vec![Some(WallGrid::Off)], "it replaced the Phase point on the same wall");
+        Ok(())
+    }
+
+    #[test]
+    fn the_wall_tag_survives_dxf() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 2145.0, "y": 3900.0}, "pitch": 400, "wall": true }))?;
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        let strip = |d: &Drawing| grid_points(d, plan).into_iter().map(|g| (g.1, g.2, g.3)).collect::<Vec<_>>();
+        assert_eq!(strip(&back), strip(s.doc()?));
+        assert_eq!(stud_xs(&back, plan, 3900.0)?, stud_xs(s.doc()?, plan, 3900.0)?);
         Ok(())
     }
 }

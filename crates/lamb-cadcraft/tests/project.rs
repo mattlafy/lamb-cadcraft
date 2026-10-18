@@ -110,6 +110,7 @@ fn drawing() -> Result<Drawing, String> {
             repeat: None,
             outside: false,
             stud_grid: None,
+            stud_grid_wall: None,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -385,6 +386,7 @@ fn all_default_slots_are_not_written() -> R {
             repeat: None,
             outside: false,
             stud_grid: None,
+            stud_grid_wall: None,
         },
     )
     .map_err(|e| e.to_string())?;

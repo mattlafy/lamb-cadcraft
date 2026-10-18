@@ -396,6 +396,7 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
             repeat: None,
             outside: false,
             stud_grid: None,
+            stud_grid_wall: None,
         };
         let deferred = data.ai_origin.is_some();
         if !deferred {
