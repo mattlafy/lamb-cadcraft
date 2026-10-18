@@ -39,6 +39,23 @@ pub fn toggles(app: &CadApp) -> Vec<StatusToggle> {
     SOURCE.get().map(|f| f(&app.session)).unwrap_or_default()
 }
 
+/// The name of a model-like block space (fork-only, LAMB T466): `Some(label)` means the session's
+/// block space is a view called `label`, shown on the first layout tab and keeping the annotation
+/// scale list.
+pub type SpaceLabelSource = fn(&Session) -> Option<String>;
+
+static SPACE_LABEL: OnceLock<SpaceLabelSource> = OnceLock::new();
+
+/// Register the space-label source. Once per process; a second call is an error.
+pub fn register_space_label(f: SpaceLabelSource) -> Result<(), &'static str> {
+    SPACE_LABEL.set(f).map_err(|_| "space label source already registered")
+}
+
+/// The label of the app's current block space; None when nothing is registered.
+pub fn space_label(app: &CadApp) -> Option<String> {
+    SPACE_LABEL.get().and_then(|f| f(&app.session))
+}
+
 /// Run a toggle's command as a click does: transparently (the active command keeps running), its
 /// `message` echoed.
 pub fn activate(app: &mut CadApp, t: &StatusToggle) -> Result<Value, String> {

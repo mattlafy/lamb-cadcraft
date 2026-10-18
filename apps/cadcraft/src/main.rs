@@ -384,6 +384,9 @@ fn main() -> eframe::Result {
     if let Err(e) = cadcraft_ui_egui::chrome::statusext::register_status_toggles(lamb_status_toggles) {
         log::warn!("LAMB status toggles not installed: {e}");
     }
+    if let Err(e) = cadcraft_ui_egui::chrome::statusext::register_space_label(lamb_cadcraft::commands::view_tab_label) {
+        log::warn!("LAMB view tab label not installed: {e}");
+    }
     if let Err(e) = cadcraft_ui_egui::palettes::props_ext::register_property_source(lamb_property_group) {
         log::warn!("LAMB Properties group not installed: {e}");
     }

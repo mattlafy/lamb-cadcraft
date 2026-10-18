@@ -359,6 +359,14 @@ pub(crate) fn edited_view(s: &Session) -> Option<Id> {
     (view_block_name(id) == *name && doc.views.iter().any(|v| v.id() == id)).then_some(id)
 }
 
+/// The first layout tab's text while editing a LAMB view (LAMB T466): the edited view's name; None
+/// in model space, a layout, or a non-LAMB block.
+pub fn view_tab_label(s: &Session) -> Option<String> {
+    let id = edited_view(s)?;
+    let doc = read_document(s.doc().ok()?).ok()?;
+    doc.views.iter().find(|v| v.id() == id).map(|v| v.name().to_owned())
+}
+
 /// The answer to a name prompt: typed text, or the default on Enter.
 pub(crate) fn name_input(i: Input, default: &str) -> Option<String> {
     match i {
@@ -1122,6 +1130,18 @@ mod tests {
         assert_eq!(s.state()?.view().height, 100.0, "Model keeps its window");
         s.execute("editview", &json!({ "viewId": id }))?;
         assert_eq!(s.state()?.view().height, 7.0, "a revisit keeps the view it had");
+        Ok(())
+    }
+
+    #[test]
+    fn the_view_tab_label_is_the_edited_views_name() -> R {
+        let mut s = session()?;
+        assert_eq!(view_tab_label(&s), None, "model space");
+        let id = s.execute("newplan", &json!({ "name": "Ground floor" }))?["viewId"].as_u64().ok_or("no id")?;
+        s.execute("editview", &json!({ "viewId": id }))?;
+        assert_eq!(view_tab_label(&s).as_deref(), Some("Ground floor"));
+        s.execute("editview", &json!({}))?;
+        assert_eq!(view_tab_label(&s), None, "back in model space");
         Ok(())
     }
 

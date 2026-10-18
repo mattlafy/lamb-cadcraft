@@ -8,10 +8,21 @@ use serde_json::json;
 use crate::CadApp;
 use crate::theme::Tokens;
 
-/// Draw the annotation scale list ending at `right` (model space only); returns its left edge,
-/// or `right` when nothing is drawn.
+/// Whether the list is drawn: in model space, or in a block space a registered space label names
+/// as a model-like view (fork-only, LAMB T466).
+fn shown(space: &cadcraft_doc::Space, view_label: Option<&str>) -> bool {
+    match space {
+        cadcraft_doc::Space::Model => true,
+        cadcraft_doc::Space::Block(_) => view_label.is_some(),
+        cadcraft_doc::Space::Paper(_) => false,
+    }
+}
+
+/// Draw the annotation scale list ending at `right` (model space, or a labelled view); returns
+/// its left edge, or `right` when nothing is drawn.
 pub fn status(app: &mut CadApp, ui: &mut egui::Ui, right: f32, cy: f32) -> f32 {
-    if !matches!(app.session.layout_space(), cadcraft_doc::Space::Model) {
+    let space = app.session.layout_space();
+    if !matches!(space, cadcraft_doc::Space::Model) && !shown(&space, super::statusext::space_label(app).as_deref()) {
         return right;
     }
     let Ok(d) = app.session.doc() else { return right };
@@ -58,4 +69,18 @@ pub fn status(app: &mut CadApp, ui: &mut egui::Ui, right: f32, cy: f32) -> f32 {
         app.start("scalelistedit");
     }
     r.left() - 6.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shown;
+    use cadcraft_doc::Space;
+
+    #[test]
+    fn the_list_shows_in_model_space_and_on_a_labelled_view_only() {
+        assert!(shown(&Space::Model, None));
+        assert!(!shown(&Space::Paper("Layout1".into()), Some("Plan 1")));
+        assert!(!shown(&Space::Block("DOOR".into()), None), "BEDIT keeps it hidden");
+        assert!(shown(&Space::Block("LAMB_VIEW_1".into()), Some("Plan 1")));
+    }
 }

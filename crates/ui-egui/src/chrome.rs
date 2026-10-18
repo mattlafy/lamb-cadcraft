@@ -392,7 +392,8 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             ls.sort_by_key(|l| l.tab_order);
             tabs.extend(ls.iter().map(|l| l.name.clone()));
         }
-        let shown_name = |i: usize, name: &str| if i == 0 { crate::tl!("Model").to_string() } else { name.to_string() };
+        let model_label = statusext::space_label(app).unwrap_or_else(|| crate::tl!("Model").to_string());
+        let shown_name = |i: usize, name: &str| if i == 0 { model_label.clone() } else { name.to_string() };
         let limit = (coord_right - STATUS_READOUT_MIN).max(x);
         let labels: Vec<_> =
             tabs.iter().enumerate().map(|(i, n)| elided(&p, &shown_name(i, n), crate::theme::body(), t.text, LAYOUT_TAB_TEXT)).collect();
