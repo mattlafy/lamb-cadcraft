@@ -1,6 +1,8 @@
 //! Modify commands: ERASE, MOVE, COPY, ROTATE, SCALE, MIRROR, OFFSET, TRIM, EXTEND, FILLET,
 //! CHAMFER, EXPLODE, STRETCH, BREAK, JOIN (arrays: `array`; draw order: `draworder`).
 
+use std::collections::HashMap;
+
 use cadcraft_doc::{Entity, EntityKind, Handle, Prim};
 use cadcraft_geom::{
     Arc, Circle, Line, Mat3, PolyVertex, Polyline, Segment, TAU, Vec2, angle_in_sweep, ccw_sweep, intersect_ext, line_line_infinite, norm_angle,
@@ -102,6 +104,10 @@ pub fn specs() -> Vec<CommandSpec> {
 pub(crate) fn transform_entities(s: &mut Session, hs: &[Handle], m: &Mat3, copy: bool) -> Result<Vec<Handle>> {
     let d = s.doc_mut()?;
     let mut out = Vec::new();
+    // Copies: original handle to copy, and the copied hatches, so a hatch copied together with
+    // its boundary follows the copied boundary.
+    let mut copies: HashMap<Handle, Handle> = HashMap::new();
+    let mut hatches = Vec::new();
     for h in hs {
         let Some(sp) = d.space_of(*h) else { continue };
         if copy {
@@ -109,9 +115,13 @@ pub(crate) fn transform_entities(s: &mut Session, hs: &[Handle], m: &Mat3, copy:
             let nh = d.new_handle();
             let mut ne = Entity { handle: nh, ..e };
             ne.kind.transform(m);
+            if matches!(ne.kind, EntityKind::Hatch(_)) {
+                hatches.push(nh);
+            }
             if let Some(st) = d.space_mut(&sp) {
                 st.push(ne);
                 out.push(nh);
+                copies.insert(*h, nh);
             }
         } else {
             let locked = d.entity(*h).and_then(|e| d.layer(&e.common.layer)).is_some_and(|l| l.locked);
@@ -120,6 +130,12 @@ pub(crate) fn transform_entities(s: &mut Session, hs: &[Handle], m: &Mat3, copy:
             }
             d.modify_entity(*h, |e| e.kind.transform(m))?;
             out.push(*h);
+        }
+    }
+    for h in hatches {
+        let Some(EntityKind::Hatch(mut x)) = d.entity(h).map(|e| e.kind.clone()) else { continue };
+        if hatch::remap_copied_sources(&mut x, &copies) {
+            d.modify_entity(h, |e| e.kind = EntityKind::Hatch(x))?;
         }
     }
     Ok(out)

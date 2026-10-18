@@ -16,7 +16,7 @@ use crate::{Accept, EngineError, Input, Interactive, Picker, Prompt, Result, Ses
 mod assoc;
 mod edit;
 mod pick;
-pub(crate) use assoc::update as refill_associative;
+pub(crate) use assoc::{remap_sources as remap_copied_sources, update as refill_associative};
 pub use pick::{HatchPicks, PickMode};
 
 pub fn specs() -> Vec<CommandSpec> {
