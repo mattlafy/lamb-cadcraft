@@ -49,7 +49,7 @@
 //!   [`crate::lambopen`]. `lambsave {path}` (View ▸ LAMB ▸ Save LAMB Project): the open drawing
 //!   written as a `.lamb` project directory — see [`crate::lambopen`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
 //!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `studgrid {point:{x,y}, pitch?}` (View ▸ LAMB ▸ Stud Grid): the edited
-//!   plan's stud grid origin (pitch 406.4) its repeats line up on — see [`crate::studgrid`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's or section's laid
+//!   the project's stud grid origin (pitch 406.4), at a point of the edited plan, that every view's repeats line up on — see [`crate::studgrid`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's or section's laid
 //!   detail bands, then each two-arm corner's placed corner detail, written into its block
 //!   `LAMB_ASSEMBLY_<id>` (`corners` counts the placed ones), `mitre` turning the plan's mitring
 //!   of undetailed corners on or off — see [`crate::assembly`]; interactive on the edited plan or section:

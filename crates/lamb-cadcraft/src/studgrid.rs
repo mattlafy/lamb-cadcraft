@@ -1,14 +1,20 @@
-//! A plan's stud grid (LAMB T458; the stud/joist grid request): one CADCraft `Point` in a plan
-//! view's block carrying [`EntityData::stud_grid`] (the pitch, mm) is the origin every repeat in
-//! that plan's assembly lines up on. [`stud_grid`] reads it; [`crate::assembly`] passes it to
-//! lamb-core's `lay_repeat`, which lays a straight run's repeat whose pitch is within
-//! [`PITCH_TOLERANCE_MM`] of the grid's at exactly the grid pitch, each copy centred on a grid line
-//! perpendicular to the run through `origin + k·pitch` — so studs on every wall, at every angle,
-//! line up from the one origin. No grid point: repeats lay as before. MOVE moves the grid and the
-//! assembly observer re-lays the block in that step. DXF/DWG see a plain point.
+//! The project's stud grid (LAMB T458, T463; the stud/joist grid request): one CADCraft `Point` in
+//! a placed plan view's block carrying [`EntityData::stud_grid`] (the pitch, mm) is the origin, in
+//! project-global XY, that every repeat in every placed plan and every placed section lines up on.
+//! The project has at most one; [`project_grid`] reads it (views in document order, plans with a
+//! placement only; a grid point in a floating plan is ignored). [`stud_grid`] maps it into a view's
+//! local space — a plan through its placement, a section through its cut line (u of the origin's
+//! projection, z 0) — and [`run_grid`] decides per run: every run in a plan, and in a section only a
+//! straight run parallel to the cut line (floors and ceilings: joists), never a wall cut in
+//! section. [`crate::assembly`] passes it to lamb-core's `lay_repeat`, which lays a straight run's
+//! repeat whose pitch is within [`PITCH_TOLERANCE_MM`] of the grid's at exactly the grid pitch, each
+//! copy centred on a grid line perpendicular to the run through `origin + k·pitch`. No grid point:
+//! repeats lay as before. MOVE moves the grid and the assembly observer re-lays every view's block
+//! in that step. DXF/DWG see a plain point.
 //!
-//! - `studgrid {point:{x,y}, pitch?}` (View ▸ LAMB ▸ Stud Grid): the edited plan's grid origin,
-//!   pitch default 406.4 mm; replaces any existing grid point in that plan, one undo step. Returns
+//! - `studgrid {point:{x,y}, pitch?}` (View ▸ LAMB ▸ Stud Grid): the project's grid origin, at a
+//!   point of the edited plan, pitch default 406.4 mm; erases every grid point in every view and
+//!   adds the new one, one undo step; refused in a plan with no placement. Returns
 //!   `{"handle": <hex>, "pitch": P}`. Interactive: `Specify stud grid origin or [Pitch] <406.4>:`,
 //!   `Pitch` asking `Specify stud grid pitch <406.4>:` and then the origin again.
 
@@ -17,13 +23,17 @@ use cadcraft_engine::units::parse_distance;
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::Vec2;
 use lamb_core::derivation::assembly::RepeatGrid;
+use lamb_core::derivation::projection::{Uz, plan_global_to_local_xy, plan_local_to_global_xy, project_to_u, vertical_basis, vertical_uz_to_local};
+use lamb_core::derivation::read::{ViewKind, ViewRef, view_ref};
+use lamb_core::derivation::walls::{RunCurve, WallRun};
 use lamb_core::geometry::Point2;
+use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::Id;
 use serde_json::{Value, json};
 
 use crate::commands::{bad, other, point_param};
 use crate::detailtags::edited_plan;
-use crate::schema::{EntityData, read_entity_data, set_entity_data, view_block_name};
+use crate::schema::{EntityData, LambDocument, read_document, read_entity_data, set_entity_data, view_block_name};
 
 /// 16 inches.
 pub(crate) const DEFAULT_PITCH_MM: f64 = 406.4;
@@ -44,12 +54,63 @@ fn grid_points(d: &Drawing, view: Id) -> Vec<(Handle, Point2, f64)> {
         .collect()
 }
 
-/// `view`'s stud grid: its first tagged point in block order, or `None`.
-pub(crate) fn stud_grid(d: &Drawing, view: Id) -> Option<RepeatGrid> {
-    grid_points(d, view).first().map(|&(_, origin, pitch)| RepeatGrid { origin, pitch, pitch_tolerance_mm: PITCH_TOLERANCE_MM })
+fn find_view(doc: &LambDocument, id: Id) -> Option<ViewRef<'_>> {
+    doc.views.iter().map(view_ref).find(|v| v.id == id)
 }
 
-/// STUDGRID's JSON form: the edited plan's one grid point at `point`, pitch `pitch` (406.4).
+/// The project's stud grid as (global origin, pitch): the first grid point of the first placed
+/// plan, in document order, that has one.
+pub(crate) fn project_grid(d: &Drawing) -> Option<(Point2, f64)> {
+    project_grid_of(d, &read_document(d).ok()?)
+}
+
+fn project_grid_of(d: &Drawing, doc: &LambDocument) -> Option<(Point2, f64)> {
+    doc.views.iter().map(view_ref).filter(|v| v.kind == ViewKind::Plan && v.transform().is_some()).find_map(|v| {
+        let &(_, local, pitch) = grid_points(d, v.id).first()?;
+        Some((plan_local_to_global_xy(&v, local).ok()?, pitch))
+    })
+}
+
+/// The project's stud grid in `view`'s local space: a placed plan, or a placed vertical view whose
+/// host resolves; `None` for anything else, or with no grid.
+pub(crate) fn stud_grid(d: &Drawing, view: Id) -> Option<RepeatGrid> {
+    let doc = read_document(d).ok()?;
+    grid_in(d, &doc, &find_view(&doc, view)?)
+}
+
+fn grid_in(d: &Drawing, doc: &LambDocument, v: &ViewRef<'_>) -> Option<RepeatGrid> {
+    let (g, pitch) = project_grid_of(d, doc)?;
+    let origin = match v.kind {
+        ViewKind::Plan => plan_global_to_local_xy(v, g).ok()?,
+        ViewKind::Vertical => {
+            let host = find_view(doc, v.host_view_id()?)?;
+            let basis = vertical_basis(v, &host).ok()?;
+            vertical_uz_to_local(v, Uz { u: project_to_u(&basis, g), z: 0.0 })
+        }
+        ViewKind::Detail => return None,
+    };
+    Some(RepeatGrid { origin, pitch, pitch_tolerance_mm: PITCH_TOLERANCE_MM })
+}
+
+/// The grid `run`'s repeats in `view` lay on: every run of a plan; in a vertical view only a
+/// straight run parallel to the cut line's u axis (joists), never a wall cut in section.
+pub(crate) fn run_grid(d: &Drawing, view: Id, run: &WallRun) -> Option<RepeatGrid> {
+    let doc = read_document(d).ok()?;
+    let v = find_view(&doc, view)?;
+    if v.kind == ViewKind::Vertical {
+        let RunCurve::Line { from, to } = run.centreline else { return None };
+        let (a, b) = (vertical_uz_to_local(&v, Uz { u: 0.0, z: 0.0 }), vertical_uz_to_local(&v, Uz { u: 1.0, z: 0.0 }));
+        let (ux, uy, rx, ry) = (b.x - a.x, b.y - a.y, to.x - from.x, to.y - from.y);
+        let angle = (ux * ry - uy * rx).abs().atan2((ux * rx + uy * ry).abs()).to_degrees();
+        if angle > TOLERANCE.angle_deg {
+            return None;
+        }
+    }
+    stud_grid(d, view)
+}
+
+/// STUDGRID's JSON form: the project's one grid point at `point` in the edited plan, pitch `pitch`
+/// (406.4).
 pub(crate) fn studgrid(s: &mut Session, p: &Value) -> Result<Value> {
     let at = point_param("studgrid", p, "point")?;
     let pitch = match p.get("pitch") {
@@ -61,7 +122,14 @@ pub(crate) fn studgrid(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // Every refusal before `doc_mut`, so a refusal records nothing.
     let view = edited_plan(s).map_err(other)?;
-    let old: Vec<Handle> = grid_points(s.doc()?, view).into_iter().map(|(h, _, _)| h).collect();
+    let doc = read_document(s.doc()?).map_err(other)?;
+    if find_view(&doc, view).and_then(|v| v.transform()).is_none() {
+        return Err(other("This plan has no placement"));
+    }
+    let old: Vec<Handle> = {
+        let d = s.doc()?;
+        doc.views.iter().flat_map(|v| grid_points(d, v.id())).map(|(h, _, _)| h).collect()
+    };
     let mut common = s.current_common();
     set_entity_data(&mut common, &EntityData { stud_grid: Some(pitch), ..EntityData::default() }).map_err(other)?;
     let space = s.space();
@@ -96,9 +164,9 @@ impl Interactive for StudGridM {
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
         match edited_plan(s) {
-            Ok(view) => {
-                if let Some(g) = stud_grid(s.doc()?, view) {
-                    self.pitch = g.pitch;
+            Ok(_) => {
+                if let Some((_, pitch)) = project_grid(s.doc()?) {
+                    self.pitch = pitch;
                 }
                 Ok(Step::Continue)
             }
@@ -146,15 +214,15 @@ pub(crate) fn studgrid_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::assembly::assembly_lines;
     use crate::assembly::tests::{room_with, undo_len};
     use crate::detailtags::graph_and_sides;
     use crate::project::DrawingProject;
-    use crate::schema::{assembly_block_name, read_document};
-    use lamb_core::derivation::walls::RunCurve;
-    use lamb_core::model::AnyView;
+    use crate::schema::{assembly_block_name, write_document};
+    use lamb_core::geometry::{IDENTITY_TRANSFORM, Transform2D};
+    use lamb_core::model::{AnyView, Placement};
     use std::collections::HashSet;
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -171,10 +239,28 @@ mod tests {
         Ok(handles(s)?.into_iter().find(|h| !before.contains(h)).ok_or("nothing drawn")?)
     }
 
+    /// Gives `plan` a plan placement with `t` (rewriting the document, as `newviews.rs`'s tests do).
+    pub(crate) fn place(s: &mut Session, plan: Id, t: Transform2D) -> R {
+        let d = s.doc_mut()?;
+        let mut doc = read_document(d)?;
+        for v in &mut doc.views {
+            if let AnyView::Plan(pv) = v
+                && pv.id == plan
+            {
+                pv.placement = Some(Placement::Plan { level_id: Id(0), cut_elevation: 1200.0, transform: t });
+            }
+        }
+        write_document(d, &doc)?;
+        Ok(())
+    }
+
+    const MOVED: Transform2D = Transform2D { origin_x: 1000.0, origin_y: 500.0, rotation: 0.25 };
+
     /// The assembly room (5000 × 4000, 200 mm walls, one edge tag spread round it) with a 38-wide
     /// stud repeated at `pitch` in its detail, editing the plan. Returns (session, plan).
     fn stud_room(pitch: f64) -> T<(Session, Id)> {
         let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
+        place(&mut s, plan, IDENTITY_TRANSFORM)?;
         let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
         s.execute("editview", &json!({ "viewId": detail.0 }))?;
         s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
@@ -302,6 +388,93 @@ mod tests {
         s.execute("editview", &json!({}))?;
         s.start("studgrid")?;
         assert!(s.running.is_none(), "refused at once");
+        Ok(())
+    }
+
+    /// [`stud_room`] plus a second plan holding the same tagged room, placed at [`MOVED`]. Returns
+    /// (session, first plan, second plan), editing the first.
+    fn two_plans() -> T<(Session, Id, Id)> {
+        let (mut s, plan) = stud_room(406.4)?;
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        let second = Id(s.execute("newplan", &json!({ "name": "Upper" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": second.0 }))?;
+        s.execute("layer.current", &json!({ "name": "WALL-EXT" }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [5000, 0], [5000, 4000], [0, 4000]], "closed": true }))?;
+        s.execute("pline", &json!({ "vertices": [[200, 200], [4800, 200], [4800, 3800], [200, 3800]], "closed": true }))?;
+        s.execute("layer.current", &json!({ "name": "TAGS" }))?;
+        s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 2500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
+        place(&mut s, second, MOVED)?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        Ok((s, plan, second))
+    }
+
+    /// `view`'s south-wall stud centres (local y 100) in global XY.
+    fn global_studs(d: &Drawing, view: Id) -> T<Vec<Point2>> {
+        let doc = read_document(d)?;
+        let v = find_view(&doc, view).ok_or("no view")?;
+        stud_xs(d, view, 100.0)?.into_iter().map(|x| Ok(plan_local_to_global_xy(&v, Point2 { x, y: 100.0 })?)).collect()
+    }
+
+    fn on_grid(p: Point2, g: Point2, dir: Point2, pitch: f64) -> bool {
+        let m = ((p.x - g.x) * dir.x + (p.y - g.y) * dir.y).rem_euclid(pitch);
+        m < 1e-6 || pitch - m < 1e-6
+    }
+
+    #[test]
+    fn one_grid_lines_up_the_studs_of_every_placed_plan_in_global_xy() -> R {
+        let (mut s, plan, second) = two_plans()?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        let (g, pitch) = project_grid(s.doc()?).ok_or("no project grid")?;
+        assert_eq!((g, pitch), (Point2 { x: 13.0, y: 7.0 }, 406.4));
+        let first = global_studs(s.doc()?, plan)?;
+        assert!(!first.is_empty());
+        assert!(first.iter().all(|&p| on_grid(p, g, Point2 { x: 1.0, y: 0.0 }, pitch)), "{first:?}");
+        let rotated = global_studs(s.doc()?, second)?;
+        assert!(!rotated.is_empty());
+        let dir = Point2 { x: MOVED.rotation.cos(), y: MOVED.rotation.sin() };
+        assert!(rotated.iter().all(|&p| on_grid(p, g, dir, pitch)), "{rotated:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_grid_set_in_another_plan_replaces_the_project_s_one() -> R {
+        let (mut s, plan, second) = two_plans()?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        s.execute("editview", &json!({ "viewId": second.0 }))?;
+        let n = undo_len(&s)?;
+        s.execute("studgrid", &json!({ "point": {"x": 100.0, "y": 0.0}, "pitch": 400 }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert!(grid_points(s.doc()?, plan).is_empty(), "the first plan's point is gone");
+        assert_eq!(grid_points(s.doc()?, second).len(), 1);
+        let (g, pitch) = project_grid(s.doc()?).ok_or("no project grid")?;
+        let want = Point2 { x: 1000.0 + 100.0 * MOVED.rotation.cos(), y: 500.0 + 100.0 * MOVED.rotation.sin() };
+        assert!((g.x - want.x).abs() < 1e-9 && (g.y - want.y).abs() < 1e-9 && pitch == 400.0, "{g:?}");
+        s.undo()?;
+        assert_eq!((grid_points(s.doc()?, plan).len(), grid_points(s.doc()?, second).len()), (1, 0), "one undo step");
+        Ok(())
+    }
+
+    #[test]
+    fn studgrid_refuses_a_plan_with_no_placement_and_ignores_a_floating_plan_s_point() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        let floating = Id(s.execute("newplan", &json!({ "name": "Loose" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": floating.0 }))?;
+        let n = undo_len(&s)?;
+        assert!(s.execute("studgrid", &json!({ "point": {"x": 0, "y": 0} })).is_err_and(|e| e.to_string().contains("This plan has no placement")));
+        assert_eq!(undo_len(&s)?, n, "the refusal records nothing");
+        // A grid point left in a plan that later lost its placement is not the project's grid.
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 0, "y": 0} }))?;
+        let d = s.doc_mut()?;
+        let mut doc = read_document(d)?;
+        for v in &mut doc.views {
+            if let AnyView::Plan(pv) = v {
+                pv.placement = None;
+            }
+        }
+        write_document(d, &doc)?;
+        assert!(project_grid(s.doc()?).is_none());
+        assert!(stud_grid(s.doc()?, plan).is_none());
         Ok(())
     }
 

@@ -18,8 +18,8 @@
 //! the document's `mitre_plans` (`assemblyplan {viewId, mitre}`, LAMB T385; §10 step 3) has every
 //! band end at a two-arm junction with no corner detail (`Untyped` or `Conflict`) moved onto that
 //! junction's bisector (lamb-core's [`junction_bisector`], [`mitre_end`]); repeats are not mitred.
-//! A view with a stud grid ([`crate::studgrid`], LAMB T458) lays each straight run's repeat whose
-//! pitch is near the grid's on that grid's lines.
+//! The project's stud grid ([`crate::studgrid`], LAMB T458, T463) lays each straight run's repeat whose
+//! pitch is near the grid's on that grid's lines — every plan run, and a section's runs along its cut line.
 //! At each two-arm junction a corner tag resolves to (§10 step 3, LAMB T461), [`corner_assembly`]
 //! places the corner detail once (lamb-core's [`place_corner`]); the block holds the run lines,
 //! then the corner lines in junction order. A placed corner owns the region around its junction
@@ -134,7 +134,7 @@ fn run_lines(
     let frame = detail_frame((r.from, r.to), &lines)?;
     let mut laid = lay_bands(run, sides, face, &bands)?;
     let n = laid.len();
-    let grid = crate::studgrid::stud_grid(d, view);
+    let grid = crate::studgrid::run_grid(d, view, run);
     let mut copies = Vec::new();
     for rep in detail_repeats(d, detail)? {
         let members = member_segments(d, detail, &rep.members);
@@ -1589,6 +1589,88 @@ pub(crate) mod tests {
         assert_eq!(s.doc()?.block(&name).ok_or("no block")?.entities.len(), total);
         assert_eq!(model_inserts(s.doc()?, &name).len(), 1);
         assert_eq!(undo_len(&s)?, n + 1);
+        Ok(())
+    }
+
+    /// T463's joists: [`open_section`] with its host plan placed at a rotated, moved transform, an
+    /// outside point below the floor and `SD` also tagged on the floor, so the floor run lays the
+    /// stud repeat (pitch 400) as joists. Returns (session, section, plan), editing the section.
+    fn joist_section() -> T<(Session, Id, Id)> {
+        let (mut s, sec) = open_section(Some((-1000.0, 1500.0)))?;
+        s.execute("outsidepoint", &json!({ "point": {"x": 2000.0, "y": 500.0} }))?;
+        let doc = read_document(s.doc()?)?;
+        let sd = doc.views.iter().find(|v| v.name() == "SD").ok_or("no SD")?.id();
+        let plan = doc.views.iter().find(|v| matches!(v, AnyView::Plan(_))).ok_or("no plan")?.id();
+        s.execute("detailtag", &json!({ "detailViewId": sd.0, "tip": {"x": 2000.0, "y": 1000.0}, "bubble": {"x": 2500.0, "y": 500.0} }))?;
+        let moved = lamb_core::geometry::Transform2D { origin_x: 1000.0, origin_y: 500.0, rotation: 0.25 };
+        crate::studgrid::tests::place(&mut s, plan, moved)?;
+        Ok((s, sec, plan))
+    }
+
+    /// The section's floor run (horizontal centreline) and its laid assembly.
+    fn floor_run(d: &Drawing, sec: Id) -> T<RunAssembly> {
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, sec);
+        let i = graph
+            .runs
+            .iter()
+            .position(|r| matches!(r.centreline, RunCurve::Line { from, to } if (from.y - to.y).abs() < 1e-9))
+            .ok_or("no floor run")?;
+        Ok(assembly_lines(d, sec)?.into_iter().find(|r| r.run == i).ok_or("floor run not laid")?)
+    }
+
+    #[test]
+    fn a_section_s_joists_take_the_project_grid_and_its_cut_walls_do_not() -> R {
+        let (mut s, sec, plan) = joist_section()?;
+        let wall = section_left_run(&s, sec)?;
+        let wall_lines =
+            |d: &Drawing| -> T<Vec<AssemblyLine>> { Ok(assembly_lines(d, sec)?.into_iter().find(|r| r.run == wall).ok_or("no wall run")?.lines) };
+        let (wall_before, floor_before) = (wall_lines(s.doc()?)?, floor_run(s.doc()?, sec)?);
+        assert_eq!(floor_before.skipped, None, "{floor_before:?}");
+        assert!(floor_before.lines.len() > floor_before.bands, "the floor lays joists");
+
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0}, "pitch": 400 }))?;
+        let d = s.doc()?;
+        assert_eq!(wall_lines(d)?, wall_before, "a wall cut in section never takes the grid");
+        let floor = floor_run(d, sec)?;
+        assert_ne!(floor.lines, floor_before.lines, "the joists moved onto the grid");
+        let (g, pitch) = crate::studgrid::project_grid(d).ok_or("no grid")?;
+        let p = DrawingProject::new(d)?;
+        use lamb_core::derivation::read::ProjectRead;
+        let (v, host) = (p.view(sec).ok_or("no section")?, p.view(plan).ok_or("no plan")?);
+        let basis = lamb_core::derivation::projection::vertical_basis(&v, &host)?;
+        let u0 = lamb_core::derivation::projection::project_to_u(&basis, g);
+        let copies: Vec<&[AssemblyLine]> = floor.lines[floor.bands..].chunks(4).collect();
+        assert!(!copies.is_empty());
+        for c in copies {
+            let xs = c.iter().flat_map(|l| [l.from.x, l.to.x]);
+            let (lo, hi) = (xs.clone().fold(f64::INFINITY, f64::min), xs.fold(f64::NEG_INFINITY, f64::max));
+            let u = lamb_core::derivation::projection::vertical_local_to_uz(&v, Point2 { x: (lo + hi) / 2.0, y: 1125.0 }).u;
+            let m = (u - u0).rem_euclid(pitch);
+            assert!(m < 1e-6 || pitch - m < 1e-6, "joist at u {u} off the grid through u {u0}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn moving_the_grid_in_a_plan_relays_a_section_s_block_in_that_undo_step() -> R {
+        let (mut s, sec, plan) = joist_section()?;
+        crate::maintain::install(&mut s);
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let h = s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0}, "pitch": 400 }))?["handle"].as_str().ok_or("no handle")?.to_owned();
+        let name = assembly_block_name(sec);
+        let before = s.doc()?.block(&name).ok_or("no block")?.clone();
+        let n = undo_len(&s)?;
+        s.execute("move", &json!({ "handles": [h], "delta": [100, 0] }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let d = s.doc()?;
+        let block = d.block(&name).ok_or("no block")?;
+        assert!(!Arc::ptr_eq(&before, block), "rewritten");
+        assert!(block_matches(block, &assembly_lines(d, sec)?, &corner_assembly(d, sec)?));
+        s.undo()?;
+        assert_eq!(**s.doc()?.block(&name).ok_or("no block")?, *before, "undo restores the section's block");
         Ok(())
     }
 
