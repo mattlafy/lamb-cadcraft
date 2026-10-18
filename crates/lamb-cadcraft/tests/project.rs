@@ -109,6 +109,7 @@ fn drawing() -> Result<Drawing, String> {
             detail_ref: None,
             repeat: None,
             outside: false,
+            stud_grid: None,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -383,6 +384,7 @@ fn all_default_slots_are_not_written() -> R {
             detail_ref: None,
             repeat: None,
             outside: false,
+            stud_grid: None,
         },
     )
     .map_err(|e| e.to_string())?;

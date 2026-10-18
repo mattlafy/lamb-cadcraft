@@ -2,7 +2,8 @@
 //! 2 and 4; LAMB T369): a detail view's **continuous bands** — its straight lines parallel to the
 //! reference line — laid along a wall run, aligned on the run's matching face (concentric arcs on
 //! an arc run, LAMB T389) — and each **repeat** (LAMB T380) arrayed at its pitch along a straight
-//! run ([`lay_repeat`]; arc runs are an error).
+//! run ([`lay_repeat`]; arc runs are an error). A plan's stud grid ([`RepeatGrid`], LAMB T458)
+//! snaps a straight run's repeat whose pitch is near the grid's onto the grid's lines.
 //! Junctions are not trimmed by default; for a plan that opts into mitring (§10 step 3, LAMB T385)
 //! the adapter moves band ends at undetailed two-arm junctions onto [`junction_bisector`] with
 //! [`mitre_end`]. Computed on demand.
@@ -200,6 +201,16 @@ pub fn lay_bands(run: &WallRun, sides: &RunSides, face: FaceRef, bands: &[Band])
         .collect())
 }
 
+/// A plan's stud grid: grid lines perpendicular to each straight run through `origin + k·pitch`
+/// along it. A repeat whose along-pitch is within `pitch_tolerance_mm` of `pitch` is laid at exactly
+/// `pitch`, each copy's along-centre on a grid line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RepeatGrid {
+    pub origin: Point2,
+    pub pitch: f64,
+    pub pitch_tolerance_mm: f64,
+}
+
 /// A repeat's `members` (straight segments in the detail's space, with their layers) arrayed along
 /// a `run`: copies shifted `k·|p|` along, `p` being `pitch`'s component along the reference, for
 /// every integer `k` whose copy's along-extent lies within `[0, run length]`
@@ -209,7 +220,9 @@ pub fn lay_bands(run: &WallRun, sides: &RunSides, face: FaceRef, bands: &[Band])
 /// `radius + outward·(width/2 − o)` at angle `start_angle + sign(sweep)·t / rf`, and each member
 /// segment is written as a straight chord between its mapped ends; a mapped radius not above
 /// `TOLERANCE.coincidence_mm` is an error. No along component, no members, or no copy that fits
-/// gives no lines.
+/// gives no lines. With a `grid` and a straight run whose `|p|` is within the grid's tolerance of
+/// its pitch, copies are `δ + k·pitch` instead, `δ` putting the members' along-centre on a grid
+/// line (independent of the run's travel direction); arc runs ignore the grid.
 pub fn lay_repeat(
     run: &WallRun,
     sides: &RunSides,
@@ -217,7 +230,10 @@ pub fn lay_repeat(
     frame: &DetailFrame,
     members: &[(Point2, Point2, String)],
     pitch: Point2,
+    grid: Option<&RepeatGrid>,
 ) -> Result<Vec<AssemblyLine>, String> {
+    // The run's along-coordinate of its `from` measured from the grid origin, straight runs only.
+    let mut grid_a0: Option<f64> = None;
     // The run length along the reference face, and a detail point `(t, o)` placed on the run.
     let (len, place): (f64, Box<dyn Fn(f64, f64) -> Result<Point2, String>>) = match run.centreline {
         RunCurve::Arc { center, radius, start_angle, sweep } => {
@@ -241,6 +257,9 @@ pub fn lay_repeat(
         }
         RunCurve::Line { .. } => {
             let f = face_frame(run, sides, face)?;
+            if let Some(g) = grid {
+                grid_a0 = Some((f.from.x - g.origin.x) * f.dir.x + (f.from.y - g.origin.y) * f.dir.y);
+            }
             let width = run.width;
             (f.len, Box::new(move |t: f64, o: f64| Ok(f.place(width, t, o))))
         }
@@ -253,10 +272,16 @@ pub fn lay_repeat(
     let ts = || local.iter().flat_map(|(a, b, _)| [a.0, b.0]);
     let (tmin, tmax) = (ts().fold(f64::INFINITY, f64::min), ts().fold(f64::NEG_INFINITY, f64::max));
     let tol = TOLERANCE.coincidence_mm;
-    let (kmin, kmax) = (((-tol - tmin) / p).ceil() as i64, ((len + tol - tmax) / p).floor() as i64);
+    let (p, shift) = match (grid, grid_a0) {
+        (Some(g), Some(a0)) if g.pitch > 0.0 && (p - g.pitch).abs() <= g.pitch_tolerance_mm => {
+            (g.pitch, (-(a0 + (tmin + tmax) / 2.0)).rem_euclid(g.pitch))
+        }
+        _ => (p, 0.0),
+    };
+    let (kmin, kmax) = (((-tol - tmin - shift) / p).ceil() as i64, ((len + tol - tmax - shift) / p).floor() as i64);
     let mut out = Vec::new();
     for k in kmin..=kmax {
-        let s = k as f64 * p;
+        let s = shift + k as f64 * p;
         for ((ta, oa), (tb, ob), layer) in &local {
             out.push(AssemblyLine { from: place(ta + s, *oa)?, to: place(tb + s, *ob)?, layer: (*layer).clone(), arc: None });
         }
@@ -517,7 +542,7 @@ mod tests {
         let r = run(p(0.0, 100.0), p(2000.0, 100.0), 200.0);
         // Outside below (right of +x): face at y = 0, into the wall is +y.
         let right_out = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
-        let out = lay_repeat(&r, &right_out, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap();
+        let out = lay_repeat(&r, &right_out, FaceRef::Exterior, &frame, &members, p(400.0, 0.0), None).unwrap();
         assert_eq!(out.len(), 20, "k = 0..4, four segments each");
         assert!(out.iter().all(|l| l.layer == "STUD"));
         let got = rounded(&out);
@@ -528,12 +553,12 @@ mod tests {
         }
         // Outside above: face at y = 200, into the wall is -y.
         let left_out = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
-        let got = rounded(&lay_repeat(&r, &left_out, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap());
+        let got = rounded(&lay_repeat(&r, &left_out, FaceRef::Exterior, &frame, &members, p(400.0, 0.0), None).unwrap());
         assert_eq!(got.len(), 20);
         assert_eq!(got[0], (100.0, 150.0, 138.0, 150.0));
         assert_eq!(got[18], (1738.0, 0.0, 1700.0, 0.0));
         // A reversed pitch arrays the same copies.
-        assert_eq!(rounded(&lay_repeat(&r, &left_out, FaceRef::Exterior, &frame, &members, p(-400.0, 0.0)).unwrap()), got);
+        assert_eq!(rounded(&lay_repeat(&r, &left_out, FaceRef::Exterior, &frame, &members, p(-400.0, 0.0), None).unwrap()), got);
     }
 
     #[test]
@@ -541,13 +566,57 @@ mod tests {
         let (frame, members) = stud();
         let r = run(p(0.0, 100.0), p(2000.0, 100.0), 200.0);
         let sides = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
-        assert!(lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(0.0, 400.0)).unwrap().is_empty());
-        let skew = lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 30.0)).unwrap();
-        let straight = lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap();
+        assert!(lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(0.0, 400.0), None).unwrap().is_empty());
+        let skew = lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 30.0), None).unwrap();
+        let straight = lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0), None).unwrap();
         assert_eq!(rounded(&skew), rounded(&straight));
         // A run shorter than the member: no copy fits.
         let short = run(p(0.0, 100.0), p(120.0, 100.0), 200.0);
-        assert!(lay_repeat(&short, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap().is_empty());
+        assert!(lay_repeat(&short, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0), None).unwrap().is_empty());
+    }
+
+    /// The along (x) centre of each four-segment stud copy.
+    fn copy_centres(lines: &[AssemblyLine]) -> Vec<f64> {
+        lines
+            .chunks(4)
+            .map(|c| {
+                let xs = c.iter().flat_map(|l| [l.from.x, l.to.x]);
+                let (lo, hi) = (xs.clone().fold(f64::INFINITY, f64::min), xs.fold(f64::NEG_INFINITY, f64::max));
+                (lo + hi) / 2.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_repeat_near_the_grid_pitch_lays_on_the_stud_grid_from_its_origin() {
+        let (frame, members) = stud();
+        let grid = RepeatGrid { origin: p(13.0, 7.0), pitch: 406.4, pitch_tolerance_mm: 5.0 };
+        let r = run(p(0.0, 100.0), p(5000.0, 100.0), 200.0);
+        let right_out = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let out = lay_repeat(&r, &right_out, FaceRef::Exterior, &frame, &members, p(406.0, 0.0), Some(&grid)).unwrap();
+        let centres = copy_centres(&out);
+        assert_eq!(centres.len(), 12);
+        for (i, c) in centres.iter().enumerate() {
+            let m = (c - 13.0).rem_euclid(406.4);
+            assert!(m < 1e-6 || 406.4 - m < 1e-6, "copy {i} at {c} is off the grid");
+            if i > 0 {
+                assert!((c - centres[i - 1] - 406.4).abs() < 1e-6, "spacing at copy {i}");
+            }
+            assert!(*c - 19.0 >= -1e-9 && *c + 19.0 <= 5000.0 + 1e-9, "copy {i} fits the run");
+        }
+        // The same wall drawn the other way: outside is now on its left; the centres are the same.
+        let rev = run(p(5000.0, 100.0), p(0.0, 100.0), 200.0);
+        let left_out = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
+        let mut back = copy_centres(&lay_repeat(&rev, &left_out, FaceRef::Exterior, &frame, &members, p(406.0, 0.0), Some(&grid)).unwrap());
+        back.sort_by(f64::total_cmp);
+        assert_eq!(back.len(), centres.len());
+        assert!(back.iter().zip(&centres).all(|(a, b)| (a - b).abs() < 1e-6), "{back:?} vs {centres:?}");
+        // A pitch outside the tolerance ignores the grid.
+        let far = lay_repeat(&r, &right_out, FaceRef::Exterior, &frame, &members, p(600.0, 0.0), Some(&grid)).unwrap();
+        assert_eq!(far, lay_repeat(&r, &right_out, FaceRef::Exterior, &frame, &members, p(600.0, 0.0), None).unwrap());
+        // An arc run ignores the grid.
+        let arc = lay_repeat(&arc_run(1000.0, 1.0), &right_out, FaceRef::Exterior, &frame, &members, p(406.0, 0.0), Some(&grid)).unwrap();
+        assert_eq!(arc, lay_repeat(&arc_run(1000.0, 1.0), &right_out, FaceRef::Exterior, &frame, &members, p(406.0, 0.0), None).unwrap());
     }
 
     #[test]
@@ -558,7 +627,7 @@ mod tests {
         let outside_right = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
         let outside_left = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
         let check = |sweep: f64, sides: &RunSides, rf: f64, radii: (f64, f64)| {
-            let out = lay_repeat(&arc_run(1000.0, sweep), sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0)).unwrap();
+            let out = lay_repeat(&arc_run(1000.0, sweep), sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0), None).unwrap();
             let n = ((rf * FRAC_PI_2 - 100.0) / 400.0).floor() as usize + 1;
             assert_eq!(out.len(), n, "sweep {sweep}, rf {rf}");
             for (k, line) in out.iter().enumerate() {
@@ -578,7 +647,7 @@ mod tests {
         // A member reaching past the centre is an error.
         let deep = vec![l((100.0, 50.0), (100.0, 2000.0), "STUD")];
         assert_eq!(
-            lay_repeat(&arc_run(1000.0, 1.0), &outside_right, FaceRef::Exterior, &frame, &deep, p(400.0, 0.0)).unwrap_err(),
+            lay_repeat(&arc_run(1000.0, 1.0), &outside_right, FaceRef::Exterior, &frame, &deep, p(400.0, 0.0), None).unwrap_err(),
             "repeat radius is not positive"
         );
     }

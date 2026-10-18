@@ -18,6 +18,8 @@
 //! the document's `mitre_plans` (`assemblyplan {viewId, mitre}`, LAMB T385; §10 step 3) has every
 //! band end at a two-arm junction with no corner detail (`Untyped` or `Conflict`) moved onto that
 //! junction's bisector (lamb-core's [`junction_bisector`], [`mitre_end`]); repeats are not mitred.
+//! A view with a stud grid ([`crate::studgrid`], LAMB T458) lays each straight run's repeat whose
+//! pitch is near the grid's on that grid's lines.
 //! Not the AI-line sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
@@ -106,6 +108,7 @@ fn member_segments(d: &Drawing, detail: Id, members: &[cadcraft_doc::Handle]) ->
 /// its width conflict, or why not.
 fn run_lines(
     d: &Drawing,
+    view: Id,
     detail: Id,
     run: &lamb_core::derivation::walls::WallRun,
     sides: &lamb_core::derivation::wall_spaces::RunSides,
@@ -121,8 +124,9 @@ fn run_lines(
     let frame = detail_frame((r.from, r.to), &lines)?;
     let mut laid = lay_bands(run, sides, face, &bands)?;
     let n = laid.len();
+    let grid = crate::studgrid::stud_grid(d, view);
     for rep in detail_repeats(d, detail)? {
-        laid.extend(lay_repeat(run, sides, face, &frame, &member_segments(d, detail, &rep.members), rep.pitch)?);
+        laid.extend(lay_repeat(run, sides, face, &frame, &member_segments(d, detail, &rep.members), rep.pitch, grid.as_ref())?);
     }
     Ok((laid, n, width_conflict(run, face, &bands)))
 }
@@ -155,7 +159,7 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
                 RunDetail::Untyped => return skip("untyped", None),
             };
             let Ok(detail) = id.parse::<u64>().map(Id) else { return skip("detail id is not a number", None) };
-            match run_lines(d, detail, run, side) {
+            match run_lines(d, plan, detail, run, side) {
                 Ok((lines, bands, conflict)) => RunAssembly { run: i, detail: Some(detail), lines, bands, skipped: None, conflict },
                 Err(e) => skip(&e, Some(detail)),
             }

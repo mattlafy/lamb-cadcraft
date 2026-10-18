@@ -48,7 +48,8 @@
 //!   project (directory or its JSON file form) opened as a new document tab — see
 //!   [`crate::lambopen`]. `lambsave {path}` (View ▸ LAMB ▸ Save LAMB Project): the open drawing
 //!   written as a `.lamb` project directory — see [`crate::lambopen`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
-//!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's or section's laid
+//!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `studgrid {point:{x,y}, pitch?}` (View ▸ LAMB ▸ Stud Grid): the edited
+//!   plan's stud grid origin (pitch 406.4) its repeats line up on — see [`crate::studgrid`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's or section's laid
 //!   detail bands written into its block `LAMB_ASSEMBLY_<id>`, `mitre` turning the plan's mitring
 //!   of undetailed corners on or off — see [`crate::assembly`]; interactive on the edited plan or section:
 //!   `Mitre missing corner details [Yes/No]`, Enter keeping the current setting.
@@ -804,6 +805,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{point:{x,y}}")
             .menu(MENU)
             .interactive(crate::outside::outsidepoint_machine),
+        CommandSpec::new("studgrid", "Stud Grid", crate::studgrid::studgrid)
+            .params("{point:{x,y}, pitch?: mm} → {handle, pitch}")
+            .menu(MENU)
+            .interactive(crate::studgrid::studgrid_machine),
         CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU),
         CommandSpec::new("assemblyplan", "Assembly Plan", crate::assembly::assemblyplan)
             .params("{viewId, mitre?: bool}")
@@ -923,6 +928,7 @@ mod tests {
             "newdetail",
             "detailtag",
             "outsidepoint",
+            "studgrid",
             "wallrun",
             "dxfimport",
             "lambopen",

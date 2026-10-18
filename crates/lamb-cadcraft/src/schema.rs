@@ -6,7 +6,7 @@
 //!   links, suppressed proposals.
 //! - `Common.ext["LAMB"]` = [`EntityData`]: an entity's line role, AI provenance and virtual
 //!   (fillet/chamfer) corner tags, on a sheet's viewport the view it shows, and on a plan's POINT
-//!   whether it is an outside pick point.
+//!   whether it is an outside pick point or the plan's stud grid origin.
 //! - `Layer.ext["LAMB"]` = [`LayerData`]: a layer's default role.
 //!
 //! A view's entities live in the block [`view_block_name`]`(id)`; an entity's id is its handle.
@@ -154,6 +154,10 @@ pub struct EntityData {
     /// outside the building (`cadcraft-integration.md` §8 "Inside and outside", [`crate::outside`]).
     #[serde(default, skip_serializing_if = "is_false")]
     pub outside: bool,
+    /// On a `Point` in a plan view's block: that plan's stud grid origin, holding the grid pitch
+    /// in mm ([`crate::studgrid`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stud_grid: Option<f64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -198,6 +202,7 @@ impl Default for EntityData {
             detail_ref: None,
             repeat: None,
             outside: false,
+            stud_grid: None,
         }
     }
 }
