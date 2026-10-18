@@ -14,6 +14,7 @@ use super::wall_junctions::{Junction, RunEnd};
 use super::wall_spaces::{RunSides, outside_on_left};
 use super::walls::{RunCurve, WallRun};
 use crate::geometry::Point2;
+use crate::geometry::intersect::infinite_line_intersect;
 use crate::geometry::tolerance::TOLERANCE;
 
 /// One continuous band of a detail: a line parallel to the reference, `offset` mm from it,
@@ -283,6 +284,53 @@ pub fn lay_repeat(
         }
     }
     Ok(out)
+}
+
+/// A corner detail placed at a two-arm junction (§10 step 3, LAMB T461). The detail's reference
+/// line is an exterior-face reference whose `to` end is the outer corner: it lands on the junction's
+/// outer corner (the two arms' exterior face lines crossed) and runs along the arm whose handedness
+/// — travel toward the corner against the wall side — matches the detail's, the wall side on that
+/// arm's interior. A rigid rotation, never a mirror. `sides` is indexed like `runs`. Every
+/// straight segment of `lines` is mapped; layers are kept.
+pub fn place_corner(
+    j: &Junction,
+    runs: &[WallRun],
+    sides: &[RunSides],
+    reference: (Point2, Point2),
+    lines: &[(Point2, Point2, String)],
+) -> Result<Vec<AssemblyLine>, String> {
+    let [a0, a1] = j.arms.as_slice() else { return Err("only two-arm corners are placed yet".into()) };
+    let frame = detail_frame(reference, lines)?;
+    let cross = |u: Point2, v: Point2| u.x * v.y - u.y * v.x;
+    // Per arm: a point and direction of its exterior face line, the travel toward the junction and
+    // the unit normal into the wall.
+    let mut arms = Vec::new();
+    for arm in [a0, a1] {
+        let run = runs.get(arm.run).ok_or("junction arm names no run")?;
+        let side = sides.get(arm.run).ok_or("junction arm has no sides")?;
+        let f = face_frame(run, side, FaceRef::Exterior)?;
+        let h = run.width / 2.0;
+        let a = Point2 { x: f.from.x + f.normal.x * h, y: f.from.y + f.normal.y * h };
+        let b = Point2 { x: f.to.x + f.normal.x * h, y: f.to.y + f.normal.y * h };
+        let s = match arm.end {
+            RunEnd::Start => -1.0,
+            RunEnd::End => 1.0,
+        };
+        let t = Point2 { x: f.dir.x * s, y: f.dir.y * s };
+        let ni = Point2 { x: -f.normal.x, y: -f.normal.y };
+        arms.push((a, b, t, ni));
+    }
+    let c = infinite_line_intersect(arms[0].0, arms[0].1, arms[1].0, arms[1].1).ok_or("the corner's arms are parallel")?.point;
+    let want = cross(frame.along, frame.into).signum();
+    let fits: Vec<_> = arms.iter().filter(|(_, _, t, ni)| cross(*t, *ni).signum() == want).collect();
+    let &[&(_, _, t, ni)] = fits.as_slice() else { return Err("the corner's arms do not fit the detail".into()) };
+    let r = reference.1;
+    let map = |p: Point2| {
+        let (dx, dy) = (p.x - r.x, p.y - r.y);
+        let (u, v) = (dx * frame.along.x + dy * frame.along.y, dx * frame.into.x + dy * frame.into.y);
+        Point2 { x: c.x + t.x * u + ni.x * v, y: c.y + t.y * u + ni.y * v }
+    };
+    Ok(lines.iter().map(|(p, q, layer)| AssemblyLine { from: map(*p), to: map(*q), layer: layer.clone(), arc: None }).collect())
 }
 
 /// A run whose detail is thicker or thinner than the drawn wall: the detail's width minus the
@@ -704,5 +752,53 @@ mod tests {
         let before = d.clone();
         mitre_end(&mut d, RunEnd::Start, p(100.0, 0.0), p(h, h));
         assert_eq!(d, before);
+    }
+
+    /// An L of two 200 mm runs with its outer corner at (0,0): `a` along +x (outside below), `b`
+    /// along +y (outside left), both starting at the junction (100,100) — or ending there, reversed.
+    fn l_corner(reversed: bool) -> (Junction, Vec<WallRun>, Vec<RunSides>) {
+        use crate::derivation::wall_junctions::JunctionArm;
+        let (o, ax, by) = (p(100.0, 100.0), p(5000.0, 100.0), p(100.0, 5000.0));
+        let right = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
+        let left = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
+        let (runs, sides, end) = if reversed {
+            (vec![run(ax, o, 200.0), run(by, o, 200.0)], vec![left.clone(), right.clone()], RunEnd::End)
+        } else {
+            (vec![run(o, ax, 200.0), run(o, by, 200.0)], vec![right, left], RunEnd::Start)
+        };
+        let arms = vec![JunctionArm { run: 0, end, direction_deg: 0.0 }, JunctionArm { run: 1, end, direction_deg: 90.0 }];
+        (Junction { point: o, arms, gaps_deg: Vec::new() }, runs, sides)
+    }
+
+    #[test]
+    fn a_corner_detail_lands_on_the_outer_corner_along_the_matching_arm() {
+        let reference = (p(-1000.0, 0.0), p(0.0, 0.0));
+        let lines = [l((-1000.0, 200.0), (0.0, 200.0), "GYP"), l((0.0, 0.0), (0.0, 1000.0), "CLAD")];
+        let want = [(200.0, 1000.0, 200.0, 0.0), (0.0, 0.0, 1000.0, 0.0)];
+        for reversed in [false, true] {
+            let (j, runs, sides) = l_corner(reversed);
+            let out = place_corner(&j, &runs, &sides, reference, &lines).unwrap();
+            assert_eq!(rounded(&out), want, "reversed {reversed}");
+            assert_eq!(out[1].layer, "CLAD");
+            assert!(out.iter().all(|l| l.arc.is_none()));
+        }
+        // The mirrored detail (wall side -y) runs along the other arm.
+        let mirrored = [l((-1000.0, -200.0), (0.0, -200.0), "GYP"), l((0.0, 0.0), (0.0, -1000.0), "CLAD")];
+        let (j, runs, sides) = l_corner(false);
+        assert_eq!(rounded(&place_corner(&j, &runs, &sides, reference, &mirrored).unwrap()), [(1000.0, 200.0, 0.0, 200.0), (0.0, 0.0, 0.0, 1000.0)]);
+    }
+
+    #[test]
+    fn a_corner_detail_refuses_three_arms_and_parallel_arms() {
+        use crate::derivation::wall_junctions::JunctionArm;
+        let reference = (p(-1000.0, 0.0), p(0.0, 0.0));
+        let lines = [l((-1000.0, 200.0), (0.0, 200.0), "GYP")];
+        let (mut j, mut runs, mut sides) = l_corner(false);
+        j.arms.push(JunctionArm { run: 0, end: RunEnd::End, direction_deg: 180.0 });
+        assert_eq!(place_corner(&j, &runs, &sides, reference, &lines).unwrap_err(), "only two-arm corners are placed yet");
+        j.arms.pop();
+        runs[1] = run(p(100.0, 100.0), p(-5000.0, 100.0), 200.0);
+        sides[1] = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
+        assert_eq!(place_corner(&j, &runs, &sides, reference, &lines).unwrap_err(), "the corner's arms are parallel");
     }
 }
