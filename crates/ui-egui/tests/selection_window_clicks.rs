@@ -104,3 +104,64 @@ fn a_real_drag_still_selects_with_a_window_from_press_to_release() {
     assert!(corner(&h).is_none(), "a drag opens and closes its window");
     assert_eq!(h.state().session.selection().len(), 1);
 }
+
+fn line_ends(h: &Harness<'_, CadApp>) -> Vec<(Vec2, Vec2)> {
+    let st = h.state().session.state().unwrap();
+    st.doc
+        .space(&Space::Model)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntityKind::Line(l) => Some((l.a.xy(), l.b.xy())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_point_click_that_wanders_a_few_pixels_places_the_point_where_it_went_down() {
+    let mut h = harness();
+    h.state_mut().start("line");
+    h.run_steps(2);
+    let a = screen(&h, Vec2::new(10.0, 10.0));
+    click(&mut h, a, &[vec2(2.0, 1.0), vec2(4.0, -2.0)]);
+    let b = screen(&h, Vec2::new(30.0, 20.0));
+    // Held still long enough that egui would call it a drag.
+    button(&mut h, b, true);
+    h.run_steps(90);
+    button(&mut h, b, false);
+    h.run_steps(1);
+    let got = line_ends(&h);
+    assert_eq!(got.len(), 2, "{got:?}");
+    let new = got[1];
+    assert!(new.0.near(world(&h, a), 1e-6), "{new:?}");
+    assert!(new.1.near(world(&h, b), 1e-6), "{new:?}");
+}
+
+#[test]
+fn a_select_objects_prompt_uses_the_same_window_clicks() {
+    let mut h = harness();
+    h.state_mut().start("erase");
+    h.run_steps(2);
+    assert!(h.state().session.prompting());
+    let p = screen(&h, Vec2::new(55.0, 35.0));
+    click(&mut h, p, &[vec2(2.0, 2.0)]);
+    let c = corner(&h).expect("the first click opens a window");
+    assert!(c.near(world(&h, p), 1e-6), "{c:?}");
+    let q = screen(&h, Vec2::new(64.0, 44.0));
+    click(&mut h, q, &[vec2(15.0, -15.0)]);
+    assert!(corner(&h).is_none(), "the second click closes the window");
+}
+
+#[test]
+fn a_grip_dragged_is_picked_up_where_it_went_down_and_put_down_where_it_comes_up() {
+    let mut h = harness();
+    let mid = screen(&h, Vec2::new(61.0, 41.0));
+    click(&mut h, mid, &[]);
+    assert_eq!(h.state().session.selection().len(), 1);
+    let end = screen(&h, Vec2::new(62.0, 42.0));
+    let to = screen(&h, Vec2::new(70.0, 30.0));
+    click(&mut h, end, &[(to - end) * 0.5, to - end]);
+    let got = line_ends(&h);
+    assert!(got[0].1.near(world(&h, to), 1e-6), "{got:?}");
+}
