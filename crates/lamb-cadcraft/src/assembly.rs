@@ -1349,6 +1349,20 @@ pub(crate) mod tests {
     /// reference (0,0)–(1000,0), a `GYP` band at y = 50 and a `STUD` repeat (38 × 150 at x 100, pitch
     /// 400), edge-tagged on the wall. Returns (session, section).
     fn section_wall(inner: f64) -> T<(Session, Id)> {
+        section_fixture(inner / 2.0, Some((-2000.0, 2000.0)), |s| {
+            s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+            s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
+            s.execute(
+                "pline",
+                &json!({ "vertices": [[inner, 250.0], [4000.0 - inner, 250.0], [4000.0 - inner, 2750.0], [inner, 2750.0]], "closed": true }),
+            )?;
+            Ok(())
+        })
+    }
+
+    /// `section_wall`'s plan, section and `SD` detail with the section's cut faces drawn by `faces`,
+    /// an `outsidepoint` at `outside` if given, and `SD` edge-tagged at (`tip_u`, 2000).
+    fn section_fixture(tip_u: f64, outside: Option<(f64, f64)>, faces: impl FnOnce(&mut Session) -> R) -> T<(Session, Id)> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);
@@ -1373,18 +1387,62 @@ pub(crate) mod tests {
             s.execute("newsectionline", &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 0}, "cutTo": {"x": 5000, "y": 0} }))?;
         let sec = Id(r["viewId"].as_u64().ok_or("no id")?);
         s.execute("editview", &json!({ "viewId": sec.0 }))?;
-        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
-        s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
-        s.execute(
-            "pline",
-            &json!({ "vertices": [[inner, 250.0], [4000.0 - inner, 250.0], [4000.0 - inner, 2750.0], [inner, 2750.0]], "closed": true }),
-        )?;
+        faces(&mut s)?;
         let hs: Vec<String> = s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.iter().map(|e| e.handle.hex()).collect();
         s.execute("setrole", &json!({ "handles": hs, "role": "cut" }))?;
         s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
-        s.execute("outsidepoint", &json!({ "point": {"x": -2000, "y": 2000} }))?;
-        s.execute("detailtag", &json!({ "detailViewId": sd.0, "tip": {"x": inner / 2.0, "y": 2000.0}, "bubble": {"x": -1000.0, "y": 2500.0} }))?;
+        if let Some((x, y)) = outside {
+            s.execute("outsidepoint", &json!({ "point": {"x": x, "y": y} }))?;
+        }
+        s.execute("detailtag", &json!({ "detailViewId": sd.0, "tip": {"x": tip_u, "y": 2000.0}, "bubble": {"x": -1000.0, "y": 2500.0} }))?;
         Ok((s, sec))
+    }
+
+    /// T456's open section: a `WALL-EXT` pair at u 0/300 (z 0..3000) and a `FLOOR` pair at z
+    /// 1000/1250 from the wall's inner face to u 4000 — a structure that doesn't close.
+    fn open_section(outside: Option<(f64, f64)>) -> T<(Session, Id)> {
+        section_fixture(150.0, outside, |s| {
+            s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+            s.execute("pline", &json!({ "vertices": [[0, 0], [0, 3000]] }))?;
+            s.execute("pline", &json!({ "vertices": [[300, 0], [300, 3000]] }))?;
+            s.execute("layer.new", &json!({ "name": "FLOOR", "current": true }))?;
+            s.execute("pline", &json!({ "vertices": [[300, 1000], [4000, 1000]] }))?;
+            s.execute("pline", &json!({ "vertices": [[300, 1250], [4000, 1250]] }))?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn an_open_section_takes_its_exterior_side_from_the_outside_point() -> R {
+        // Without a point the wall run has no exterior side and is skipped, as before.
+        let (s, sec) = open_section(None)?;
+        let tagged = section_left_run(&s, sec)?;
+        let runs = assembly_lines(s.doc()?, sec)?;
+        let r = runs.iter().find(|r| r.run == tagged).ok_or("no tagged run")?;
+        assert_eq!(r.skipped.as_deref(), Some("no single exterior side"), "{r:?}");
+
+        // With the point at u -1000: the bands are measured from the wall's u 0 face.
+        let (mut s, sec) = open_section(Some((-1000.0, 1500.0)))?;
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, sec);
+        let tagged = section_left_run(&s, sec)?;
+        let runs = assembly_lines(d, sec)?;
+        let r = runs.iter().find(|r| r.run == tagged).ok_or("no tagged run")?;
+        assert_eq!((r.skipped.as_deref(), r.conflict), (None, None), "{r:?}");
+        let RunCurve::Line { from, to } = graph.runs[tagged].centreline else { return Err("arc run".into()) };
+        let len = (to.x - from.x).hypot(to.y - from.y);
+        let copies = ((len - 138.0) / 400.0).floor() as usize + 1;
+        assert_eq!((r.bands, r.lines.len()), (2, 2 + 4 * copies), "{r:?}");
+        let mut us: Vec<f64> = r.lines[..2].iter().map(|l| r6(l.from.x)).collect();
+        us.sort_by(f64::total_cmp);
+        assert_eq!(us, [50.0, 300.0]);
+        assert!(r.lines[2..].iter().all(|l| l.layer == "STUD"));
+        let total: usize = runs.iter().map(|r| r.lines.len()).sum();
+        let out = s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        assert_eq!(out["lines"].as_u64(), Some(total as u64), "{out}");
+        assert_eq!(s.doc()?.block(&assembly_block_name(sec)).ok_or("no block")?.entities.len(), total);
+        Ok(())
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use cadcraft_doc::{Drawing, EntityKind, Handle};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
 use lamb_core::derivation::assembly::{FaceRef, WidthConflict};
-use lamb_core::derivation::wall_spaces::SideKind;
+use lamb_core::derivation::wall_spaces::outside_on_left;
 use lamb_core::derivation::walls::RunCurve;
 use lamb_core::model::Id;
 use serde_json::{Value, json};
@@ -159,11 +159,7 @@ fn plan_moves(d: &Drawing, plan: Id, only: Option<&[usize]>, hold: Hold) -> Resu
         }
         let (run, side) = (&graph.runs[r.run], &sides.runs[r.run]);
         let RunCurve::Line { from, to } = run.centreline else { continue };
-        let outside_left = match (side.left, side.right) {
-            (SideKind::Outside, SideKind::Space(_)) => true,
-            (SideKind::Space(_), SideKind::Outside) => false,
-            _ => continue,
-        };
+        let Some(outside_left) = outside_on_left(side) else { continue };
         let (dx, dy) = (to.x - from.x, to.y - from.y);
         let len = dx.hypot(dy);
         for (face, amount) in hold.moves(&c) {

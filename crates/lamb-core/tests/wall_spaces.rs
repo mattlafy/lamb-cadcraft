@@ -8,7 +8,7 @@ use std::f64::consts::PI;
 
 use common::{VIEW, add_layer, on_layer, project, pt, wall};
 use lamb_core::derivation::wall_junctions::wall_graph;
-use lamb_core::derivation::wall_spaces::{SideKind, SideParams, WallSides, wall_sides};
+use lamb_core::derivation::wall_spaces::{SideKind, SideParams, WallSides, outside_on_left, wall_sides};
 use lamb_core::derivation::walls::{RunCurve, WallRunParams};
 use lamb_core::geometry::Point2;
 use lamb_core::model::{AnyView, DrawingEntity, Project};
@@ -227,6 +227,40 @@ fn lone_garden_wall_is_outside_on_both_sides() {
     assert_eq!(s.runs.len(), 1);
     let r = &s.runs[0];
     assert_eq!((r.left, r.right, r.exterior), (SideKind::Outside, SideKind::Outside, true));
+}
+
+#[test]
+fn open_run_takes_its_exterior_side_from_an_outside_point_beside_it() {
+    let p = project(vec![wall(1, &[(0.0, 0.0), (5000.0, 0.0)]), wall(2, &[(0.0, 200.0), (5000.0, 200.0)])]);
+    let c = graph_runs(&p)[0];
+    let RunCurve::Line { from, to } = c else { panic!("{c:?}") };
+    let one = |pts: Vec<Point2>| {
+        let r = sides(&p, &SideParams { outside_points: pts, ..SideParams::default() }).runs[0].clone();
+        assert_eq!((r.left, r.right, r.exterior), (SideKind::Outside, SideKind::Outside, true));
+        (r.open_outside_left, outside_on_left(&r))
+    };
+    assert_eq!(one(vec![beside(&c, false)]), (Some(false), Some(false)));
+    assert_eq!(one(vec![beside(&c, true)]), (Some(true), Some(true)));
+    // The nearest point beside the run wins.
+    let far_left = pt(2500.0 + (beside(&c, true).x - 2500.0) * 10.0, 100.0 + (beside(&c, true).y - 100.0) * 10.0);
+    assert_eq!(one(vec![far_left, beside(&c, false)]), (Some(false), Some(false)));
+    // Beyond the run's end, inside its faces, or no point at all: undecided.
+    let beyond = pt(to.x + (to.x - from.x).signum() * 1000.0, 400.0);
+    assert_eq!(one(vec![beyond]), (None, None));
+    assert_eq!(one(vec![pt(2500.0, 150.0)]), (None, None));
+    assert_eq!(one(Vec::new()), (None, None));
+}
+
+#[test]
+fn closed_room_sides_ignore_open_resolution() {
+    let p = project(closed_room(1, 0.0));
+    let plain = sides(&p, &SideParams::default());
+    let with_point = sides(&p, &SideParams { outside_points: vec![pt(-1000.0, 2000.0)], ..SideParams::default() });
+    assert_eq!(plain, with_point);
+    for r in &plain.runs {
+        assert_eq!(r.open_outside_left, None);
+        assert_eq!(outside_on_left(r), Some(r.left == SideKind::Outside));
+    }
 }
 
 #[test]

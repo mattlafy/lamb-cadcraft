@@ -12,7 +12,9 @@
 //!
 //! Overrides, passed as [`SideParams`] until a later task stores them: an outside pick point turns
 //! the smallest space containing it into `Outside` (a courtyard); a run with a face on an exterior
-//! layer is `exterior` whatever its sides say.
+//! layer is `exterior` whatever its sides say. A structure that doesn't close (both sides of a run
+//! `Outside`) takes a straight run's exterior side from the nearest outside pick point beside it
+//! ([`RunSides::open_outside_left`]).
 //!
 //! Not handled: a structure standing inside another's room (a separate component nested in a
 //! space) — its outer face is reported `Outside` and the enclosing space does not know about it.
@@ -23,7 +25,7 @@ use super::read::ProjectRead;
 use super::wall_junctions::{RunEnd, WallGraph, run_ends};
 use super::walls::RunCurve;
 use crate::geometry::Point2;
-use crate::geometry::point::{angle_of2, dist2, scale2, sub2};
+use crate::geometry::point::{angle_of2, cross2, dist2, dot2, scale2, sub2};
 use crate::geometry::tolerance::TOLERANCE;
 use crate::geometry::triangulate::polygon_area_signed;
 
@@ -41,6 +43,44 @@ pub struct RunSides {
     pub right: SideKind,
     /// A side is `Outside`, or a face is on an exterior layer.
     pub exterior: bool,
+    /// For a straight run with both sides `Outside`: whether the nearest outside pick point beside
+    /// it lies to the left. `None` when no point resolves it, and for every other run.
+    pub open_outside_left: Option<bool>,
+}
+
+/// Whether the run's exterior side is the left of its centreline's travel: the single `Outside`
+/// side, or for an open structure [`RunSides::open_outside_left`]. `None` when undecided.
+pub fn outside_on_left(sides: &RunSides) -> Option<bool> {
+    match (sides.left, sides.right) {
+        (SideKind::Outside, SideKind::Space(_)) => Some(true),
+        (SideKind::Space(_), SideKind::Outside) => Some(false),
+        (SideKind::Outside, SideKind::Outside) => sides.open_outside_left,
+        _ => None,
+    }
+}
+
+/// The side (left = `true`) of the straight centreline `from → to` holding the nearest of `points`
+/// beside the run: projecting within its extent (± `TOLERANCE.grouping_mm`) and off its faces.
+fn open_side(from: Point2, to: Point2, width: f64, points: &[Point2]) -> Option<bool> {
+    let len = dist2(from, to);
+    if len <= TOLERANCE.coincidence_mm {
+        return None;
+    }
+    let dir = scale2(sub2(to, from), 1.0 / len);
+    let g = TOLERANCE.grouping_mm;
+    let mut best: Option<(f64, bool)> = None;
+    for &q in points {
+        let v = sub2(q, from);
+        let t = dot2(v, dir);
+        let c = cross2(dir, v);
+        if t < -g || t > len + g || c.abs() <= width / 2.0 + TOLERANCE.coincidence_mm {
+            continue;
+        }
+        if best.is_none_or(|(d, _)| c.abs() < d) {
+            best = Some((c.abs(), c > 0.0));
+        }
+    }
+    best.map(|(_, left)| left)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -279,7 +319,13 @@ pub fn wall_sides(p: &impl ProjectRead, graph: &WallGraph, params: &SideParams) 
         .map(|r| {
             let (left, right) = (kind[face_of[2 * r]], kind[face_of[2 * r + 1]]);
             let exterior = left == SideKind::Outside || right == SideKind::Outside || on_exterior_layer(r);
-            RunSides { left, right, exterior }
+            let open_outside_left = match runs[r].centreline {
+                RunCurve::Line { from, to } if left == SideKind::Outside && right == SideKind::Outside => {
+                    open_side(from, to, runs[r].width, &params.outside_points)
+                }
+                _ => None,
+            };
+            RunSides { left, right, exterior, open_outside_left }
         })
         .collect();
     WallSides { runs: run_sides, spaces }

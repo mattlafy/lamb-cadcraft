@@ -11,7 +11,7 @@
 //! Not the AI-line sweep (`crate::sweeps` in the adapter); everything here is "assembly".
 
 use super::wall_junctions::{Junction, RunEnd};
-use super::wall_spaces::{RunSides, SideKind};
+use super::wall_spaces::{RunSides, outside_on_left};
 use super::walls::{RunCurve, WallRun};
 use crate::geometry::Point2;
 use crate::geometry::tolerance::TOLERANCE;
@@ -141,13 +141,9 @@ impl FaceFrame {
 }
 
 /// Whether the `face` side of a run is the left of its centreline's travel: the `Outside` side for
-/// `Exterior`, the other for `Interior`. Errors unless exactly one side is `Outside`.
+/// `Exterior`, the other for `Interior`. Errors unless [`outside_on_left`] decides it.
 fn face_on_left(sides: &RunSides, face: FaceRef) -> Result<bool, String> {
-    let outside_left = match (sides.left, sides.right) {
-        (SideKind::Outside, SideKind::Space(_)) => true,
-        (SideKind::Space(_), SideKind::Outside) => false,
-        _ => return Err("no single exterior side".into()),
-    };
+    let outside_left = outside_on_left(sides).ok_or("no single exterior side")?;
     Ok(outside_left == (face == FaceRef::Exterior))
 }
 
@@ -372,6 +368,7 @@ pub fn mitre_end(line: &mut AssemblyLine, end: RunEnd, point: Point2, bisector: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derivation::wall_spaces::SideKind;
     use crate::derivation::walls::RunFace;
     use crate::model::{Id, LinkAnchor};
 
@@ -433,12 +430,12 @@ mod tests {
         let bands = [Band { offset: -20.0, layer: "CLAD".into() }, Band { offset: 200.0, layer: "GYP".into() }];
         let r = run(p(0.0, 100.0), p(5000.0, 100.0), 200.0);
         // Travelling +x, right is -y: outside below, face at y = 0.
-        let right_out = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let right_out = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
         let out = lay_bands(&r, &right_out, FaceRef::Exterior, &bands).unwrap();
         assert_eq!(ys(&out), [(0.0, -20.0, 5000.0, -20.0), (0.0, 200.0, 5000.0, 200.0)]);
         assert_eq!(out[0].layer, "CLAD");
         // Outside on the left (above): face at y = 200.
-        let left_out = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
+        let left_out = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
         assert_eq!(ys(&lay_bands(&r, &left_out, FaceRef::Exterior, &bands).unwrap()), [(0.0, 220.0, 5000.0, 220.0), (0.0, 0.0, 5000.0, 0.0)]);
         // Interior face of the first case is the top face, y = 200.
         assert_eq!(ys(&lay_bands(&r, &right_out, FaceRef::Interior, &bands).unwrap()), [(0.0, 220.0, 5000.0, 220.0), (0.0, 0.0, 5000.0, 0.0)]);
@@ -448,9 +445,9 @@ mod tests {
     fn ambiguous_sides_are_errors() {
         let bands = [Band { offset: 0.0, layer: "A".into() }];
         let r = run(p(0.0, 0.0), p(1000.0, 0.0), 200.0);
-        let both = RunSides { left: SideKind::Outside, right: SideKind::Outside, exterior: true };
+        let both = RunSides { left: SideKind::Outside, right: SideKind::Outside, exterior: true, open_outside_left: None };
         assert_eq!(lay_bands(&r, &both, FaceRef::Exterior, &bands).unwrap_err(), "no single exterior side");
-        let neither = RunSides { left: SideKind::Space(0), right: SideKind::Space(1), exterior: false };
+        let neither = RunSides { left: SideKind::Space(0), right: SideKind::Space(1), exterior: false, open_outside_left: None };
         assert_eq!(lay_bands(&r, &neither, FaceRef::Interior, &bands).unwrap_err(), "no single exterior side");
     }
 
@@ -472,8 +469,8 @@ mod tests {
     fn bands_lay_as_concentric_arcs_along_an_arc_run() {
         use std::f64::consts::FRAC_PI_2;
         let bands = arc_bands();
-        let outside_right = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
-        let outside_left = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
+        let outside_right = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
+        let outside_left = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
         // Exterior outside the curve, travelling CCW (left is toward the centre).
         let ccw = lay_bands(&arc_run(1000.0, FRAC_PI_2), &outside_right, FaceRef::Exterior, &bands).unwrap();
         assert_eq!(radii(&ccw), [1120.0, 1050.0, 900.0]);
@@ -494,14 +491,14 @@ mod tests {
 
     #[test]
     fn a_band_past_the_centre_of_an_arc_run_is_an_error() {
-        let sides = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let sides = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
         let deep = [Band { offset: 1000.0, layer: "A".into() }];
         assert_eq!(lay_bands(&arc_run(300.0, 1.0), &sides, FaceRef::Exterior, &deep).unwrap_err(), "band radius is not positive");
     }
 
     #[test]
     fn mitre_end_leaves_an_arc_unchanged() {
-        let sides = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let sides = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
         let mut a = lay_bands(&arc_run(1000.0, 1.0), &sides, FaceRef::Exterior, &arc_bands()).unwrap().remove(0);
         let before = a.clone();
         mitre_end(&mut a, RunEnd::Start, p(0.0, 0.0), p(0.0, 1.0));
@@ -541,7 +538,7 @@ mod tests {
         let (frame, members) = stud();
         let r = run(p(0.0, 100.0), p(2000.0, 100.0), 200.0);
         // Outside below (right of +x): face at y = 0, into the wall is +y.
-        let right_out = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let right_out = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
         let out = lay_repeat(&r, &right_out, FaceRef::Exterior, &frame, &members, p(400.0, 0.0), None).unwrap();
         assert_eq!(out.len(), 20, "k = 0..4, four segments each");
         assert!(out.iter().all(|l| l.layer == "STUD"));
@@ -552,7 +549,7 @@ mod tests {
             assert_eq!(got[4 * k..4 * k + 4], want, "copy {k}");
         }
         // Outside above: face at y = 200, into the wall is -y.
-        let left_out = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
+        let left_out = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
         let got = rounded(&lay_repeat(&r, &left_out, FaceRef::Exterior, &frame, &members, p(400.0, 0.0), None).unwrap());
         assert_eq!(got.len(), 20);
         assert_eq!(got[0], (100.0, 150.0, 138.0, 150.0));
@@ -565,7 +562,7 @@ mod tests {
     fn a_repeat_uses_only_the_along_component_of_its_pitch() {
         let (frame, members) = stud();
         let r = run(p(0.0, 100.0), p(2000.0, 100.0), 200.0);
-        let sides = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let sides = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
         assert!(lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(0.0, 400.0), None).unwrap().is_empty());
         let skew = lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 30.0), None).unwrap();
         let straight = lay_repeat(&r, &sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0), None).unwrap();
@@ -592,7 +589,7 @@ mod tests {
         let (frame, members) = stud();
         let grid = RepeatGrid { origin: p(13.0, 7.0), pitch: 406.4, pitch_tolerance_mm: 5.0 };
         let r = run(p(0.0, 100.0), p(5000.0, 100.0), 200.0);
-        let right_out = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
+        let right_out = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
         let out = lay_repeat(&r, &right_out, FaceRef::Exterior, &frame, &members, p(406.0, 0.0), Some(&grid)).unwrap();
         let centres = copy_centres(&out);
         assert_eq!(centres.len(), 12);
@@ -606,7 +603,7 @@ mod tests {
         }
         // The same wall drawn the other way: outside is now on its left; the centres are the same.
         let rev = run(p(5000.0, 100.0), p(0.0, 100.0), 200.0);
-        let left_out = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
+        let left_out = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
         let mut back = copy_centres(&lay_repeat(&rev, &left_out, FaceRef::Exterior, &frame, &members, p(406.0, 0.0), Some(&grid)).unwrap());
         back.sort_by(f64::total_cmp);
         assert_eq!(back.len(), centres.len());
@@ -624,8 +621,8 @@ mod tests {
         use std::f64::consts::FRAC_PI_2;
         let frame = detail_frame((p(0.0, 0.0), p(1000.0, 0.0)), &[l((0.0, 200.0), (1000.0, 200.0), "GYP")]).unwrap();
         let members = vec![l((100.0, 50.0), (100.0, 200.0), "STUD")];
-        let outside_right = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true };
-        let outside_left = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true };
+        let outside_right = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
+        let outside_left = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
         let check = |sweep: f64, sides: &RunSides, rf: f64, radii: (f64, f64)| {
             let out = lay_repeat(&arc_run(1000.0, sweep), sides, FaceRef::Exterior, &frame, &members, p(400.0, 0.0), None).unwrap();
             let n = ((rf * FRAC_PI_2 - 100.0) / 400.0).floor() as usize + 1;
