@@ -34,9 +34,10 @@ visible and is listed below with its upstream PR.
 
 ## Our upstream PRs in `lamb`
 
-Our open upstream PRs are merged into `lamb` (merge, never rebase), and merged again when their
-branch is updated. A PR that mostly moves existing code waits until upstream merges it. A PR closed
-unmerged is reverted here or becomes a patch above.
+Our upstream PRs exist to help LAMB, so each is merged into `lamb` (merge, never rebase) once open,
+and merged again when its branch is updated. One rejected upstream stays here as a patch above. A PR
+that mostly moves existing code to ease syncing waits until upstream merges it, and is dropped if
+upstream rejects it.
 
 | PR | Branch | In `lamb` |
 |---|---|---|
