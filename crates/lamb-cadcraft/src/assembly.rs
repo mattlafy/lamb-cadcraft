@@ -361,7 +361,8 @@ fn face_ids<'a>(runs: impl IntoIterator<Item = &'a WallRun>) -> Vec<Id> {
 
 /// The assembly plans' own gaps as RESOLVE issues (§10): for every plan or section view that has an assembly
 /// block, in document view order, each laid run's width conflict (by run), then each junction with
-/// no corner detail that has a laid arm (by junction). Locations are view-local.
+/// no corner detail that has a laid arm (by junction), then each run that got no detail — any skip
+/// reason, LAMB T471 (by run). Locations are view-local.
 pub(crate) fn wall_issues(d: &Drawing) -> Result<Vec<Issue>, String> {
     let doc = read_document(d).map_err(|e| e.to_string())?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
@@ -409,6 +410,16 @@ pub(crate) fn wall_issues(d: &Drawing) -> Result<Vec<Issue>, String> {
                 junction.point,
                 face_ids(junction.arms.iter().filter_map(|a| graph.runs.get(a.run))),
                 format!("Corner at ({:.0}, {:.0}) has no corner detail{suffix}", junction.point.x, junction.point.y),
+            ));
+        }
+        for r in &runs {
+            let (Some(why), Some(run)) = (&r.skipped, graph.runs.get(r.run)) else { continue };
+            out.push(issue(
+                IssueKind::UndetailedRun,
+                format!("undetailed_run:{plan}:{}", r.run),
+                run_midpoint(run),
+                face_ids([run]),
+                format!("Wall run {} has no detail ({why})", r.run),
             ));
         }
     }
@@ -1079,6 +1090,53 @@ pub(crate) mod tests {
 
         let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
         assert_eq!(s.execute("wallconflicts", &json!({ "viewId": plan.0 }))?, json!({ "conflicts": [] }));
+        Ok(())
+    }
+
+    #[test]
+    fn wall_issues_list_each_undetailed_run_after_the_corners() -> R {
+        let (mut s, plan) = room("exterior_face", false)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let list = wall_issues(s.doc()?)?;
+        assert_eq!(list.len(), 4, "{list:?}");
+        let p = DrawingProject::new(s.doc()?)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        for (i, u) in list.iter().enumerate() {
+            assert_eq!(u.kind, IssueKind::UndetailedRun);
+            assert_eq!(u.id, format!("undetailed_run:{plan}:{i}"));
+            assert_eq!(u.priority, 7);
+            assert_eq!(u.note, format!("Wall run {i} has no detail (untyped)"));
+            assert_eq!(u.entity_ids.len(), 2, "{u:?}");
+            assert_eq!(u.location, run_midpoint(&graph.runs[i]));
+        }
+        assert_eq!(serde_json::to_value(&list[0])?["kind"], "undetailed_run");
+
+        let (mut s, plan) = room("exterior_face", true)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert!(wall_issues(s.doc()?)?.iter().all(|i| i.kind != IssueKind::UndetailedRun), "fully tagged room");
+        Ok(())
+    }
+
+    #[test]
+    fn two_different_edge_tags_list_the_runs_between_them() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        let d2 = Id(s.execute("newdetail", &json!({ "name": "D2" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": d2.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": format!("{:X}", r.0), "kind": "exterior_face" }))?;
+        line(&mut s, [0.0, 30.0], [1000.0, 30.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("detailtag", &json!({ "detailViewId": d2.0, "tip": {"x": 2500.0, "y": 4000.0}, "bubble": {"x": 2500.0, "y": 5000.0} }))?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let runs = assembly_lines(s.doc()?, plan)?;
+        let skipped: Vec<usize> = runs.iter().filter(|r| r.skipped.is_some()).map(|r| r.run).collect();
+        assert_eq!(skipped.len(), 2, "the two side walls: {runs:?}");
+        let all = wall_issues(s.doc()?)?;
+        assert!(all.iter().any(|i| i.kind == IssueKind::UndetailedCorner), "{all:?}");
+        let first_run = all.iter().position(|i| i.kind == IssueKind::UndetailedRun).ok_or("no run issue")?;
+        assert!(all[first_run..].iter().all(|i| i.kind == IssueKind::UndetailedRun), "runs come after the corners: {all:?}");
+        let listed: Vec<String> = all.into_iter().filter(|i| i.kind == IssueKind::UndetailedRun).map(|i| i.id).collect();
+        assert_eq!(listed, skipped.iter().map(|i| format!("undetailed_run:{plan}:{i}")).collect::<Vec<_>>());
         Ok(())
     }
 

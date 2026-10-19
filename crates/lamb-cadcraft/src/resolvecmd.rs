@@ -1,6 +1,7 @@
 //! RESOLVE (LAMB T351, TS `resolveCommand.ts`, T158): step through lamb-core's [`find_issues`]
 //! list followed by the assembly plans' own gaps ([`wall_issues`], LAMB T393: width conflicts and
-//! junctions with no corner detail, for plans that have an assembly block). Each step edits the issue's view, centres the camera on its location (block coordinates
+//! junctions with no corner detail, then runs with no detail (LAMB T471), for plans that have an
+//! assembly block). Each step edits the issue's view, centres the camera on its location (block coordinates
 //! are the view's local coordinates, so no transform), names it on the command line and haloes its
 //! entities ([`crate::overlays::halo`]). The list is snapshotted when the command starts and never
 //! re-derived mid-command; `Next`/`Previous` (or a typed `>`/`<`) step, clamped at both ends;
@@ -226,6 +227,30 @@ mod tests {
         s.input(Input::Enter)?;
         assert!(s.running.is_none(), "Enter ends it");
         assert_eq!(current_attention(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_steps_onto_an_undetailed_run_with_its_faces_haloed() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        set_attention(None);
+        let (mut s, plan) = crate::assembly::tests::room_with("exterior_face", false, 200.0)?;
+        let core = find_issues(&DrawingProject::new(s.doc()?)?)?.len();
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let found = issues(&s)?;
+        assert_eq!(found.len(), core + 4);
+        let first = &found[core];
+        assert_eq!(first.id, format!("undetailed_run:{plan}:0"));
+        s.start("resolve")?;
+        for _ in 0..core {
+            s.input(Input::Keyword("Next".into()))?;
+        }
+        assert!(at(&s, first)?, "the plan's view, centred on the run midpoint");
+        let (block, handles) = current_attention().ok_or("no halo")?;
+        assert_eq!(block, view_block_name(plan));
+        assert_eq!(handles.len(), 2);
+        assert_eq!(handles, first.entity_ids.iter().map(|e| Handle(e.0)).collect::<Vec<_>>());
+        s.input(Input::Cancel)?;
         Ok(())
     }
 
