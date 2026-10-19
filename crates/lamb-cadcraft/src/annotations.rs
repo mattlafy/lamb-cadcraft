@@ -1,12 +1,15 @@
 //! Generated annotation (LAMB's `docs/07-architecture/cadcraft-integration.md` §5, LAMB T474):
 //! every placed plan gets a plotted section cut symbol for each placed vertical view whose cut line
 //! projects into it — the cut LINE, a gaze arrow at each end, and the section's name at each end
-//! (plus `<n>/<layout>` when a sheet shows the section, [`crate::sheets::sheet_refs`]).
+//! (plus `<n>/<layout>` when a sheet shows the section, [`crate::sheets::sheet_refs`]) — and every
+//! placed section or elevation gets a plotted level line for each LEVEL (LAMB T473): a LINE at the
+//! level's projected floor elevation spanning the view block's extents ±[`LEVEL_OVERRUN_MM`], and
+//! `"<name> <±elev>"` left-aligned past its right end. Plan cut elevations stay overlay-only.
 //!
-//! The symbols live in their own block per plan, [`annotation_block_name`]`(plan)`, never in the
+//! The annotation lives in its own block per view, [`annotation_block_name`]`(view)`, never in the
 //! view block, so derivation, the wall graph, links and LAMBSAVE never see them. The block's one
-//! model-space INSERT sits at the origin on the plan's own view layer, so a sheet viewport showing
-//! the plan shows its annotation and every other viewport freezes it. [`annotation_observer`]
+//! model-space INSERT sits at the origin on the view's own view layer, so a sheet viewport showing
+//! the view shows its annotation and every other viewport freezes it. [`annotation_observer`]
 //! regenerates the blocks after every command, writing the drawing back only when one changed, so
 //! the change lands in the command's own undo step.
 
@@ -16,6 +19,8 @@ use cadcraft_doc::{Block, Common, Drawing, Entity, EntityKind, HAlign, Insert, L
 use cadcraft_engine::Session;
 use cadcraft_geom::Vec3;
 use lamb_core::derivation::markers::compute_cut_lines_for_view;
+use lamb_core::derivation::projection::{Uz, vertical_uz_to_local};
+use lamb_core::derivation::read::{ProjectRead, ViewKind};
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id};
 
@@ -31,14 +36,23 @@ pub const CUT_HEAD_MM: f64 = 200.0;
 pub const CUT_TEXT_MM: f64 = 250.0;
 /// The name sits this far beyond the arrow's tip.
 const CUT_TEXT_GAP_MM: f64 = 300.0;
+/// A level line runs this far past the view block's extents at each end.
+pub const LEVEL_OVERRUN_MM: f64 = 1000.0;
+/// A level label's text height.
+pub const LEVEL_TEXT_MM: f64 = 250.0;
+/// The level label starts this far past the line's right end.
+const LEVEL_TEXT_GAP_MM: f64 = 200.0;
 /// Every generated entity's layer inside the block.
 const LAYER: &str = "0";
 
-/// One generated entity, in plan-local coordinates.
+/// One generated entity, in view-local coordinates.
 #[derive(Clone, Debug, PartialEq)]
 enum Item {
     Line(Vec3, Vec3),
+    /// A cut symbol's name: centred, [`CUT_TEXT_MM`] high.
     Text(Vec3, String),
+    /// A level label: left-aligned, [`LEVEL_TEXT_MM`] high.
+    Label(Vec3, String),
 }
 
 fn v(x: f64, y: f64) -> Vec3 {
@@ -49,12 +63,15 @@ fn near(a: Vec3, b: Vec3) -> bool {
     (a.x - b.x).hypot(a.y - b.y) <= TOLERANCE.coincidence_mm
 }
 
-/// The cut symbols plan `plan` wants, in write order; nothing for an unplaced plan.
-fn wanted(d: &Drawing, plan: Id, sheet_of: &dyn Fn(Id) -> Option<String>) -> Result<Vec<Item>, String> {
+/// What view `id` wants, in write order: a plan its cut symbols, a vertical view its level lines;
+/// nothing for an unplaced view.
+fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>) -> Result<Vec<Item>, String> {
     let dp = DrawingProject::new(d).map_err(|e| e.to_string())?;
-    if dp.document().views.iter().find(|v| v.id() == plan).is_none_or(|v| v.placement().is_none()) {
-        return Ok(Vec::new());
+    let Some(view) = dp.view(id).filter(|v| v.placement.is_some()) else { return Ok(Vec::new()) };
+    if view.kind == ViewKind::Vertical {
+        return Ok(level_lines(d, &dp, id));
     }
+    let plan = id;
     let mut out = Vec::new();
     for c in compute_cut_lines_for_view(&dp, plan)? {
         let (g, n) = ((c.gaze_dir.x, c.gaze_dir.y), c.name);
@@ -81,17 +98,45 @@ fn wanted(d: &Drawing, plan: Id, sheet_of: &dyn Fn(Id) -> Option<String>) -> Res
     Ok(out)
 }
 
-fn text(at: Vec3, value: &str) -> Text {
+/// `"+0"`, `"+3000"`, `"-2700"`: signed whole millimetres, never `-0`.
+fn signed_mm(z: f64) -> String {
+    let r = z.round();
+    format!("{:+.0}", if r == 0.0 { 0.0 } else { r })
+}
+
+/// Placed vertical view `id`'s level lines: per LEVEL (by `order`, then id) a LINE at its projected
+/// floor elevation across the view block's x-extents ±[`LEVEL_OVERRUN_MM`], then its label. An
+/// empty view block wants none.
+fn level_lines(d: &Drawing, dp: &DrawingProject, id: Id) -> Vec<Item> {
+    let Some(view) = dp.view(id) else { return Vec::new() };
+    let ext = d.extents(&Space::Block(view_block_name(id)));
+    if ext.is_empty() {
+        return Vec::new();
+    }
+    let (x0, x1) = (ext.min.x - LEVEL_OVERRUN_MM, ext.max.x + LEVEL_OVERRUN_MM);
+    let mut levels: Vec<_> = dp.document().levels.iter().collect();
+    levels.sort_by(|a, b| a.order.total_cmp(&b.order).then(a.id.0.cmp(&b.id.0)));
+    let mut out = Vec::new();
+    for l in levels {
+        let z = l.floor_elevation.value;
+        let y = vertical_uz_to_local(&view, Uz { u: 0.0, z }).y;
+        out.push(Item::Line(v(x0, y), v(x1, y)));
+        out.push(Item::Label(v(x1 + LEVEL_TEXT_GAP_MM, y), format!("{} {}", l.name, signed_mm(z))));
+    }
+    out
+}
+
+fn text(at: Vec3, value: &str, height: f64, halign: HAlign) -> Text {
     Text {
         insert: at,
         align_pt: Some(at),
-        height: CUT_TEXT_MM,
+        height,
         value: value.into(),
         rotation: 0.0,
         width_factor: 1.0,
         oblique: 0.0,
         style: "Standard".into(),
-        halign: HAlign::Center,
+        halign,
         valign: VAlign::Middle,
     }
 }
@@ -99,7 +144,8 @@ fn text(at: Vec3, value: &str) -> Text {
 fn entity_of(i: &Item) -> EntityKind {
     match i {
         Item::Line(a, b) => EntityKind::Line(Line { a: *a, b: *b }),
-        Item::Text(at, s) => EntityKind::Text(text(*at, s)),
+        Item::Text(at, s) => EntityKind::Text(text(*at, s, CUT_TEXT_MM, HAlign::Center)),
+        Item::Label(at, s) => EntityKind::Text(text(*at, s, LEVEL_TEXT_MM, HAlign::Left)),
     }
 }
 
@@ -111,13 +157,18 @@ fn block_matches(block: &Block, want: &[Item]) -> bool {
             e.common.layer == LAYER
                 && match (&e.kind, w) {
                     (EntityKind::Line(l), Item::Line(a, b)) => near(l.a, *a) && near(l.b, *b),
-                    (EntityKind::Text(t), Item::Text(at, s)) => near(t.align_pt.unwrap_or(t.insert), *at) && t.value == *s,
+                    (EntityKind::Text(t), Item::Text(at, s)) => {
+                        t.halign == HAlign::Center && near(t.align_pt.unwrap_or(t.insert), *at) && t.value == *s
+                    }
+                    (EntityKind::Text(t), Item::Label(at, s)) => {
+                        t.halign == HAlign::Left && near(t.align_pt.unwrap_or(t.insert), *at) && t.value == *s
+                    }
                     _ => false,
                 }
         })
 }
 
-/// The block's canonical model-space INSERT: at the origin, scale 1, on the plan's view layer.
+/// The block's canonical model-space INSERT: at the origin, scale 1, on the view's own layer.
 /// Added only when model space has no INSERT of the block.
 fn ensure_insert(d: &mut Drawing, plan: Id) {
     let name = annotation_block_name(plan);
@@ -152,14 +203,14 @@ fn replace_block(d: &mut Drawing, plan: Id, items: &[Item]) -> Result<(), String
     Ok(())
 }
 
-/// Per plan whose block must change: the plan and its wanted items.
+/// Per view whose block must change: the view and its wanted items.
 fn plan_changes(d: &Drawing) -> Result<Vec<(Id, Vec<Item>)>, String> {
     let doc = read_document(d).map_err(|e| e.to_string())?;
     let blocks: Vec<(Id, String)> = doc.views.iter().map(|v| (v.id(), view_block_name(v.id()))).collect();
     let refs = sheet_refs(d, &blocks);
     let sheet_of = |id: Id| refs.iter().find(|(v, _, _)| *v == id).map(|(_, n, l)| format!("{n}/{l}"));
     let mut out = Vec::new();
-    for p in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_))).map(AnyView::id) {
+    for p in doc.views.iter().map(AnyView::id) {
         let want = wanted(d, p, &sheet_of)?;
         let changed = match d.block(&annotation_block_name(p)) {
             Some(b) => !block_matches(b, &want),
@@ -172,9 +223,9 @@ fn plan_changes(d: &Drawing) -> Result<Vec<(Id, Vec<Item>)>, String> {
     Ok(out)
 }
 
-/// The after-command observer: every plan's [`annotation_block_name`] block made to equal its
-/// wanted cut symbols — untouched when it already does, rewritten (and given its INSERT) when not,
-/// emptied but kept when the plan now wants nothing. The drawing is written back only when some
+/// The after-command observer: every view's [`annotation_block_name`] block made to equal its
+/// wanted annotation — untouched when it already does, rewritten (and given its INSERT) when not,
+/// emptied but kept when the view now wants nothing. The drawing is written back only when some
 /// block changed; an error is echoed and changes nothing.
 pub fn annotation_observer(s: &mut Session, _before: &Arc<Drawing>) {
     let todo = match s.doc().map_err(|e| e.to_string()).and_then(plan_changes) {
@@ -236,6 +287,7 @@ mod tests {
                 }
                 match &e.kind {
                     EntityKind::Line(l) => Ok(Item::Line(l.a, l.b)),
+                    EntityKind::Text(t) if t.halign == HAlign::Left => Ok(Item::Label(t.align_pt.unwrap_or(t.insert), t.value.clone())),
                     EntityKind::Text(t) => Ok(Item::Text(t.align_pt.unwrap_or(t.insert), t.value.clone())),
                     _ => Err("unexpected kind".into()),
                 }
@@ -244,7 +296,7 @@ mod tests {
     }
 
     fn texts(s: &Session, plan: Id) -> T<Vec<String>> {
-        Ok(items(s, plan)?.into_iter().filter_map(|i| if let Item::Text(_, t) = i { Some(t) } else { None }).collect())
+        Ok(items(s, plan)?.into_iter().filter_map(|i| if let Item::Text(_, t) | Item::Label(_, t) = i { Some(t) } else { None }).collect())
     }
 
     fn undo_len(s: &Session) -> T<usize> {
@@ -361,6 +413,135 @@ mod tests {
         let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(d).as_bytes()).map_err(|e| format!("{e:?}"))?;
         assert!(back.model.iter().any(|e| matches!(&e.kind, EntityKind::Insert(i) if i.block == annotation_block_name(plan))));
         assert!(plan_changes(&back)?.is_empty(), "the observer would change nothing after a round trip");
+        Ok(())
+    }
+    /// [`fixture`] plus `Level 2` at 3000 and a 4000-wide rectangle drawn in the section from
+    /// (0,0); returns (session, plan, section, level 1, level 2).
+    fn levelled() -> T<(Session, Id, Id, Id, Id)> {
+        let (mut s, plan, sec) = fixture()?;
+        let l1 = read_document(s.doc()?)?.levels.first().ok_or("no level")?.id;
+        let l2 =
+            Id(s.execute("level", &json!({ "mode": "create", "name": "Level 2", "floorElevationMm": 3000 }))?["levelId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
+        Ok((s, plan, sec, l1, l2))
+    }
+
+    /// The level lines' (y, x0, x1, label) per level, in block order.
+    fn levels_of(s: &Session, view: Id) -> T<Vec<(f64, f64, f64, String)>> {
+        let it = items(s, view)?;
+        it.chunks(2)
+            .map(|c| match c {
+                [Item::Line(a, b), Item::Label(at, t)] => {
+                    assert!((a.y - b.y).abs() < 1e-9 && (at.y - a.y).abs() < 1e-9 && (at.x - b.x - LEVEL_TEXT_GAP_MM).abs() < 1e-9);
+                    Ok((a.y, a.x, b.x, t.clone()))
+                }
+                _ => Err(format!("not a level line: {c:?}").into()),
+            })
+            .collect()
+    }
+
+    fn local_y(s: &Session, view: Id, z: f64) -> T<f64> {
+        let d = s.doc()?;
+        let dp = DrawingProject::new(d)?;
+        let vr = dp.view(view).ok_or("no view")?;
+        Ok(vertical_uz_to_local(&vr, Uz { u: 0.0, z }).y)
+    }
+
+    #[test]
+    fn a_placed_section_gets_a_level_line_per_level_and_its_block_is_unchanged() -> R {
+        let (s, plan, sec, _l1, _l2) = levelled()?;
+        let (y0, y1) = (local_y(&s, sec, 0.0)?, local_y(&s, sec, 3000.0)?);
+        assert!((y1 - y0 - 3000.0).abs() < 1e-6, "{y0} {y1}");
+        let ext = s.doc()?.extents(&Space::Block(view_block_name(sec)));
+        let (x0, x1) = (ext.min.x - LEVEL_OVERRUN_MM, ext.max.x + LEVEL_OVERRUN_MM);
+        let got = levels_of(&s, sec)?;
+        assert_eq!(got.len(), 2, "{got:?}");
+        for ((y, a, b, t), (wy, wt)) in got.iter().zip([(y0, "Level 1 +0"), (y1, "Level 2 +3000")]) {
+            assert!((y - wy).abs() < 1e-6 && (a - x0).abs() < 1e-6 && (b - x1).abs() < 1e-6, "{y} {a} {b}");
+            assert_eq!(t, wt);
+        }
+        // The section's own block holds only what was drawn; the plan keeps its cut symbols only.
+        assert_eq!(s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.len(), 1);
+        assert_eq!(texts(&s, plan)?, ["A-A", "A-A"]);
+        assert_eq!(inserts(&s, sec)?, [view_block_name(sec)]);
+        let t = s.doc()?.block(&annotation_block_name(sec)).ok_or("no block")?;
+        let Some(EntityKind::Text(tx)) = t.entities.iter().nth(1).map(|e| &e.kind) else { return Err("no label".into()) };
+        assert_eq!((tx.height, tx.halign), (LEVEL_TEXT_MM, HAlign::Left));
+        Ok(())
+    }
+
+    #[test]
+    fn level_edits_move_and_relabel_the_line_in_one_undo_step_and_longer_geometry_widens_it() -> R {
+        let (mut s, _plan, sec, l1, l2) = levelled()?;
+        let before = levels_of(&s, sec)?;
+        let n = undo_len(&s)?;
+        s.execute("level", &json!({ "mode": "elevation", "levelId": l2.0, "floorElevationMm": 3300 }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        let moved = levels_of(&s, sec)?;
+        assert!((moved[1].0 - local_y(&s, sec, 3300.0)?).abs() < 1e-6 && moved[1].3 == "Level 2 +3300", "{moved:?}");
+        s.undo()?;
+        assert_eq!(levels_of(&s, sec)?, before);
+
+        s.execute("level", &json!({ "mode": "rename", "levelId": l1.0, "name": "Basement" }))?;
+        s.execute("level", &json!({ "mode": "elevation", "levelId": l1.0, "floorElevationMm": -2700 }))?;
+        assert_eq!(levels_of(&s, sec)?[0].3, "Basement -2700");
+
+        s.execute("line", &json!({ "points": [[-2000, 500], [9000, 500]] }))?;
+        let wide = levels_of(&s, sec)?;
+        assert!(
+            wide.iter().all(|l| (l.1 - (-2000.0 - LEVEL_OVERRUN_MM)).abs() < 1e-6 && (l.2 - (9000.0 + LEVEL_OVERRUN_MM)).abs() < 1e-6),
+            "{wide:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn elevations_get_them_unplaced_verticals_and_plans_do_not_unrelated_commands_rewrite_nothing() -> R {
+        let (mut s, plan, sec, _l1, _l2) = levelled()?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let r = s.execute(
+            "newelevationline",
+            &json!({ "name": "North", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 8000}, "cutTo": {"x": 5000, "y": 8000} }),
+        )?;
+        let el = Id(r["viewId"].as_u64().ok_or("no id")?);
+        assert!(block_of(&s, el).is_none_or(|b| b.entities.is_empty()), "an empty elevation wants nothing");
+        s.execute("editview", &json!({ "viewId": el.0 }))?;
+        s.execute("line", &json!({ "points": [[0, 0], [5000, 0]] }))?;
+        assert_eq!(levels_of(&s, el)?.len(), 2);
+        assert!(items(&s, plan)?.iter().all(|i| !matches!(i, Item::Label(..))), "a plan gets no level lines");
+
+        let b0 = block_of(&s, sec).ok_or("no block")?;
+        s.execute("line", &json!({ "points": [[100, 100], [200, 100]] }))?;
+        assert!(Arc::ptr_eq(&b0, &block_of(&s, sec).ok_or("no block")?), "an unrelated command leaves the block alone");
+
+        s.execute("unplaceview", &json!({ "viewId": sec.0 }))?;
+        assert!(items(&s, sec)?.is_empty(), "an unplaced vertical wants nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn level_lines_change_no_marker_link_or_wall_graph_run() -> R {
+        let (s, _plan, sec, _l1, _l2) = levelled()?;
+        let d = s.doc()?;
+        assert!(!items(&s, sec)?.is_empty());
+        let mut bare = d.clone();
+        bare.blocks.remove(&annotation_block_name(sec));
+        let h =
+            bare.model.iter().find(|e| matches!(&e.kind, EntityKind::Insert(i) if i.block == annotation_block_name(sec))).ok_or("no insert")?.handle;
+        bare.model.remove(h);
+        let (with, without) = (DrawingProject::new(d)?, DrawingProject::new(&bare)?);
+        let all = |p: &DrawingProject| -> String {
+            let ids: Vec<Id> = p.views().map(|v| v.id).collect();
+            let ents: String = ids.iter().map(|id| format!("{:?}", p.entities(*id).collect::<Vec<_>>())).collect();
+            let marks: String = ids.iter().map(|id| format!("{:?}", lamb_core::derivation::markers::compute_markers_for_view(p, *id))).collect();
+            let params = lamb_core::derivation::walls::WallRunParams::for_vertical(p.layers());
+            let walls = format!("{:?}", lamb_core::derivation::wall_junctions::wall_graph(p, sec, &params));
+            format!("{ents}|{marks}|{walls}|{:?}", p.document().links)
+        };
+        assert_eq!(all(&with), all(&without));
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(d).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert!(plan_changes(&back)?.is_empty(), "level labels survive a DXF round trip unchanged");
         Ok(())
     }
 }
