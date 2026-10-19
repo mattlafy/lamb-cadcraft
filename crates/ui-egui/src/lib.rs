@@ -8,6 +8,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod aliasdlg;
 pub mod animation;
 pub mod autosave;
 pub mod bedit;
@@ -244,6 +245,8 @@ pub struct CadApp {
     pub gpu_faults: std::sync::Arc<gpu::GpuFaults>,
     /// The notice shown after one (see [`autosave::gpu_notice`]).
     pub gpu_notice: Option<autosave::GpuNotice>,
+    /// The Command Aliases dialog while open ([`aliasdlg`]).
+    pub alias_dlg: Option<aliasdlg::AliasDlgState>,
     /// The Hatch and Gradient dialog while open or picking ([`hatchdlg`]).
     pub hatch_dlg: Option<hatchdlg::HatchDlgState>,
     /// The Edit Block Definition dialog ([`bedit`]).
@@ -291,6 +294,7 @@ impl CadApp {
             recovery: autosave::Recovery::default(),
             gpu_faults: std::sync::Arc::default(),
             gpu_notice: None,
+            alias_dlg: None,
             hatch_dlg: None,
             bedit: bedit::State::default(),
             scene3d: scene3d::Scene3dState::default(),
@@ -654,6 +658,9 @@ impl CadApp {
             chrome::file_tabs(self, ui);
         }
         let has_doc = !self.session.docs.is_empty() && !self.ui.start_tab;
+        if has_doc && !self.ui.show_toolsets {
+            palettes::toolsets_strip(self, ui);
+        }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |ui| {
             if has_doc {
                 docking::show(self, ui);

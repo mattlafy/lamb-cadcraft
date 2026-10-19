@@ -14,7 +14,7 @@ use crate::{Result, Session};
 
 const CMD: &str = "shapes";
 
-pub const PARAMS: &str = "{type?, layer?, window?: [[x,y],[x,y]], crossing?: bool (default true; false = entirely inside), limit? (default 200), offset?, tolerance?: positive number (default 1e-9 × the extents diagonal; near-duplicate vertices and a first vertex equal to the last)} → {schema: 1, count (all closed shapes), returned, offset, truncated, shapes: [{handle, type, layer, perimeter, area (≥ 0), winding: ccw|cw, centroid: [x,y] | null (zero area), selfIntersection: [x,y] | null (the first crossing of two non-adjacent edges), duplicateVertices: [{index, distance} (vertices index and index+1, wrapping)]}], skipped: {<type>: {count, reason}} (the other matches)}: closed polylines, circles, full ellipses and closed splines, arcs and bulges exact";
+pub const PARAMS: &str = "{type?, layer?, window?: [[x,y],[x,y]], crossing?: bool (default true; false = entirely inside), limit? (default 200), offset?, tolerance?: positive number (default 1e-9 × the extents diagonal; near-duplicate vertices and a first vertex equal to the last)} → {schema: 1, count (all closed shapes), returned, offset, truncated, shapes: [{handle, type, layer, perimeter, area (≥ 0), winding: ccw|cw, centroid: [x,y] | null (zero area), selfIntersection: [x,y] | null (the first crossing of two non-adjacent edges; null past 4000 edges), duplicateVertices: [{index, distance} (vertices index and index+1, wrapping)]}], skipped: {<type>: {count, reason}} (the other matches)}: closed polylines, circles, full ellipses and closed splines, arcs and bulges exact";
 
 /// The facts SHAPES reports for one closed shape, or why an entity is not one.
 enum Facts {
@@ -171,10 +171,17 @@ fn facts(s: &Session, e: &Entity, tol: f64) -> Result<Facts> {
     })
 }
 
+/// Shapes with more edges than this report no selfIntersection.
+const MAX_CROSSING_SEGMENTS: usize = 4_000;
+
 /// The first crossing between two non-adjacent edges, in edge order.
 fn first_crossing(g: &Polyline) -> Option<Vec2> {
     let segs = g.segments();
     let n = segs.len();
+    // The pairwise test is quadratic: past this many edges the answer is null, not a hang.
+    if n > MAX_CROSSING_SEGMENTS {
+        return None;
+    }
     for (i, a) in segs.iter().enumerate() {
         for (j, b) in segs.iter().enumerate().skip(i + 2) {
             if i == 0 && j + 1 == n {

@@ -61,6 +61,11 @@ pub struct Prompt {
     /// "Enter option [CAmera/TArget/…]:").
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub options_only: bool,
+    /// The prompt asks for a distance from `base` (a radius, a diameter, a length), and a point
+    /// answers with its distance from it: Dynamic Input shows one distance field instead of the
+    /// pointer boxes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub distance: bool,
 }
 
 /// Parse `@distance<angle` (relative polar), returning `(distance, angle in radians)`.
@@ -111,6 +116,11 @@ impl Prompt {
     pub fn corner(mut self, p: Vec2) -> Self {
         self.base = Some(p);
         self.corner = true;
+        self
+    }
+    /// Asks for a distance from the base (the `distance` field).
+    pub fn distance(mut self) -> Self {
+        self.distance = true;
         self
     }
     /// Accept deferred tangent/perpendicular snaps (the `deferred` field).
@@ -221,6 +231,12 @@ pub trait Interactive: Send {
     }
     /// Rubber-band geometry for the cursor position.
     fn preview(&self, _s: &Session, _cursor: Vec2) -> Vec<EntityKind> {
+        Vec::new()
+    }
+    /// Preview objects drawn with their own properties (colour, layer, linetype) rather than
+    /// the current layer's, as [`Interactive::preview`]'s are: a block reference re-evaluated
+    /// under the cursor, drawn as it will look. Drawn under the rubber band.
+    fn preview_objects(&self, _s: &Session, _cursor: Vec2) -> Vec<cadcraft_doc::Entity> {
         Vec::new()
     }
     /// The preview as existing objects under one transform, when it is that (MOVE, COPY,

@@ -1177,7 +1177,7 @@
 	Viewports	Viewports
 	Volume	Volume
 	W	O
-	WCS ⌄	SCM ⌄
+	WCS	SCM
 	White	Branco
 	Width factor	Fator de largura
 	Window	Janela
@@ -1251,3 +1251,5 @@
 	3D View	3D View
 	No 3D scene source	No 3D scene source
 	Empty	Vazio
+	Select using two clicks only	Selecionar apenas com dois cliques
+	Define each corner of the selection window with a separate click.	Defina cada canto da janela de seleção com um clique separado.
