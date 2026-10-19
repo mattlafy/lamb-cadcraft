@@ -825,3 +825,107 @@ fn vertex_edits_keep_links_on_their_segments() -> R {
     assert_eq!((seg_of(&s, 0)?, seg_of(&s, 1)?, seg_of(&s, 2)?), (1, 2, 0));
     Ok(())
 }
+
+/// Every view-block entity's layer, by id.
+fn layers_by_entity(d: &Drawing) -> Result<BTreeMap<Id, String>, Box<dyn std::error::Error>> {
+    let p = DrawingProject::new(d)?;
+    let mut out = BTreeMap::new();
+    for v in p.views() {
+        for e in p.entities(v.id) {
+            out.insert(e.id, e.layer_id.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// T468: `properties.set` of the plan wall to a new layer moves its whole automatic-link component
+/// (the linked lines of both sections) with it, in one undo step; an explicit link stops the walk.
+#[test]
+fn a_layer_change_carries_the_automatic_link_component() -> R {
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let (_, plan_e, sec_e, plan_view) = crossbar(&d)?;
+    let component = lamb_core::derivation::linking::linked_entity_component(&DrawingProject::new(&d)?, plan_e);
+    let views: std::collections::BTreeSet<Id> = component.iter().map(|m| view_of(&d, *m)).collect::<Result<_, _>>()?;
+    assert!(views.len() >= 3, "the component spans the plan and both sections: {views:?}");
+    let mut s = Session::new();
+    s.open_drawing(d, "u-wall", None);
+    install_link_maintenance(&mut s);
+    s.execute("layer.new", &json!({"name": "WALLS"}))?;
+
+    // --- An explicit link from the plan wall to an otherwise unlinked section line.
+    let sec_view = view_of(s.doc()?, sec_e)?;
+    let edge = Id(draw_edge(&mut s, sec_view, [-90000.0, -90000.0], [-85000.0, -90000.0])?.0);
+    let anchor = |e: Id, i: usize| json!({"entityId": hex(e), "segmentIndex": i, "segmentParam": 0.5});
+    s.execute("link", &json!({"a": anchor(plan_e, 1), "b": anchor(edge, 0)}))?;
+    let before = layers_by_entity(s.doc()?)?;
+    assert!(component.iter().all(|m| before[m] != "WALLS"));
+
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    s.execute("properties.set", &json!({"handles": [hex(plan_e)], "layer": "WALLS"}))?;
+    let after = layers_by_entity(s.doc()?)?;
+    for (id, layer) in &after {
+        let expect = if component.contains(id) { "WALLS" } else { before[id].as_str() };
+        assert_eq!(layer, expect, "entity {id}");
+    }
+    assert_eq!(after[&edge], before[&edge], "the explicitly linked line keeps its layer");
+
+    s.undo()?;
+    assert_eq!(layers_by_entity(s.doc()?)?, before, "one undo puts every one back");
+    Ok(())
+}
+
+/// T468: two members of one component set to different layers relayer nothing else; an unlinked
+/// view entity or a model-space entity relayers nothing.
+#[test]
+fn a_disagreeing_or_unlinked_layer_change_relayers_nothing() -> R {
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let (_, plan_e, sec_e, plan_view) = crossbar(&d)?;
+
+    // Both changes land in one drawing (no observer), then one maintenance pass.
+    let mut raw = Session::new();
+    raw.open_drawing(d.clone(), "raw", None);
+    raw.execute("layer.new", &json!({"name": "ONE"}))?;
+    raw.execute("layer.new", &json!({"name": "TWO"}))?;
+    raw.execute("editview", &json!({"viewId": plan_view.0}))?;
+    raw.execute("properties.set", &json!({"handles": [hex(plan_e)], "layer": "ONE"}))?;
+    raw.execute("properties.set", &json!({"handles": [hex(sec_e)], "layer": "TWO"}))?;
+    let mut after = raw.doc()?.clone();
+    let report = maintain_links(&d, &mut after, "t", &[])?;
+    assert!(report.relayered.is_empty(), "{report:?}");
+    let (old, new) = (layers_by_entity(&d)?, layers_by_entity(&after)?);
+    for (id, layer) in &new {
+        if *id != plan_e && *id != sec_e {
+            assert_eq!(layer, &old[id], "entity {id} untouched");
+        }
+    }
+
+    let mut s = Session::new();
+    s.open_drawing(d, "u-wall", None);
+    install_link_maintenance(&mut s);
+    s.execute("layer.new", &json!({"name": "X"}))?;
+    let model = {
+        let model_handles = |s: &Session| -> Result<Vec<Handle>, Box<dyn std::error::Error>> {
+            Ok(s.doc()?.space(&cadcraft_doc::Space::Model).map(|m| m.handles()).unwrap_or_default())
+        };
+        let before = model_handles(&s)?;
+        s.execute("line", &json!({"points": [[0, 0], [100, 0]]}))?;
+        model_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("model line not drawn")?
+    };
+    let edge = draw_edge(&mut s, plan_view, [-90000.0, -90000.0], [-85000.0, -90000.0])?;
+    assert!(!layers_by_entity(s.doc()?)?.contains_key(&Id(model.0)), "the model-space line is in no view block");
+    for h in [edge, model] {
+        let before = layers_by_entity(s.doc()?)?;
+        let ext = read_document(s.doc()?)?;
+        s.execute("properties.set", &json!({"handles": [h.hex()], "layer": "X"}))?;
+        let now = layers_by_entity(s.doc()?)?;
+        for (id, layer) in &now {
+            if *id != Id(h.0) {
+                assert_eq!(layer, &before[id], "entity {id} untouched by {}", h.hex());
+            }
+        }
+        assert_eq!(read_document(s.doc()?)?.links, ext.links);
+    }
+    Ok(())
+}

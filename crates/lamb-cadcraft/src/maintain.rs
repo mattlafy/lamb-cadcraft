@@ -37,7 +37,9 @@
 //!    (TS T256 `createEntity.ts` `pushEntity`), so later layer-role edits leave it alone;
 //! 3. auto-links each entity new to a view block through its view's hollow markers, skipping a
 //!    pair of segments some link already joins (a re-anchored piece crosses the marker its own link
-//!    fills) and any entity whose resolved role is `Reference` (TS T113).
+//!    fills) and any entity whose resolved role is `Reference` (TS T113);
+//! 4. relayers: an entity whose layer the command changed carries its automatic-link component to
+//!    the new layer, stopping at explicit links (TS SETLAYER, [`crate::relayer`]).
 //!
 //! [`install`] registers [`link_observer`] on a `Session`, so all of this lands in the command's own
 //! undo step. Out of scope: travel or erase cascading past the first partner, Tier 2 declarations.
@@ -80,6 +82,8 @@ pub struct MaintenanceReport {
     pub erased: Vec<Id>,
     /// New entities (not links) given a concrete `Cut`/`Seen` role from a cut-default layer.
     pub stamped: Vec<Id>,
+    /// Entities (not links) moved to the new layer of a relayered entity in their automatic-link component.
+    pub relayered: Vec<Id>,
 }
 
 impl MaintenanceReport {
@@ -92,6 +96,7 @@ impl MaintenanceReport {
             && self.reanchored.is_empty()
             && self.erased.is_empty()
             && self.stamped.is_empty()
+            && self.relayered.is_empty()
     }
 }
 
@@ -457,6 +462,9 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
         doc.links.extend(records);
         write_document(after, &doc)?;
     }
+
+    // 4: a layer change carries the entity's automatic-link component with it.
+    report.relayered = crate::relayer::cascade_layers(before, after)?;
     Ok(report)
 }
 

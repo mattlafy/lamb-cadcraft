@@ -59,6 +59,7 @@ pub mod props;
 pub mod provider;
 mod querycmds;
 mod refpane;
+mod relayer;
 pub mod repeats;
 mod resolvecmd;
 mod revertex;
