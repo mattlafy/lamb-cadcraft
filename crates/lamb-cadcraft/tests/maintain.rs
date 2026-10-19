@@ -95,7 +95,7 @@ fn link_observer_maintains_links() -> R {
     s.open_drawing(d, "u-wall", None);
     install(&mut s);
     install(&mut s);
-    assert_eq!(s.observers.len(), 5, "install is idempotent: corner, link, sweep, assembly, then bubble observer");
+    assert_eq!(s.observers.len(), 6, "install is idempotent: corner, link, sweep, assembly, bubble, then annotation observer");
     install_link_maintenance(&mut s);
 
     // --- ERASE a linked plan entity: exactly its links go; one undo restores both.

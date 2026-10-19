@@ -39,6 +39,12 @@ pub fn assembly_block_name(id: Id) -> String {
     format!("LAMB_ASSEMBLY_{}", id.0)
 }
 
+/// The block holding plan `id`'s generated annotation (section cut symbols, [`crate::annotations`]):
+/// `LAMB_ANNO_<id>`, id in decimal. Not a view: it has no entry in [`LambDocument`]`.views`.
+pub fn annotation_block_name(id: Id) -> String {
+    format!("LAMB_ANNO_{}", id.0)
+}
+
 /// Why a LAMB slot could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SchemaError {
