@@ -22,6 +22,10 @@
 //! 0c. erases travelling partners: an entity the command erased outright (its view gained no
 //!    entity, so not a TRIM/BREAK cut-away) takes the partner of every travel-set link on it with it
 //!    — one hop, no cascade, unaccepted AI partners included (TS T109 `erase.ts` parity);
+//! 0d. remaps vertex edits: a polyline that gained, lost or reversed vertices in place (grips' Add/
+//!    Remove Vertex, `pedit` insert / straighten / reverse — same handle, so 0b never runs) keeps
+//!    each anchor on its segment; one exactly at a removed vertex drops its link (TS `vertex.ts`
+//!    parity, [`crate::revertex`]);
 //! 1. drops every link with an anchor whose entity is no longer in any view block (ERASE);
 //! 2. re-checks every link with an anchor on a touched entity (new, or a different polyline) or in
 //!    a touched view (its document entry, or its host's, changed) with lamb-core's
@@ -96,9 +100,9 @@ fn derivation_error(message: String) -> SchemaError {
 }
 
 /// Entity id → (view id, polyline) over every view block.
-type EntityMap = BTreeMap<Id, (Id, Option<Polyline2>)>;
+pub(crate) type EntityMap = BTreeMap<Id, (Id, Option<Polyline2>)>;
 
-fn entity_map(p: &DrawingProject<'_>) -> EntityMap {
+pub(crate) fn entity_map(p: &DrawingProject<'_>) -> EntityMap {
     let mut out = BTreeMap::new();
     for v in p.views() {
         for e in p.entities(v.id) {
@@ -371,6 +375,10 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
     report.reanchored = reanchor(&before_entities, after)?;
     // 0c: an erased entity takes its travel-set partners with it; step 1 drops their links.
     report.erased = erase_partners(&before_entities, after, travel_set)?;
+    // 0d: vertex inserts, removals and reversals on the same handle keep anchors on their segments.
+    let (remapped, dropped) = crate::revertex::remap_vertex_edits(&before_entities, after)?;
+    report.reanchored.extend(remapped);
+    report.dropped.extend(dropped);
 
     // 1 + 2: drop and re-check, against one read of `after`.
     let (new_entities, links) = {

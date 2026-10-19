@@ -742,3 +742,86 @@ fn reference_lines_never_auto_link() -> R {
     assert!(on(&created[0], Id(cutline.0)));
     Ok(())
 }
+
+/// T469: PEDIT vertex insert, straighten and reverse on the linked plan wall (0,5000)-(0,0)-(10000,0)-
+/// (10000,5000), each segment linked at its midpoint, keep every link on the segment that holds its
+/// point; straightening away the vertex a link sits on drops it, and undo restores it.
+#[test]
+fn vertex_edits_keep_links_on_their_segments() -> R {
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let (_, plan_e, _, plan_view) = crossbar(&d)?;
+    let original = read_document(&d)?.links;
+    let mut s = Session::new();
+    s.open_drawing(d, "u-wall", None);
+    install_link_maintenance(&mut s);
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    let points =
+        |s: &Session| -> Result<Vec<Point2>, Box<dyn std::error::Error>> { links(s)?.iter().map(|l| anchor_point(s.doc()?, l, plan_e)).collect() };
+    let holds = |s: &Session| -> Result<(), Box<dyn std::error::Error>> {
+        let p = DrawingProject::new(s.doc()?)?;
+        for l in links(s)? {
+            assert!(l.stale.is_none(), "link {} not stale", l.id);
+            assert!(link_still_coincides(&p, &l)?, "link {} holds", l.id);
+        }
+        Ok(())
+    };
+    let same = |a: &[Point2], b: &[Point2]| a.len() == b.len() && a.iter().zip(b).all(|(p, q)| close(p.x, q.x) && close(p.y, q.y));
+    let seg_of = |s: &Session, i: usize| -> Result<usize, Box<dyn std::error::Error>> {
+        let l = links(s)?.into_iter().nth(i).ok_or("no link")?;
+        Ok(if l.a.entity_id == plan_e { l.a.segment_index } else { l.b.segment_index })
+    };
+    let start = points(&s)?;
+    let pedit = |s: &mut Session, args: serde_json::Value| -> R {
+        let mut a = json!({"handle": hex(plan_e), "option": "vertex"});
+        a.as_object_mut().ok_or("obj")?.extend(args.as_object().ok_or("obj")?.clone());
+        s.execute("pedit", &a)?;
+        Ok(())
+    };
+
+    // Insert (0,1000) inside segment 0: its anchor (0,2500) lands on piece 0; segments 1, 2 shift.
+    pedit(&mut s, json!({"action": "insert", "index": 0, "to": [0, 1000]}))?;
+    assert_eq!(poly(s.doc()?, plan_e)?.segments.len(), 4, "the vertex went in");
+    holds(&s)?;
+    assert!(same(&points(&s)?, &start), "anchor points unchanged: {:?} vs {start:?}", points(&s)?);
+    assert_eq!((seg_of(&s, 0)?, seg_of(&s, 1)?, seg_of(&s, 2)?), (2, 0, 3));
+    s.undo()?;
+    assert_eq!(links(&s)?, original, "undo restores the anchors");
+
+    // Insert a collinear (3000,0) before the crossbar's anchor, then straighten it away again.
+    pedit(&mut s, json!({"action": "insert", "index": 1, "to": [3000, 0]}))?;
+    holds(&s)?;
+    assert!(same(&points(&s)?, &start));
+    assert_eq!((seg_of(&s, 0)?, seg_of(&s, 1)?, seg_of(&s, 2)?), (2, 0, 3));
+    pedit(&mut s, json!({"action": "straighten", "index": 1, "index2": 3}))?;
+    assert_eq!(poly(s.doc()?, plan_e)?.segments.len(), 3, "the vertex came out");
+    holds(&s)?;
+    assert!(same(&points(&s)?, &start), "anchor points unchanged after the removal");
+    assert_eq!(links(&s)?.len(), 3);
+    s.undo()?;
+    s.undo()?;
+    assert_eq!(links(&s)?, original);
+
+    // A vertex at the crossbar's own anchor (5000,0), then straightened away: that link drops,
+    // the others stay; undo restores it.
+    pedit(&mut s, json!({"action": "insert", "index": 1, "to": [5000, 0]}))?;
+    holds(&s)?;
+    assert_eq!(links(&s)?.len(), 3);
+    let before_drop = links(&s)?;
+    pedit(&mut s, json!({"action": "straighten", "index": 1, "index2": 3}))?;
+    let after = links(&s)?;
+    assert_eq!(after.len(), 2, "the link at the removed vertex dropped: {after:?}");
+    assert!(after.iter().all(|l| l.id != original[0].id), "it is the crossbar's");
+    holds(&s)?;
+    s.undo()?;
+    assert_eq!(links(&s)?, before_drop, "undo restores the dropped link");
+    s.undo()?;
+    assert_eq!(links(&s)?, original);
+
+    // Reverse: every link kept, anchor points unchanged.
+    s.execute("pedit", &json!({"handle": hex(plan_e), "option": "reverse"}))?;
+    holds(&s)?;
+    assert!(same(&points(&s)?, &start), "reverse keeps anchor points");
+    assert_eq!((seg_of(&s, 0)?, seg_of(&s, 1)?, seg_of(&s, 2)?), (1, 2, 0));
+    Ok(())
+}

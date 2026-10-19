@@ -61,6 +61,7 @@ mod querycmds;
 mod refpane;
 pub mod repeats;
 mod resolvecmd;
+mod revertex;
 pub mod rounding;
 pub mod scene;
 pub mod schema;
