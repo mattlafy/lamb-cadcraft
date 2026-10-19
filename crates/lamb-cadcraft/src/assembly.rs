@@ -17,7 +17,9 @@
 //! command, inside that command's undo step; a plan without the block gets none. A plan listed in
 //! the document's `mitre_plans` (`assemblyplan {viewId, mitre}`, LAMB T385; §10 step 3) has every
 //! band end at a two-arm junction with no corner detail (`Untyped` or `Conflict`) moved onto that
-//! junction's bisector (lamb-core's [`junction_bisector`], [`mitre_end`]); repeats are not mitred.
+//! junction's bisector (lamb-core's [`junction_bisector`], [`mitre_end`]), and at such a T junction
+//! the branch run's band ends butted onto the through run's face on its side (lamb-core's
+//! [`tee_butt`], LAMB T472); repeats are not mitred.
 //! The project's stud grid ([`crate::studgrid`], LAMB T458, T463) lays each straight run's repeat whose
 //! pitch is near the grid's on that grid's lines — every plan run, and a section's runs along its cut line.
 //! At each two-arm junction a corner tag resolves to (§10 step 3, LAMB T461), [`corner_assembly`]
@@ -36,7 +38,7 @@ use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult
 use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
     AssemblyLine, FaceRef, WidthConflict, arm_direction, corner_reach, detail_bands, detail_frame, junction_bisector, lay_bands, lay_repeat,
-    mitre_end, place_corner, trim_to_reach, width_conflict,
+    mitre_end, place_corner, tee_butt, trim_to_reach, width_conflict,
 };
 use lamb_core::derivation::detail_tags::RunDetail;
 use lamb_core::derivation::issues::{Issue, IssueKind};
@@ -191,7 +193,7 @@ fn move_studs(lines: &mut [AssemblyLine], copies: &[usize], run: &WallRun, moves
 }
 
 /// Every run of `plan`'s wall graph, in graph order, with its detail's bands laid along it — mitred
-/// at undetailed two-arm junctions when `plan` is in the document's `mitre_plans`.
+/// at undetailed two-arm junctions, and butted at undetailed T junctions, when `plan` is in the document's `mitre_plans`.
 pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String> {
     let (details, corners) = resolve_view_details(d, plan)?;
     let mitre = read_document(d).map_err(|e| e.to_string())?.mitre_plans.contains(&plan);
@@ -230,12 +232,20 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             if !matches!(corner, RunDetail::Untyped | RunDetail::Conflict) {
                 continue;
             }
-            let Some(bisector) = junction_bisector(j) else { continue };
-            for arm in &j.arms {
+            if let Some(bisector) = junction_bisector(j) {
+                for arm in &j.arms {
+                    let Some(r) = runs.get_mut(arm.run).filter(|r| r.skipped.is_none()) else { continue };
+                    let n = r.bands;
+                    for l in &mut r.lines[..n] {
+                        mitre_end(l, arm.end, j.point, bisector);
+                    }
+                }
+            } else if let Some((b, point, dir)) = tee_butt(j, &graph.runs) {
+                let arm = &j.arms[b];
                 let Some(r) = runs.get_mut(arm.run).filter(|r| r.skipped.is_none()) else { continue };
                 let n = r.bands;
                 for l in &mut r.lines[..n] {
-                    mitre_end(l, arm.end, j.point, bisector);
+                    mitre_end(l, arm.end, point, dir);
                 }
             }
         }
@@ -391,7 +401,8 @@ pub(crate) fn wall_issues(d: &Drawing) -> Result<Vec<Issue>, String> {
             if !junction.arms.iter().any(|a| runs.get(a.run).is_some_and(|r| r.skipped.is_none())) {
                 continue;
             }
-            let suffix = if mitred { " (mitred)" } else { "" };
+            let cut = junction_bisector(junction).is_some() || tee_butt(junction, &graph.runs).is_some();
+            let suffix = if mitred && cut { " (mitred)" } else { "" };
             out.push(issue(
                 IssueKind::UndetailedCorner,
                 format!("undetailed_corner:{plan}:{j}"),
@@ -1335,6 +1346,113 @@ pub(crate) mod tests {
             horizontal_spans(&assembly_lines(d, plan)?, &graph, 100.0)?,
             [(-20.0, 200.0, 4800.0), (50.0, 200.0, 4800.0), (200.0, 200.0, 4800.0)]
         );
+        Ok(())
+    }
+
+    /// [`room`]'s detail and tag, but with an annex of 200 mm walls built onto the main room's east
+    /// wall (outer face x = 5000): its bottom wall rises at 15° from (5000, 1000) to x = 6500, its
+    /// top wall is horizontal at y = 2800..3000. The east wall's run is split into exterior, shared
+    /// and exterior parts, and both annex walls are T branches with a single exterior side — the
+    /// bottom one skewed, so its unmitred bands end on a cut square to the branch, not on the face.
+    /// (A partition inside the room is no fixture for this: a run with a space on both sides lays no
+    /// face detail, and a square branch's run already ends on the through run's face.)
+    fn t_plan() -> T<(Session, Id)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let detail = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": format!("{:X}", r.0), "kind": "exterior_face" }))?;
+        s.execute("layer.new", &json!({ "name": "CLAD", "current": true }))?;
+        line(&mut s, [0.0, -20.0], [1000.0, -20.0])?;
+        s.execute("layer.new", &json!({ "name": "GYP", "current": true }))?;
+        line(&mut s, [0.0, 50.0], [1000.0, 50.0])?;
+        line(&mut s, [0.0, 200.0], [1000.0, 200.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        let tan = 15f64.to_radians().tan();
+        let outer = [
+            [0.0, 0.0],
+            [5000.0, 0.0],
+            [5000.0, 1000.0],
+            [6500.0, 1000.0 + 1500.0 * tan],
+            [6500.0, 3000.0],
+            [5000.0, 3000.0],
+            [5000.0, 4000.0],
+            [0.0, 4000.0],
+        ];
+        s.execute("pline", &json!({ "vertices": outer, "closed": true }))?;
+        s.execute("pline", &json!({ "vertices": [[200, 200], [4800, 200], [4800, 3800], [200, 3800]], "closed": true }))?;
+        let k = 1000.0 + 200.0 / 15f64.to_radians().cos();
+        let annex = [[5000.0, k], [6300.0, k + 1300.0 * tan], [6300.0, 2800.0], [5000.0, 2800.0]];
+        s.execute("pline", &json!({ "vertices": annex, "closed": true }))?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 2500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
+        Ok((s, plan))
+    }
+
+    /// The T junctions of `graph` with their branch run and branch end.
+    fn tees(graph: &lamb_core::derivation::wall_junctions::WallGraph) -> Vec<(Point2, usize, lamb_core::derivation::wall_junctions::RunEnd)> {
+        graph.junctions.iter().filter_map(|j| tee_butt(j, &graph.runs).map(|(b, _, _)| (j.point, j.arms[b].run, j.arms[b].end))).collect()
+    }
+
+    /// The x of each band line's end at `end`.
+    fn end_xs(a: &RunAssembly, end: lamb_core::derivation::wall_junctions::RunEnd) -> Vec<f64> {
+        use lamb_core::derivation::wall_junctions::RunEnd;
+        a.lines[..a.bands].iter().map(|l| r6(if end == RunEnd::Start { l.from.x } else { l.to.x })).collect()
+    }
+
+    #[test]
+    fn mitre_butts_a_t_branch_s_bands_into_the_through_run_s_face() -> R {
+        let (s, plan) = t_plan()?;
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        let off = assembly_lines(d, plan)?;
+        let tees = tees(&graph);
+        assert_eq!(tees.len(), 2, "{:?}", graph.junctions);
+        for &(_, run, _) in &tees {
+            assert!(off[run].skipped.is_none() && off[run].bands == 3, "{:?}", off[run]);
+        }
+        // Unmitred, the skewed branch's bands end on a cut square to it, not on the face.
+        let skewed = tees.iter().find(|t| end_xs(&off[t.1], t.2).iter().any(|x| (x - 5000.0).abs() > 1.0)).ok_or("no skewed branch")?;
+
+        let (mut s, plan) = t_plan()?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": true }))?;
+        let d = s.doc()?;
+        let on = assembly_lines(d, plan)?;
+        for &(_, run, end) in &tees {
+            assert_eq!(end_xs(&on[run], end), [5000.0; 3], "butted on the face x = 5000: {:?}", on[run]);
+        }
+        assert_ne!(on[skewed.1].lines, off[skewed.1].lines);
+        // The through runs' band ends at the T nodes are as with mitre off.
+        let branch_runs: Vec<usize> = tees.iter().map(|t| t.1).collect();
+        for i in (0..graph.runs.len()).filter(|i| !branch_runs.contains(i)) {
+            let near = |a: &RunAssembly| -> Vec<(f64, f64)> {
+                a.lines[..a.bands]
+                    .iter()
+                    .flat_map(|l| [l.from, l.to])
+                    .filter(|q| tees.iter().any(|t| (q.x - t.0.x).abs() < 300.0 && (q.y - t.0.y).abs() < 300.0))
+                    .map(|q| (r6(q.x), r6(q.y)))
+                    .collect()
+            };
+            assert_eq!(near(&on[i]), near(&off[i]), "run {i}");
+        }
+        // RESOLVE's notes: the T corners and the L corners read "(mitred)".
+        let corners: Vec<Issue> = wall_issues(d)?.into_iter().filter(|c| c.kind == IssueKind::UndetailedCorner).collect();
+        for t in &tees {
+            let c = corners.iter().find(|c| c.location == t.0).ok_or("no T issue")?;
+            assert!(c.note.ends_with("(mitred)"), "{}", c.note);
+        }
+        assert!(corners.iter().all(|c| c.note.ends_with("(mitred)")), "{corners:?}");
+        // Mitre off again leaves the branches as they were.
+        s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": false }))?;
+        let back = assembly_lines(s.doc()?, plan)?;
+        for &(_, run, _) in &tees {
+            assert_eq!(back[run].lines, off[run].lines);
+        }
         Ok(())
     }
 

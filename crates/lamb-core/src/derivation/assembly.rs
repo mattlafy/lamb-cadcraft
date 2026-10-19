@@ -6,7 +6,8 @@
 //! snaps a straight run's repeat whose pitch is near the grid's onto the grid's lines.
 //! Junctions are not trimmed by default; for a plan that opts into mitring (§10 step 3, LAMB T385)
 //! the adapter moves band ends at undetailed two-arm junctions onto [`junction_bisector`] with
-//! [`mitre_end`]. Computed on demand.
+//! [`mitre_end`], and a T's branch band ends onto the through run's face with [`tee_butt`] (LAMB
+//! T472). Computed on demand.
 //!
 //! Not the AI-line sweep (`crate::sweeps` in the adapter); everything here is "assembly".
 
@@ -426,6 +427,34 @@ pub fn arm_direction(j: &Junction, runs: &[WallRun], i: usize) -> Option<Point2>
     (len > 0.0).then(|| Point2 { x: dx / len, y: dy / len })
 }
 
+/// The butt line for an undetailed T junction (§10 step 3, LAMB T472): `None` unless `j` has three
+/// arms and exactly one gap within `TOLERANCE.angle_deg` of 180°, whose two through arms
+/// (`arms[i]`, `arms[(i + 1) % 3]`) are straight and of equal `width` within
+/// `TOLERANCE.coincidence_mm`. Returns `(branch arm index, face point, face dir)`: the through run's
+/// drawn face on the branch's side — `j.point + n · width / 2`, along the first through arm `t`.
+pub fn tee_butt(j: &Junction, runs: &[WallRun]) -> Option<(usize, Point2, Point2)> {
+    if j.arms.len() != 3 || j.gaps_deg.len() != 3 {
+        return None;
+    }
+    let mut straight = (0..3).filter(|&i| (j.gaps_deg[i] - 180.0).abs() <= TOLERANCE.angle_deg);
+    let i = straight.next()?;
+    if straight.next().is_some() {
+        return None;
+    }
+    let (a, b, branch) = (i, (i + 1) % 3, (i + 2) % 3);
+    let t = arm_direction(j, runs, a)?;
+    arm_direction(j, runs, b)?;
+    let (wa, wb) = (runs.get(j.arms[a].run)?.width, runs.get(j.arms[b].run)?.width);
+    if (wa - wb).abs() > TOLERANCE.coincidence_mm {
+        return None;
+    }
+    let r = j.arms[branch].direction_deg.to_radians();
+    let left = Point2 { x: -t.y, y: t.x };
+    let s = if left.x * r.cos() + left.y * r.sin() >= 0.0 { 1.0 } else { -1.0 };
+    let half = wa / 2.0 * s;
+    Some((branch, Point2 { x: j.point.x + left.x * half, y: j.point.y + left.y * half }, t))
+}
+
 /// How far a placed corner detail (§10 step 3, LAMB T462) reaches into each arm of `j`, in arm
 /// order: the farthest along-arm distance, from `j.point` along [`arm_direction`], of any end of
 /// the `corner` lines, floored at 0. An arc arm's reach is 0.
@@ -819,6 +848,54 @@ mod tests {
         };
         let arms = vec![JunctionArm { run: 0, end, direction_deg: 0.0 }, JunctionArm { run: 1, end, direction_deg: 90.0 }];
         (Junction { point: o, arms, gaps_deg: Vec::new() }, runs, sides)
+    }
+
+    /// A T of 200 mm runs at (100,100): the through run along x as two runs (west, east, both
+    /// starting at the node) and the branch along +y; arms in signature order, gaps [90, 90, 180].
+    fn t_junction() -> (Junction, Vec<WallRun>) {
+        use crate::derivation::wall_junctions::JunctionArm;
+        let o = p(100.0, 100.0);
+        let runs = vec![run(o, p(5000.0, 100.0), 200.0), run(o, p(100.0, 5000.0), 200.0), run(o, p(-5000.0, 100.0), 200.0)];
+        let arms = vec![
+            JunctionArm { run: 0, end: RunEnd::Start, direction_deg: 0.0 },
+            JunctionArm { run: 1, end: RunEnd::Start, direction_deg: 90.0 },
+            JunctionArm { run: 2, end: RunEnd::Start, direction_deg: 180.0 },
+        ];
+        (Junction { point: o, arms, gaps_deg: vec![90.0, 90.0, 180.0] }, runs)
+    }
+
+    #[test]
+    fn tee_butt_finds_the_branch_and_the_through_run_s_face_on_its_side() {
+        let (j, runs) = t_junction();
+        let (b, point, dir) = tee_butt(&j, &runs).unwrap();
+        assert_eq!(b, 1);
+        assert!((point.x - 100.0).abs() < 1e-9 && (point.y - 200.0).abs() < 1e-9, "{point:?}");
+        assert!((dir.x.abs() - 1.0).abs() < 1e-12 && dir.y.abs() < 1e-12, "{dir:?}");
+        // Branch along -y: arms east, west, south (gaps 180, 90, 90) — the face below.
+        use crate::derivation::wall_junctions::JunctionArm;
+        let mut r2 = runs.clone();
+        r2[1] = run(p(100.0, 100.0), p(100.0, -5000.0), 200.0);
+        let arms = vec![
+            JunctionArm { run: 0, end: RunEnd::Start, direction_deg: 0.0 },
+            JunctionArm { run: 2, end: RunEnd::Start, direction_deg: 180.0 },
+            JunctionArm { run: 1, end: RunEnd::Start, direction_deg: 270.0 },
+        ];
+        let j2 = Junction { point: j.point, arms, gaps_deg: vec![180.0, 90.0, 90.0] };
+        let (b2, pt2, _) = tee_butt(&j2, &r2).unwrap();
+        assert_eq!(b2, 2);
+        assert!((pt2.x - 100.0).abs() < 1e-9 && pt2.y.abs() < 1e-9, "{pt2:?}");
+        // Unequal through widths.
+        let mut wide = runs.clone();
+        wide[2].width = 300.0;
+        assert_eq!(tee_butt(&j, &wide), None);
+        // A Y, an X and an L.
+        assert_eq!(tee_butt(&Junction { gaps_deg: vec![120.0, 120.0, 120.0], ..j.clone() }, &runs), None);
+        let mut x = j.clone();
+        x.arms.push(JunctionArm { run: 1, end: RunEnd::Start, direction_deg: 270.0 });
+        x.gaps_deg = vec![90.0, 90.0, 90.0, 90.0];
+        assert_eq!(tee_butt(&x, &runs), None);
+        let (l, lruns, _) = l_corner(false);
+        assert_eq!(tee_butt(&Junction { gaps_deg: vec![90.0, 270.0], ..l }, &lruns), None);
     }
 
     #[test]
