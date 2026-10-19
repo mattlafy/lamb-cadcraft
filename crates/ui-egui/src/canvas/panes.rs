@@ -114,6 +114,7 @@ pub(super) fn prepare(app: &mut CadApp, tiles: &[(Rect, ModelTile)], rots: &[f64
             transparency,
             skip_viewport: None,
             cancel: None,
+            on_screen: true,
         };
         slot.list = Some(cadcraft_render::build(&st.doc, &space, &opts));
         slot.window = opts.view;

@@ -221,8 +221,10 @@ pub struct Options {
     pub view: Option<Bounds2>,
     /// Draw objects with their transparency ([`DPrim::transparency`]). Off by default: the screen
     /// follows TRANSPARENCYDISPLAY, plots the page setup's "Plot transparency".
-    /// On-screen builds fade objects on locked layers by LAYLOCKFADECTL either way.
     pub transparency: bool,
+    /// A build for the interactive canvas: objects on locked layers fade by LAYLOCKFADECTL,
+    /// whatever [`Options::transparency`] says. Off by default, so plots and exports never fade.
+    pub on_screen: bool,
     /// A layout viewport whose model-space contents are left out (its border is still drawn):
     /// the canvas draws the active viewport's contents itself, see [`viewport_content`].
     pub skip_viewport: Option<Handle>,
@@ -252,6 +254,7 @@ impl Default for Options {
             view: None,
             skip_viewport: None,
             transparency: false,
+            on_screen: false,
             cancel: None,
         }
     }
@@ -1066,8 +1069,8 @@ fn resolve_common(ctx: &Ctx, c: &cadcraft_doc::Common, plotting: bool) -> Resolv
     (rgb, lw_mm, lt, scale, visible, layer.map_or(0, |l| l.transparency), lock_fade(d, layer, plotting))
 }
 
-/// The fade (percent, 0..=90) of an object on `layer`: LAYLOCKFADECTL on screen when the layer is
-/// locked (0 or negative: no fade); plots never fade.
+/// The fade (percent, 0..=90) of an object on `layer`: LAYLOCKFADECTL when the layer is locked
+/// (0 or negative: no fade); plots never fade. Only [`Options::on_screen`] builds apply it.
 fn lock_fade(d: &Drawing, layer: Option<&cadcraft_doc::Layer>, plotting: bool) -> u8 {
     if plotting || !layer.is_some_and(|l| l.locked) {
         return 0;
@@ -1151,7 +1154,8 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     if !visible {
         return;
     }
-    // A locked layer's fade shows even when transparency display is off.
+    // A locked layer's fade shows on screen even when transparency display is off.
+    let fade = if b.opts.on_screen { fade } else { 0 };
     let own = if b.opts.transparency { transparency(e.common.transparency, layer_transparency, ctx.block_transparency) } else { 0 };
     b.transparency = own.max(fade);
     // A plot style's linetype replaces the object's.
@@ -1648,7 +1652,7 @@ fn insert(b: &mut Builder, ctx: &Ctx, e: &Entity, ins: &cadcraft_doc::Insert, rg
                     let c = a.props.over(&def.map(|d| d.common.clone()).unwrap_or_else(by_block));
                     let (ink, lw, _, _, shown, layer_t, fade) = resolve_common(&sub_ctx(ctx, e, Mat3::IDENTITY), &c, b.plotting);
                     let t = if b.opts.transparency { transparency(c.transparency, layer_t, reference) } else { 0 };
-                    let t = t.max(fade);
+                    let t = if b.opts.on_screen { t.max(fade) } else { t };
                     (ink, lw, shown, t)
                 }
             };

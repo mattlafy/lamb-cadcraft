@@ -136,7 +136,11 @@ pub(crate) fn remap_sources(h: &mut Hatch, map: &HashMap<Handle, Handle>) -> boo
         return false;
     }
     for l in &mut h.loops {
-        l.sources.iter_mut().for_each(|s| *s = map[s]);
+        for s in &mut l.sources {
+            if let Some(&c) = map.get(s) {
+                *s = c;
+            }
+        }
     }
     true
 }

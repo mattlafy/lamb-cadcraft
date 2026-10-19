@@ -943,27 +943,35 @@ fn faded(l: &DisplayList) -> Vec<u8> {
     l.prims.iter().map(|p| p.transparency).collect()
 }
 
+fn on_screen(o: Options) -> Options {
+    Options { on_screen: true, ..o }
+}
+
 #[test]
 fn objects_on_locked_layers_fade_on_screen() {
     use cadcraft_doc::Transparency::{ByLayer, Percent};
     let mut d = locked_lines(ByLayer);
     // Default 50, whether transparency display is on or off; the unlocked line is unchanged.
-    for opts in [Options::default(), with_transparency()] {
+    for opts in [on_screen(Options::default()), on_screen(with_transparency())] {
         let l = build(&d, &Space::Model, &opts);
         assert_eq!(faded(&l), vec![50, 0]);
         assert!(l.prims[0].alpha() < 255);
         assert_eq!(l.prims[1].alpha(), 255);
     }
-    // Plots never fade.
-    assert_eq!(faded(&build_plot(&d, &Space::Model, &Options::default())), vec![0, 0]);
+    // Builds without the on-screen flag (exports) and plots never fade.
+    for opts in [Options::default(), with_transparency()] {
+        assert_eq!(faded(&build(&d, &Space::Model, &opts)), vec![0, 0]);
+    }
+    assert_eq!(faded(&build_plot(&d, &Space::Model, &on_screen(Options::default()))), vec![0, 0]);
     for (v, want) in [(0, 0), (-30, 0), (70, 70)] {
         d.header.set_i64("LAYLOCKFADECTL", v);
-        assert_eq!(faded(&build(&d, &Space::Model, &Options::default())), vec![want, 0], "LAYLOCKFADECTL {v}");
+        assert_eq!(faded(&build(&d, &Space::Model, &on_screen(Options::default()))), vec![want, 0], "LAYLOCKFADECTL {v}");
     }
     // An object more transparent than the fade keeps its own transparency.
     let d = locked_lines(Percent(80));
+    assert_eq!(faded(&build(&d, &Space::Model, &on_screen(with_transparency()))), vec![80, 0]);
+    assert_eq!(faded(&build(&d, &Space::Model, &on_screen(Options::default()))), vec![50, 0]);
     assert_eq!(faded(&build(&d, &Space::Model, &with_transparency())), vec![80, 0]);
-    assert_eq!(faded(&build(&d, &Space::Model, &Options::default())), vec![50, 0]);
 }
 
 #[test]
@@ -975,7 +983,8 @@ fn layer_zero_in_a_block_on_a_locked_layer_fades() {
     blk.entities.push(block_entity(1, c, k));
     d.blocks.insert("B".into(), std::sync::Arc::new(blk));
     d.add(&Space::Model, Common { layer: "Locked".into(), ..Default::default() }, insert_of("B")).unwrap();
-    assert_eq!(faded(&build(&d, &Space::Model, &Options::default())), vec![50]);
+    assert_eq!(faded(&build(&d, &Space::Model, &on_screen(Options::default()))), vec![50]);
+    assert_eq!(faded(&build(&d, &Space::Model, &Options::default())), vec![0]);
 }
 
 fn handle_prims(l: &DisplayList, h: cadcraft_doc::Handle) -> Vec<Vec<Vec2>> {
