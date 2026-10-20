@@ -29,6 +29,7 @@
 //! (lamb-core's [`corner_reach`], [`trim_to_reach`]; dropped when wholly inside) and every repeat
 //! copy with a line end inside the reach is dropped whole. Before that trim, each stud-move point
 //! ([`crate::studgrid`], LAMB T464) shifts its run's nearest repeat copy along the run onto itself.
+//! A structural-centre detail (LAMB T476) is laid from the exterior face, its farthest band there.
 //! Not the AI-line sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
@@ -117,6 +118,24 @@ fn member_segments(d: &Drawing, detail: Id, members: &[cadcraft_doc::Handle]) ->
     out
 }
 
+/// The reference line and run face `run_lines` lays a detail from. A face reference is itself; a
+/// structural-centre reference (LAMB T476) is moved across onto the detail's farthest band, on
+/// [`detail_frame`]'s wall side, and laid from the exterior face — that band then sits on the face
+/// and the frame turns toward the interior. A tie is [`detail_frame`]'s ambiguity error.
+fn laid_reference(r: &crate::detailref::DetailRef, lines: &[(Point2, Point2, String)]) -> Result<((Point2, Point2), FaceRef), String> {
+    match r.kind {
+        DetailRefKind::ExteriorFace => Ok(((r.from, r.to), FaceRef::Exterior)),
+        DetailRefKind::InteriorFace => Ok(((r.from, r.to), FaceRef::Interior)),
+        DetailRefKind::Grid => Err("reference kind not laid yet".into()),
+        DetailRefKind::StructuralCentre => {
+            let frame = detail_frame((r.from, r.to), lines)?;
+            let far = detail_bands((r.from, r.to), lines)?.iter().map(|b| b.offset).fold(0.0, f64::max);
+            let shift = |p: Point2| Point2 { x: p.x + frame.into.x * far, y: p.y + frame.into.y * far };
+            Ok(((shift(r.from), shift(r.to)), FaceRef::Exterior))
+        }
+    }
+}
+
 /// One run's lines from `detail` (bands, then each repeat's copies), how many of them are bands, the
 /// line count of each copy, and its width conflict, or why not.
 fn run_lines(
@@ -127,14 +146,10 @@ fn run_lines(
     sides: &lamb_core::derivation::wall_spaces::RunSides,
 ) -> Result<(Vec<AssemblyLine>, usize, Vec<usize>, Option<WidthConflict>), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
-    let face = match r.kind {
-        DetailRefKind::ExteriorFace => FaceRef::Exterior,
-        DetailRefKind::InteriorFace => FaceRef::Interior,
-        DetailRefKind::StructuralCentre | DetailRefKind::Grid => return Err("reference kind not laid yet".into()),
-    };
     let lines = detail_lines(d, detail, r.handle)?;
-    let bands = detail_bands((r.from, r.to), &lines)?;
-    let frame = detail_frame((r.from, r.to), &lines)?;
+    let (reference, face) = laid_reference(&r, &lines)?;
+    let bands = detail_bands(reference, &lines)?;
+    let frame = detail_frame(reference, &lines)?;
     let mut laid = lay_bands(run, sides, face, &bands)?;
     let n = laid.len();
     let grid = crate::studgrid::run_grid(d, view, run);
@@ -834,6 +849,98 @@ pub(crate) mod tests {
         let runs = assembly_lines(s.doc()?, plan)?;
         assert_eq!(runs.len(), 4);
         assert!(runs.iter().all(|r| r.lines.is_empty() && r.detail.is_none() && r.skipped.as_deref() == Some("untyped")), "{runs:?}");
+        Ok(())
+    }
+
+    /// The horizontal bottom run's band ys and layers, and its width conflict.
+    fn bottom_run(s: &Session, plan: Id) -> T<(Vec<(f64, String)>, Option<WidthConflict>)> {
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        for r in assembly_lines(d, plan)? {
+            let RunCurve::Line { from, to } = graph.runs[r.run].centreline else { continue };
+            if from.y < 2000.0 && (from.y - to.y).abs() < 1e-9 {
+                let ys = horizontal(&RunAssembly { lines: r.lines[..r.bands].to_vec(), ..r.clone() }).ok_or("not horizontal")?;
+                return Ok((ys, r.conflict));
+            }
+        }
+        Err("no bottom run".into())
+    }
+
+    #[test]
+    fn a_structural_centre_detail_lays_its_farthest_band_on_the_exterior_face() -> R {
+        let (s, plan) = room_with("structural_centre", true, 220.0)?;
+        let runs = assembly_lines(s.doc()?, plan)?;
+        assert_eq!(runs.len(), 4);
+        assert!(runs.iter().all(|r| r.skipped.is_none() && r.lines.len() == 3), "{runs:?}");
+        let (ys, conflict) = bottom_run(&s, plan)?;
+        assert_eq!(ys, [(0.0, "GYP".to_string()), (150.0, "GYP".to_string()), (220.0, "CLAD".to_string())]);
+        assert_eq!(conflict, None, "220 detail in a 220 wall");
+
+        let (s, plan) = room_with("structural_centre", true, 200.0)?;
+        let (_, conflict) = bottom_run(&s, plan)?;
+        let c = conflict.ok_or("no conflict")?;
+        assert!((c.delta - 20.0).abs() < 1e-9, "{c:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_structural_centre_detail_whose_far_bands_tie_is_skipped_as_ambiguous() -> R {
+        let (mut s, plan) = room("structural_centre", true)?;
+        let d1 = detail_id(&s)?;
+        s.execute("editview", &json!({ "viewId": d1.0 }))?;
+        line(&mut s, [0.0, -200.0], [1000.0, -200.0])?;
+        let d2 = Id(s.execute("newdetail", &json!({ "name": "D2" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": d2.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": format!("{:X}", r.0), "kind": "exterior_face" }))?;
+        line(&mut s, [0.0, 30.0], [1000.0, 30.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("detailtag", &json!({ "detailViewId": d2.0, "tip": {"x": 2500.0, "y": 4000.0}, "bubble": {"x": 2500.0, "y": 5000.0} }))?;
+        let runs = assembly_lines(s.doc()?, plan)?;
+        let of = |id: Id| runs.iter().filter(move |r| r.detail == Some(id)).collect::<Vec<_>>();
+        assert_eq!(of(d1).len(), 1, "{runs:?}");
+        assert!(of(d1)[0].lines.is_empty() && of(d1)[0].skipped.as_deref().is_some_and(|w| w.contains("ambiguous")), "{runs:?}");
+        assert_eq!(of(d2).len(), 1, "{runs:?}");
+        assert!(of(d2)[0].skipped.is_none() && of(d2)[0].lines.len() == 1, "{runs:?}");
+        Ok(())
+    }
+
+    /// The along positions (x of each STUD line start on the bottom run) of a stud repeat tagged on
+    /// [`room`]'s detail of `kind`.
+    fn bottom_stud_xs(kind: &str) -> T<Vec<f64>> {
+        let (mut s, plan) = room(kind, true)?;
+        let detail = detail_id(&s)?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
+        let before = all_handles(&s)?;
+        s.execute("pline", &json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?;
+        let stud = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no stud")?;
+        let before = all_handles(&s)?;
+        s.execute("dimaligned", &json!({ "p1": [100, 0], "p2": [500, 0], "at": [300, -300] }))?;
+        let pitch = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no dimension")?;
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()] }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        for r in assembly_lines(d, plan)? {
+            let RunCurve::Line { from, to } = graph.runs[r.run].centreline else { continue };
+            if from.y < 2000.0 && (from.y - to.y).abs() < 1e-9 {
+                assert!(r.lines.len() > r.bands, "no copies: {r:?}");
+                return Ok(r.lines[r.bands..].iter().map(|l| (l.from.x.min(l.to.x) * 1e6).round() / 1e6).collect());
+            }
+        }
+        Err("no bottom run".into())
+    }
+
+    #[test]
+    fn a_repeat_on_a_structural_centre_detail_lays_at_the_exterior_face_details_along_positions() -> R {
+        let mut centre = bottom_stud_xs("structural_centre")?;
+        let mut face = bottom_stud_xs("exterior_face")?;
+        centre.sort_by(f64::total_cmp);
+        face.sort_by(f64::total_cmp);
+        assert_eq!(centre, face);
         Ok(())
     }
 
