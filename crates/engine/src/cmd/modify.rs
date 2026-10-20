@@ -718,7 +718,10 @@ pub(crate) fn offset_polyline(pl: &Polyline, d: f64, gap: i64) -> Option<Vec<Pol
         } else {
             let prev = segs.get((i + n - 1) % n)?;
             let corner = pairs.get(i)?.0.start();
-            match gap_fill(prev, s, corner, d.abs(), gap) {
+            // Only two segments that meet in the source have a corner to fill (a collapsed arc
+            // between them leaves none).
+            let adjacent = pairs.get((i + n - 1) % n)?.0.end().near(corner, 1e-9);
+            match gap_fill(prev, s, corner, d.abs(), if adjacent { gap } else { 0 }) {
                 Some((a, fill, b)) => (a, Some(fill), b),
                 None => {
                     let j = join_point(prev, s).unwrap_or(s.start());

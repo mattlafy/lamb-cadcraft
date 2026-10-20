@@ -810,6 +810,28 @@ fn offset_gap_type_extends_fillets_or_chamfers_outside_corners() {
 }
 
 #[test]
+fn offset_gap_type_handles_open_outside_corners_in_both_orientations() {
+    let k = std::f64::consts::SQRT_2 - 1.0;
+    // A left turn offset to the right and a right turn offset to the left: the corner at (10, 0)
+    // is outside in both, with the copies at y = -1 / x = 11 and y = 1 / x = 11.
+    for (pts, side, sy) in [(json!([[0, 0], [10, 0], [10, 10]]), [5.0, -2.0], -1.0), (json!([[0, 0], [10, 0], [10, -10]]), [5.0, 2.0], 1.0)] {
+        let p = offset_with_gap(pts.clone(), false, side, 1);
+        assert_eq!(p.vertices.len(), 4, "{:?}", p.vertices);
+        assert!(near(p.vertices[1].p, 10.0, sy) && near(p.vertices[2].p, 11.0, 0.0), "{:?}", p.vertices);
+        let (arc, ccw) = cadcraft_geom::bulge_to_arc(p.vertices[1].p, p.vertices[2].p, p.vertices[1].bulge).unwrap();
+        assert_eq!(ccw, sy < 0.0, "{arc:?}");
+        assert!(near(arc.center, 10.0, 0.0) && (arc.radius - 1.0).abs() < 1e-9, "{arc:?}");
+
+        let p = offset_with_gap(pts, false, side, 2);
+        assert_eq!(p.vertices.len(), 4, "{:?}", p.vertices);
+        assert!(p.vertices.iter().all(|v| v.bulge == 0.0));
+        let (a, b) = (p.vertices[1].p, p.vertices[2].p);
+        assert!(near(a, 10.0 + k, sy) && near(b, 11.0, sy * k), "{:?}", p.vertices);
+        assert!((cadcraft_geom::Line::new(a, b).dist(Vec2::new(10.0, 0.0)) - 1.0).abs() < 1e-9, "chamfer {a:?}-{b:?}");
+    }
+}
+
+#[test]
 fn offset_gap_type_leaves_inside_corners_and_arc_joints_alone() {
     let inward: Vec<_> = (0..3).map(|g| offset_with_gap(square(), true, [5.0, 2.0], g).vertices).collect();
     assert_eq!(inward[0].len(), 4);
@@ -825,6 +847,16 @@ fn offset_gap_type_leaves_inside_corners_and_arc_joints_alone() {
     assert!(arcs.iter().all(|v| *v == arcs[0]));
     let outward: Vec<_> = (0..3).map(|g| offset_with_gap(la.clone(), false, [9.0, 5.0], g).vertices).collect();
     assert!(outward.iter().all(|v| *v == outward[0]));
+}
+
+#[test]
+fn offset_gap_type_leaves_lines_around_a_collapsed_arc_joined() {
+    // Offset 1 towards the centre of the radius-0.5 arc collapses it; the lines either side of
+    // it never met, so no gap type fills a corner between them.
+    let pts = json!([[-2, 0], {"p": [0, 0], "bulge": 1}, [0, -1], [1, -4]]);
+    let joined: Vec<_> = (0..3).map(|g| offset_with_gap(pts.clone(), false, [-0.3, -0.5], g).vertices).collect();
+    assert!(joined[0].iter().all(|v| v.bulge == 0.0), "arc collapsed: {:?}", joined[0]);
+    assert!(joined.iter().all(|v| *v == joined[0]), "{joined:?}");
 }
 
 #[test]
