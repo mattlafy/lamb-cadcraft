@@ -114,9 +114,9 @@ impl Foreign {
     }
 
     /// [`Foreign::rename`] on a drawing's shared copy, which is cloned only when it keeps
-    /// something for the renamed record.
+    /// something for the renamed record and the name really changes (not only its case).
     pub fn rename_shared(this: &mut std::sync::Arc<Foreign>, kinds: &[&str], from: &str, to: &str) {
-        if this.names(kinds, from) {
+        if !from.trim().eq_ignore_ascii_case(to.trim()) && this.names(kinds, from) {
             std::sync::Arc::make_mut(this).rename(kinds, from, to);
         }
     }

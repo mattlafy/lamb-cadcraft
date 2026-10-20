@@ -80,6 +80,11 @@ fn a_rename_that_only_changes_case_keeps_everything() {
     s.execute("rename", &json!({ "table": "layer", "from": "Walls", "to": "WALLS" })).unwrap();
     s.execute("rename", &json!({ "table": "block", "from": "Door", "to": "DOOR" })).unwrap();
     let d = saved_and_read(&s);
+    let layers: Vec<&str> = d.layers.iter().map(|l| l.name.as_str()).filter(|n| n.eq_ignore_ascii_case("walls")).collect();
+    assert_eq!(layers, ["WALLS"], "the layer is saved under the new spelling");
+    let blocks: Vec<(&str, &str)> =
+        d.blocks.iter().filter(|(k, _)| k.eq_ignore_ascii_case("door")).map(|(k, b)| (k.as_str(), b.name.as_str())).collect();
+    assert_eq!(blocks, [("DOOR", "DOOR")], "the block is saved under the new spelling");
     assert_eq!(layer_xdata(&d, "WALLS"), acme());
     assert!(dynamic_block(&d, "Door").is_some());
 }
