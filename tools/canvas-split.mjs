@@ -58,9 +58,14 @@ const MANIFEST = {
     'What a wheel notch or a click acts on: wheel zoom, the text to edit, the hatch under the cursor.',
     ['wheel_zoom_points', 'edit_text_at', 'hatch_at'],
   ],
+  cycle: [
+    'Selection cycling: the list of overlapping objects under a click, Shift+Space, and the badge.',
+    ['CycleList', 'cycle_click', 'shift_space_cycle', 'cycle_badge', 'cycle_list'],
+  ],
   // Inline test modules become file modules with the same body.
   tests: [null, ['tests']],
   hatch_pick_tests: [null, ['hatch_pick_tests']],
+  highlight_stability_tests: [null, ['highlight_stability_tests']],
 };
 // Modules whose items are reached as `crate::canvas::<item>` from outside the canvas.
 const REEXPORT = new Set(['draw', 'dyn_boxes']);
