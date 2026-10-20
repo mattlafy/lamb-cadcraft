@@ -29,7 +29,9 @@
 //! (lamb-core's [`corner_reach`], [`trim_to_reach`]; dropped when wholly inside) and every repeat
 //! copy with a line end inside the reach is dropped whole. Before that trim, each stud-move point
 //! ([`crate::studgrid`], LAMB T464) shifts its run's nearest repeat copy along the run onto itself.
-//! A structural-centre detail (LAMB T476) is laid from the exterior face, its farthest band there.
+//! A structural-centre detail (LAMB T476) is laid from the exterior face, its farthest band there;
+//! a grid detail (LAMB T477) from the exterior face too, its reference on the run's nearest parallel
+//! `datum` line within the wall ([`run_grid_offset`]).
 //! Not the AI-line sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
@@ -118,15 +120,98 @@ fn member_segments(d: &Drawing, detail: Id, members: &[cadcraft_doc::Handle]) ->
     out
 }
 
+/// How far beyond a run's half-width a `datum` line may sit and still be that run's grid line
+/// (LAMB T477).
+const GRID_REACH_MM: f64 = 50.0;
+
+/// The signed distance `h` from straight `run`'s centreline, toward the side `outside_left` names,
+/// of the run's grid line (LAMB T477): the straight `datum`-role segment in `view` parallel to the
+/// run (within `TOLERANCE.angle_deg`), overlapping its along-extent and within `width/2 +`
+/// [`GRID_REACH_MM`] of the centreline, nearest it. Two at the same distance on opposite sides are
+/// ambiguous.
+fn run_grid_offset(d: &Drawing, view: Id, run: &WallRun, outside_left: bool) -> Result<f64, String> {
+    use lamb_core::derivation::read::ProjectRead;
+    let RunCurve::Line { from, to } = run.centreline else { return Err("grid reference on an arc run not laid yet".into()) };
+    let len = (to.x - from.x).hypot(to.y - from.y);
+    if len <= TOLERANCE.coincidence_mm {
+        return Err("no grid line on the run".into());
+    }
+    let u = Point2 { x: (to.x - from.x) / len, y: (to.y - from.y) / len };
+    let out = if outside_left { Point2 { x: -u.y, y: u.x } } else { Point2 { x: u.y, y: -u.x } };
+    let max_sin = TOLERANCE.angle_deg.to_radians().sin();
+    let reach = run.width / 2.0 + GRID_REACH_MM;
+    let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
+    let mut found: Vec<f64> = Vec::new();
+    for e in p.entities(view) {
+        if p.role_of(&e) != lamb_core::model::entities::LineRole::Datum {
+            continue;
+        }
+        let Some(poly) = e.polyline.as_deref() else { continue };
+        let mut at = poly.start;
+        for seg in &poly.segments {
+            let (a, b) = (at, seg.to);
+            at = seg.to;
+            if seg.bulge != 0.0 {
+                continue;
+            }
+            let (lx, ly) = (b.x - a.x, b.y - a.y);
+            let l = lx.hypot(ly);
+            if l <= TOLERANCE.coincidence_mm || (u.x * ly - u.y * lx).abs() / l > max_sin {
+                continue;
+            }
+            let along = |q: Point2| (q.x - from.x) * u.x + (q.y - from.y) * u.y;
+            let (ta, tb) = (along(a), along(b));
+            if ta.min(tb).max(0.0) >= ta.max(tb).min(len) {
+                continue;
+            }
+            let (mx, my) = ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+            let h = (mx - from.x) * out.x + (my - from.y) * out.y;
+            if h.abs() <= reach {
+                found.push(h);
+            }
+        }
+    }
+    found.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
+    match found.as_slice() {
+        [] => Err("no grid line on the run".into()),
+        [h, rest @ ..] => {
+            let tie = rest.iter().any(|k| (k.abs() - h.abs()).abs() <= TOLERANCE.coincidence_mm && (k - h).abs() > TOLERANCE.coincidence_mm);
+            if tie { Err("ambiguous grid line".into()) } else { Ok(*h) }
+        }
+    }
+}
+
 /// The reference line and run face `run_lines` lays a detail from. A face reference is itself; a
 /// structural-centre reference (LAMB T476) is moved across onto the detail's farthest band, on
 /// [`detail_frame`]'s wall side, and laid from the exterior face — that band then sits on the face
-/// and the frame turns toward the interior. A tie is [`detail_frame`]'s ambiguity error.
-fn laid_reference(r: &crate::detailref::DetailRef, lines: &[(Point2, Point2, String)]) -> Result<((Point2, Point2), FaceRef), String> {
+/// and the frame turns toward the interior. A tie is [`detail_frame`]'s ambiguity error. A grid
+/// reference (LAMB T477) is moved against the wall side by `s = width/2 − h` ([`run_grid_offset`])
+/// and laid from the exterior face, so the reference line lands on the run's grid line.
+fn laid_reference(
+    d: &Drawing,
+    view: Id,
+    run: &WallRun,
+    sides: &lamb_core::derivation::wall_spaces::RunSides,
+    r: &crate::detailref::DetailRef,
+    lines: &[(Point2, Point2, String)],
+) -> Result<((Point2, Point2), FaceRef), String> {
     match r.kind {
         DetailRefKind::ExteriorFace => Ok(((r.from, r.to), FaceRef::Exterior)),
         DetailRefKind::InteriorFace => Ok(((r.from, r.to), FaceRef::Interior)),
-        DetailRefKind::Grid => Err("reference kind not laid yet".into()),
+        DetailRefKind::Grid => {
+            if matches!(run.centreline, RunCurve::Arc { .. }) {
+                return Err("grid reference on an arc run not laid yet".into());
+            }
+            let outside_left = lamb_core::derivation::wall_spaces::outside_on_left(sides).ok_or("no single exterior side")?;
+            let s = run.width / 2.0 - run_grid_offset(d, view, run, outside_left)?;
+            let frame = detail_frame((r.from, r.to), lines)?;
+            let shift = |p: Point2| Point2 { x: p.x - frame.into.x * s, y: p.y - frame.into.y * s };
+            let laid = (shift(r.from), shift(r.to));
+            if detail_frame(laid, lines).map(|f| f.into) != Ok(frame.into) {
+                return Err("grid offset flips the detail's wall side".into());
+            }
+            Ok((laid, FaceRef::Exterior))
+        }
         DetailRefKind::StructuralCentre => {
             let frame = detail_frame((r.from, r.to), lines)?;
             let far = detail_bands((r.from, r.to), lines)?.iter().map(|b| b.offset).fold(0.0, f64::max);
@@ -147,7 +232,7 @@ fn run_lines(
 ) -> Result<(Vec<AssemblyLine>, usize, Vec<usize>, Option<WidthConflict>), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let lines = detail_lines(d, detail, r.handle)?;
-    let (reference, face) = laid_reference(&r, &lines)?;
+    let (reference, face) = laid_reference(d, view, run, sides, &r, &lines)?;
     let bands = detail_bands(reference, &lines)?;
     let frame = detail_frame(reference, &lines)?;
     let mut laid = lay_bands(run, sides, face, &bands)?;
@@ -839,16 +924,57 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_grid_reference_or_no_tag_skips_every_run() -> R {
-        let (s, plan) = room("grid", true)?;
-        let runs = assembly_lines(s.doc()?, plan)?;
-        assert_eq!(runs.len(), 4);
-        assert!(runs.iter().all(|r| r.lines.is_empty() && r.skipped.as_deref() == Some("reference kind not laid yet")), "{runs:?}");
-
+    fn no_tag_skips_every_run() -> R {
         let (s, plan) = room("exterior_face", false)?;
         let runs = assembly_lines(s.doc()?, plan)?;
         assert_eq!(runs.len(), 4);
         assert!(runs.iter().all(|r| r.lines.is_empty() && r.detail.is_none() && r.skipped.as_deref() == Some("untyped")), "{runs:?}");
+        Ok(())
+    }
+
+    /// [`room_with`]`("grid", true, 220.0)` plus a `datum` line across the plan at each y in `ys`.
+    fn grid_room(ys: &[f64]) -> T<(Session, Id)> {
+        let (mut s, plan) = room_with("grid", true, 220.0)?;
+        for &y in ys {
+            let h = line(&mut s, [0.0, y], [5000.0, y])?;
+            s.execute("setrole", &json!({ "handles": [format!("{:X}", h.0)], "role": "datum" }))?;
+        }
+        Ok((s, plan))
+    }
+
+    #[test]
+    fn a_grid_detail_lays_its_reference_on_the_runs_datum_line() -> R {
+        let (s, plan) = grid_room(&[20.0])?;
+        let (ys, conflict) = bottom_run(&s, plan)?;
+        assert_eq!(ys, [(0.0, "CLAD".to_string()), (70.0, "GYP".to_string()), (220.0, "GYP".to_string())]);
+        assert_eq!(conflict, None, "220 detail in a 220 wall");
+        let runs = assembly_lines(s.doc()?, plan)?;
+        assert_eq!(runs.len(), 4);
+        assert_eq!(runs.iter().filter(|r| r.skipped.is_none() && r.lines.len() == 3).count(), 1, "{runs:?}");
+        let rest = runs.iter().filter(|r| r.lines.is_empty()).collect::<Vec<_>>();
+        assert_eq!(rest.len(), 3, "{runs:?}");
+        assert!(rest.iter().all(|r| r.detail.is_some() && r.skipped.as_deref() == Some("no grid line on the run")), "{runs:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_grid_detail_without_one_nearest_datum_line_in_reach_is_skipped() -> R {
+        let bottom_skip = |ys: &[f64]| -> T<Option<String>> {
+            let (s, plan) = grid_room(ys)?;
+            let d = s.doc()?;
+            let p = DrawingProject::new(d)?;
+            let (graph, _) = graph_and_sides(&p, plan);
+            for r in assembly_lines(d, plan)? {
+                let RunCurve::Line { from, to } = graph.runs[r.run].centreline else { continue };
+                if from.y < 2000.0 && (from.y - to.y).abs() < 1e-9 {
+                    assert!(r.lines.is_empty(), "{r:?}");
+                    return Ok(r.skipped);
+                }
+            }
+            Err("no bottom run".into())
+        };
+        assert_eq!(bottom_skip(&[300.0])?.as_deref(), Some("no grid line on the run"));
+        assert_eq!(bottom_skip(&[10.0, 210.0])?.as_deref(), Some("ambiguous grid line"));
         Ok(())
     }
 
