@@ -4,13 +4,19 @@
 //! the delta). A moving face moves along the run's normal toward its own side by
 //! [`WidthConflict::delta`]. A LINE face moves both ends; an LWPOLYLINE face moves its segment's two vertices, so the
 //! neighbouring segments stretch with it (a rectangle stays a rectangle, and two faces sharing a
-//! corner vertex compose). Arc runs carry no conflict yet and are never fitted.
+//! corner vertex compose). Arc runs carry no conflict yet and are never fitted. Two runs sharing
+//! one face segment (either side of a T) move it once. Every other wall-run face line whose free
+//! end (a LINE end, or an open LWPOLYLINE's first or last vertex) lay on a moved face segment has
+//! that end extended or trimmed along its own line to meet the moved face (T478).
 
 use cadcraft_doc::{Drawing, EntityKind, Handle};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
 use lamb_core::derivation::assembly::{FaceRef, WidthConflict};
 use lamb_core::derivation::wall_spaces::outside_on_left;
 use lamb_core::derivation::walls::RunCurve;
+use lamb_core::geometry::Point2;
+use lamb_core::geometry::intersect::infinite_line_intersect;
+use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::Id;
 use serde_json::{Value, json};
 
@@ -104,6 +110,78 @@ fn segment_mid(d: &Drawing, h: Handle, segment: usize) -> Result<(f64, f64), Str
     }
 }
 
+/// A follower's free end moved to meet a moved face: LINE vertex 0 = `a`, 1 = `b`; LWPOLYLINE the
+/// vertex index.
+struct EndMove {
+    handle: Handle,
+    vertex: usize,
+    to: Point2,
+}
+
+/// Everything one WALLFIT does: the fitted run indices, the face moves (one per face segment) and
+/// the end follow-ups.
+struct Plan {
+    fitted: Vec<usize>,
+    moves: Vec<Move>,
+    ends: Vec<EndMove>,
+}
+
+/// The straight segment `segment` of entity `h` as `(start, end)`, with each end's vertex index and
+/// whether it is free (a LINE end, or the first/last vertex of an open LWPOLYLINE).
+fn segment_ends(d: &Drawing, h: Handle, segment: usize) -> Option<[(Point2, usize, bool); 2]> {
+    let e = d.entity(h)?;
+    match &e.kind {
+        EntityKind::Line(l) => Some([(Point2 { x: l.a.x, y: l.a.y }, 0, true), (Point2 { x: l.b.x, y: l.b.y }, 1, true)]),
+        EntityKind::LwPolyline(p) => {
+            let n = p.vertices.len();
+            let next = if segment + 1 < n {
+                segment + 1
+            } else if p.closed {
+                0
+            } else {
+                return None;
+            };
+            let (a, b) = (p.vertices.get(segment)?.p, p.vertices.get(next)?.p);
+            let free = |i: usize| !p.closed && (i == 0 || i + 1 == n);
+            Some([(Point2 { x: a.x, y: a.y }, segment, free(segment)), (Point2 { x: b.x, y: b.y }, next, free(next))])
+        }
+        _ => None,
+    }
+}
+
+/// Whether `q` lies on segment `a→b` (inside its extent) within `TOLERANCE.coincidence_mm`.
+fn on_segment(q: Point2, a: Point2, b: Point2) -> bool {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    if len2 <= 0.0 {
+        return false;
+    }
+    let t = ((q.x - a.x) * dx + (q.y - a.y) * dy) / len2;
+    let (px, py) = (a.x + t * dx, a.y + t * dy);
+    let tol = TOLERANCE.coincidence_mm;
+    let ext = tol / len2.sqrt();
+    (-ext..=1.0 + ext).contains(&t) && (q.x - px).hypot(q.y - py) <= tol
+}
+
+fn apply_end(d: &mut Drawing, m: &EndMove) -> Result<(), String> {
+    let (to, v) = (m.to, m.vertex);
+    d.modify_entity(m.handle, |e| match &mut e.kind {
+        EntityKind::Line(l) => {
+            let p = if v == 0 { &mut l.a } else { &mut l.b };
+            p.x = to.x;
+            p.y = to.y;
+        }
+        EntityKind::LwPolyline(p) => {
+            if let Some(vx) = p.vertices.get_mut(v) {
+                vx.p.x = to.x;
+                vx.p.y = to.y;
+            }
+        }
+        _ => {}
+    })
+    .map_err(|e| e.to_string())
+}
+
 fn apply(d: &mut Drawing, m: &Move) -> Result<(), String> {
     let (dx, dy, seg) = (m.dx, m.dy, m.segment);
     d.modify_entity(m.handle, |e| match &mut e.kind {
@@ -135,18 +213,19 @@ pub fn wall_fit(d: &mut Drawing, plan: Id, only: Option<&[usize]>) -> Result<Vec
 
 /// [`wall_fit`] with `hold` choosing which face of every fitted run stays put.
 pub fn wall_fit_holding(d: &mut Drawing, plan: Id, only: Option<&[usize]>, hold: Hold) -> Result<Vec<usize>, String> {
-    let moves = plan_moves(d, plan, only, hold)?;
-    for (_, m) in &moves {
+    let plan = plan_moves(d, plan, only, hold)?;
+    for m in &plan.moves {
         apply(d, m)?;
     }
-    let mut fitted: Vec<usize> = moves.into_iter().map(|(i, _)| i).collect();
-    fitted.dedup();
-    Ok(fitted)
+    for e in &plan.ends {
+        apply_end(d, e)?;
+    }
+    Ok(plan.fitted)
 }
 
-/// The face moves [`wall_fit_holding`] would make, with their run indices, computed without
-/// mutating.
-fn plan_moves(d: &Drawing, plan: Id, only: Option<&[usize]>, hold: Hold) -> Result<Vec<(usize, Move)>, String> {
+/// The face moves and end follow-ups [`wall_fit_holding`] would make, with the fitted run indices,
+/// computed without mutating.
+fn plan_moves(d: &Drawing, plan: Id, only: Option<&[usize]>, hold: Hold) -> Result<Plan, String> {
     check_plan(d, plan)?;
     let runs = assembly_lines(d, plan)?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
@@ -179,7 +258,50 @@ fn plan_moves(d: &Drawing, plan: Id, only: Option<&[usize]>, hold: Hold) -> Resu
             moves.push((r.run, Move { handle, segment, dx: nx * amount, dy: ny * amount }));
         }
     }
-    Ok(moves)
+    // One move per face segment: runs either side of a T share the through wall's segment.
+    let tol = TOLERANCE.coincidence_mm;
+    let mut fitted = Vec::new();
+    let mut unique: Vec<(usize, Move)> = Vec::new();
+    for (run, m) in moves {
+        fitted.push(run);
+        if let Some((other_run, u)) = unique.iter().find(|(_, u)| u.handle == m.handle && u.segment == m.segment) {
+            if (u.dx - m.dx).hypot(u.dy - m.dy) > tol {
+                return Err(format!("runs {other_run} and {run} disagree on face {:X}", m.handle.0));
+            }
+            continue;
+        }
+        unique.push((run, m));
+    }
+    fitted.dedup();
+    let moves: Vec<Move> = unique.into_iter().map(|(_, m)| m).collect();
+
+    // End follow-ups: a free end of any other run face lying on a moved segment meets the moved line.
+    let shift = |h: Handle, seg: usize| moves.iter().find(|m| m.handle == h && m.segment == seg).map_or((0.0, 0.0), |m| (m.dx, m.dy));
+    let mut ends: Vec<EndMove> = Vec::new();
+    for m in &moves {
+        let Some([(a, ..), (b, ..)]) = segment_ends(d, m.handle, m.segment) else { continue };
+        let (na, nb) = (Point2 { x: a.x + m.dx, y: a.y + m.dy }, Point2 { x: b.x + m.dx, y: b.y + m.dy });
+        for run in &graph.runs {
+            for f in &run.faces {
+                let (h, seg) = (Handle(f.from.entity_id.0), f.from.segment_index);
+                if h == m.handle && seg == m.segment {
+                    continue;
+                }
+                let Some(fe) = segment_ends(d, h, seg) else { continue };
+                let (sx, sy) = shift(h, seg);
+                let (p0, p1) = (Point2 { x: fe[0].0.x + sx, y: fe[0].0.y + sy }, Point2 { x: fe[1].0.x + sx, y: fe[1].0.y + sy });
+                for &(q, vertex, free) in &fe {
+                    if !free || ends.iter().any(|e| e.handle == h && e.vertex == vertex) || !on_segment(q, a, b) {
+                        continue;
+                    }
+                    if let Some(hit) = infinite_line_intersect(p0, p1, na, nb) {
+                        ends.push(EndMove { handle: h, vertex, to: hit.point });
+                    }
+                }
+            }
+        }
+    }
+    Ok(Plan { fitted, moves, ends })
 }
 
 /// WALLFIT `{viewId, runs?: [index], hold?}`: [`wall_fit_holding`] in one undo step, `hold` one of
@@ -200,8 +322,8 @@ pub fn wallfit(s: &mut Session, p: &Value) -> EngineResult<Value> {
         Some(_) => return Err(other(HOLD_VALUES)),
     };
     // Validate before `doc_mut`: touching the drawing on a refusal would still record an undo step.
-    let moves = plan_moves(s.doc()?, plan, only.as_deref(), hold).map_err(other)?;
-    if moves.is_empty() {
+    let planned = plan_moves(s.doc()?, plan, only.as_deref(), hold).map_err(other)?;
+    if planned.moves.is_empty() {
         s.echo("No width conflicts".to_string());
         return Ok(json!({ "fitted": [], "hold": hold.name() }));
     }
@@ -434,6 +556,75 @@ mod tests {
         let (mut p, plan2) = room_with("exterior_face", true, 210.0)?;
         p.execute("wallfit", &json!({ "viewId": plan2.0 }))?;
         assert_eq!(plines(&s, plan)?, plines(&p, plan2)?, "Enter holds the reference");
+        Ok(())
+    }
+
+    /// Endpoints of every LINE in the plan's view block, in block order, rounded to 1e-6.
+    fn lines(s: &Session, plan: Id) -> T<Vec<((f64, f64), (f64, f64))>> {
+        let d = s.doc()?;
+        let b = d.block(&crate::schema::view_block_name(plan)).ok_or("no view block")?;
+        let r = |v: f64| (v * 1e6).round() / 1e6;
+        Ok(b.entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Line(l) => Some(((r(l.a.x), r(l.a.y)), (r(l.b.x), r(l.b.y)))),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// `room_with(.., inner)` plus a partition of two WALL-EXT LINEs x = 2400 and x = 2600 from
+    /// y = `y0` to y = `y1`, and any `extra` WALL-EXT LINEs.
+    fn room_with_partition(inner: f64, y0: f64, y1: f64, extra: &[[[f64; 2]; 2]]) -> T<(Session, Id)> {
+        let (mut s, plan) = room_with("exterior_face", true, inner)?;
+        s.execute("layer.current", &json!({ "name": "WALL-EXT" }))?;
+        for x in [2400.0, 2600.0] {
+            s.execute("line", &json!({ "points": [[x, y0], [x, y1]] }))?;
+        }
+        for l in extra {
+            s.execute("line", &json!({ "points": l }))?;
+        }
+        Ok((s, plan))
+    }
+
+    #[test]
+    fn wallfit_extends_partition_face_lines_to_the_moved_face_and_moves_a_shared_segment_once() -> R {
+        let (mut s, plan) = room_with_partition(210.0, 210.0, 3790.0, &[])?;
+        let (pl0, ln0) = (plines(&s, plan)?, lines(&s, plan)?);
+        assert_eq!(ln0, [((2400.0, 210.0), (2400.0, 3790.0)), ((2600.0, 210.0), (2600.0, 3790.0))]);
+        let n = undo_len(&s)?;
+        s.execute("wallfit", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!(plines(&s, plan)?[1], [(200.0, 200.0), (4800.0, 200.0), (4800.0, 3800.0), (200.0, 3800.0)], "not shifted twice");
+        assert_eq!(lines(&s, plan)?, [((2400.0, 200.0), (2400.0, 3800.0)), ((2600.0, 200.0), (2600.0, 3800.0))]);
+        s.undo()?;
+        assert_eq!(plines(&s, plan)?, pl0);
+        assert_eq!(lines(&s, plan)?, ln0);
+        Ok(())
+    }
+
+    #[test]
+    fn wallfit_trims_partition_face_lines_when_the_face_moves_toward_them() -> R {
+        let (mut s, plan) = room_with_partition(190.0, 190.0, 3810.0, &[])?;
+        s.execute("wallfit", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(plines(&s, plan)?[1], [(200.0, 200.0), (4800.0, 200.0), (4800.0, 3800.0), (200.0, 3800.0)]);
+        assert_eq!(lines(&s, plan)?, [((2400.0, 200.0), (2400.0, 3800.0)), ((2600.0, 200.0), (2600.0, 3800.0))]);
+        Ok(())
+    }
+
+    #[test]
+    fn wallfit_leaves_lines_off_the_face_and_moves_a_collinear_line_with_its_wall() -> R {
+        // A second partition 1 mm short of the face at its bottom end, and a line lying along the
+        // bottom inner face's line, touching it at its corner. A line parallel to a face can only
+        // touch it collinearly, which makes it a face of the same wall: it moves with that wall's
+        // face, and its corner end meets the moved side face — never a sideways jump.
+        let extra = [[[3400.0, 211.0], [3400.0, 3790.0]], [[3600.0, 211.0], [3600.0, 3790.0]], [[4790.0, 210.0], [4900.0, 210.0]]];
+        let (mut s, plan) = room_with_partition(210.0, 210.0, 3790.0, &extra)?;
+        s.execute("wallfit", &json!({ "viewId": plan.0 }))?;
+        let after = lines(&s, plan)?;
+        assert_eq!(after[2].0, (3400.0, 211.0), "1 mm off: bottom end untouched");
+        assert_eq!(after[3].0, (3600.0, 211.0), "1 mm off: bottom end untouched");
+        assert_eq!(after[4], ((4800.0, 200.0), (4900.0, 200.0)), "collinear: moves with its wall");
         Ok(())
     }
 }
