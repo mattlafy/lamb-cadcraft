@@ -2774,7 +2774,7 @@ pub(crate) mod tests {
     /// and a `GYP` band (−50,200)–(0,200) giving it a wall side — corner-tagged at the window when `opening_tag`. With `extra`, the left wall has a window
     /// gap too (y 1500..2500, same class) and the top wall is 300 thick with its own window gap (x
     /// 2000..3000) and its own `D1` edge tag. Returns (session, plan).
-    fn window_room(extra: bool, opening_tag: bool) -> T<(Session, Id)> {
+    pub(crate) fn window_room(extra: bool, opening_tag: bool) -> T<(Session, Id)> {
         window_room_with(extra, opening_tag, "exterior_face")
     }
 

@@ -11,22 +11,27 @@
 //! Each repeat copy of such a run (studs, LAMB T489) whose lines chain end to start into one closed
 //! loop becomes a prism of that loop over the same z range, in its first line's layer, after the
 //! run's strips; a copy that does not close stays 2D.
+//! Each placed corner and jamb detail (LAMB T491) then adds, per adjoining straight run with a z
+//! range, strips from its lines parallel to that run (same boundary rule, each strip over the
+//! overlap of its two boundaries' extents) and a prism per closed chain of its lines (whose lines
+//! bound no strip), replacing nothing.
 
 use std::collections::BTreeSet;
 
 use cadcraft_doc::Drawing;
-use lamb_core::derivation::assembly::{AssemblyLine, Band, lay_bands};
+use lamb_core::derivation::assembly::{AssemblyLine, Band, FaceRef, lay_bands};
 use lamb_core::derivation::projection::plan_local_to_global_xy;
-use lamb_core::derivation::read::{ProjectRead, ViewKind};
+use lamb_core::derivation::read::{ProjectRead, ViewKind, ViewRef};
 use lamb_core::derivation::resolve::ProvenanceKind;
 use lamb_core::derivation::solids::{SolidForm, SynthesizedSolid, most_doubtful, prism_from_loop, solid_triangles};
 use lamb_core::derivation::synthesis::SynthesisResult;
-use lamb_core::derivation::walls::RunCurve;
+use lamb_core::derivation::wall_spaces::RunSides;
+use lamb_core::derivation::walls::{RunCurve, WallRun};
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::geometry::{Point2, Point3};
 use lamb_core::model::Id;
 
-use crate::assembly::assembly_lines;
+use crate::assembly::{assembly_lines, corner_assembly, opening_assembly};
 use crate::detailtags::graph_and_sides;
 use crate::project::DrawingProject;
 use crate::schema::assembly_block_name;
@@ -89,111 +94,271 @@ struct Boundary<'a> {
     line: Option<&'a AssemblyLine>,
 }
 
-fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &lamb_core::derivation::read::ViewRef<'_>, result: &SynthesisResult, out: &mut Layered) {
+/// A straight run's reference face line as a frame: origin `a` at its start, unit `u` along it and
+/// unit `n` normal to it toward the centreline.
+struct Frame {
+    a: Point2,
+    u: Point2,
+    n: Point2,
+}
+
+impl Frame {
+    /// Signed offset of `q` from the reference line, positive toward the centreline.
+    fn off(&self, q: Point2) -> f64 {
+        dot(sub(q, self.a), self.n)
+    }
+
+    /// Distance of `q`'s foot along the reference line from `a`.
+    fn along(&self, q: Point2) -> f64 {
+        dot(sub(q, self.a), self.u)
+    }
+
+    fn at(&self, t: f64, h: f64) -> Point2 {
+        Point2 { x: self.a.x + self.u.x * t + self.n.x * h, y: self.a.y + self.u.y * t + self.n.y * h }
+    }
+
+    fn foot(&self, q: Point2) -> Point2 {
+        let h = self.off(q);
+        Point2 { x: q.x - self.n.x * h, y: q.y - self.n.y * h }
+    }
+}
+
+/// The frame of straight `run`'s `face` line ([`lay_bands`] at offset 0), or `None` for an arc run
+/// or a degenerate face.
+fn run_frame(run: &WallRun, side: &RunSides, face: FaceRef) -> Option<Frame> {
+    let RunCurve::Line { from: c0, to: c1 } = run.centreline else { return None };
+    let reference = lay_bands(run, side, face, &[Band { offset: 0.0, layer: String::new() }]).ok()?;
+    let reference = reference.first()?;
+    let (a, b) = (reference.from, reference.to);
+    let len = sub(b, a).x.hypot(sub(b, a).y);
+    if len <= TOLERANCE.coincidence_mm {
+        return None;
+    }
+    let u = Point2 { x: (b.x - a.x) / len, y: (b.y - a.y) / len };
+    let mid_c = Point2 { x: (c0.x + c1.x) / 2.0, y: (c0.y + c1.y) / 2.0 };
+    let mut n = Point2 { x: -u.y, y: u.x };
+    if dot(sub(mid_c, a), n) < 0.0 {
+        n = Point2 { x: u.y, y: -u.x };
+    }
+    Some(Frame { a, u, n })
+}
+
+/// The z range a run's massing has, with the run's face keys and the most doubtful provenance.
+struct ZRange {
+    bottom: f64,
+    top: f64,
+    provenance: ProvenanceKind,
+    keys: [(Id, usize); 2],
+}
+
+/// `run`'s z range: the synthesized surfaces of its two face segments, else the solid of either
+/// face's entity; `None` when that has no height.
+fn run_z(run: &WallRun, result: &SynthesisResult) -> Option<ZRange> {
+    let ends = [&run.faces[0].from, &run.faces[1].from];
+    let keys = ends.map(|f| (f.entity_id, f.segment_index));
+    let mut zs: Vec<f64> = Vec::new();
+    let mut provs: Vec<ProvenanceKind> = Vec::new();
+    for s in result.surfaces.iter().filter(|s| keys.contains(&(s.entity_id, s.segment_index))) {
+        zs.extend(s.triangles.iter().map(|q| q.z));
+        provs.push(s.provenance);
+    }
+    if zs.is_empty() {
+        for s in result.solids.iter().filter(|s| s.entity_ids.first().is_some_and(|e| keys.iter().any(|k| k.0 == *e))) {
+            zs.extend(s.faces.iter().flatten().map(|q| q.z));
+            provs.push(s.provenance);
+        }
+    }
+    let zs: Vec<f64> = zs.into_iter().filter(|z| z.is_finite()).collect();
+    let (bottom, top) = (zs.iter().copied().fold(f64::INFINITY, f64::min), zs.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+    if top - bottom <= TOLERANCE.coincidence_mm || !(top - bottom).is_finite() {
+        return None;
+    }
+    Some(ZRange { bottom, top, provenance: most_doubtful(&provs), keys })
+}
+
+/// Pushes the prism of plan-local loop `local` over `z` in `layer`; false when nothing was emitted.
+fn push_prism(view: &ViewRef<'_>, local: &[Point2], layer: String, z: &ZRange, out: &mut Layered) -> bool {
+    let Ok(global) = local.iter().map(|&q| plan_local_to_global_xy(view, q)).collect::<Result<Vec<_>, _>>() else { return false };
+    let base: Vec<Point3> = global.iter().map(|g| Point3 { x: g.x, y: g.y, z: z.bottom }).collect();
+    let faces = prism_from_loop(&base, Point3 { x: 0.0, y: 0.0, z: 1.0 }, 0.0, z.top - z.bottom);
+    let sources = z.keys.map(|k| k.0);
+    let solid = SynthesizedSolid { entity_ids: sources.to_vec(), provenance: z.provenance, faces, form: SolidForm::Shell, layer_id: layer.clone() };
+    let triangles = solid_triangles(&solid);
+    if triangles.is_empty() {
+        return false;
+    }
+    out.strips.push(LayerStrip { sources, provenance: z.provenance, layer, triangles });
+    true
+}
+
+/// `all` sorted by offset and merged within tolerance, a band line replacing the reference it
+/// coincides with.
+fn merge(mut all: Vec<Boundary<'_>>) -> Vec<Boundary<'_>> {
+    let tol = TOLERANCE.coincidence_mm;
+    all.sort_by(|x, y| x.offset.total_cmp(&y.offset));
+    let mut out: Vec<Boundary<'_>> = Vec::with_capacity(all.len());
+    for bd in all {
+        match out.last_mut() {
+            Some(last) if (bd.offset - last.offset).abs() <= tol => {
+                if last.line.is_none() {
+                    *last = bd;
+                }
+            }
+            _ => out.push(bd),
+        }
+    }
+    out
+}
+
+fn midpoint(l: &AssemblyLine) -> Point2 {
+    Point2 { x: (l.from.x + l.to.x) / 2.0, y: (l.from.y + l.to.y) / 2.0 }
+}
+
+/// The layer of a pair of consecutive boundaries — the boundary farther from the face — or `None`
+/// for a pair too thin or with no band line on that side.
+fn pair_layer<'a>(lo: &Boundary<'a>, hi: &Boundary<'a>) -> Option<String> {
+    if hi.offset - lo.offset <= TOLERANCE.coincidence_mm {
+        return None;
+    }
+    let far = if hi.offset.abs() >= lo.offset.abs() { hi } else { lo };
+    far.line.map(|l| l.layer.clone())
+}
+
+fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, result: &SynthesisResult, out: &mut Layered) {
     let Ok(runs) = assembly_lines(d, view.id) else { return };
     let (graph, sides) = graph_and_sides(p, view.id);
     let tol = TOLERANCE.coincidence_mm;
     for ra in runs.iter().filter(|r| r.skipped.is_none() && r.bands > 0) {
         let Some(face) = ra.face else { continue };
         let (Some(run), Some(side)) = (graph.runs.get(ra.run), sides.runs.get(ra.run)) else { continue };
-        let RunCurve::Line { from: c0, to: c1 } = run.centreline else { continue };
-        let Ok(reference) = lay_bands(run, side, face, &[Band { offset: 0.0, layer: String::new() }]) else { continue };
-        let Some(reference) = reference.first() else { continue };
-        let (a, b) = (reference.from, reference.to);
-        let len = sub(b, a).x.hypot(sub(b, a).y);
-        if len <= tol {
-            continue;
-        }
-        let u = Point2 { x: (b.x - a.x) / len, y: (b.y - a.y) / len };
-        let mid_c = Point2 { x: (c0.x + c1.x) / 2.0, y: (c0.y + c1.y) / 2.0 };
-        let mut n = Point2 { x: -u.y, y: u.x };
-        if dot(sub(mid_c, a), n) < 0.0 {
-            n = Point2 { x: u.y, y: -u.x };
-        }
-        let off = |q: Point2| dot(sub(q, a), n);
+        let Some(fr) = run_frame(run, side, face) else { continue };
         let Some(bands) = ra.lines.get(..ra.bands) else { continue };
         if bands.iter().any(|l| l.arc.is_some()) {
             continue;
         }
         let mut all: Vec<Boundary<'_>> = vec![Boundary { offset: 0.0, line: None }];
-        all.extend(
-            bands.iter().map(|l| Boundary { offset: off(Point2 { x: (l.from.x + l.to.x) / 2.0, y: (l.from.y + l.to.y) / 2.0 }), line: Some(l) }),
-        );
-        all.sort_by(|x, y| x.offset.total_cmp(&y.offset));
-        let mut merged: Vec<Boundary<'_>> = Vec::with_capacity(all.len());
-        for bd in all {
-            match merged.last_mut() {
-                Some(last) if (bd.offset - last.offset).abs() <= tol => {
-                    if last.line.is_none() {
-                        *last = bd;
-                    }
-                }
-                _ => merged.push(bd),
-            }
-        }
-
-        let ends = [&run.faces[0].from, &run.faces[1].from];
-        let keys = ends.map(|f| (f.entity_id, f.segment_index));
-        let mut zs: Vec<f64> = Vec::new();
-        let mut provs: Vec<ProvenanceKind> = Vec::new();
-        for s in result.surfaces.iter().filter(|s| keys.contains(&(s.entity_id, s.segment_index))) {
-            zs.extend(s.triangles.iter().map(|q| q.z));
-            provs.push(s.provenance);
-        }
-        if zs.is_empty() {
-            for s in result.solids.iter().filter(|s| s.entity_ids.first().is_some_and(|e| keys.iter().any(|k| k.0 == *e))) {
-                zs.extend(s.faces.iter().flatten().map(|q| q.z));
-                provs.push(s.provenance);
-            }
-        }
-        let zs: Vec<f64> = zs.into_iter().filter(|z| z.is_finite()).collect();
-        let (bottom, top) = (zs.iter().copied().fold(f64::INFINITY, f64::min), zs.iter().copied().fold(f64::NEG_INFINITY, f64::max));
-        if top - bottom <= tol || !(top - bottom).is_finite() {
-            continue;
-        }
-        let provenance = most_doubtful(&provs);
-        let foot = |q: Point2| {
-            let h = off(q);
-            Point2 { x: q.x - n.x * h, y: q.y - n.y * h }
-        };
+        all.extend(bands.iter().map(|l| Boundary { offset: fr.off(midpoint(l)), line: Some(l) }));
+        let merged = merge(all);
+        let Some(z) = run_z(run, result) else { continue };
         let mut emitted = false;
-        let push = |local: &[Point2], layer: String, out: &mut Layered| -> bool {
-            let Ok(global) = local.iter().map(|&q| plan_local_to_global_xy(view, q)).collect::<Result<Vec<_>, _>>() else { return false };
-            let base: Vec<Point3> = global.iter().map(|g| Point3 { x: g.x, y: g.y, z: bottom }).collect();
-            let faces = prism_from_loop(&base, Point3 { x: 0.0, y: 0.0, z: 1.0 }, 0.0, top - bottom);
-            let solid =
-                SynthesizedSolid { entity_ids: keys.map(|k| k.0).to_vec(), provenance, faces, form: SolidForm::Shell, layer_id: layer.clone() };
-            let triangles = solid_triangles(&solid);
-            if triangles.is_empty() {
-                return false;
-            }
-            out.strips.push(LayerStrip { sources: keys.map(|k| k.0), provenance, layer, triangles });
-            true
-        };
         for pair in merged.windows(2) {
             let [lo, hi] = pair else { continue };
-            if hi.offset - lo.offset <= tol {
-                continue;
-            }
-            let far = if hi.offset.abs() >= lo.offset.abs() { hi } else { lo };
-            let Some(layer) = far.line.map(|l| l.layer.clone()) else { continue };
+            let Some(layer) = pair_layer(lo, hi) else { continue };
             let quad = match (lo.line, hi.line) {
                 (Some(l), Some(h)) => [l.from, l.to, h.to, h.from],
-                (Some(l), None) | (None, Some(l)) => [l.from, l.to, foot(l.to), foot(l.from)],
+                (Some(l), None) | (None, Some(l)) => [l.from, l.to, fr.foot(l.to), fr.foot(l.from)],
                 (None, None) => continue,
             };
-            emitted |= push(&quad, layer, out);
+            emitted |= push_prism(view, &quad, layer, &z, out);
         }
         let mut start = ra.bands;
         for &count in &ra.copies {
             let Some(copy) = ra.lines.get(start..start + count) else { break };
             start += count;
             if let (Some(ring), Some(head)) = (closed_loop(copy, tol), copy.first()) {
-                push(&ring, head.layer.clone(), out);
+                push_prism(view, &ring, head.layer.clone(), &z, out);
             }
         }
         if emitted {
-            out.replaced.extend(keys);
+            out.replaced.extend(z.keys);
+        }
+    }
+
+    // Placed corner and jamb details (LAMB T491): after the runs' strips, replacing nothing.
+    let faces: Vec<(usize, FaceRef)> = runs.iter().filter_map(|r| r.face.map(|f| (r.run, f))).collect();
+    let corners = corner_assembly(d, view.id).unwrap_or_default();
+    let openings = opening_assembly(d, view.id).unwrap_or_default();
+    let mut groups: Vec<(&[AssemblyLine], Vec<usize>)> = Vec::new();
+    for c in corners.iter().filter(|c| c.skipped.is_none()) {
+        let Some(j) = graph.junctions.get(c.junction) else { continue };
+        groups.push((&c.lines, j.arms.iter().map(|a| a.run).collect()));
+    }
+    for o in openings.iter().filter(|o| o.skipped.is_none() && o.lines.len() % 2 == 0) {
+        let Some(b) = graph.bridges.get(o.bridge) else { continue };
+        let (first, second) = o.lines.split_at(o.lines.len() / 2);
+        groups.push((first, vec![b.a.0]));
+        groups.push((second, vec![b.b.0]));
+    }
+    let ctx = DetailCtx { view, runs: &graph.runs, sides: &sides.runs, faces: &faces, result };
+    for (lines, adjoining) in groups {
+        ctx.meshes(lines, &adjoining, out);
+    }
+}
+
+/// What placing one corner or jamb detail's meshes reads.
+struct DetailCtx<'a> {
+    view: &'a ViewRef<'a>,
+    runs: &'a [WallRun],
+    sides: &'a [RunSides],
+    /// Each laid run's reference face, by run index.
+    faces: &'a [(usize, FaceRef)],
+    result: &'a SynthesisResult,
+}
+
+impl DetailCtx<'_> {
+    /// One placed detail's meshes: per `adjoining` straight run with a z range, `lines` parallel to
+    /// it as strips over the overlap of consecutive boundaries; then each closed chain of `lines` as
+    /// a prism over the first such run's z range. A closed chain's lines are not strip boundaries.
+    fn meshes(&self, lines: &[AssemblyLine], adjoining: &[usize], out: &mut Layered) {
+        let tol = TOLERANCE.coincidence_mm;
+        let sin_tol = TOLERANCE.angle_deg.to_radians().sin();
+        let near = |a: Point2, b: Point2| (a.x - b.x).hypot(a.y - b.y) <= tol;
+        let mut rings: Vec<(Vec<Point2>, String)> = Vec::new();
+        let mut in_ring = vec![false; lines.len()];
+        let mut start = 0;
+        for k in 1..=lines.len() {
+            let (Some(prev), Some(head)) = (lines.get(k - 1), lines.get(start)) else { break };
+            if !near(prev.to, head.from) && lines.get(k).is_some_and(|l| near(l.from, prev.to)) {
+                continue;
+            }
+            if let Some(ring) = lines.get(start..k).and_then(|chain| closed_loop(chain, tol)) {
+                rings.push((ring, head.layer.clone()));
+                in_ring.iter_mut().take(k).skip(start).for_each(|f| *f = true);
+            }
+            start = k;
+        }
+        let mut first_z: Option<ZRange> = None;
+        for &i in adjoining {
+            let (Some(run), Some(side)) = (self.runs.get(i), self.sides.get(i)) else { continue };
+            let Some(&(_, face)) = self.faces.iter().find(|f| f.0 == i) else { continue };
+            let (Some(fr), Some(z)) = (run_frame(run, side, face), run_z(run, self.result)) else { continue };
+            let parallel = |l: &AssemblyLine| {
+                let v = sub(l.to, l.from);
+                let len = v.x.hypot(v.y);
+                l.arc.is_none() && len > tol && (dot(v, fr.n) / len).abs() <= sin_tol
+            };
+            let mut all: Vec<Boundary<'_>> = vec![Boundary { offset: 0.0, line: None }];
+            all.extend(
+                lines.iter().zip(&in_ring).filter(|(l, r)| !**r && parallel(l)).map(|(l, _)| Boundary { offset: fr.off(midpoint(l)), line: Some(l) }),
+            );
+            let extent = |l: &AssemblyLine| {
+                let (s, e) = (fr.along(l.from), fr.along(l.to));
+                (s.min(e), s.max(e))
+            };
+            for pair in merge(all).windows(2) {
+                let [lo, hi] = pair else { continue };
+                let Some(layer) = pair_layer(lo, hi) else { continue };
+                let (t0, t1) = match (lo.line, hi.line) {
+                    (Some(l), Some(h)) => {
+                        let (x, y) = (extent(l), extent(h));
+                        (x.0.max(y.0), x.1.min(y.1))
+                    }
+                    (Some(l), None) | (None, Some(l)) => extent(l),
+                    (None, None) => continue,
+                };
+                if t1 - t0 <= tol {
+                    continue;
+                }
+                let quad = [fr.at(t0, lo.offset), fr.at(t1, lo.offset), fr.at(t1, hi.offset), fr.at(t0, hi.offset)];
+                push_prism(self.view, &quad, layer, &z, out);
+            }
+            if first_z.is_none() {
+                first_z = Some(z);
+            }
+        }
+        let Some(z) = first_z else { return };
+        for (ring, layer) in rings {
+            push_prism(self.view, &ring, layer, &z, out);
         }
     }
 }
@@ -243,9 +408,7 @@ mod tests {
 
     fn placed(tagged: bool) -> T<(Session, Id)> {
         let (mut s, plan) = room("exterior_face", tagged)?;
-        let level = Id(s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].as_u64().ok_or("no id")?);
-        let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
-        s.execute("placeview", &json!({ "viewId": plan.0, "kind": "plan", "levelId": level.0, "cutElevation": 1200, "transform": t }))?;
+        place(&mut s, plan)?;
         Ok((s, plan))
     }
 
@@ -412,6 +575,112 @@ mod tests {
         let sc = scene(d)?;
         assert!(sc.meshes.iter().all(|m| m.layer != "STUD"));
         assert_eq!(sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).count(), 12);
+        Ok(())
+    }
+
+    /// Places `plan` on a new level L1 at the origin.
+    fn place(s: &mut Session, plan: Id) -> R {
+        let level = Id(s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].as_u64().ok_or("no id")?);
+        let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
+        s.execute("placeview", &json!({ "viewId": plan.0, "kind": "plan", "levelId": level.0, "cutElevation": 1200, "transform": t }))?;
+        Ok(())
+    }
+
+    /// [`placed`] (tagged) with [`corner_detail`](crate::assembly::tests::corner_detail) at every
+    /// corner — with `post`, plus a closed `POST` pline (−300,50)…(−200,150) in it — then ASSEMBLYPLAN.
+    fn cornered(post: bool) -> T<(Session, Id)> {
+        let (mut s, plan) = placed(true)?;
+        let cd = crate::assembly::tests::corner_detail(&mut s, plan, "exterior_face", false, (0.0, 0.0))?;
+        if post {
+            s.execute("editview", &json!({ "viewId": cd.0 }))?;
+            s.execute("layer.new", &json!({ "name": "POST", "current": true }))?;
+            s.execute("pline", &json!({ "vertices": [[-300, 50], [-200, 50], [-200, 150], [-300, 150]], "closed": true }))?;
+            s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        }
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        Ok((s, plan))
+    }
+
+    #[test]
+    fn each_placed_corner_fills_its_band_over_the_arm_z_range() -> R {
+        let (s, _) = cornered(false)?;
+        let sc = scene(s.doc()?)?;
+        let layers: Vec<_> = sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).collect();
+        let crn: Vec<_> = layers.iter().filter(|m| m.layer.starts_with("CRN")).collect();
+        assert_eq!(crn.len(), 4, "{:?}", crn.iter().map(|m| &m.layer).collect::<Vec<_>>());
+        assert!(crn.iter().all(|m| m.layer == "CRN-B"));
+        let clad = layers.iter().find(|m| m.layer == "CLAD").ok_or("no CLAD")?;
+        let (zlo, zhi) = range(&sc, clad, 2);
+        for m in &crn {
+            let (x, y, z) = (range(&sc, m, 0), range(&sc, m, 1), range(&sc, m, 2));
+            let (w, h) = (x.1 - x.0, y.1 - y.0);
+            assert!((w - 1000.0).abs() < 0.01 && (h - 200.0).abs() < 0.01 || (w - 200.0).abs() < 0.01 && (h - 1000.0).abs() < 0.01, "{x:?} {y:?}");
+            // Spans face to offset 200: one side on the outer face of the box.
+            let on_face = |r: (f64, f64), hi: f64| r.0.abs() < 0.01 || (r.1 - hi).abs() < 0.01;
+            if h < w {
+                assert!(on_face(y, 4000.0), "{y:?}")
+            } else {
+                assert!(on_face(x, 5000.0), "{x:?}")
+            }
+            assert!((z.0 - zlo).abs() < 0.01 && (z.1 - zhi).abs() < 0.01, "{z:?} vs {zlo}..{zhi}");
+            assert_eq!(m.sources.len(), 2);
+        }
+
+        // The run strips are the uncornered room's, trimmed: same count and layers.
+        let (mut plain, plain_plan) = placed(true)?;
+        plain.execute("assemblyplan", &json!({ "viewId": plain_plan.0 }))?;
+        let base = scene(plain.doc()?)?;
+        let want: Vec<_> = base.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).map(|m| m.layer.clone()).collect();
+        let got: Vec<_> = layers.iter().filter(|m| !m.layer.starts_with("CRN")).map(|m| m.layer.clone()).collect();
+        assert_eq!(got, want);
+        let total = |sc: &crate::scene::Scene| -> f64 {
+            sc.meshes
+                .iter()
+                .filter(|m| m.kind == SceneMeshKind::Layer && !m.layer.starts_with("CRN"))
+                .map(|m| range(sc, m, 0).1 - range(sc, m, 0).0 + range(sc, m, 1).1 - range(sc, m, 1).0)
+                .sum()
+        };
+        assert!(total(&sc) < total(&base) - 1.0, "the corners trim the run strips");
+        Ok(())
+    }
+
+    #[test]
+    fn a_closed_chain_in_a_corner_detail_is_one_prism_per_corner() -> R {
+        let (s, _) = cornered(true)?;
+        let sc = scene(s.doc()?)?;
+        let layers: Vec<_> = sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).collect();
+        let posts: Vec<_> = layers.iter().filter(|m| m.layer == "POST").collect();
+        assert_eq!(posts.len(), 4);
+        for m in &posts {
+            let (x, y) = (range(&sc, m, 0), range(&sc, m, 1));
+            assert!((x.1 - x.0 - 100.0).abs() < 0.01 && (y.1 - y.0 - 100.0).abs() < 0.01, "{x:?} {y:?}");
+        }
+        assert_eq!(layers.iter().filter(|m| m.layer == "CRN-B").count(), 4, "the post bounds no strip");
+        Ok(())
+    }
+
+    #[test]
+    fn a_jamb_detail_fills_both_jambs() -> R {
+        let layered_of = |tag: bool| -> T<crate::scene::Scene> {
+            let (mut s, plan) = crate::assembly::tests::window_room(false, tag)?;
+            place(&mut s, plan)?;
+            s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+            Ok(scene(s.doc()?)?)
+        };
+        let (base, sc) = (layered_of(false)?, layered_of(true)?);
+        let count = |sc: &crate::scene::Scene| sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).count();
+        assert_eq!(count(&sc), count(&base) + 2, "one GYP strip per jamb");
+        // Each jamb's GYP band: 50 along the bottom wall beside the gap, face (y 0) to 200.
+        let jambs: Vec<_> = sc
+            .meshes
+            .iter()
+            .filter(|m| m.kind == SceneMeshKind::Layer && m.layer == "GYP")
+            .map(|m| (range(&sc, m, 0), range(&sc, m, 1)))
+            .filter(|(x, y)| (x.1 - x.0 - 50.0).abs() < 0.01 && y.0.abs() < 0.01 && (y.1 - 200.0).abs() < 0.01)
+            .collect();
+        assert_eq!(jambs.len(), 2, "{jambs:?}");
+        assert!(jambs.iter().any(|(x, _)| (x.1 - 2000.0).abs() < 0.01), "{jambs:?}");
+        assert!(jambs.iter().any(|(x, _)| (x.0 - 3000.0).abs() < 0.01), "{jambs:?}");
         Ok(())
     }
 }
