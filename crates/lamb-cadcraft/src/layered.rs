@@ -6,8 +6,11 @@
 //! from the reference face, extruded over the z range the run's massing already has (the
 //! synthesized surfaces of its two face segments, else the solid of either face's entity). Those
 //! face segments' surfaces are then replaced, and a solid is dropped once every segment of its plan
-//! entity is. Arc runs, skipped runs and repeat copies keep their massing; a run with no massing to
-//! take a z range from emits nothing. Unreadable layered data yields no layers, never an error.
+//! entity is. An arc run whose bands are all arcs (LAMB T492) does the same with concentric
+//! boundaries: each strip is the ring between two consecutive arcs over the overlap of their angular
+//! spans, sampled as `asmview`'s ghost face lines are. Skipped runs and runs mixing arc and straight
+//! bands keep their massing; a run with no massing to take a z range from emits nothing.
+//! Unreadable layered data yields no layers, never an error.
 //! Each repeat copy of such a run (studs, LAMB T489) whose lines chain end to start into one closed
 //! loop becomes a prism of that loop over the same z range, in its first line's layer, after the
 //! run's strips; a copy that does not close stays 2D.
@@ -231,25 +234,16 @@ fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, result: 
     for ra in runs.iter().filter(|r| r.skipped.is_none() && r.bands > 0) {
         let Some(face) = ra.face else { continue };
         let (Some(run), Some(side)) = (graph.runs.get(ra.run), sides.runs.get(ra.run)) else { continue };
-        let Some(fr) = run_frame(run, side, face) else { continue };
         let Some(bands) = ra.lines.get(..ra.bands) else { continue };
-        if bands.iter().any(|l| l.arc.is_some()) {
-            continue;
-        }
-        let mut all: Vec<Boundary<'_>> = vec![Boundary { offset: 0.0, line: None }];
-        all.extend(bands.iter().map(|l| Boundary { offset: fr.off(midpoint(l)), line: Some(l) }));
-        let merged = merge(all);
+        let loops = match run.centreline {
+            RunCurve::Line { .. } => straight_loops(run, side, face, bands),
+            RunCurve::Arc { radius, .. } => arc_loops(run, side, face, bands, radius),
+        };
+        let Some(loops) = loops else { continue };
         let Some(z) = run_z(run, result) else { continue };
         let mut emitted = false;
-        for pair in merged.windows(2) {
-            let [lo, hi] = pair else { continue };
-            let Some(layer) = pair_layer(lo, hi) else { continue };
-            let quad = match (lo.line, hi.line) {
-                (Some(l), Some(h)) => [l.from, l.to, h.to, h.from],
-                (Some(l), None) | (None, Some(l)) => [l.from, l.to, fr.foot(l.to), fr.foot(l.from)],
-                (None, None) => continue,
-            };
-            emitted |= push_prism(view, &quad, layer, &z, out);
+        for (ring, layer) in loops {
+            emitted |= push_prism(view, &ring, layer, &z, out);
         }
         let mut start = ra.bands;
         for &count in &ra.copies {
@@ -283,6 +277,89 @@ fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, result: 
     for (lines, adjoining) in groups {
         ctx.meshes(lines, &adjoining, out);
     }
+}
+
+/// A straight run's layer loops (plan-local) with their layers, or `None` when its frame is
+/// degenerate or a band is an arc.
+fn straight_loops(run: &WallRun, side: &RunSides, face: FaceRef, bands: &[AssemblyLine]) -> Option<Vec<(Vec<Point2>, String)>> {
+    let fr = run_frame(run, side, face)?;
+    if bands.iter().any(|l| l.arc.is_some()) {
+        return None;
+    }
+    let mut all: Vec<Boundary<'_>> = vec![Boundary { offset: 0.0, line: None }];
+    all.extend(bands.iter().map(|l| Boundary { offset: fr.off(midpoint(l)), line: Some(l) }));
+    let mut out = Vec::new();
+    for pair in merge(all).windows(2) {
+        let [lo, hi] = pair else { continue };
+        let Some(layer) = pair_layer(lo, hi) else { continue };
+        let quad = match (lo.line, hi.line) {
+            (Some(l), Some(h)) => vec![l.from, l.to, h.to, h.from],
+            (Some(l), None) | (None, Some(l)) => vec![l.from, l.to, fr.foot(l.to), fr.foot(l.from)],
+            (None, None) => continue,
+        };
+        out.push((quad, layer));
+    }
+    Some(out)
+}
+
+/// An arc line as `(center, radius, start angle, ccw sweep ≥ 0)`, direction-free.
+fn arc_of(l: &AssemblyLine) -> Option<(Point2, f64, f64, f64)> {
+    let a = l.arc.as_ref()?;
+    let (s, e) = if a.ccw { (l.from, l.to) } else { (l.to, l.from) };
+    let ang = |q: Point2| (q.y - a.center.y).atan2(q.x - a.center.x);
+    let (a0, a1) = (ang(s), ang(e));
+    Some((a.center, a.radius, a0, (a1 - a0).rem_euclid(std::f64::consts::TAU)))
+}
+
+/// An arc run's layer loops (plan-local) with their layers: each pair of consecutive concentric
+/// boundaries gives the ring between them over the overlap of their angular spans. `None` when a
+/// band is straight or the reference face is not an arc.
+fn arc_loops(run: &WallRun, side: &RunSides, face: FaceRef, bands: &[AssemblyLine], centre_r: f64) -> Option<Vec<(Vec<Point2>, String)>> {
+    use crate::asmview::{GHOST_MIN_SEGMENTS, GHOST_SEGMENTS_PER_TURN};
+    use std::f64::consts::{PI, TAU};
+    let reference = lay_bands(run, side, face, &[Band { offset: 0.0, layer: String::new() }]).ok()?;
+    let (rc, rr, ra0, rsw) = arc_of(reference.first()?)?;
+    if bands.iter().any(|l| l.arc.is_none()) {
+        return None;
+    }
+    let toward = if centre_r >= rr { 1.0 } else { -1.0 };
+    let mut all: Vec<Boundary<'_>> = vec![Boundary { offset: 0.0, line: None }];
+    all.extend(bands.iter().filter_map(|l| arc_of(l).map(|(_, r, ..)| Boundary { offset: (r - rr) * toward, line: Some(l) })));
+    // A boundary's (center, radius, start relative to the reference start, sweep).
+    let geom = |b: &Boundary<'_>| -> Option<(Point2, f64, f64, f64)> {
+        match b.line {
+            None => Some((rc, rr, 0.0, rsw)),
+            Some(l) => {
+                let (c, r, a0, sw) = arc_of(l)?;
+                Some((c, r, (a0 - ra0 + PI).rem_euclid(TAU) - PI, sw))
+            }
+        }
+    };
+    let tol = TOLERANCE.coincidence_mm;
+    let mut out = Vec::new();
+    for pair in merge(all).windows(2) {
+        let [lo, hi] = pair else { continue };
+        let Some(layer) = pair_layer(lo, hi) else { continue };
+        let (Some(g0), Some(g1)) = (geom(lo), geom(hi)) else { continue };
+        let (t0, t1) = (g0.2.max(g1.2), (g0.2 + g0.3).min(g1.2 + g1.3));
+        if (t1 - t0) * g0.1.max(g1.1) <= tol {
+            continue;
+        }
+        let n = (((t1 - t0) / TAU * GHOST_SEGMENTS_PER_TURN).ceil() as usize).max(GHOST_MIN_SEGMENTS);
+        let pts = |(c, r, ..): (Point2, f64, f64, f64)| -> Vec<Point2> {
+            (0..=n)
+                .map(|i| {
+                    let t = ra0 + t0 + (t1 - t0) * i as f64 / n as f64;
+                    Point2 { x: c.x + r * t.cos(), y: c.y + r * t.sin() }
+                })
+                .collect()
+        };
+        let (outer, inner) = if g0.1 >= g1.1 { (g0, g1) } else { (g1, g0) };
+        let mut ring = pts(outer);
+        ring.extend(pts(inner).into_iter().rev());
+        out.push((ring, layer));
+    }
+    Some(out)
 }
 
 /// What placing one corner or jamb detail's meshes reads.
@@ -501,6 +578,12 @@ mod tests {
     /// outline, or with `open` a single stud line — then ASSEMBLYPLAN.
     fn studded(open: bool) -> T<(Session, Id)> {
         let (mut s, plan) = placed(true)?;
+        add_studs(&mut s, plan, open)?;
+        Ok((s, plan))
+    }
+
+    /// Adds [`studded`]'s STUD repeat to `plan`'s detail D1, then runs ASSEMBLYPLAN.
+    fn add_studs(s: &mut Session, plan: Id, open: bool) -> R {
         let detail = {
             let p = crate::project::DrawingProject::new(s.doc()?)?;
             p.views().find(|v| v.kind == lamb_core::derivation::read::ViewKind::Detail).ok_or("no detail")?.id
@@ -508,15 +591,15 @@ mod tests {
         s.execute("editview", &json!({ "viewId": detail.0 }))?;
         s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
         let stud = if open {
-            drawn(&mut s, "line", json!({ "points": [[100, 50], [100, 200]] }))?
+            drawn(s, "line", json!({ "points": [[100, 50], [100, 200]] }))?
         } else {
-            drawn(&mut s, "pline", json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?
+            drawn(s, "pline", json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?
         };
-        let pitch = drawn(&mut s, "dimaligned", json!({ "p1": [100, 0], "p2": [500, 0], "at": [300, -300] }))?;
+        let pitch = drawn(s, "dimaligned", json!({ "p1": [100, 0], "p2": [500, 0], "at": [300, -300] }))?;
         s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()] }))?;
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
         s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
-        Ok((s, plan))
+        Ok(())
     }
 
     fn range(sc: &crate::scene::Scene, m: &crate::scene::SceneMesh, axis: usize) -> (f64, f64) {
@@ -681,6 +764,109 @@ mod tests {
         assert_eq!(jambs.len(), 2, "{jambs:?}");
         assert!(jambs.iter().any(|(x, _)| (x.1 - 2000.0).abs() < 0.01), "{jambs:?}");
         assert!(jambs.iter().any(|(x, _)| (x.0 - 3000.0).abs() < 0.01), "{jambs:?}");
+        Ok(())
+    }
+
+    /// [`d_room`](crate::assembly::tests::d_room) placed, its two plines redrawn clockwise when
+    /// `cw`, with [`add_studs`]'s closed STUD repeat when `studs`, then ASSEMBLYPLAN.
+    fn arc_room(cw: bool, studs: bool) -> T<(Session, Id)> {
+        let (mut s, plan) = crate::assembly::tests::d_room()?;
+        if cw {
+            let old: Vec<String> = plines(&s, plan)?.iter().map(|h| h.hex()).collect();
+            s.execute("erase", &json!({ "handles": old }))?;
+            s.execute("layer.current", &json!({ "name": "WALL-EXT" }))?;
+            let v = |x: f64, y: f64, bulge: f64| json!({ "p": [x, y], "bulge": bulge });
+            for (lo, hi, x0) in [(0.0, 2200.0, 0.0), (200.0, 2000.0, 200.0)] {
+                let vs = [v(x0, hi, 0.0), v(3000.0, hi, -1.0), v(3000.0, lo, 0.0), v(x0, lo, 0.0)];
+                s.execute("pline", &json!({ "vertices": vs, "closed": true }))?;
+            }
+        }
+        place(&mut s, plan)?;
+        if studs {
+            add_studs(&mut s, plan, false)?;
+        } else {
+            s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        }
+        Ok((s, plan))
+    }
+
+    /// The scene's Layer meshes on the arc run (every vertex at x ≥ 3000, some past 3100).
+    fn arc_meshes(sc: &crate::scene::Scene) -> Vec<&crate::scene::SceneMesh> {
+        sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer && range(sc, m, 0).0 > 2999.99 && range(sc, m, 0).1 > 3100.0).collect()
+    }
+
+    /// `m`'s vertex radii about the arc's centre (3000, 1100): (min, max).
+    fn radii(sc: &crate::scene::Scene, m: &crate::scene::SceneMesh) -> (f64, f64) {
+        let r = m.positions.iter().map(|p| (sc.origin[0] + f64::from(p[0]) - 3000.0).hypot(sc.origin[1] + f64::from(p[1]) - 1100.0));
+        (r.clone().fold(f64::INFINITY, f64::min), r.fold(f64::NEG_INFINITY, f64::max))
+    }
+
+    #[test]
+    fn a_laid_arc_run_shows_as_curved_layer_slabs_at_the_band_radii() -> R {
+        let (s, _) = arc_room(false, false)?;
+        let sc = scene(s.doc()?)?;
+        let arcs = arc_meshes(&sc);
+        let mut got: Vec<(String, f64, f64)> = arcs.iter().map(|m| (m.layer.clone(), radii(&sc, m).0, radii(&sc, m).1)).collect();
+        got.sort_by(|a, b| a.1.total_cmp(&b.1));
+        assert_eq!(got.len(), 3, "{got:?}");
+        // Reference (exterior) face r 1100; CLAD −20 outward, GYP 50 and 200 toward the centre.
+        let want = [("GYP", 900.0, 1050.0), ("GYP", 1050.0, 1100.0), ("CLAD", 1100.0, 1120.0)];
+        for ((l, lo, hi), (wl, wlo, whi)) in got.iter().zip(want) {
+            assert_eq!(l, wl);
+            assert!((lo - wlo).abs() < 0.05 && (hi - whi).abs() < 0.05, "{got:?}");
+        }
+        // Smooth: a semicircle sampled at 32 segments per arc, so 33 points per side.
+        let clad = arcs.iter().find(|m| m.layer == "CLAD").ok_or("no CLAD")?;
+        let distinct: std::collections::BTreeSet<_> =
+            clad.positions.iter().map(|p| ((p[0] * 10.0).round() as i64, (p[1] * 10.0).round() as i64)).collect();
+        assert_eq!(distinct.len(), 66, "two arcs of 33 points");
+        // Every run is layered, so both plines' solids — arc segment included — are replaced.
+        assert!(sc.meshes.iter().all(|m| m.kind != SceneMeshKind::Solid));
+        assert_eq!(sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).count(), 12);
+        Ok(())
+    }
+
+    #[test]
+    fn a_clockwise_arc_gives_the_same_slabs() -> R {
+        let key = |cw: bool| -> T<Vec<(String, std::collections::BTreeSet<(i64, i64, i64)>)>> {
+            let (s, _) = arc_room(cw, false)?;
+            let sc = scene(s.doc()?)?;
+            let mut v: Vec<_> = arc_meshes(&sc)
+                .iter()
+                .map(|m| {
+                    let pts =
+                        m.positions.iter().map(|p| (0..3).map(|k| ((sc.origin[k] + f64::from(p[k])) * 10.0).round() as i64).collect::<Vec<_>>());
+                    (m.layer.clone(), pts.map(|q| (q[0], q[1], q[2])).collect())
+                })
+                .collect();
+            v.sort();
+            Ok(v)
+        };
+        let (ccw, cw) = (key(false)?, key(true)?);
+        assert_eq!(ccw.len(), 3);
+        assert_eq!(ccw, cw);
+        Ok(())
+    }
+
+    #[test]
+    fn closed_stud_copies_on_an_arc_run_become_prisms() -> R {
+        let (s, plan) = arc_room(false, true)?;
+        let d = s.doc()?;
+        let p = crate::project::DrawingProject::new(d)?;
+        let (graph, _) = crate::detailtags::graph_and_sides(&p, plan);
+        let runs = crate::assembly::assembly_lines(d, plan)?;
+        let arc = runs
+            .iter()
+            .find(|r| graph.runs.get(r.run).is_some_and(|w| matches!(w.centreline, lamb_core::derivation::walls::RunCurve::Arc { .. })))
+            .ok_or("no arc run")?;
+        assert!(!arc.copies.is_empty(), "copies laid along the arc");
+        let sc = scene(d)?;
+        let studs: Vec<_> = arc_meshes(&sc).into_iter().filter(|m| m.layer == "STUD").collect();
+        assert_eq!(studs.len(), arc.copies.len());
+        for m in &studs {
+            let (lo, hi) = radii(&sc, m);
+            assert!(lo > 900.0 - 2.0 && hi < 1050.0 + 2.0, "{lo}..{hi}");
+        }
         Ok(())
     }
 }

@@ -231,8 +231,8 @@ pub fn assemblysource(s: &mut Session, p: &Value) -> EngineResult<Value> {
 /// The assembly-space ghost (TS ghost grey).
 pub const GHOST_COLOR: Rgb = Rgb(150, 150, 150);
 /// Arc face lines are sampled at this many segments per full turn (at least [`GHOST_MIN_SEGMENTS`]).
-const GHOST_SEGMENTS_PER_TURN: f64 = 64.0;
-const GHOST_MIN_SEGMENTS: usize = 8;
+pub(crate) const GHOST_SEGMENTS_PER_TURN: f64 = 64.0;
+pub(crate) const GHOST_MIN_SEGMENTS: usize = 8;
 
 /// The view whose assembly block `space` is, when that view is a plan or section holding one.
 fn assembly_view_of(d: &Drawing, space: &Space) -> Option<Id> {
