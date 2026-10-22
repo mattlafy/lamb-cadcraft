@@ -22,8 +22,9 @@
 //! [`tee_butt`], LAMB T472); repeats are not mitred.
 //! The project's stud grid ([`crate::studgrid`], LAMB T458, T463) lays each straight run's repeat whose
 //! pitch is near the grid's on that grid's lines — every plan run, and a section's runs along its cut line.
-//! At each two-arm junction a corner tag resolves to (§10 step 3, LAMB T461), [`corner_assembly`]
-//! places the corner detail once (lamb-core's [`place_corner`]); the block holds the run lines,
+//! At each L or T junction a corner tag resolves to (§10 step 3, LAMB T461, T481), [`corner_assembly`]
+//! places the corner detail once from its exterior- or interior-face reference (lamb-core's
+//! [`place_corner`]; a T's reference on the through run's face opposite the branch); the block holds the run lines,
 //! then the corner lines in junction order. A placed corner owns the region around its junction
 //! (LAMB T462): on each straight arm's run, band lines are clipped to start at the corner's reach
 //! (lamb-core's [`corner_reach`], [`trim_to_reach`]; dropped when wholly inside) and every repeat
@@ -400,12 +401,14 @@ fn corner_lines(
     sides: &[lamb_core::derivation::wall_spaces::RunSides],
 ) -> Result<Vec<AssemblyLine>, String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
-    if !matches!(r.kind, DetailRefKind::ExteriorFace) {
-        return Err("corner reference kind not placed yet".into());
-    }
+    let face = match r.kind {
+        DetailRefKind::ExteriorFace => FaceRef::Exterior,
+        DetailRefKind::InteriorFace => FaceRef::Interior,
+        _ => return Err("corner reference kind not placed yet".into()),
+    };
     let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
     let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| *h != r.handle).collect();
-    place_corner(j, runs, sides, (r.from, r.to), &member_segments(d, detail, &others))
+    place_corner(j, runs, sides, face, (r.from, r.to), &member_segments(d, detail, &others))
 }
 
 /// Every junction of `view`'s wall graph whose corner detail resolves (`Tagged`, `Spread` or
@@ -2359,14 +2362,62 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_interior_face_corner_reference_is_skipped_with_its_reason() -> R {
+    fn an_interior_face_corner_detail_is_placed_at_each_inner_corner() -> R {
         let (mut s, plan) = room("exterior_face", true)?;
         corner_detail(&mut s, plan, "interior_face", false, (0.0, 0.0))?;
         let r = s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
-        assert_eq!((r["corners"].as_u64(), r["lines"].as_u64()), (Some(0), Some(12)), "{r}");
+        assert_eq!((r["corners"].as_u64(), r["skipped"].clone()), (Some(4), json!([])), "{r}");
+        let all = corner_xy(&corner_assembly(s.doc()?, plan)?);
+        let mut inner: Vec<_> = all.iter().filter(|l| l.4 == "CRN-A").map(|l| (l.0, l.1)).collect();
+        inner.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        assert_eq!(inner, [(200.0, 200.0), (200.0, 3800.0), (4800.0, 200.0), (4800.0, 3800.0)], "{all:?}");
+        // Bottom-left: the reference runs along the bottom inner face to (200,200), the wall side
+        // toward the exterior.
+        assert!(all.contains(&(200.0, 200.0, 200.0, -800.0, "CRN-A".into())), "{all:?}");
+        assert!(all.contains(&(1200.0, 0.0, 200.0, 0.0, "CRN-B".into())), "{all:?}");
+        assert_trimmed(s.doc()?, plan)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_t_corner_detail_sits_on_the_through_run_s_far_face_at_the_foot_of_the_branch() -> R {
+        let (mut s, plan) = t_plan()?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, plan);
+        let tees = tees(&graph);
+        assert_eq!(tees.len(), 2);
+        // An exterior-face T detail: the far face (x = 4800) is the room's interior face.
+        let (mut s2, plan2) = t_plan()?;
+        corner_detail(&mut s2, plan2, "exterior_face", false, (tees[0].0.x, tees[0].0.y))?;
+        let at_tee = |c: &CornerAssembly| tees.iter().any(|t| graph.junctions[c.junction].point == t.0);
+        let ext = corner_assembly(s2.doc()?, plan2)?;
+        assert!(ext.iter().any(at_tee), "{ext:?}");
+        assert!(
+            ext.iter().filter(|c| at_tee(c)).all(|c| c.skipped.as_deref() == Some("the detail's reference face is on the branch side")),
+            "{ext:?}"
+        );
+
+        corner_detail(&mut s, plan, "interior_face", false, (tees[0].0.x, tees[0].0.y))?;
+        let n = undo_len(&s)?;
+        let r = s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        let corners = corner_assembly(s.doc()?, plan)?;
+        let placed: Vec<_> = corners.iter().filter(|c| at_tee(c)).collect();
+        assert!(!placed.is_empty(), "{corners:?}");
+        for c in &placed {
+            assert!(c.skipped.is_none(), "{c:?}");
+            let foot = (4800.0, r6(graph.junctions[c.junction].point.y));
+            let crn_a = c.lines.iter().find(|l| l.layer == "CRN-A").ok_or("no CRN-A")?;
+            assert_eq!((r6(crn_a.from.x), r6(crn_a.from.y)), foot, "{c:?}");
+            assert_eq!(r6(crn_a.to.x), 4800.0 + 1000.0, "the wall side is toward the branch: {c:?}");
+        }
         let skipped = r["skipped"].as_array().ok_or("no skipped")?;
-        assert_eq!(skipped.len(), 4, "{r}");
-        assert!(skipped.iter().all(|x| x["junction"].is_u64() && x["reason"] == "corner reference kind not placed yet"), "{r}");
+        assert!(skipped.iter().all(|x| !placed.iter().any(|c| x["junction"].as_u64() == Some(c.junction as u64))), "{r}");
+        assert_eq!(r["corners"].as_u64(), Some(corners.iter().filter(|c| c.skipped.is_none()).count() as u64), "{r}");
+        // The branch and both through runs' bands start at the corner's reach.
+        assert_trimmed(s.doc()?, plan)?;
+        assert!(trims_something(s.doc()?, plan)?, "no band was clipped at a corner");
+        s.undo()?;
+        assert!(s.doc()?.block(&assembly_block_name(plan)).is_none(), "undo removes the block");
         Ok(())
     }
 
