@@ -503,17 +503,18 @@ pub fn travel_box_observer(s: &mut Session, handles: &[Handle], crossing: bool) 
 }
 
 /// Registers [`crate::corners::corner_observer`], [`link_observer`],
-/// [`crate::sweeps::sweep_observer`], [`crate::assembly::assembly_observer`], [`crate::bubbles::bubble_observer`] then
+/// [`crate::sweeps::sweep_observer`], [`crate::asmview::assembly_edit_observer`], [`crate::assembly::assembly_observer`], [`crate::bubbles::bubble_observer`] then
 /// [`crate::annotations::annotation_observer`] on `s` (each
 /// once), so link travel reads corner tags already re-seated by the same command, the AI /
 /// solid-cut sweeps see the links already maintained, and the assembly blocks regenerate from all
 /// of it; and [`travel_box_observer`] once per process.
 pub fn install(s: &mut Session) {
     let _ = cadcraft_engine::travel::register_box_observer(travel_box_observer);
-    let fs: [cadcraft_engine::AfterCommand; 6] = [
+    let fs: [cadcraft_engine::AfterCommand; 7] = [
         crate::corners::corner_observer,
         link_observer,
         crate::sweeps::sweep_observer,
+        crate::asmview::assembly_edit_observer,
         crate::assembly::assembly_observer,
         crate::bubbles::bubble_observer,
         crate::annotations::annotation_observer,

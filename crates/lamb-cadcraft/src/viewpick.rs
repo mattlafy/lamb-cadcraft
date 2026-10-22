@@ -102,9 +102,13 @@ fn toggle_travel_link(s: &mut Session, p: Vec2, aperture: f64) -> bool {
 }
 
 /// The engine's idle-pick hook: a marker click toggling a travelling link
-/// ([`toggle_travel_link`]) first, else [`pick_cut_line`].
+/// ([`toggle_travel_link`]) first, then in an assembly space the line's source
+/// ([`crate::asmview::pick_assembly`]), else [`pick_cut_line`].
 pub fn idle_pick(s: &mut Session, p: Vec2, aperture: f64) -> Option<IdlePicked> {
     if toggle_travel_link(s, p, aperture) {
+        return Some(IdlePicked::Consumed);
+    }
+    if crate::asmview::pick_assembly(s, p, aperture) {
         return Some(IdlePicked::Consumed);
     }
     pick_cut_line(s, p, aperture).map(IdlePicked::Pick)

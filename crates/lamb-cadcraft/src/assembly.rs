@@ -455,7 +455,7 @@ fn run_midpoint(run: &WallRun) -> Point2 {
 }
 
 /// The face entity ids of `runs`, deduped, sorted by display string.
-fn face_ids<'a>(runs: impl IntoIterator<Item = &'a WallRun>) -> Vec<Id> {
+pub(crate) fn face_ids<'a>(runs: impl IntoIterator<Item = &'a WallRun>) -> Vec<Id> {
     let mut ids: Vec<Id> = runs.into_iter().flat_map(|r| r.faces.iter().map(|f| f.from.entity_id)).collect();
     ids.sort_by_cached_key(Id::to_string);
     ids.dedup();
@@ -640,6 +640,16 @@ fn block_matches(block: &Block, runs: &[RunAssembly], corners: &[CornerAssembly]
         }
     }
     want.next().is_none()
+}
+
+/// `true` when `view`'s assembly block exists and equals its derivation ([`assembly_lines`] then
+/// [`corner_assembly`]); `false` when it differs, is missing, or the view does not derive.
+pub(crate) fn block_matches_view(d: &Drawing, view: Id) -> bool {
+    let Some(block) = d.block(&assembly_block_name(view)) else { return false };
+    match (assembly_lines(d, view), corner_assembly(d, view)) {
+        (Ok(runs), Ok(corners)) => block_matches(block, &runs, &corners),
+        _ => false,
+    }
 }
 
 /// The after-command observer: every plan or section view whose assembly block exists gets it rewritten when
@@ -856,7 +866,7 @@ pub(crate) mod tests {
     /// (outer face 0..5000 × 0..4000) and a detail `D1` holding a reference (0,0)–(1000,0) of
     /// `kind` and bands at y = −20 (`CLAD`), 50 and 200 (`GYP`). With `tagged`, one edge tag on the
     /// bottom wall. Returns (session, plan).
-    fn room(kind: &str, tagged: bool) -> T<(Session, Id)> {
+    pub(crate) fn room(kind: &str, tagged: bool) -> T<(Session, Id)> {
         room_with(kind, tagged, 200.0)
     }
 
@@ -2265,7 +2275,7 @@ pub(crate) mod tests {
     /// A corner detail `CD` (vertical when `vertical`): a reference (−1000,0)–(0,0) of `kind`, a
     /// `CRN-A` line (0,0)–(0,1000) and a `CRN-B` band (−1000,200)–(0,200) putting the wall side at
     /// +y; corner-tagged at `tip` in `view`, which is edited afterwards.
-    fn corner_detail(s: &mut Session, view: Id, kind: &str, vertical: bool, tip: (f64, f64)) -> T<Id> {
+    pub(crate) fn corner_detail(s: &mut Session, view: Id, kind: &str, vertical: bool, tip: (f64, f64)) -> T<Id> {
         let mut p = json!({ "name": "CD" });
         if vertical {
             p["cutDirection"] = json!("vertical");

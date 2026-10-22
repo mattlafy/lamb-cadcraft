@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 pub mod annotations;
+pub mod asmview;
 pub mod assembly;
 pub mod assistant;
 pub mod assistant_cli;

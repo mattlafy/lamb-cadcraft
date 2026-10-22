@@ -54,6 +54,9 @@
 //!   `LAMB_ASSEMBLY_<id>` (`corners` counts the placed ones), `mitre` turning the plan's mitring
 //!   of undetailed corners on or off — see [`crate::assembly`]; interactive on the edited plan or section:
 //!   `Mitre missing corner details [Yes/No]`, Enter keeping the current setting.
+//!   `assemblyview {viewId?}` (`asv`, View ▸ LAMB ▸ Assembly View) edits inside that block,
+//!   read-only (edits regenerate away), and `assemblysource {point:{x,y}, viewId?, aperture?}` names
+//!   the run or junction, detail and faces an assembly line came from — see [`crate::asmview`].
 //!   `wallconflicts {viewId}` (View ▸ LAMB ▸ Wall Conflicts): each run whose detail is thicker or
 //!   thinner than the drawn wall, read-only, in a plan or section; interactive, the edited view's conflicts one per line.
 //!   `wallrun {viewId, point:{x,y}}` (View ▸ LAMB ▸ Wall Run): the wall run under a point — its
@@ -828,6 +831,15 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{viewId, mitre?: bool}")
             .menu(MENU)
             .interactive(crate::assembly::assemblyplan_machine),
+        CommandSpec::new("assemblyview", "Assembly View", crate::asmview::assemblyview)
+            .alias(&["asv"])
+            .params("{viewId?} → {block}")
+            .noundo()
+            .menu(MENU)
+            .interactive(crate::asmview::assemblyview_machine),
+        CommandSpec::new("assemblysource", "Assembly Source", crate::asmview::assemblysource)
+            .params("{point:{x,y}, viewId?, aperture?: mm} → {view, run, junction, detail, kind, layer, sources} | null")
+            .noundo(),
         CommandSpec::new("wallconflicts", "Wall Conflicts", crate::assembly::wallconflicts)
             .params("{viewId}")
             .noundo()
