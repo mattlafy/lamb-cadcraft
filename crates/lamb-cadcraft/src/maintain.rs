@@ -183,7 +183,14 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -
         }
         writes
     };
-    for (id, geometry) in &writes {
+    write_travelled(after, &writes)?;
+    Ok(writes.into_iter().map(|(id, _)| id).collect())
+}
+
+/// Writes each travelled partner's new geometry into `after`, keeping the entity's handle, layer
+/// and `ext`; an LWPOLYLINE's corner tags are re-derived from the new geometry.
+pub(crate) fn write_travelled(after: &mut Drawing, writes: &[(Id, Polyline2)]) -> Result<(), SchemaError> {
+    for (id, geometry) in writes {
         let (kind, _) = from_polyline(geometry);
         // The corner tags go with the geometry, so `ext` never disagrees with what was written.
         let corners = if matches!(kind, EntityKind::LwPolyline(_)) { virtual_corner_entries(geometry) } else { Vec::new() };
@@ -203,7 +210,7 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -
             return Err(e);
         }
     }
-    Ok(writes.into_iter().map(|(id, _)| id).collect())
+    Ok(())
 }
 
 /// `piece` lies along `old`: both its ends within coincidence of `old`, and the same curvature sign.

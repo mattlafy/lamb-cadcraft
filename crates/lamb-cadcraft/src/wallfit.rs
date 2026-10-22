@@ -7,22 +7,26 @@
 //! corner vertex compose). Arc runs carry no conflict yet and are never fitted. Two runs sharing
 //! one face segment (either side of a T) move it once. Every other wall-run face line whose free
 //! end (a LINE end, or an open LWPOLYLINE's first or last vertex) lay on a moved face segment has
-//! that end extended or trimmed along its own line to meet the moved face (T478).
+//! that end extended or trimmed along its own line to meet the moved face (T478). Every line in a
+//! vertical view linked to a moved face segment travels with it in the same undo step (T484).
 
 use cadcraft_doc::{Drawing, EntityKind, Handle};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
 use lamb_core::derivation::assembly::{FaceRef, WidthConflict};
+use lamb_core::derivation::read::ProjectRead;
+use lamb_core::derivation::travel::travel_segment_move;
 use lamb_core::derivation::wall_spaces::outside_on_left;
 use lamb_core::derivation::walls::RunCurve;
-use lamb_core::geometry::Point2;
 use lamb_core::geometry::intersect::infinite_line_intersect;
 use lamb_core::geometry::tolerance::TOLERANCE;
+use lamb_core::geometry::{Point2, Polyline2};
 use lamb_core::model::Id;
 use serde_json::{Value, json};
 
 use crate::assembly::{assembly_lines, check_plan};
 use crate::commands::{id_value, other};
 use crate::detailtags::{edited_plan, graph_and_sides};
+use crate::maintain::write_travelled;
 use crate::project::DrawingProject;
 
 /// Which face of a fitted run stays put.
@@ -213,6 +217,12 @@ pub fn wall_fit(d: &mut Drawing, plan: Id, only: Option<&[usize]>) -> Result<Vec
 
 /// [`wall_fit`] with `hold` choosing which face of every fitted run stays put.
 pub fn wall_fit_holding(d: &mut Drawing, plan: Id, only: Option<&[usize]>, hold: Hold) -> Result<Vec<usize>, String> {
+    wall_fit_travelling(d, plan, only, hold).map(|(fitted, _)| fitted)
+}
+
+/// [`wall_fit_holding`], returning also the entity ids of the linked partners that travelled with
+/// their moved faces.
+fn wall_fit_travelling(d: &mut Drawing, plan: Id, only: Option<&[usize]>, hold: Hold) -> Result<(Vec<usize>, Vec<Id>), String> {
     let plan = plan_moves(d, plan, only, hold)?;
     for m in &plan.moves {
         apply(d, m)?;
@@ -220,7 +230,40 @@ pub fn wall_fit_holding(d: &mut Drawing, plan: Id, only: Option<&[usize]>, hold:
     for e in &plan.ends {
         apply_end(d, e)?;
     }
-    Ok(plan.fitted)
+    let writes = linked_travel(d, &plan.moves)?;
+    write_travelled(d, &writes).map_err(|e| e.to_string())?;
+    Ok((plan.fitted, writes.into_iter().map(|(id, _)| id).collect()))
+}
+
+/// The new geometry of every partner linked to a moved face segment, slid by that segment's move
+/// (`travel_segment_move`) on the already-moved drawing `d`. Each partner travels at most once
+/// (first move, then `doc.links` order); a partner that is itself a moved face, or an unaccepted AI
+/// line, never travels. A partial slide (`unreachable`) is still returned; the link re-check
+/// decides stale.
+fn linked_travel(d: &Drawing, moves: &[Move]) -> Result<Vec<(Id, Polyline2)>, String> {
+    let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
+    let mut writes: Vec<(Id, Polyline2)> = Vec::new();
+    for m in moves {
+        let id = Id(m.handle.0);
+        for link in &p.document().links {
+            for (mine, other) in [(&link.a, &link.b), (&link.b, &link.a)] {
+                if mine.entity_id != id || mine.segment_index != m.segment {
+                    continue;
+                }
+                if moves.iter().any(|o| Id(o.handle.0) == other.entity_id) || writes.iter().any(|(w, _)| *w == other.entity_id) {
+                    continue;
+                }
+                if p.entity(other.entity_id).and_then(|e| e.ai_origin).is_some_and(|o| !o.accepted) {
+                    continue;
+                }
+                let Some(t) = travel_segment_move(&p, link, mine, Point2 { x: m.dx, y: m.dy })? else { continue };
+                if t.entity_id == other.entity_id {
+                    writes.push((t.entity_id, t.geometry));
+                }
+            }
+        }
+    }
+    Ok(writes)
 }
 
 /// The face moves and end follow-ups [`wall_fit_holding`] would make, with the fitted run indices,
@@ -325,11 +368,13 @@ pub fn wallfit(s: &mut Session, p: &Value) -> EngineResult<Value> {
     let planned = plan_moves(s.doc()?, plan, only.as_deref(), hold).map_err(other)?;
     if planned.moves.is_empty() {
         s.echo("No width conflicts".to_string());
-        return Ok(json!({ "fitted": [], "hold": hold.name() }));
+        return Ok(json!({ "fitted": [], "hold": hold.name(), "travelled": [] }));
     }
-    let fitted = wall_fit_holding(s.doc_mut()?, plan, only.as_deref(), hold).map_err(other)?;
-    s.echo(format!("{} runs fitted, {} holds", fitted.len(), hold.name()));
-    Ok(json!({ "fitted": fitted, "hold": hold.name() }))
+    let (fitted, travelled) = wall_fit_travelling(s.doc_mut()?, plan, only.as_deref(), hold).map_err(other)?;
+    let moved = if travelled.is_empty() { String::new() } else { format!(", {} linked lines moved", travelled.len()) };
+    s.echo(format!("{} runs fitted, {} holds{moved}", fitted.len(), hold.name()));
+    let travelled: Vec<Value> = travelled.iter().map(|id| json!(format!("{:X}", id.0))).collect();
+    Ok(json!({ "fitted": fitted, "hold": hold.name(), "travelled": travelled }))
 }
 
 /// WALLFIT's interactive form, on the edited plan view: which face holds, then every conflicted run
@@ -423,7 +468,7 @@ mod tests {
         assert_eq!(before.len(), 2);
         let n = undo_len(&s)?;
         let r = s.execute("wallfit", &json!({ "viewId": plan.0 }))?;
-        assert_eq!(r, json!({ "fitted": [0, 1, 2, 3], "hold": "reference" }));
+        assert_eq!(r, json!({ "fitted": [0, 1, 2, 3], "hold": "reference", "travelled": [] }));
         assert_eq!(undo_len(&s)?, n + 1);
         let after = plines(&s, plan)?;
         assert_eq!(after[0], before[0], "outer face unchanged");
@@ -448,7 +493,7 @@ mod tests {
             .position(|r| matches!(r.centreline, lamb_core::derivation::walls::RunCurve::Line { from, to } if from.y < 1000.0 && to.y < 1000.0))
             .ok_or("no bottom run")?;
         let r = s.execute("wallfit", &json!({ "viewId": plan.0, "runs": [bottom] }))?;
-        assert_eq!(r, json!({ "fitted": [bottom], "hold": "reference" }));
+        assert_eq!(r, json!({ "fitted": [bottom], "hold": "reference", "travelled": [] }));
         assert_eq!(plines(&s, plan)?[1], [(210.0, 200.0), (4790.0, 200.0), (4790.0, 3790.0), (210.0, 3790.0)]);
         // The bottom run is now 200 mm and fits its detail. Detail resolution runs per (exterior,
         // width) class, so the three 210 mm runs no longer share the bottom run's tag: they are
@@ -463,7 +508,7 @@ mod tests {
     fn wallfit_with_nothing_to_fit_or_a_bad_view_records_nothing() -> R {
         let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
         let n = undo_len(&s)?;
-        assert_eq!(s.execute("wallfit", &json!({ "viewId": plan.0 }))?, json!({ "fitted": [], "hold": "reference" }));
+        assert_eq!(s.execute("wallfit", &json!({ "viewId": plan.0 }))?, json!({ "fitted": [], "hold": "reference", "travelled": [] }));
         assert_eq!(undo_len(&s)?, n, "no undo step");
 
         let (mut s, plan) = room_with("exterior_face", true, 210.0)?;
@@ -625,6 +670,100 @@ mod tests {
         assert_eq!(after[2].0, (3400.0, 211.0), "1 mm off: bottom end untouched");
         assert_eq!(after[3].0, (3600.0, 211.0), "1 mm off: bottom end untouched");
         assert_eq!(after[4], ((4800.0, 200.0), (4900.0, 200.0)), "collinear: moves with its wall");
+        Ok(())
+    }
+
+    /// `room_with(.., 190)` (a 10 mm conflict) plus a section across the bottom wall at x = 2500
+    /// (u = y + 1000) holding two vertical lines, at the outer face's u and the inner face's u, each
+    /// linked to its face pline's bottom segment. Returns the session, plan and the two
+    /// section lines' hex handles (outer, inner).
+    fn room_with_linked_section() -> T<(Session, Id, String, String)> {
+        let (mut s, plan) = room_with("exterior_face", true, 190.0)?;
+        crate::maintain::install(&mut s);
+        let level = Id(s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].as_u64().ok_or("no id")?);
+        let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
+        s.execute("placeview", &json!({ "viewId": plan.0, "kind": "plan", "levelId": level.0, "cutElevation": 1200, "transform": t }))?;
+        let faces: Vec<String> = {
+            let d = s.doc()?;
+            let b = d.block(&crate::schema::view_block_name(plan)).ok_or("no view block")?;
+            b.entities.iter().filter(|e| matches!(e.kind, EntityKind::LwPolyline(_))).map(|e| e.handle.hex()).collect()
+        };
+        let r = s.execute(
+            "newsectionline",
+            &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 2500, "y": -1000}, "cutTo": {"x": 2500, "y": 5000} }),
+        )?;
+        let sec = Id(r["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        let mut drawn = Vec::new();
+        for (face, u, param) in [(&faces[0], 1000.0, 0.5), (&faces[1], 1190.0, (2500.0 - 190.0) / 4620.0)] {
+            let handles = |s: &Session| -> T<Vec<String>> {
+                Ok(s.doc()?.block(&crate::schema::view_block_name(sec)).ok_or("no section block")?.entities.iter().map(|e| e.handle.hex()).collect())
+            };
+            let before = handles(&s)?;
+            s.execute("line", &json!({ "points": [[u, 0.0], [u, 3000.0]] }))?;
+            // The sweep may add or remove AI lines in the same step: the new LINE at `u` is ours.
+            let h = handles(&s)?.into_iter().find(|h| !before.contains(h) && us(&s, &[h]).is_ok_and(|x| x == [(u, u)])).ok_or("line not drawn")?;
+            let a = json!({ "entityId": face, "segmentIndex": 0, "segmentParam": param });
+            s.execute("link.apply", &json!({ "a": a, "b": { "entityId": h, "segmentIndex": 0, "segmentParam": 0.5 } }))?;
+            drawn.push(h);
+        }
+        let inner = drawn.pop().ok_or("no inner")?;
+        let outer = drawn.pop().ok_or("no outer")?;
+        Ok((s, plan, outer, inner))
+    }
+
+    /// The u (local x) of each named section LINE's two ends, rounded to 1e-6. The section also
+    /// holds the sweep's unaccepted AI lines, which these tests don't name.
+    fn us(s: &Session, lines: &[&str]) -> T<Vec<(f64, f64)>> {
+        let d = s.doc()?;
+        let r = |v: f64| (v * 1e6).round() / 1e6;
+        lines
+            .iter()
+            .map(|h| match d.entity(cadcraft_doc::Handle::parse_hex(h).ok_or("bad handle")?).map(|e| &e.kind) {
+                Some(EntityKind::Line(l)) => Ok((r(l.a.x), r(l.b.x))),
+                _ => Err(format!("{h} is not a LINE").into()),
+            })
+            .collect()
+    }
+
+    fn stale_links(s: &Session) -> T<usize> {
+        Ok(crate::schema::read_document(s.doc()?)?.links.iter().filter(|l| l.stale == Some(true)).count())
+    }
+
+    #[test]
+    fn wallfit_carries_a_moved_faces_linked_section_line_in_the_same_undo_step() -> R {
+        let (mut s, plan, outer, inner) = room_with_linked_section()?;
+        let (pl0, sl0) = (plines(&s, plan)?, us(&s, &[&outer, &inner])?);
+        assert_eq!(sl0, [(1000.0, 1000.0), (1190.0, 1190.0)]);
+        let links = crate::schema::read_document(s.doc()?)?.links.len();
+        assert_eq!(stale_links(&s)?, 0);
+        let n = undo_len(&s)?;
+        let r = s.execute("wallfit", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(r["travelled"], json!([inner]), "{r}");
+        assert!(s.log.iter().any(|l| l.ends_with(", 1 linked lines moved")), "{:?}", s.log);
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!(plines(&s, plan)?[1][0], (200.0, 200.0));
+        assert_eq!(us(&s, &[&outer, &inner])?, [(1000.0, 1000.0), (1200.0, 1200.0)], "inner partner at the moved face's u; outer untouched");
+        assert_eq!(crate::schema::read_document(s.doc()?)?.links.len(), links, "links survive");
+        assert_eq!(stale_links(&s)?, 0, "no stale link");
+        s.undo()?;
+        assert_eq!(plines(&s, plan)?, pl0);
+        assert_eq!(us(&s, &[&outer, &inner])?, sl0);
+        Ok(())
+    }
+
+    #[test]
+    fn wallfit_centre_hold_travels_both_faces_partners_by_half_the_delta() -> R {
+        let (mut s, plan, outer, inner) = room_with_linked_section()?;
+        let r = s.execute("wallfit", &json!({ "viewId": plan.0, "hold": "centre" }))?;
+        assert_eq!(r["travelled"], json!([outer, inner]), "{r}");
+        assert_eq!(us(&s, &[&outer, &inner])?, [(995.0, 995.0), (1195.0, 1195.0)]);
+        assert_eq!(stale_links(&s)?, 0, "no stale link");
+
+        let (mut s, plan, outer, inner) = room_with_linked_section()?;
+        let r = s.execute("wallfit", &json!({ "viewId": plan.0, "hold": "interior" }))?;
+        assert_eq!(r["travelled"], json!([outer]), "{r}");
+        assert_eq!(us(&s, &[&outer, &inner])?, [(990.0, 990.0), (1190.0, 1190.0)], "the held interior face's partner is untouched");
         Ok(())
     }
 }
