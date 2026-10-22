@@ -7,6 +7,10 @@
 //! project-global millimetres can exceed what `f32` holds to half a millimetre. Meshes are not
 //! welded: every triangle owns its three corners, `indices` is `0..n`, and each corner carries the
 //! triangle's face normal — the shape a renderer wants for flat shading.
+//!
+//! In a placed plan with an assembly block, each laid straight run is layered (LAMB T487,
+//! [`crate::layered`]): one [`SceneMeshKind::Layer`] prism per band gap replaces the massing
+//! surfaces of the run's face segments, and a solid whose every plan segment is replaced is dropped.
 
 use std::fmt;
 
@@ -27,15 +31,18 @@ pub enum SceneMeshKind {
     Surface,
     /// A closed solid from a plan entity (and its linked vertical partners).
     Solid,
+    /// One layer of a detail-resolved wall run: a thin prism between two band boundaries.
+    Layer,
 }
 
 /// One flat-shaded triangle mesh.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneMesh {
     pub kind: SceneMeshKind,
-    /// The source lines: a surface's one entity; a solid's entities in order, plan entity first.
+    /// The source lines: a surface's one entity; a solid's entities in order, plan entity first; a
+    /// layer's run's two face entities.
     pub sources: Vec<Handle>,
-    /// The segment a surface was swept from; `None` for a solid.
+    /// The segment a surface was swept from; `None` for a solid or a layer.
     pub segment_index: Option<usize>,
     pub provenance: ProvenanceKind,
     pub layer: String,
@@ -161,19 +168,20 @@ struct Pending {
 pub fn scene(d: &Drawing) -> Result<Scene, SceneError> {
     let project = DrawingProject::new(d)?;
     let result = synthesize(&project).map_err(SceneError::Synthesis)?;
+    let layers = crate::layered::layered(&project, &result);
 
-    let mut pending: Vec<Pending> = Vec::with_capacity(result.surfaces.len() + result.solids.len());
-    for s in result.surfaces {
+    let mut pending: Vec<Pending> = Vec::with_capacity(result.surfaces.len() + result.solids.len() + layers.strips.len());
+    for s in result.surfaces.iter().filter(|s| !layers.replaced.contains(&(s.entity_id, s.segment_index))) {
         pending.push(Pending {
             kind: SceneMeshKind::Surface,
             sources: vec![handle(s.entity_id)],
             segment_index: Some(s.segment_index),
             provenance: s.provenance,
-            layer: s.layer_id,
-            triangles: s.triangles,
+            layer: s.layer_id.clone(),
+            triangles: s.triangles.clone(),
         });
     }
-    for s in &result.solids {
+    for (_, s) in result.solids.iter().enumerate().filter(|(i, _)| !layers.dropped_solids.contains(i)) {
         pending.push(Pending {
             kind: SceneMeshKind::Solid,
             sources: s.entity_ids.iter().copied().map(handle).collect(),
@@ -181,6 +189,16 @@ pub fn scene(d: &Drawing) -> Result<Scene, SceneError> {
             provenance: s.provenance,
             layer: s.layer_id.clone(),
             triangles: solid_triangles(s),
+        });
+    }
+    for l in layers.strips {
+        pending.push(Pending {
+            kind: SceneMeshKind::Layer,
+            sources: l.sources.iter().copied().map(handle).collect(),
+            segment_index: None,
+            provenance: l.provenance,
+            layer: l.layer,
+            triangles: l.triangles,
         });
     }
 

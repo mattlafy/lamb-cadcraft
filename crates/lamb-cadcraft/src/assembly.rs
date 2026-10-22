@@ -84,6 +84,8 @@ pub struct RunAssembly {
     /// The detail is thicker or thinner than the drawn wall; `None` when they agree or the run was
     /// skipped.
     pub conflict: Option<WidthConflict>,
+    /// The run face the detail was laid from; `None` when the run was skipped.
+    pub face: Option<FaceRef>,
 }
 
 /// Every entity in `detail`'s block except `reference` and repeat members ([`crate::repeats`]) that
@@ -229,14 +231,14 @@ fn laid_reference(
 }
 
 /// One run's lines from `detail` (bands, then each repeat's copies), how many of them are bands, the
-/// line count of each copy, and its width conflict, or why not.
+/// line count of each copy, its width conflict and the face it was laid from, or why not.
 fn run_lines(
     d: &Drawing,
     view: Id,
     detail: Id,
     run: &lamb_core::derivation::walls::WallRun,
     sides: &lamb_core::derivation::wall_spaces::RunSides,
-) -> Result<(Vec<AssemblyLine>, usize, Vec<usize>, Option<WidthConflict>), String> {
+) -> Result<(Vec<AssemblyLine>, usize, Vec<usize>, Option<WidthConflict>, FaceRef), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let lines = detail_lines(d, detail, r.handle)?;
     let (reference, face) = laid_reference(d, view, run, sides, &r, &lines)?;
@@ -255,7 +257,7 @@ fn run_lines(
         laid.extend(copy);
     }
     move_studs(&mut laid[n..], &copies, run, &crate::studgrid::stud_moves(d, view, run));
-    Ok((laid, n, copies, width_conflict(run, face, &bands)))
+    Ok((laid, n, copies, width_conflict(run, face, &bands), face))
 }
 
 /// LAMB T464: each stud-move point, in order, shifts the not-yet-moved repeat copy whose centre
@@ -321,6 +323,7 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
                 copies: Vec::new(),
                 skipped: Some(why.into()),
                 conflict: None,
+                face: None,
             };
             let id = match resolved {
                 RunDetail::Tagged(id) | RunDetail::Spread(id) | RunDetail::Gap(id) => id,
@@ -329,7 +332,9 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             };
             let Ok(detail) = id.parse::<u64>().map(Id) else { return skip("detail id is not a number", None) };
             match run_lines(d, plan, detail, run, side) {
-                Ok((lines, bands, copies, conflict)) => RunAssembly { run: i, detail: Some(detail), lines, bands, copies, skipped: None, conflict },
+                Ok((lines, bands, copies, conflict, face)) => {
+                    RunAssembly { run: i, detail: Some(detail), lines, bands, copies, skipped: None, conflict, face: Some(face) }
+                }
                 Err(e) => skip(&e, Some(detail)),
             }
         })
@@ -1713,7 +1718,16 @@ pub(crate) mod tests {
         };
         let EntityKind::Arc(a) = line_entity(&cw) else { panic!("not an arc") };
         assert_eq!((r6(a.start.to_degrees()), r6(a.end.to_degrees())), (0.0, 90.0));
-        let run = |l: AssemblyLine| RunAssembly { run: 0, detail: None, lines: vec![l], bands: 1, copies: vec![], skipped: None, conflict: None };
+        let run = |l: AssemblyLine| RunAssembly {
+            run: 0,
+            detail: None,
+            lines: vec![l],
+            bands: 1,
+            copies: vec![],
+            skipped: None,
+            conflict: None,
+            face: None,
+        };
         let mut block = Block::new("X");
         block.entities.push(Entity {
             handle: cadcraft_doc::Handle(1),

@@ -63,7 +63,7 @@ pub fn to_scene3(s: &Scene, d: &Drawing) -> Scene3 {
         .iter()
         .map(|m| {
             let rgba = match m.kind {
-                SceneMeshKind::Solid => rgba(layer_rgb(d, &m.layer).unwrap_or(SOLID_FALLBACK), 1.0),
+                SceneMeshKind::Solid | SceneMeshKind::Layer => rgba(layer_rgb(d, &m.layer).unwrap_or(SOLID_FALLBACK), 1.0),
                 SceneMeshKind::Surface => rgba(SURFACE.0, SURFACE.1),
             };
             let edges_rgba = (m.provenance == ProvenanceKind::Conflicted).then(|| rgba_opaque(CONFLICT_EDGES));

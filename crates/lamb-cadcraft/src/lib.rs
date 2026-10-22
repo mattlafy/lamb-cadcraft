@@ -48,6 +48,7 @@ pub mod fillet;
 pub mod fillet_matrix;
 pub mod import;
 mod lambopen;
+mod layered;
 mod linkcmds;
 pub mod maintain;
 mod newviews;
