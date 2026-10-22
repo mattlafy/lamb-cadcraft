@@ -25,6 +25,9 @@ pub enum IssueKind {
     /// A wall junction with no corner detail (mitred or ghosted). Adapter-only, like
     /// [`IssueKind::WidthConflict`].
     UndetailedCorner,
+    /// A wall opening bridge with no opening detail, in a view that tags some opening. Adapter-only,
+    /// like [`IssueKind::WidthConflict`].
+    UndetailedOpening,
     /// A wall run of an assembly plan that got no detail. Adapter-only, like
     /// [`IssueKind::WidthConflict`].
     UndetailedRun,
@@ -41,7 +44,7 @@ impl IssueKind {
             IssueKind::StaleLink => 3,
             IssueKind::DefaultedExtent => 4,
             IssueKind::WidthConflict => 5,
-            IssueKind::UndetailedCorner => 6,
+            IssueKind::UndetailedCorner | IssueKind::UndetailedOpening => 6,
             IssueKind::UndetailedRun => 7,
         }
     }

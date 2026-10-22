@@ -20,7 +20,9 @@
 use cadcraft_doc::{Drawing, EntityKind, Handle, Leader, Line};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::Vec2;
-use lamb_core::derivation::detail_tags::{CornerTag, EdgeTag, RunDetail, resolve_corner_details, resolve_edge_details};
+use lamb_core::derivation::detail_tags::{
+    CornerTag, EdgeTag, OpeningTag, RunDetail, resolve_corner_details, resolve_edge_details, resolve_opening_details,
+};
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::derivation::wall_junctions::{WallGraph, wall_graph};
 use lamb_core::derivation::wall_spaces::{SideParams, WallSides, wall_sides};
@@ -42,6 +44,8 @@ pub use crate::schema::DetailTag;
 pub struct ViewTags {
     pub edges: Vec<EdgeTag>,
     pub corners: Vec<CornerTag>,
+    /// Corner-shaped tags whose tip attaches to no junction but to an opening bridge (LAMB T486).
+    pub openings: Vec<OpeningTag>,
     /// Tags whose tip attaches to nothing, or whose detail view no longer exists.
     pub unattached: Vec<Handle>,
 }
@@ -97,6 +101,23 @@ fn attach_junction(graph: &WallGraph, tip: Point2) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// The opening bridge a corner-shaped tag at `tip` attaches to when no junction does (LAMB T486):
+/// the nearest bridge whose segment `from → to` is within `max(its two runs' widths) / 2 +
+/// TOLERANCE.grouping_mm` of the tip.
+fn attach_bridge(graph: &WallGraph, tip: Point2) -> Option<usize> {
+    graph
+        .bridges
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            let w = [b.a.0, b.b.0].iter().filter_map(|&r| graph.runs.get(r)).map(|r| r.width).fold(0.0, f64::max);
+            let d = curve_distance(&RunCurve::Line { from: b.from, to: b.to }, tip);
+            (d <= w / 2.0 + TOLERANCE.grouping_mm).then_some((i, d))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
 /// The view's wall graph and sides, with `WALL-EXT*` layers exterior and the view's outside pick
 /// points ([`crate::outside::outside_points`]) marking their regions outside.
 pub(crate) fn graph_and_sides(p: &DrawingProject<'_>, view: Id) -> (WallGraph, WallSides) {
@@ -142,7 +163,12 @@ fn graph_tags(d: &Drawing, view: Id, graph: &WallGraph) -> std::result::Result<V
         let attached = if !is_detail(tag.detail_view_id) {
             false
         } else if tag.corner {
-            attach_junction(graph, tip).map(|junction| out.corners.push(CornerTag { detail, junction })).is_some()
+            if let Some(junction) = attach_junction(graph, tip) {
+                out.corners.push(CornerTag { detail, junction });
+                true
+            } else {
+                attach_bridge(graph, tip).map(|bridge| out.openings.push(OpeningTag { detail, bridge })).is_some()
+            }
         } else {
             attach_run(graph, tip).map(|run| out.edges.push(EdgeTag { detail, run })).is_some()
         };
@@ -185,6 +211,16 @@ pub fn view_detail_tags(d: &Drawing, view: Id) -> std::result::Result<ViewTags, 
 /// graph's `runs` and `junctions`).
 pub fn resolve_view_details(d: &Drawing, view: Id) -> std::result::Result<(Vec<RunDetail>, Vec<RunDetail>), String> {
     resolve_with_tags(d, view).map(|(runs, junctions, _)| (runs, junctions))
+}
+
+/// Every opening bridge's opening detail in `view` (parallel to its wall graph's `bridges`, LAMB
+/// T486).
+pub fn resolve_view_openings(d: &Drawing, view: Id) -> std::result::Result<Vec<RunDetail>, String> {
+    wall_view(d, view)?;
+    let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
+    let (graph, sides) = graph_and_sides(&p, view);
+    let tags = graph_tags(d, view, &graph)?;
+    Ok(resolve_opening_details(&graph, &sides, &tags.openings))
 }
 
 fn resolve_with_tags(d: &Drawing, view: Id) -> std::result::Result<(Vec<RunDetail>, Vec<RunDetail>, ViewTags), String> {
