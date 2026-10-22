@@ -304,6 +304,13 @@ pub fn lay_repeat(
 ///   direction matching the detail's handedness.
 ///
 /// Any other junction is an error.
+///
+/// `insets` (indexed like `j.arms`; a missing entry is 0) move each arm's `face` line that far into
+/// the wall before anything else — an L's corner is the crossing of the moved lines, a T's corner
+/// point moves by its through arm's inset — and `outward` maps the detail's `into` away from the
+/// wall instead of into it (the handedness tests use that image). Structural-centre and grid
+/// references place through these (§9, LAMB T490); `&[]` and `false` are a face reference.
+#[allow(clippy::too_many_arguments)]
 pub fn place_corner(
     j: &Junction,
     runs: &[WallRun],
@@ -311,21 +318,26 @@ pub fn place_corner(
     face: FaceRef,
     reference: (Point2, Point2),
     lines: &[(Point2, Point2, String)],
+    insets: &[f64],
+    outward: bool,
 ) -> Result<Vec<AssemblyLine>, String> {
     let frame = detail_frame(reference, lines)?;
     let cross = |u: Point2, v: Point2| u.x * v.y - u.y * v.x;
     let want = cross(frame.along, frame.into).signum();
+    let inset = |k: usize| insets.get(k).copied().unwrap_or(0.0);
+    let sgn = if outward { -1.0 } else { 1.0 };
+    let image = |ni: Point2| Point2 { x: ni.x * sgn, y: ni.y * sgn };
     // The corner point `c`, the reference's travel `t` and the unit normal `ni` into the wall.
     let (c, t, ni) = match j.arms.as_slice() {
         [a0, a1] => {
             // Per arm: two points of its face line, the travel toward the junction and the normal
             // into the wall.
             let mut arms = Vec::new();
-            for arm in [a0, a1] {
+            for (k, arm) in [a0, a1].into_iter().enumerate() {
                 let run = runs.get(arm.run).ok_or("junction arm names no run")?;
                 let side = sides.get(arm.run).ok_or("junction arm has no sides")?;
                 let f = face_frame(run, side, face)?;
-                let h = run.width / 2.0;
+                let h = run.width / 2.0 - inset(k);
                 let a = Point2 { x: f.from.x + f.normal.x * h, y: f.from.y + f.normal.y * h };
                 let b = Point2 { x: f.to.x + f.normal.x * h, y: f.to.y + f.normal.y * h };
                 let s = match arm.end {
@@ -337,7 +349,7 @@ pub fn place_corner(
                 arms.push((a, b, t, ni));
             }
             let c = infinite_line_intersect(arms[0].0, arms[0].1, arms[1].0, arms[1].1).ok_or("the corner's arms are parallel")?.point;
-            let fits: Vec<_> = arms.iter().filter(|(_, _, t, ni)| cross(*t, *ni).signum() == want).collect();
+            let fits: Vec<_> = arms.iter().filter(|(_, _, t, ni)| cross(*t, image(*ni)).signum() == want).collect();
             let &[&(_, _, t, ni)] = fits.as_slice() else { return Err("the corner's arms do not fit the detail".into()) };
             (c, t, ni)
         }
@@ -348,24 +360,26 @@ pub fn place_corner(
             }
             let (branch, toward, _) = tee_butt(j, runs).ok_or("the T's through arms are not straight runs of equal width")?;
             // The first through arm whose sides decide the face (one may be shared by two spaces).
-            let frame_of = |k: usize| -> Result<(&WallRun, FaceFrame), String> {
-                let i = j.arms[(branch + k) % 3].run;
+            let frame_of = |k: usize| -> Result<(&WallRun, FaceFrame, f64), String> {
+                let a = (branch + k) % 3;
+                let i = j.arms[a].run;
                 let run = runs.get(i).ok_or("junction arm names no run")?;
-                Ok((run, face_frame(run, sides.get(i).ok_or("junction arm has no sides")?, face)?))
+                Ok((run, face_frame(run, sides.get(i).ok_or("junction arm has no sides")?, face)?, inset(a)))
             };
-            let (run, f) = frame_of(1).or_else(|e| frame_of(2).map_err(|_| e))?;
+            let (run, f, ins) = frame_of(1).or_else(|e| frame_of(2).map_err(|_| e))?;
             // `toward` is the through run's face on the branch side.
             if (toward.x - j.point.x) * f.normal.x + (toward.y - j.point.y) * f.normal.y > 0.0 {
                 return Err("the detail's reference face is on the branch side".into());
             }
-            let h = run.width / 2.0;
+            let h = run.width / 2.0 - ins;
             let c = Point2 { x: j.point.x + f.normal.x * h, y: j.point.y + f.normal.y * h };
             let ni = Point2 { x: -f.normal.x, y: -f.normal.y };
-            let t = if cross(f.dir, ni).signum() == want { f.dir } else { Point2 { x: -f.dir.x, y: -f.dir.y } };
+            let t = if cross(f.dir, image(ni)).signum() == want { f.dir } else { Point2 { x: -f.dir.x, y: -f.dir.y } };
             (c, t, ni)
         }
         _ => return Err("only L and T corners are placed yet".into()),
     };
+    let ni = image(ni);
     let r = reference.1;
     let map = |p: Point2| {
         let (dx, dy) = (p.x - r.x, p.y - r.y);
@@ -397,6 +411,10 @@ pub fn jamb_point(run: &WallRun, sides: &RunSides, face: FaceRef, end: RunEnd) -
 /// the detail's and **as its mirror image at the other** — intended: a jamb is drawn once, "typ.".
 /// `sides` is indexed like `runs`. Errors: the detail's frame ([`detail_frame`]), a missing run, an
 /// arc run, an undecided face side.
+///
+/// `insets` (`[a's, b's]`; a missing entry is 0) move each jamb's point that far into the wall
+/// along `ni`, and `outward` maps the detail's `into` to `−ni` — as in [`place_corner`] (LAMB T490).
+#[allow(clippy::too_many_arguments)]
 pub fn place_opening(
     bridge: &OpeningBridge,
     runs: &[WallRun],
@@ -404,15 +422,19 @@ pub fn place_opening(
     face: FaceRef,
     reference: (Point2, Point2),
     lines: &[(Point2, Point2, String)],
+    insets: &[f64],
+    outward: bool,
 ) -> Result<[Vec<AssemblyLine>; 2], String> {
     let frame = detail_frame(reference, lines)?;
     let r = reference.1;
-    let jamb = |(i, end): (usize, RunEnd)| -> Result<Vec<AssemblyLine>, String> {
+    let sgn = if outward { -1.0 } else { 1.0 };
+    let jamb = |(i, end): (usize, RunEnd), inset: f64| -> Result<Vec<AssemblyLine>, String> {
         let run = runs.get(i).ok_or("the opening bridge names no run")?;
         let side = sides.get(i).ok_or("the opening bridge's run has no sides")?;
         let f = face_frame(run, side, face)?;
         let (c, t) = jamb_point(run, side, face, end)?;
-        let ni = Point2 { x: -f.normal.x, y: -f.normal.y };
+        let c = Point2 { x: c.x - f.normal.x * inset, y: c.y - f.normal.y * inset };
+        let ni = Point2 { x: -f.normal.x * sgn, y: -f.normal.y * sgn };
         let map = |p: Point2| {
             let (dx, dy) = (p.x - r.x, p.y - r.y);
             let (u, v) = (dx * frame.along.x + dy * frame.along.y, dx * frame.into.x + dy * frame.into.y);
@@ -420,7 +442,8 @@ pub fn place_opening(
         };
         Ok(lines.iter().map(|(p, q, layer)| AssemblyLine { from: map(*p), to: map(*q), layer: layer.clone(), arc: None }).collect())
     };
-    Ok([jamb(bridge.a)?, jamb(bridge.b)?])
+    let inset = |k: usize| insets.get(k).copied().unwrap_or(0.0);
+    Ok([jamb(bridge.a, inset(0))?, jamb(bridge.b, inset(1))?])
 }
 
 /// How far a placed jamb detail reaches back into its run from the jamb point `c`, `t` being the
@@ -1001,7 +1024,7 @@ mod tests {
         let want = [(200.0, 1000.0, 200.0, 0.0), (0.0, 0.0, 1000.0, 0.0)];
         for reversed in [false, true] {
             let (j, runs, sides) = l_corner(reversed);
-            let out = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines).unwrap();
+            let out = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap();
             assert_eq!(rounded(&out), want, "reversed {reversed}");
             assert_eq!(out[1].layer, "CLAD");
             assert!(out.iter().all(|l| l.arc.is_none()));
@@ -1010,7 +1033,7 @@ mod tests {
         let mirrored = [l((-1000.0, -200.0), (0.0, -200.0), "GYP"), l((0.0, 0.0), (0.0, -1000.0), "CLAD")];
         let (j, runs, sides) = l_corner(false);
         assert_eq!(
-            rounded(&place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &mirrored).unwrap()),
+            rounded(&place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &mirrored, &[], false).unwrap()),
             [(1000.0, 200.0, 0.0, 200.0), (0.0, 0.0, 0.0, 1000.0)]
         );
     }
@@ -1022,11 +1045,14 @@ mod tests {
         let lines = [l((-1000.0, 200.0), (0.0, 200.0), "GYP")];
         let (mut j, mut runs, mut sides) = l_corner(false);
         j.arms.push(JunctionArm { run: 0, end: RunEnd::End, direction_deg: 180.0 });
-        assert_eq!(place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines).unwrap_err(), "only L and T corners are placed yet");
+        assert_eq!(
+            place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap_err(),
+            "only L and T corners are placed yet"
+        );
         j.arms.pop();
         runs[1] = run(p(100.0, 100.0), p(-5000.0, 100.0), 200.0);
         sides[1] = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
-        assert_eq!(place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines).unwrap_err(), "the corner's arms are parallel");
+        assert_eq!(place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap_err(), "the corner's arms are parallel");
     }
 
     /// The corner detail of the adapter's tests: reference (−1000,0)–(0,0), `CRN-A` (0,0)–(0,1000),
@@ -1044,26 +1070,43 @@ mod tests {
         let both = RunSides { left: SideKind::Space(0), right: SideKind::Space(1), exterior: false, open_outside_left: None };
         let sides = vec![right, both, left];
         let (reference, lines) = crn();
-        let out = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines).unwrap();
+        let out = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap();
         assert_eq!(rounded(&out), [(100.0, 0.0, 100.0, 1000.0), (-900.0, 200.0, 100.0, 200.0)]);
         assert_eq!((out[0].layer.as_str(), out[1].layer.as_str()), ("CRN-A", "CRN-B"));
         // The interior face is the branch side.
         assert_eq!(
-            place_corner(&j, &runs, &sides, FaceRef::Interior, reference, &lines).unwrap_err(),
+            place_corner(&j, &runs, &sides, FaceRef::Interior, reference, &lines, &[], false).unwrap_err(),
             "the detail's reference face is on the branch side"
         );
         // The mirrored detail (wall side −y) runs the other way along the same face.
         let mirrored: Vec<_> = lines.iter().map(|(a, b, n)| (p(a.x, -a.y), p(b.x, -b.y), n.clone())).collect();
         assert_eq!(
-            rounded(&place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &mirrored).unwrap()),
+            rounded(&place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &mirrored, &[], false).unwrap()),
             [(100.0, 0.0, 100.0, 1000.0), (1100.0, 200.0, 100.0, 200.0)]
         );
         // A Y junction, and unequal through widths.
         let y = Junction { gaps_deg: vec![120.0, 120.0, 120.0], ..j.clone() };
-        assert_eq!(place_corner(&y, &runs, &sides, FaceRef::Exterior, reference, &lines).unwrap_err(), "only L and T corners are placed yet");
+        assert_eq!(
+            place_corner(&y, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap_err(),
+            "only L and T corners are placed yet"
+        );
         let mut wide = runs.clone();
         wide[2].width = 300.0;
-        assert!(place_corner(&j, &wide, &sides, FaceRef::Exterior, reference, &lines).is_err());
+        assert!(place_corner(&j, &wide, &sides, FaceRef::Exterior, reference, &lines, &[], false).is_err());
+    }
+
+    #[test]
+    fn corner_insets_move_the_corner_and_outward_mirrors_across_the_face() {
+        let reference = (p(-1000.0, 0.0), p(0.0, 0.0));
+        let lines = [l((-1000.0, 200.0), (0.0, 200.0), "GYP"), l((0.0, 0.0), (0.0, 1000.0), "CLAD")];
+        for reversed in [false, true] {
+            let (j, runs, sides) = l_corner(reversed);
+            let out = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[200.0, 200.0], false).unwrap();
+            assert_eq!(rounded(&out), [(400.0, 1200.0, 400.0, 200.0), (200.0, 200.0, 1200.0, 200.0)], "reversed {reversed}");
+            // Outward: the detail's wall side points out of the wall, so the other arm carries it.
+            let out = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[100.0, 100.0], true).unwrap();
+            assert_eq!(rounded(&out), [(1100.0, -100.0, 100.0, -100.0), (100.0, 100.0, 100.0, -900.0)], "reversed {reversed}");
+        }
     }
 
     #[test]
@@ -1079,6 +1122,8 @@ mod tests {
                 FaceRef::Interior,
                 (reference.0, reference.1),
                 &[l((-1000.0, 0.0), (0.0, 0.0), "REF"), lines[0].clone()],
+                &[],
+                false,
             )
             .unwrap();
             assert_eq!(rounded(&out[..1]), [(1200.0, 200.0, 200.0, 200.0)], "reversed {reversed}");
@@ -1091,7 +1136,7 @@ mod tests {
         let lines = [l((-1000.0, 200.0), (0.0, 200.0), "GYP"), l((0.0, 0.0), (0.0, 1000.0), "CLAD")];
         for reversed in [false, true] {
             let (j, runs, sides) = l_corner(reversed);
-            let placed = place_corner(&j, &runs, &sides, FaceRef::Exterior, (p(-1000.0, 0.0), p(0.0, 0.0)), &lines).unwrap();
+            let placed = place_corner(&j, &runs, &sides, FaceRef::Exterior, (p(-1000.0, 0.0), p(0.0, 0.0)), &lines, &[], false).unwrap();
             assert_eq!(corner_reach(&j, &runs, &placed), vec![900.0, 900.0], "reversed {reversed}");
             assert_eq!(arm_direction(&j, &runs, 1), Some(p(0.0, 1.0)));
         }
@@ -1153,7 +1198,7 @@ mod tests {
         let (reference, lines) = jamb_detail();
         for reversed in [false, true] {
             let (bridge, runs, sides) = bridged(reversed);
-            let [a, b] = place_opening(&bridge, &runs, &sides, FaceRef::Exterior, reference, &lines).unwrap();
+            let [a, b] = place_opening(&bridge, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap();
             assert_eq!(rounded(&a), [(1000.0, 0.0, 1000.0, 200.0), (900.0, 200.0, 1000.0, 200.0)], "reversed {reversed}");
             assert_eq!(rounded(&b), [(2000.0, 0.0, 2000.0, 200.0), (2100.0, 200.0, 2000.0, 200.0)], "reversed {reversed}");
             assert_eq!((a[0].layer.as_str(), a[1].layer.as_str()), ("JAMB", "GYP"));
@@ -1170,10 +1215,22 @@ mod tests {
     }
 
     #[test]
+    fn a_jamb_inset_moves_both_jambs_into_the_wall() {
+        let (reference, lines) = jamb_detail();
+        let (bridge, runs, sides) = bridged(false);
+        let [a, b] = place_opening(&bridge, &runs, &sides, FaceRef::Exterior, reference, &lines, &[100.0, 100.0], false).unwrap();
+        assert_eq!(rounded(&a), [(1000.0, 100.0, 1000.0, 300.0), (900.0, 300.0, 1000.0, 300.0)]);
+        assert_eq!(rounded(&b), [(2000.0, 100.0, 2000.0, 300.0), (2100.0, 300.0, 2000.0, 300.0)]);
+        // Outward: the bands turn toward the face from the moved reference.
+        let [a, _] = place_opening(&bridge, &runs, &sides, FaceRef::Exterior, reference, &lines, &[200.0, 200.0], true).unwrap();
+        assert_eq!(rounded(&a), [(1000.0, 200.0, 1000.0, 0.0), (900.0, 0.0, 1000.0, 0.0)]);
+    }
+
+    #[test]
     fn an_opening_detail_on_the_interior_face_lands_on_the_top_face() {
         let (reference, lines) = jamb_detail();
         let (bridge, runs, sides) = bridged(false);
-        let [a, b] = place_opening(&bridge, &runs, &sides, FaceRef::Interior, reference, &lines).unwrap();
+        let [a, b] = place_opening(&bridge, &runs, &sides, FaceRef::Interior, reference, &lines, &[], false).unwrap();
         assert_eq!(rounded(&a), [(1000.0, 200.0, 1000.0, 0.0), (900.0, 0.0, 1000.0, 0.0)]);
         assert_eq!(rounded(&b), [(2000.0, 200.0, 2000.0, 0.0), (2100.0, 0.0, 2000.0, 0.0)]);
     }
@@ -1184,8 +1241,11 @@ mod tests {
         let (bridge, mut runs, sides) = bridged(false);
         let neither = RunSides { left: SideKind::Space(0), right: SideKind::Space(1), exterior: false, open_outside_left: None };
         let undecided = vec![sides[0].clone(), neither];
-        assert_eq!(place_opening(&bridge, &runs, &undecided, FaceRef::Exterior, reference, &lines).unwrap_err(), "no single exterior side");
+        assert_eq!(
+            place_opening(&bridge, &runs, &undecided, FaceRef::Exterior, reference, &lines, &[], false).unwrap_err(),
+            "no single exterior side"
+        );
         runs[0].centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
-        assert_eq!(place_opening(&bridge, &runs, &sides, FaceRef::Exterior, reference, &lines).unwrap_err(), "arc runs are not laid yet");
+        assert_eq!(place_opening(&bridge, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap_err(), "arc runs are not laid yet");
     }
 }

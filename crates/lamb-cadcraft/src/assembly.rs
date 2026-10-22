@@ -419,23 +419,67 @@ pub struct CornerAssembly {
     pub skipped: Option<String>,
 }
 
+/// The face, per-arm insets and `outward` flag a corner or jamb detail is placed with
+/// ([`place_corner`], [`place_opening`]; LAMB T490), mirroring [`laid_reference`]'s edge rule.
+/// `arms` names each arm's run (`None`: inset 0). A face reference is that face, no insets. A
+/// structural-centre reference is laid from the exterior face with every inset the detail's
+/// farthest band offset, outward — that band then sits on each arm's exterior face. A grid
+/// reference is laid from the exterior face with each arm inset `width/2 − h`
+/// ([`run_grid_offset`]), so the reference lands on that arm's grid line.
+fn junction_placement(
+    d: &Drawing,
+    view: Id,
+    r: &crate::detailref::DetailRef,
+    lines: &[(Point2, Point2, String)],
+    arms: &[Option<usize>],
+    runs: &[WallRun],
+    sides: &[lamb_core::derivation::wall_spaces::RunSides],
+) -> Result<(FaceRef, Vec<f64>, bool), String> {
+    match r.kind {
+        DetailRefKind::ExteriorFace => Ok((FaceRef::Exterior, Vec::new(), false)),
+        DetailRefKind::InteriorFace => Ok((FaceRef::Interior, Vec::new(), false)),
+        DetailRefKind::StructuralCentre => {
+            let far = detail_bands((r.from, r.to), lines)?.iter().map(|b| b.offset).fold(0.0, f64::max);
+            Ok((FaceRef::Exterior, vec![far; arms.len()], true))
+        }
+        DetailRefKind::Grid => {
+            let mut insets = Vec::new();
+            for arm in arms {
+                let Some(i) = *arm else {
+                    insets.push(0.0);
+                    continue;
+                };
+                let run = runs.get(i).ok_or("junction arm names no run")?;
+                if matches!(run.centreline, RunCurve::Arc { .. }) {
+                    return Err("grid reference on an arc run not laid yet".into());
+                }
+                let side = sides.get(i).ok_or("junction arm has no sides")?;
+                let outside_left = lamb_core::derivation::wall_spaces::outside_on_left(side).ok_or("no single exterior side")?;
+                insets.push(run.width / 2.0 - run_grid_offset(d, view, run, outside_left)?);
+            }
+            Ok((FaceRef::Exterior, insets, false))
+        }
+    }
+}
+
 /// One corner detail's lines placed at junction `j`, or why not.
 fn corner_lines(
     d: &Drawing,
+    view: Id,
     detail: Id,
     j: &lamb_core::derivation::wall_junctions::Junction,
     runs: &[WallRun],
     sides: &[lamb_core::derivation::wall_spaces::RunSides],
 ) -> Result<Vec<AssemblyLine>, String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
-    let face = match r.kind {
-        DetailRefKind::ExteriorFace => FaceRef::Exterior,
-        DetailRefKind::InteriorFace => FaceRef::Interior,
-        _ => return Err("corner reference kind not placed yet".into()),
-    };
     let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
     let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| *h != r.handle).collect();
-    place_corner(j, runs, sides, face, (r.from, r.to), &member_segments(d, detail, &others))
+    let lines = member_segments(d, detail, &others);
+    // A T's branch arm carries no reference, so it needs no grid line.
+    let branch = if j.arms.len() == 3 { lamb_core::derivation::assembly::tee_butt(j, runs).map(|(b, _, _)| b) } else { None };
+    let arms: Vec<Option<usize>> = j.arms.iter().enumerate().map(|(k, a)| (Some(k) != branch).then_some(a.run)).collect();
+    let (face, insets, outward) = junction_placement(d, view, &r, &lines, &arms, runs, sides)?;
+    place_corner(j, runs, sides, face, (r.from, r.to), &lines, &insets, outward)
 }
 
 /// Every junction of `view`'s wall graph whose corner detail resolves (`Tagged`, `Spread` or
@@ -456,7 +500,7 @@ pub fn corner_assembly(d: &Drawing, view: Id) -> Result<Vec<CornerAssembly>, Str
             out.push(skip("detail id is not a number".into(), None));
             continue;
         };
-        out.push(match corner_lines(d, detail, j, &graph.runs, &sides.runs) {
+        out.push(match corner_lines(d, view, detail, j, &graph.runs, &sides.runs) {
             Ok(lines) => CornerAssembly { junction: i, detail: Some(detail), lines, skipped: None },
             Err(e) => skip(e, Some(detail)),
         });
@@ -478,20 +522,18 @@ pub struct OpeningAssembly {
 /// One opening detail's lines placed at both jambs of `bridge`, a's then b's, or why not.
 fn opening_lines(
     d: &Drawing,
+    view: Id,
     detail: Id,
     bridge: &OpeningBridge,
     runs: &[WallRun],
     sides: &[lamb_core::derivation::wall_spaces::RunSides],
 ) -> Result<Vec<AssemblyLine>, String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
-    let face = match r.kind {
-        DetailRefKind::ExteriorFace => FaceRef::Exterior,
-        DetailRefKind::InteriorFace => FaceRef::Interior,
-        _ => return Err("opening reference kind not placed yet".into()),
-    };
     let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
     let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| *h != r.handle).collect();
-    let [a, b] = place_opening(bridge, runs, sides, face, (r.from, r.to), &member_segments(d, detail, &others))?;
+    let lines = member_segments(d, detail, &others);
+    let (face, insets, outward) = junction_placement(d, view, &r, &lines, &[Some(bridge.a.0), Some(bridge.b.0)], runs, sides)?;
+    let [a, b] = place_opening(bridge, runs, sides, face, (r.from, r.to), &lines, &insets, outward)?;
     Ok(a.into_iter().chain(b).collect())
 }
 
@@ -513,7 +555,7 @@ pub fn opening_assembly(d: &Drawing, view: Id) -> Result<Vec<OpeningAssembly>, S
             out.push(skip("detail id is not a number".into(), None));
             continue;
         };
-        out.push(match opening_lines(d, detail, b, &graph.runs, &sides.runs) {
+        out.push(match opening_lines(d, view, detail, b, &graph.runs, &sides.runs) {
             Ok(lines) => OpeningAssembly { bridge: i, detail: Some(detail), lines, skipped: None },
             Err(e) => skip(e, Some(detail)),
         });
@@ -2486,6 +2528,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_structural_centre_corner_detail_puts_its_farthest_band_on_the_exterior_faces() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        corner_detail(&mut s, plan, "structural_centre", false, (0.0, 0.0))?;
+        let corners = corner_assembly(s.doc()?, plan)?;
+        assert_eq!(corners.len(), 4);
+        assert!(corners.iter().all(|c| c.skipped.is_none() && c.lines.len() == 2), "{corners:?}");
+        let all = corner_xy(&corners);
+        let on_face = |x: f64, y: f64| x == 0.0 || x == 5000.0 || y == 0.0 || y == 4000.0;
+        for l in all.iter().filter(|l| l.4 == "CRN-B") {
+            assert!(on_face(l.0, l.1) && on_face(l.2, l.3) && (l.0 == l.2 || l.1 == l.3), "on an exterior face line: {l:?}");
+        }
+        let mut starts: Vec<_> = all.iter().filter(|l| l.4 == "CRN-A").map(|l| (l.0, l.1)).collect();
+        starts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        assert_eq!(starts, [(200.0, 200.0), (200.0, 3800.0), (4800.0, 200.0), (4800.0, 3800.0)], "{all:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_grid_corner_detail_is_placed_at_the_grid_lines_crossings() -> R {
+        let (mut s, plan) = grid_room(&[20.0, 3980.0])?;
+        corner_detail(&mut s, plan, "grid", false, (0.0, 0.0))?;
+        let corners = corner_assembly(s.doc()?, plan)?;
+        assert_eq!(corners.len(), 4);
+        assert!(corners.iter().all(|c| c.skipped.as_deref() == Some("no grid line on the run")), "{corners:?}");
+        s.execute("layer.current", &json!({ "name": "0" }))?;
+        for x in [20.0, 4980.0] {
+            let h = line(&mut s, [x, 0.0], [x, 4000.0])?;
+            s.execute("setrole", &json!({ "handles": [h.hex()], "role": "datum" }))?;
+        }
+        let corners = corner_assembly(s.doc()?, plan)?;
+        assert!(corners.iter().all(|c| c.skipped.is_none() && c.lines.len() == 2), "{corners:?}");
+        let all = corner_xy(&corners);
+        let mut starts: Vec<_> = all.iter().filter(|l| l.4 == "CRN-A").map(|l| (l.0, l.1)).collect();
+        starts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        assert_eq!(starts, [(20.0, 20.0), (20.0, 3980.0), (4980.0, 20.0), (4980.0, 3980.0)], "{all:?}");
+        Ok(())
+    }
+
+    #[test]
     fn an_interior_face_corner_detail_is_placed_at_each_inner_corner() -> R {
         let (mut s, plan) = room("exterior_face", true)?;
         corner_detail(&mut s, plan, "interior_face", false, (0.0, 0.0))?;
@@ -2694,6 +2775,11 @@ pub(crate) mod tests {
     /// gap too (y 1500..2500, same class) and the top wall is 300 thick with its own window gap (x
     /// 2000..3000) and its own `D1` edge tag. Returns (session, plan).
     fn window_room(extra: bool, opening_tag: bool) -> T<(Session, Id)> {
+        window_room_with(extra, opening_tag, "exterior_face")
+    }
+
+    /// [`window_room`] with the jamb detail `JD`'s reference of `jamb_kind`.
+    fn window_room_with(extra: bool, opening_tag: bool, jamb_kind: &str) -> T<(Session, Id)> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);
@@ -2711,7 +2797,7 @@ pub(crate) mod tests {
         s.execute("editview", &json!({ "viewId": jd.0 }))?;
         s.execute("layer.current", &json!({ "name": "0" }))?;
         let r = line(&mut s, [-1000.0, 0.0], [0.0, 0.0])?;
-        s.execute("detailref", &json!({ "handle": r.hex(), "kind": "exterior_face" }))?;
+        s.execute("detailref", &json!({ "handle": r.hex(), "kind": jamb_kind }))?;
         s.execute("layer.new", &json!({ "name": "JAMB", "current": true }))?;
         line(&mut s, [-50.0, 0.0], [-50.0, 200.0])?;
         s.execute("layer.current", &json!({ "name": "GYP" }))?;
@@ -2812,6 +2898,32 @@ pub(crate) mod tests {
         assert!(block_matches(b, &assembly_lines(d, plan)?, &corner_assembly(d, plan)?, &opening_assembly(d, plan)?));
         s.undo()?;
         assert!(Arc::ptr_eq(&before, s.doc()?.block(&assembly_block_name(plan)).ok_or("no block")?), "undo restores the block");
+        Ok(())
+    }
+
+    #[test]
+    fn a_structural_centre_jamb_detail_puts_its_farthest_band_on_the_exterior_face_at_both_jambs() -> R {
+        let (mut s, plan) = window_room_with(false, true, "structural_centre")?;
+        let r = s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!((r["openings"].as_u64(), r["skipped"].clone()), (Some(1), json!([])), "{r}");
+        let all: Vec<_> = opening_assembly(s.doc()?, plan)?
+            .iter()
+            .flat_map(|o| o.lines.clone())
+            .map(|l| (r6(l.from.x), r6(l.from.y), r6(l.to.x), r6(l.to.y), l.layer))
+            .collect();
+        // The reference sits on the interior face (200 in), the GYP band turned out onto y = 0.
+        assert_eq!(
+            all,
+            [
+                (1950.0, 200.0, 1950.0, 0.0, "JAMB".into()),
+                (1950.0, 0.0, 2000.0, 0.0, "GYP".into()),
+                (3050.0, 200.0, 3050.0, 0.0, "JAMB".into()),
+                (3050.0, 0.0, 3000.0, 0.0, "GYP".into()),
+            ]
+        );
+        let mut ext = bottom_band_extents(&assembly_lines(s.doc()?, plan)?);
+        ext.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!((ext.len(), ext[0].1, ext[1].0), (2, 1950.0, 3050.0), "bands trimmed to the jambs: {ext:?}");
         Ok(())
     }
 

@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn a_corner_that_cannot_be_placed_draws_a_cross_at_each_junction_it_resolves_to() -> R {
         let (mut s, plan) = room("exterior_face", true)?;
-        corner_detail(&mut s, plan, "structural_centre", false, (0.0, 0.0))?;
+        corner_detail(&mut s, plan, "grid", false, (0.0, 0.0))?;
         s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
         let d = s.doc()?;
         let corners = corner_assembly(d, plan)?;
