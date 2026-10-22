@@ -637,17 +637,7 @@ pub(crate) fn wall_issues(d: &Drawing) -> Result<Vec<Issue>, String> {
     Ok(out)
 }
 
-/// `Ok` when `plan` names a plan view.
-pub(crate) fn check_plan(d: &Drawing, plan: Id) -> Result<(), String> {
-    let doc = read_document(d).map_err(|e| e.to_string())?;
-    match doc.views.iter().find(|v| v.id() == plan) {
-        None => Err("No such view".into()),
-        Some(AnyView::Plan(_)) => Ok(()),
-        Some(_) => Err("Not a plan view".into()),
-    }
-}
-
-/// `Ok` when `view` names a plan or section view — the views ASSEMBLYPLAN, WALLCONFLICTS and
+/// `Ok` when `view` names a plan or section view — the views ASSEMBLYPLAN, WALLCONFLICTS, WALLFIT and
 /// WALLRUN accept.
 pub(crate) fn check_wall_view(d: &Drawing, view: Id) -> Result<(), String> {
     let doc = read_document(d).map_err(|e| e.to_string())?;
@@ -2032,9 +2022,7 @@ pub(crate) mod tests {
                 assert_eq!(edited_wall_view(&s), Err("Edit a plan or section view first (EDITVIEW)".to_owned()));
             }
             for cmd in ["assemblyplan", "wallconflicts", "wallfit"] {
-                // WALLFIT is plan-only; the other two take a section too.
-                let why = if cmd == "wallfit" { crate::detailtags::edited_plan(&s) } else { edited_wall_view(&s) };
-                let why = why.err().ok_or("a plan is edited")?;
+                let why = edited_wall_view(&s).err().ok_or("a plan is edited")?;
                 let before = s.doc()?.clone();
                 let n = undo_len(&s)?;
                 s.log.clear();
@@ -2052,7 +2040,7 @@ pub(crate) mod tests {
     /// 1250, u `inner`..4000), all SETROLE cut; and a vertical detail `SD` with an exterior-face
     /// reference (0,0)–(1000,0), a `GYP` band at y = 50 and a `STUD` repeat (38 × 150 at x 100, pitch
     /// 400), edge-tagged on the wall. Returns (session, section).
-    fn section_wall(inner: f64) -> T<(Session, Id)> {
+    pub(crate) fn section_wall(inner: f64) -> T<(Session, Id)> {
         section_fixture(inner / 2.0, Some((-2000.0, 2000.0)), |s| {
             s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
             s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
@@ -2382,7 +2370,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn wallrun_names_a_section_wall_and_wallfit_stays_plan_only() -> R {
+    fn wallrun_names_a_section_wall_and_wallfit_fits_it() -> R {
         let (mut s, sec) = section_wall(310.0)?;
         let left = section_left_run(&s, sec)?;
         let r = s.execute("wallrun", &json!({ "viewId": sec.0, "point": {"x": 155, "y": 1500} }))?;
@@ -2391,13 +2379,9 @@ pub(crate) mod tests {
         assert_eq!(r["conflict"], "-10.0mm toward interior");
 
         let n = undo_len(&s)?;
-        let e = s.execute("wallfit", &json!({ "viewId": sec.0 })).err().ok_or("wallfit accepted a section")?;
-        assert!(e.to_string().contains("Not a plan view"), "{e}");
-        s.log.clear();
-        s.start("wallfit")?;
-        assert!(s.running.is_none());
-        assert_eq!(crate::detailtags::edited_plan(&s).err().as_ref().map(|w| s.log.contains(w)), Some(true), "{:?}", s.log);
-        assert_eq!(undo_len(&s)?, n);
+        let r = s.execute("wallfit", &json!({ "viewId": sec.0 }))?;
+        assert!(r["fitted"].as_array().is_some_and(|f| f.contains(&json!(left))), "{r}");
+        assert_eq!(undo_len(&s)?, n + 1);
         Ok(())
     }
 

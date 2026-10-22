@@ -1,4 +1,4 @@
-//! WALLFIT: close a plan's width conflicts by moving a conflicted straight run's faces so the drawn
+//! WALLFIT: close a plan's or section's width conflicts by moving a conflicted straight run's faces so the drawn
 //! wall is as thick as its detail. A [`Hold`] chooses which face stays put: the detail's reference
 //! face (the default), the exterior face, the interior face, or the centre (both faces move by half
 //! the delta). A moving face moves along the run's normal toward its own side by
@@ -8,10 +8,14 @@
 //! one face segment (either side of a T) move it once. Every other wall-run face line whose free
 //! end (a LINE end, or an open LWPOLYLINE's first or last vertex) lay on a moved face segment has
 //! that end extended or trimmed along its own line to meet the moved face (T478). Every line in a
-//! vertical view linked to a moved face segment travels with it in the same undo step (T484).
+//! vertical view linked to a moved face segment travels with it in the same undo step (T484); in a
+//! section, every linked plan line travels the same way. In a section the exterior side comes from
+//! its wall sides (`outsidepoint`) exactly as for its assembly. While the Hold prompt is up, the
+//! interactive form previews the reference hold's moved face segments as LINEs (T488).
 
-use cadcraft_doc::{Drawing, EntityKind, Handle};
+use cadcraft_doc::{Drawing, EntityKind, Handle, Line};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
+use cadcraft_geom::Vec2;
 use lamb_core::derivation::assembly::{FaceRef, WidthConflict};
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::derivation::travel::travel_segment_move;
@@ -23,9 +27,9 @@ use lamb_core::geometry::{Point2, Polyline2};
 use lamb_core::model::Id;
 use serde_json::{Value, json};
 
-use crate::assembly::{assembly_lines, check_plan};
+use crate::assembly::{assembly_lines, check_wall_view};
 use crate::commands::{id_value, other};
-use crate::detailtags::{edited_plan, graph_and_sides};
+use crate::detailtags::{edited_wall_view, graph_and_sides};
 use crate::maintain::write_travelled;
 use crate::project::DrawingProject;
 
@@ -268,11 +272,11 @@ fn linked_travel(d: &Drawing, moves: &[Move]) -> Result<Vec<(Id, Polyline2)>, St
 
 /// The face moves and end follow-ups [`wall_fit_holding`] would make, with the fitted run indices,
 /// computed without mutating.
-fn plan_moves(d: &Drawing, plan: Id, only: Option<&[usize]>, hold: Hold) -> Result<Plan, String> {
-    check_plan(d, plan)?;
-    let runs = assembly_lines(d, plan)?;
+fn plan_moves(d: &Drawing, view: Id, only: Option<&[usize]>, hold: Hold) -> Result<Plan, String> {
+    check_wall_view(d, view)?;
+    let runs = assembly_lines(d, view)?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
-    let (graph, sides) = graph_and_sides(&p, plan);
+    let (graph, sides) = graph_and_sides(&p, view);
     let mut moves = Vec::new();
     for r in &runs {
         let Some(c) = r.conflict else { continue };
@@ -377,8 +381,8 @@ pub fn wallfit(s: &mut Session, p: &Value) -> EngineResult<Value> {
     Ok(json!({ "fitted": fitted, "hold": hold.name(), "travelled": travelled }))
 }
 
-/// WALLFIT's interactive form, on the edited plan view: which face holds, then every conflicted run
-/// is fitted.
+/// WALLFIT's interactive form, on the edited plan or section view: which face holds, then every
+/// conflicted run is fitted. The Hold prompt previews the reference hold's moved face segments.
 struct WallFitM;
 
 const HOLD_WORDS: [&str; 4] = ["Reference", "Exterior", "Interior", "Centre"];
@@ -401,7 +405,7 @@ impl Interactive for WallFitM {
         Prompt::new("Hold", Accept::TEXT).kw(&HOLD_WORDS).default("Reference".to_owned())
     }
     fn begin(&mut self, s: &mut Session) -> EngineResult<Step> {
-        if let Err(e) = edited_plan(s) {
+        if let Err(e) = edited_wall_view(s) {
             s.echo(e);
             return Ok(Step::Done);
         }
@@ -420,11 +424,24 @@ impl Interactive for WallFitM {
             },
             _ => return Ok(Step::Continue),
         };
-        let plan = edited_plan(s).map_err(other)?;
-        if let Err(e) = wallfit(s, &json!({ "viewId": plan.0, "hold": hold })) {
+        let view = edited_wall_view(s).map_err(other)?;
+        if let Err(e) = wallfit(s, &json!({ "viewId": view.0, "hold": hold })) {
             s.echo(e.to_string());
         }
         Ok(Step::Done)
+    }
+    fn preview(&self, s: &Session, _cursor: Vec2) -> Vec<EntityKind> {
+        let Ok(view) = edited_wall_view(s) else { return Vec::new() };
+        let Ok(d) = s.doc() else { return Vec::new() };
+        let Ok(plan) = plan_moves(d, view, None, Hold::Reference) else { return Vec::new() };
+        plan.moves
+            .iter()
+            .filter_map(|m| {
+                let [(a, ..), (b, ..)] = segment_ends(d, m.handle, m.segment)?;
+                let shifted = |p: Point2| Vec2::new(p.x + m.dx, p.y + m.dy).to3(0.0);
+                Some(EntityKind::Line(Line { a: shifted(a), b: shifted(b) }))
+            })
+            .collect()
     }
 }
 
@@ -516,7 +533,7 @@ mod tests {
         let n = undo_len(&s)?;
         let detail = crate::schema::read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
         let e = s.execute("wallfit", &json!({ "viewId": detail.0 })).err().ok_or("detail accepted")?;
-        assert!(e.to_string().contains("Not a plan view"), "{e}");
+        assert!(e.to_string().contains("Not a plan or section view"), "{e}");
         let e = s.execute("wallfit", &json!({ "viewId": 999_999 })).err().ok_or("unknown accepted")?;
         assert!(e.to_string().contains("No such view"), "{e}");
         assert_eq!(undo_len(&s)?, n);
@@ -764,6 +781,101 @@ mod tests {
         let r = s.execute("wallfit", &json!({ "viewId": plan.0, "hold": "interior" }))?;
         assert_eq!(r["travelled"], json!([outer]), "{r}");
         assert_eq!(us(&s, &[&outer, &inner])?, [(990.0, 990.0), (1190.0, 1190.0)], "the held interior face's partner is untouched");
+        Ok(())
+    }
+
+    #[test]
+    fn wallfit_fits_a_sections_conflicted_run_under_each_hold() -> R {
+        let (mut s, sec) = crate::assembly::tests::section_wall(290.0)?;
+        let before = plines(&s, sec)?;
+        assert_eq!(before[1], [(290.0, 250.0), (3710.0, 250.0), (3710.0, 2750.0), (290.0, 2750.0)]);
+        let n = undo_len(&s)?;
+        let r = s.execute("wallfit", &json!({ "viewId": sec.0 }))?;
+        assert_eq!(r["fitted"], json!([1, 3]), "both vertical runs carry SD's 10 mm conflict: {r}");
+        assert_eq!(undo_len(&s)?, n + 1);
+        let after = plines(&s, sec)?;
+        assert_eq!(after[1], [(300.0, 250.0), (3700.0, 250.0), (3700.0, 2750.0), (300.0, 2750.0)], "inner faces move 10 mm inward, z unchanged");
+        assert_eq!(after[0], before[0], "outer face holds at u 0");
+        s.undo()?;
+        assert_eq!(plines(&s, sec)?, before);
+
+        let (mut s, sec) = crate::assembly::tests::section_wall(290.0)?;
+        s.execute("wallfit", &json!({ "viewId": sec.0, "hold": "exterior" }))?;
+        assert_eq!(plines(&s, sec)?[1][0], (300.0, 250.0), "exterior holds: the inner face moves");
+
+        let (mut s, sec) = crate::assembly::tests::section_wall(290.0)?;
+        s.execute("wallfit", &json!({ "viewId": sec.0, "hold": "interior" }))?;
+        let pl = plines(&s, sec)?;
+        assert_eq!(pl[0], [(-10.0, 0.0), (4010.0, 0.0), (4010.0, 3000.0), (-10.0, 3000.0)], "interior holds: the outer faces move out");
+        assert_eq!(pl[1], before[1]);
+        Ok(())
+    }
+
+    #[test]
+    fn wallfit_in_a_section_travels_a_linked_plan_line() -> R {
+        let (mut s, sec) = crate::assembly::tests::section_wall(290.0)?;
+        crate::maintain::install(&mut s);
+        let doc = crate::schema::read_document(s.doc()?)?;
+        let plan = doc.views.iter().find_map(|v| match v {
+            AnyView::Plan(p) => Some(p.id),
+            _ => None,
+        });
+        let plan = plan.ok_or("no plan")?;
+        let level = Id(s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].as_u64().ok_or("no id")?);
+        let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
+        s.execute("placeview", &json!({ "viewId": plan.0, "kind": "plan", "levelId": level.0, "cutElevation": 1200, "transform": t }))?;
+        let inner = {
+            let d = s.doc()?;
+            let b = d.block(&crate::schema::view_block_name(sec)).ok_or("no section block")?;
+            let pl: Vec<String> = b.entities.iter().filter(|e| matches!(e.kind, EntityKind::LwPolyline(_))).map(|e| e.handle.hex()).collect();
+            pl.get(1).cloned().ok_or("no inner face")?
+        };
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let handles = |s: &Session| -> T<Vec<String>> {
+            Ok(s.doc()?.block(&crate::schema::view_block_name(plan)).ok_or("no plan block")?.entities.iter().map(|e| e.handle.hex()).collect())
+        };
+        let before = handles(&s)?;
+        s.execute("line", &json!({ "points": [[290.0, 500.0], [290.0, 1500.0]] }))?;
+        let h =
+            handles(&s)?.into_iter().find(|h| !before.contains(h) && us(&s, &[h]).is_ok_and(|x| x == [(290.0, 290.0)])).ok_or("line not drawn")?;
+        let a = json!({ "entityId": inner, "segmentIndex": 3, "segmentParam": 0.5 });
+        s.execute("link.apply", &json!({ "a": a, "b": { "entityId": h, "segmentIndex": 0, "segmentParam": 0.5 } }))?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        let r = s.execute("wallfit", &json!({ "viewId": sec.0 }))?;
+        assert_eq!(r["travelled"], json!([h]), "{r}");
+        assert_eq!(us(&s, &[&h])?, [(300.0, 300.0)], "the plan line follows the moved face");
+        Ok(())
+    }
+
+    #[test]
+    fn wallfit_machine_previews_the_reference_holds_moved_face_and_refuses_a_detail() -> R {
+        let (mut s, _sec) = crate::assembly::tests::section_wall(290.0)?;
+        s.start("wallfit")?;
+        let pv = s.running.as_ref().ok_or("not running")?.machine.preview(&s, cadcraft_geom::Vec2::new(0.0, 0.0));
+        let mut spans: Vec<(f64, f64, f64, f64)> = pv
+            .iter()
+            .map(|k| match k {
+                EntityKind::Line(l) => Ok((l.a.x, l.b.x, l.a.y.min(l.b.y), l.a.y.max(l.b.y))),
+                k => Err(format!("not a LINE: {k:?}")),
+            })
+            .collect::<Result<_, _>>()?;
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(spans, [(300.0, 300.0, 250.0, 2750.0), (3700.0, 3700.0, 250.0, 2750.0)], "one LINE per moved inner face segment");
+
+        let doc = crate::schema::read_document(s.doc()?)?;
+        let sd = doc.views.iter().find_map(|v| match v {
+            AnyView::Detail(d) => Some(d.id),
+            _ => None,
+        });
+        let sd = sd.ok_or("no detail")?;
+        s.running = None;
+        s.execute("editview", &json!({ "viewId": sd.0 }))?;
+        let n = undo_len(&s)?;
+        s.log.clear();
+        s.start("wallfit")?;
+        assert!(s.running.is_none());
+        assert!(s.log.iter().any(|l| l.contains("plan and section views")), "{:?}", s.log);
+        assert_eq!(undo_len(&s)?, n);
         Ok(())
     }
 }
