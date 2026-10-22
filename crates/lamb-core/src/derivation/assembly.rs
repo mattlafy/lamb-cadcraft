@@ -12,6 +12,7 @@
 //! Not the AI-line sweep (`crate::sweeps` in the adapter); everything here is "assembly".
 
 use super::wall_junctions::{Junction, RunEnd};
+use super::wall_openings::OpeningBridge;
 use super::wall_spaces::{RunSides, outside_on_left};
 use super::walls::{RunCurve, WallRun};
 use crate::geometry::Point2;
@@ -372,6 +373,61 @@ pub fn place_corner(
         Point2 { x: c.x + t.x * u + ni.x * v, y: c.y + t.y * u + ni.y * v }
     };
     Ok(lines.iter().map(|(p, q, layer)| AssemblyLine { from: map(*p), to: map(*q), layer: layer.clone(), arc: None }).collect())
+}
+
+/// A jamb of an opening bridge (§9 item 3, LAMB T485): the run `end`'s `face` line end `c` — its
+/// centreline end offset `width / 2` toward the face — and the unit travel `t` toward the opening
+/// (along the centreline at `End`, against it at `Start`). Errors as `face_frame`: an arc run, an
+/// undecided face side.
+pub fn jamb_point(run: &WallRun, sides: &RunSides, face: FaceRef, end: RunEnd) -> Result<(Point2, Point2), String> {
+    let f = face_frame(run, sides, face)?;
+    let h = run.width / 2.0;
+    let (e, s) = match end {
+        RunEnd::Start => (f.from, -1.0),
+        RunEnd::End => (f.to, 1.0),
+    };
+    Ok((Point2 { x: e.x + f.normal.x * h, y: e.y + f.normal.y * h }, Point2 { x: f.dir.x * s, y: f.dir.y * s }))
+}
+
+/// An opening detail placed at both jambs of `bridge` (§9 item 3, LAMB T485), `[a's, b's]`. The
+/// detail is drawn for one jamb: its reference line on `face`, its `to` end at the jamb. At each
+/// jamb ([`jamb_point`]) a detail point `p` maps, as in [`place_corner`], from `(u, v)` — `p −
+/// reference.1` in the detail's `(along, into)` — to `c + t·u + ni·v`, `ni` pointing into the wall.
+/// Each jamb uses its own travel, so the detail lands rigidly at the jamb whose handedness matches
+/// the detail's and **as its mirror image at the other** — intended: a jamb is drawn once, "typ.".
+/// `sides` is indexed like `runs`. Errors: the detail's frame ([`detail_frame`]), a missing run, an
+/// arc run, an undecided face side.
+pub fn place_opening(
+    bridge: &OpeningBridge,
+    runs: &[WallRun],
+    sides: &[RunSides],
+    face: FaceRef,
+    reference: (Point2, Point2),
+    lines: &[(Point2, Point2, String)],
+) -> Result<[Vec<AssemblyLine>; 2], String> {
+    let frame = detail_frame(reference, lines)?;
+    let r = reference.1;
+    let jamb = |(i, end): (usize, RunEnd)| -> Result<Vec<AssemblyLine>, String> {
+        let run = runs.get(i).ok_or("the opening bridge names no run")?;
+        let side = sides.get(i).ok_or("the opening bridge's run has no sides")?;
+        let f = face_frame(run, side, face)?;
+        let (c, t) = jamb_point(run, side, face, end)?;
+        let ni = Point2 { x: -f.normal.x, y: -f.normal.y };
+        let map = |p: Point2| {
+            let (dx, dy) = (p.x - r.x, p.y - r.y);
+            let (u, v) = (dx * frame.along.x + dy * frame.along.y, dx * frame.into.x + dy * frame.into.y);
+            Point2 { x: c.x + t.x * u + ni.x * v, y: c.y + t.y * u + ni.y * v }
+        };
+        Ok(lines.iter().map(|(p, q, layer)| AssemblyLine { from: map(*p), to: map(*q), layer: layer.clone(), arc: None }).collect())
+    };
+    Ok([jamb(bridge.a)?, jamb(bridge.b)?])
+}
+
+/// How far a placed jamb detail reaches back into its run from the jamb point `c`, `t` being the
+/// travel toward the opening ([`jamb_point`]): the farthest distance along `−t` of any line end,
+/// floored at 0. The run's bands are trimmed to it.
+pub fn jamb_reach(c: Point2, t: Point2, lines: &[AssemblyLine]) -> f64 {
+    lines.iter().flat_map(|l| [l.from, l.to]).map(|p| -((p.x - c.x) * t.x + (p.y - c.y) * t.y)).fold(0.0, f64::max)
 }
 
 /// A run whose detail is thicker or thinner than the drawn wall: the detail's width minus the
@@ -1061,5 +1117,75 @@ mod tests {
         let mut outside = line(1000.0, 2000.0);
         assert!(trim_to_reach(&mut outside, node, u, 900.0));
         assert_eq!(outside, line(1000.0, 2000.0));
+    }
+
+    /// A 200-wide horizontal wall 0..1000 and 2000..3000 on centreline y = 100, exterior below (face
+    /// y = 0), bridged 1000 → 2000; `reversed` draws both runs right to left.
+    fn bridged(reversed: bool) -> (OpeningBridge, Vec<WallRun>, Vec<RunSides>) {
+        let below_right = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
+        let below_left = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
+        let (runs, sides, a, b) = if reversed {
+            (
+                vec![run(p(1000.0, 100.0), p(0.0, 100.0), 200.0), run(p(3000.0, 100.0), p(2000.0, 100.0), 200.0)],
+                vec![below_left.clone(), below_left],
+                (0, RunEnd::Start),
+                (1, RunEnd::End),
+            )
+        } else {
+            (
+                vec![run(p(0.0, 100.0), p(1000.0, 100.0), 200.0), run(p(2000.0, 100.0), p(3000.0, 100.0), 200.0)],
+                vec![below_right.clone(), below_right],
+                (0, RunEnd::End),
+                (1, RunEnd::Start),
+            )
+        };
+        (OpeningBridge { a, b, from: p(1000.0, 100.0), to: p(2000.0, 100.0), opening_entity_ids: vec![Id(9)] }, runs, sides)
+    }
+
+    /// A jamb detail: reference (0,0) → (100,0) on the exterior face, the jamb line at its `to` end
+    /// and a band 200 into the wall reaching 100 back from the jamb.
+    fn jamb_detail() -> ((Point2, Point2), Vec<(Point2, Point2, String)>) {
+        ((p(0.0, 0.0), p(100.0, 0.0)), vec![l((100.0, 0.0), (100.0, 200.0), "JAMB"), l((0.0, 200.0), (100.0, 200.0), "GYP")])
+    }
+
+    #[test]
+    fn an_opening_detail_lands_at_both_jambs_mirrored_at_the_second() {
+        let (reference, lines) = jamb_detail();
+        for reversed in [false, true] {
+            let (bridge, runs, sides) = bridged(reversed);
+            let [a, b] = place_opening(&bridge, &runs, &sides, FaceRef::Exterior, reference, &lines).unwrap();
+            assert_eq!(rounded(&a), [(1000.0, 0.0, 1000.0, 200.0), (900.0, 200.0, 1000.0, 200.0)], "reversed {reversed}");
+            assert_eq!(rounded(&b), [(2000.0, 0.0, 2000.0, 200.0), (2100.0, 200.0, 2000.0, 200.0)], "reversed {reversed}");
+            assert_eq!((a[0].layer.as_str(), a[1].layer.as_str()), ("JAMB", "GYP"));
+            assert!(a.iter().chain(&b).all(|l| l.arc.is_none()));
+            // Each jamb's reach back into its run is the band's 100.
+            for (lines, (i, end)) in [(&a, bridge.a), (&b, bridge.b)] {
+                let (c, t) = jamb_point(&runs[i], &sides[i], FaceRef::Exterior, end).unwrap();
+                assert!((jamb_reach(c, t, lines) - 100.0).abs() < 1e-9, "reversed {reversed}, run {i}");
+            }
+        }
+        // Nothing behind the jamb: reach 0.
+        let ahead = [AssemblyLine { from: p(1000.0, 0.0), to: p(1200.0, 0.0), layer: "A".into(), arc: None }];
+        assert_eq!(jamb_reach(p(1000.0, 0.0), p(1.0, 0.0), &ahead), 0.0);
+    }
+
+    #[test]
+    fn an_opening_detail_on_the_interior_face_lands_on_the_top_face() {
+        let (reference, lines) = jamb_detail();
+        let (bridge, runs, sides) = bridged(false);
+        let [a, b] = place_opening(&bridge, &runs, &sides, FaceRef::Interior, reference, &lines).unwrap();
+        assert_eq!(rounded(&a), [(1000.0, 200.0, 1000.0, 0.0), (900.0, 0.0, 1000.0, 0.0)]);
+        assert_eq!(rounded(&b), [(2000.0, 200.0, 2000.0, 0.0), (2100.0, 0.0, 2000.0, 0.0)]);
+    }
+
+    #[test]
+    fn an_opening_detail_refuses_an_arc_run_and_an_undecided_side() {
+        let (reference, lines) = jamb_detail();
+        let (bridge, mut runs, sides) = bridged(false);
+        let neither = RunSides { left: SideKind::Space(0), right: SideKind::Space(1), exterior: false, open_outside_left: None };
+        let undecided = vec![sides[0].clone(), neither];
+        assert_eq!(place_opening(&bridge, &runs, &undecided, FaceRef::Exterior, reference, &lines).unwrap_err(), "no single exterior side");
+        runs[0].centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
+        assert_eq!(place_opening(&bridge, &runs, &sides, FaceRef::Exterior, reference, &lines).unwrap_err(), "arc runs are not laid yet");
     }
 }

@@ -28,6 +28,12 @@
 //! building's convex corner (outside gap 270) never shares a class with a reflex one (outside gap
 //! 90). Two junctions are neighbours when a run, continued across opening bridges, joins them
 //! ([`junction_neighbours`]). Straight-through N = 2 nodes are junctions like any other.
+//!
+//! **Opening details** (LAMB T485) resolve per opening bridge ([`resolve_opening_details`]) by rules
+//! 1 and 2 only — tagged, then class spread — never by gaps. A bridge's class is its two bridged
+//! runs' [`RunClass`]es, sorted, so a jamb detail for a 200 mm exterior wall never lands in a 90 mm
+//! partition's door. The detail is drawn for one jamb and placed at both
+//! (`assembly::place_opening`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -209,7 +215,31 @@ pub fn resolve_corner_details(graph: &WallGraph, sides: &WallSides, tags: &[Corn
     resolve_greedy(&junction_classes(graph, sides), &junction_neighbours(graph), &tags)
 }
 
-/// The greedy algorithm shared by edges and corners: `classes[i]` and `neighbours[i]` describe item
+/// An opening-detail tag placed on one opening bridge: `bridge` indexes [`WallGraph::bridges`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpeningTag {
+    pub detail: String,
+    pub bridge: usize,
+}
+
+/// One [`RunDetail`] per bridge of `graph`: rules 1 and 2 of the module docs over each bridge's
+/// class — its two runs' [`RunClass`]es, sorted — with no neighbours, so gaps never decide it.
+/// Tags naming a bridge that is not in the graph are ignored.
+pub fn resolve_opening_details(graph: &WallGraph, sides: &WallSides, tags: &[OpeningTag]) -> Vec<RunDetail> {
+    let rc = run_classes(graph, sides);
+    let classes: Vec<(Option<RunClass>, Option<RunClass>)> = graph
+        .bridges
+        .iter()
+        .map(|b| {
+            let (x, y) = (rc.get(b.a.0).copied(), rc.get(b.b.0).copied());
+            if x <= y { (x, y) } else { (y, x) }
+        })
+        .collect();
+    let tags: Vec<(usize, &str)> = tags.iter().map(|t| (t.bridge, t.detail.as_str())).collect();
+    resolve_greedy(&classes, &vec![BTreeSet::new(); classes.len()], &tags)
+}
+
+/// The greedy algorithm shared by edges, corners and openings: `classes[i]` and `neighbours[i]` describe item
 /// i (a run or a junction), `tags` are `(item, detail)`; items out of range are ignored.
 fn resolve_greedy<K: Ord + Clone>(classes: &[K], neighbours: &[BTreeSet<usize>], tags: &[(usize, &str)]) -> Vec<RunDetail> {
     let n = classes.len();
@@ -276,4 +306,69 @@ fn resolve_greedy<K: Ord + Clone>(classes: &[K], neighbours: &[BTreeSet<usize>],
 /// The set's single member, if it has exactly one.
 fn only(set: &BTreeSet<&str>) -> Option<String> {
     if set.len() == 1 { set.first().map(|d| (*d).to_string()) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::derivation::wall_openings::OpeningBridge;
+    use crate::derivation::wall_spaces::RunSides;
+    use crate::derivation::walls::{RunCurve, RunFace, WallRun};
+    use crate::geometry::Point2;
+    use crate::model::{Id, LinkAnchor};
+
+    fn run(width: f64) -> WallRun {
+        let a = LinkAnchor { entity_id: Id(1), segment_index: 0, segment_param: 0.0 };
+        let p = Point2 { x: 0.0, y: 0.0 };
+        WallRun {
+            view_id: Id(1),
+            faces: [RunFace { from: a.clone(), to: a.clone() }, RunFace { from: a.clone(), to: a }],
+            width,
+            centreline: RunCurve::Line { from: p, to: Point2 { x: 1000.0, y: 0.0 } },
+        }
+    }
+
+    /// Exterior runs of the given widths, bridged in pairs (0–1, 2–3, …).
+    fn bridged(widths: &[f64]) -> (WallGraph, WallSides) {
+        let p = Point2 { x: 0.0, y: 0.0 };
+        let bridges = (0..widths.len() / 2)
+            .map(|k| OpeningBridge { a: (2 * k, RunEnd::End), b: (2 * k + 1, RunEnd::Start), from: p, to: p, opening_entity_ids: vec![Id(k as u64)] })
+            .collect();
+        let graph = WallGraph { runs: widths.iter().map(|w| run(*w)).collect(), junctions: Vec::new(), free_ends: Vec::new(), bridges };
+        let side = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
+        (graph, WallSides { runs: vec![side; widths.len()], spaces: Vec::new() })
+    }
+
+    fn tag(detail: &str, bridge: usize) -> OpeningTag {
+        OpeningTag { detail: detail.into(), bridge }
+    }
+
+    #[test]
+    fn one_tagged_opening_spreads_to_its_class() {
+        let (g, s) = bridged(&[200.0; 4]);
+        assert_eq!(resolve_opening_details(&g, &s, &[tag("J1", 0)]), [RunDetail::Tagged("J1".into()), RunDetail::Spread("J1".into())]);
+    }
+
+    #[test]
+    fn two_details_in_a_class_leave_the_third_untyped() {
+        let (g, s) = bridged(&[200.0; 6]);
+        assert_eq!(
+            resolve_opening_details(&g, &s, &[tag("J1", 0), tag("J2", 1)]),
+            [RunDetail::Tagged("J1".into()), RunDetail::Tagged("J2".into()), RunDetail::Untyped]
+        );
+    }
+
+    #[test]
+    fn two_tags_on_one_opening_conflict() {
+        let (g, s) = bridged(&[200.0; 4]);
+        assert_eq!(resolve_opening_details(&g, &s, &[tag("J1", 0), tag("J2", 0)]), [RunDetail::Conflict, RunDetail::Untyped]);
+        // A tag on a bridge not in the graph is ignored.
+        assert_eq!(resolve_opening_details(&g, &s, &[tag("J1", 7)]), [RunDetail::Untyped, RunDetail::Untyped]);
+    }
+
+    #[test]
+    fn an_opening_in_another_width_is_not_spread_to() {
+        let (g, s) = bridged(&[200.0, 200.0, 90.0, 90.0, 200.0, 90.0]);
+        assert_eq!(resolve_opening_details(&g, &s, &[tag("J1", 0)]), [RunDetail::Tagged("J1".into()), RunDetail::Untyped, RunDetail::Untyped]);
+    }
 }
