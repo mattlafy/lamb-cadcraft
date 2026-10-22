@@ -1,8 +1,10 @@
 //! LAMB's overlay and snap providers (`cadcraft-integration.md` §7): while a space is a LAMB view's
 //! block (`Space::Block("LAMB_VIEW_<id>")`), [`lamb_overlay`] draws that view's intersection markers
 //! and cut lines over the drawing, and [`lamb_snaps`] offers every marker centre as a snap point.
-//! Block coordinates are the view's local coordinates, so lamb-core's output is drawn as-is. Any
-//! other space, and any error reading the LAMB slots or deriving, gives nothing.
+//! Block coordinates are the view's local coordinates, so lamb-core's output is drawn as-is. In a
+//! view's assembly block (`LAMB_ASSEMBLY_<id>`) it draws the assembly-space ghost instead
+//! ([`crate::asmview::draw`]: what the assembly plan does not lay, in grey). Any other space, and
+//! any error reading the LAMB slots or deriving, gives nothing.
 
 use std::sync::OnceLock;
 
@@ -77,7 +79,7 @@ fn outline(m: &Marker, r: f64) -> Vec<Vec2> {
         .collect()
 }
 
-fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kind, pts: &[Vec2]) {
+pub(crate) fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kind, pts: &[Vec2]) {
     let into_tris = matches!(kind, Kind::Tris | Kind::Mask);
     let buf = if into_tris { &mut list.tris } else { &mut list.verts };
     let start = buf.len() as u32;
@@ -88,13 +90,15 @@ fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kind, pts: &[V
 /// The overlay provider: the edited view's underlay ([`underlay`], drawn first, pale), its halos
 /// ([`halo`]: RESOLVE's attention, unaccepted AI lines' glow), a detail's reference line
 /// ([`crate::detailref`], magenta), a detail's repeat ghosts ([`crate::repeats::draw`], one pale copy
-/// of each repeat's members at its pitch), then its markers and cut lines, in
+/// of each repeat's members at its pitch), an assembly block's ghost ([`crate::asmview::draw`]),
+/// then its markers and cut lines, in
 /// its block's coordinates.
 pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let mut list = underlay::draw(d, space, opts);
     append_list(&mut list, halo::draw(d, space, opts));
     append_list(&mut list, crate::detailref::draw(d, space, opts));
     append_list(&mut list, crate::repeats::draw(d, space, opts));
+    append_list(&mut list, crate::asmview::draw(d, space, opts));
     let Some((dp, id)) = view_of(d, space) else { return list };
     let Ok(markers) = compute_markers_for_view(&dp, id) else { return list };
     let Ok(cuts) = compute_cut_lines_for_view(&dp, id) else { return list };

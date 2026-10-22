@@ -11,13 +11,21 @@
 //!   point ([`assembly_source`]) — its run or junction, detail, band/repeat/corner, layer and the
 //!   wall faces it was laid from. An idle click in the assembly space echoes the same
 //!   ([`pick_assembly`], from [`crate::viewpick::idle_pick`]).
+//! - While the space is an assembly block, [`draw`] (an overlay, via
+//!   [`crate::overlays::lamb_overlay`]) shows in ghost grey what the assembly plan does not lay
+//!   (§9 "Greedy resolution": anything untyped "renders ghosted"): the two face lines of every run
+//!   skipped for any reason (untyped, conflict, unplaceable detail), and a cross at every junction
+//!   whose resolved corner detail was skipped. The block and plots are unchanged.
 
 use std::sync::Arc;
 
-use cadcraft_doc::{Drawing, Space};
+use cadcraft_color::Rgb;
+use cadcraft_doc::{Drawing, Handle, Space};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
-use cadcraft_geom::Vec2;
+use cadcraft_geom::{Bounds2, Vec2};
+use cadcraft_render::{DisplayList, Kind, Options};
 use lamb_core::derivation::assembly::AssemblyLine;
+use lamb_core::derivation::walls::{RunCurve, WallRun};
 use lamb_core::geometry::Point2;
 use lamb_core::model::Id;
 use serde_json::{Value, json};
@@ -220,6 +228,80 @@ pub fn assemblysource(s: &mut Session, p: &Value) -> EngineResult<Value> {
     Ok(assembly_source(d, view, point, aperture).map_or(Value::Null, |src| src.to_json()))
 }
 
+/// The assembly-space ghost (TS ghost grey).
+pub const GHOST_COLOR: Rgb = Rgb(150, 150, 150);
+/// Arc face lines are sampled at this many segments per full turn (at least [`GHOST_MIN_SEGMENTS`]).
+const GHOST_SEGMENTS_PER_TURN: f64 = 64.0;
+const GHOST_MIN_SEGMENTS: usize = 8;
+
+/// The view whose assembly block `space` is, when that view is a plan or section holding one.
+fn assembly_view_of(d: &Drawing, space: &Space) -> Option<Id> {
+    let Space::Block(name) = space else { return None };
+    let id = Id(name.strip_prefix("LAMB_ASSEMBLY_")?.parse().ok()?);
+    (assembly_block_name(id) == *name && d.block(name).is_some() && check_wall_view(d, id).is_ok()).then_some(id)
+}
+
+/// A run's two face lines: its centreline offset by ±`width / 2` (an arc run: concentric arcs).
+fn face_lines(run: &WallRun) -> [Vec<Vec2>; 2] {
+    let h = run.width / 2.0;
+    match run.centreline {
+        RunCurve::Line { from, to } => {
+            let (dx, dy) = (to.x - from.x, to.y - from.y);
+            let len = dx.hypot(dy);
+            let (nx, ny) = if len > 0.0 { (-dy / len * h, dx / len * h) } else { (0.0, 0.0) };
+            let side = |k: f64| vec![Vec2::new(from.x + k * nx, from.y + k * ny), Vec2::new(to.x + k * nx, to.y + k * ny)];
+            [side(1.0), side(-1.0)]
+        }
+        RunCurve::Arc { center, radius, start_angle, sweep } => {
+            let n = ((sweep.abs() / std::f64::consts::TAU * GHOST_SEGMENTS_PER_TURN).ceil() as usize).max(GHOST_MIN_SEGMENTS);
+            let arc = |r: f64| {
+                (0..=n)
+                    .map(|i| {
+                        let t = start_angle + sweep * i as f64 / n as f64;
+                        Vec2::new(center.x + r * t.cos(), center.y + r * t.sin())
+                    })
+                    .collect()
+            };
+            [arc(radius + h), arc(radius - h)]
+        }
+    }
+}
+
+/// The assembly-space ghost overlay: in `Space::Block(assembly_block_name(id))` of a plan or
+/// section with that block, every skipped run's two face lines and a cross at every skipped
+/// corner's junction (half-size: its widest arm's width / 2), as polylines in [`GHOST_COLOR`].
+/// Empty in any other space or when the view does not derive.
+pub fn draw(d: &Drawing, space: &Space, _opts: &Options) -> DisplayList {
+    let mut list = DisplayList { bounds: Bounds2::EMPTY, ..DisplayList::default() };
+    let Some(view) = assembly_view_of(d, space) else { return list };
+    let (Ok(runs), Ok(corners)) = (assembly_lines(d, view), corner_assembly(d, view)) else { return list };
+    let Ok(dp) = DrawingProject::new(d) else { return list };
+    let (graph, _) = graph_and_sides(&dp, view);
+    let ghost = |list: &mut DisplayList, handle: Handle, pts: Vec<Vec2>| {
+        for p in &pts {
+            list.bounds.add(*p);
+        }
+        crate::overlays::push(list, handle, GHOST_COLOR, Kind::Polyline, &pts);
+    };
+    for r in runs.iter().filter(|r| r.skipped.is_some()) {
+        let Some(run) = graph.runs.get(r.run) else { continue };
+        let handle = Handle(run.faces[0].from.entity_id.0);
+        for pts in face_lines(run) {
+            ghost(&mut list, handle, pts);
+        }
+    }
+    for c in corners.iter().filter(|c| c.skipped.is_some()) {
+        let Some(j) = graph.junctions.get(c.junction) else { continue };
+        let arms: Vec<&WallRun> = j.arms.iter().filter_map(|a| graph.runs.get(a.run)).collect();
+        let h = arms.iter().map(|r| r.width).fold(0.0, f64::max) / 2.0;
+        let handle = arms.first().map_or(Handle(0), |r| Handle(r.faces[0].from.entity_id.0));
+        let (x, y) = (j.point.x, j.point.y);
+        ghost(&mut list, handle, vec![Vec2::new(x - h, y - h), Vec2::new(x + h, y + h)]);
+        ghost(&mut list, handle, vec![Vec2::new(x - h, y + h), Vec2::new(x + h, y - h)]);
+    }
+    list
+}
+
 /// ASSEMBLYVIEW's interactive form: no prompt; the edited plan or section's assembly plan.
 struct AssemblyViewM;
 
@@ -249,6 +331,7 @@ pub(crate) fn assemblyview_machine(_s: &Session) -> EngineResult<Box<dyn Interac
 mod tests {
     use super::*;
     use crate::assembly::tests::{corner_detail, room, undo_len};
+    use crate::schema::view_block_name;
     use cadcraft_doc::EntityKind;
     use cadcraft_engine::idle_pick::IdlePicked;
     use lamb_core::model::AnyView;
@@ -400,5 +483,97 @@ mod tests {
         assert!((dist_to_line(Point2 { x: 0.0, y: -10.0 }, &l) - 200f64.sqrt()).abs() < 1e-9, "outside the sweep: nearest end");
         let cw = AssemblyLine { from: l.to, to: l.from, arc: Some(ArcSpan { center: c, radius: 10.0, ccw: false }), ..l.clone() };
         assert!((dist_to_line(Point2 { x: r, y: r }, &cw) - 2.0).abs() < 1e-9);
+    }
+
+    /// The ghost-grey prims of `lamb_overlay` in `space`, as point lists.
+    fn ghosts(s: &Session, space: &Space) -> std::result::Result<Vec<Vec<Vec2>>, Box<dyn std::error::Error>> {
+        let list = crate::overlays::lamb_overlay(s.doc()?, space, &Options::default());
+        Ok(list.prims.iter().filter(|p| p.color == GHOST_COLOR).map(|p| list.points(p).to_vec()).collect())
+    }
+
+    #[test]
+    fn an_untagged_wall_draws_its_face_lines_ghosted_in_the_assembly_space_only() -> R {
+        let (mut s, plan) = room("exterior_face", false)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let asm = Space::Block(assembly_block_name(plan));
+        let g = ghosts(&s, &asm)?;
+        let runs = assembly_lines(s.doc()?, plan)?;
+        assert_eq!(runs.len(), 4);
+        assert!(runs.iter().all(|r| r.skipped.as_deref() == Some("untyped")));
+        assert_eq!(g.len(), 8, "two face lines per run: {g:?}");
+        // Every ghost is an axis-aligned segment on the outer (0/5000, 0/4000) or inner (200/4800,
+        // 200/3800) face.
+        for pts in &g {
+            let [a, b] = pts[..] else { return Err(format!("not a segment: {pts:?}").into()) };
+            let on = if (a.y - b.y).abs() < 1e-9 {
+                [0.0, 200.0, 3800.0, 4000.0].iter().any(|y| (a.y - y).abs() < 1e-9)
+            } else {
+                (a.x - b.x).abs() < 1e-9 && [0.0, 200.0, 4800.0, 5000.0].iter().any(|x| (a.x - x).abs() < 1e-9)
+            };
+            assert!(on, "{pts:?}");
+        }
+        // Bounds cover the ghost.
+        let list = crate::overlays::lamb_overlay(s.doc()?, &asm, &Options::default());
+        assert!(list.bounds.min.x <= 0.0 + 1e-9 && list.bounds.max.y >= 4000.0 - 1e-9, "{:?}", list.bounds);
+
+        // Not in the plan's own block, nor in model space.
+        assert!(ghosts(&s, &Space::Block(view_block_name(plan)))?.is_empty());
+        assert!(ghosts(&s, &Space::Model)?.is_empty());
+
+        // Tagged: nothing ghosted.
+        let (mut s, plan) = room("exterior_face", true)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert!(ghosts(&s, &Space::Block(assembly_block_name(plan)))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_corner_that_cannot_be_placed_draws_a_cross_at_each_junction_it_resolves_to() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        corner_detail(&mut s, plan, "structural_centre", false, (0.0, 0.0))?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let d = s.doc()?;
+        let corners = corner_assembly(d, plan)?;
+        let skipped: Vec<_> = corners.iter().filter(|c| c.skipped.is_some()).collect();
+        assert_eq!(skipped.len(), 4, "{corners:?}");
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        let g = ghosts(&s, &Space::Block(assembly_block_name(plan)))?;
+        assert_eq!(g.len(), 8, "a two-segment cross per junction: {g:?}");
+        for (pair, c) in g.chunks(2).zip(&skipped) {
+            let j = graph.junctions[c.junction].point;
+            for seg in pair {
+                let mid = (seg[0] + seg[1]) * 0.5;
+                assert!((mid.x - j.x).abs() < 1e-9 && (mid.y - j.y).abs() < 1e-9, "{seg:?} at {j:?}");
+                // Half-size 100 (a 200 wide wall): each arm of the cross spans 200 in x and y.
+                assert!(((seg[0].x - seg[1].x).abs() - 200.0).abs() < 1e-9 && ((seg[0].y - seg[1].y).abs() - 200.0).abs() < 1e-9, "{seg:?}");
+            }
+        }
+
+        // A placed corner draws none.
+        let (mut s, plan) = room("exterior_face", true)?;
+        corner_detail(&mut s, plan, "exterior_face", false, (0.0, 0.0))?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert!(corner_assembly(s.doc()?, plan)?.iter().all(|c| c.skipped.is_none()));
+        assert!(ghosts(&s, &Space::Block(assembly_block_name(plan)))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_arc_run_ghosts_as_two_concentric_arcs() {
+        use lamb_core::model::LinkAnchor;
+        let a = LinkAnchor { entity_id: Id(7), segment_index: 0, segment_param: 0.0 };
+        let face = lamb_core::derivation::walls::RunFace { from: a.clone(), to: a };
+        let run = WallRun {
+            view_id: Id(1),
+            faces: [face.clone(), face],
+            width: 20.0,
+            centreline: RunCurve::Arc { center: Point2 { x: 0.0, y: 0.0 }, radius: 100.0, start_angle: 0.0, sweep: std::f64::consts::FRAC_PI_2 },
+        };
+        let [outer, inner] = face_lines(&run);
+        assert_eq!(outer.len(), GHOST_SEGMENTS_PER_TURN as usize / 4 + 1);
+        assert!(outer.iter().all(|p| (p.len() - 110.0).abs() < 1e-9) && inner.iter().all(|p| (p.len() - 90.0).abs() < 1e-9));
+        let last = outer[outer.len() - 1];
+        assert!(last.x.abs() < 1e-9 && (last.y - 110.0).abs() < 1e-9, "{last:?}");
     }
 }
