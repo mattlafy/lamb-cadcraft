@@ -70,6 +70,39 @@ fn arithmetic_follows_autolisp() {
     assert_eq!(eval(&mut s, "(+ 1 nil)"), Err("bad argument type: numberp: nil".into()));
 }
 
+/// `=` answers for the symbols `type` returns, which is how AutoLISP routines test a type:
+/// `(= (type x) 'INT)`. Coercing the symbol to a number failed the whole routine with "bad
+/// argument type" instead, so a routine written for AutoLISP stopped at its first type test
+/// (#1597). The ordering comparisons are still numbers and strings, as AutoLISP has them.
+#[test]
+fn equality_compares_symbols_as_autolisp_does() {
+    let mut s = session();
+    assert_eq!(ok(&mut s, "(= (type 1) 'INT)"), "T");
+    assert_eq!(ok(&mut s, "(= (type 1.0) 'INT)"), "nil");
+    assert_eq!(ok(&mut s, "(= (type '(1 2)) 'LIST)"), "T");
+    assert_eq!(ok(&mut s, "(= (type \"a\") 'STR)"), "T");
+    assert_eq!(ok(&mut s, "(/= (type 1) 'REAL)"), "T");
+    assert_eq!(ok(&mut s, "(= 'a 'a 'a)"), "T");
+    assert_eq!(ok(&mut s, "(= 'a 'b)"), "nil");
+
+    // The routine from the report runs.
+    ok(&mut s, "(defun isint (a) (if (= (type a) 'INT) T nil))");
+    assert_eq!(ok(&mut s, "(isint 3)"), "T");
+    assert_eq!(ok(&mut s, "(isint 3.0)"), "nil");
+    assert_eq!(ok(&mut s, "(isint \"3\")"), "nil");
+
+    // A mismatch of kinds is nil, not an error; numbers and strings are unchanged.
+    assert_eq!(ok(&mut s, "(= 1 \"1\")"), "nil");
+    assert_eq!(ok(&mut s, "(= '(1) '(1))"), "nil", "`=` is not `equal`");
+    assert_eq!(ok(&mut s, "(= nil nil)"), "T");
+    assert_eq!(ok(&mut s, "(= 1 1.0)"), "T");
+    assert_eq!(ok(&mut s, "(= \"a\" \"a\" \"a\")"), "T");
+    assert_eq!(ok(&mut s, "(= 1 1 2)"), "nil");
+
+    // Ordering still refuses what AutoLISP refuses.
+    assert_eq!(eval(&mut s, "(< 'a 'b)"), Err("bad argument type: numberp: A".into()));
+}
+
 #[test]
 fn lists_and_strings() {
     let mut s = session();
@@ -450,6 +483,37 @@ fn hostile_lisp_never_panics() {
         let _ = eval(&mut s, code);
     }
     assert!(!s.lisp_running());
+}
+
+/// `entsel` and `nentsel` pick one object, so the cursor shows the pick box at their prompt. It
+/// was read off the message's first word, and a routine's own message begins with a newline -- so
+/// the same call showed the pick box without a message and lost it with one (#1598).
+#[test]
+fn an_entsel_prompt_picks_objects_whatever_its_message_says() {
+    let mut s = session();
+    // No message: the default "Select object: ".
+    s.cmdline("(nentsel)").unwrap();
+    assert!(s.current_prompt().unwrap().picks_objects(), "{}", s.prompt_text());
+    s.cancel();
+
+    // The reported case: the routine's own message, starting with a newline.
+    s.cmdline("(nentsel \"\nSelect second line or polyline: \")").unwrap();
+    assert!(s.current_prompt().unwrap().picks_objects(), "{}", s.prompt_text());
+    s.cancel();
+
+    // Wording that never says "select" picks an object just the same.
+    s.cmdline("(entsel \"\nPick a line: \")").unwrap();
+    assert!(s.current_prompt().unwrap().picks_objects(), "{}", s.prompt_text());
+    s.cancel();
+
+    // A point prompt is not a pick, and keeps its point modifiers -- including one whose own
+    // message happens to begin with the word the built-in commands are read by. `picks_one` says
+    // which calls pick, so the wording is only ever read where the engine wrote it (#1635 review).
+    for point in ["(getpoint \"\nSpecify a point: \")", "(getpoint \"\nSelect a point: \")", "(getpoint \"Select a point: \")"] {
+        s.cmdline(point).unwrap();
+        assert!(!s.current_prompt().unwrap().picks_objects(), "{point}: {}", s.prompt_text());
+        s.cancel();
+    }
 }
 
 #[test]
