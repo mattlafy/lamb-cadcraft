@@ -8,6 +8,9 @@
 //! face segments' surfaces are then replaced, and a solid is dropped once every segment of its plan
 //! entity is. Arc runs, skipped runs and repeat copies keep their massing; a run with no massing to
 //! take a z range from emits nothing. Unreadable layered data yields no layers, never an error.
+//! Each repeat copy of such a run (studs, LAMB T489) whose lines chain end to start into one closed
+//! loop becomes a prism of that loop over the same z range, in its first line's layer, after the
+//! run's strips; a copy that does not close stays 2D.
 
 use std::collections::BTreeSet;
 
@@ -154,6 +157,19 @@ fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &lamb_core::derivation
             Point2 { x: q.x - n.x * h, y: q.y - n.y * h }
         };
         let mut emitted = false;
+        let push = |local: &[Point2], layer: String, out: &mut Layered| -> bool {
+            let Ok(global) = local.iter().map(|&q| plan_local_to_global_xy(view, q)).collect::<Result<Vec<_>, _>>() else { return false };
+            let base: Vec<Point3> = global.iter().map(|g| Point3 { x: g.x, y: g.y, z: bottom }).collect();
+            let faces = prism_from_loop(&base, Point3 { x: 0.0, y: 0.0, z: 1.0 }, 0.0, top - bottom);
+            let solid =
+                SynthesizedSolid { entity_ids: keys.map(|k| k.0).to_vec(), provenance, faces, form: SolidForm::Shell, layer_id: layer.clone() };
+            let triangles = solid_triangles(&solid);
+            if triangles.is_empty() {
+                return false;
+            }
+            out.strips.push(LayerStrip { sources: keys.map(|k| k.0), provenance, layer, triangles });
+            true
+        };
         for pair in merged.windows(2) {
             let [lo, hi] = pair else { continue };
             if hi.offset - lo.offset <= tol {
@@ -166,22 +182,49 @@ fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &lamb_core::derivation
                 (Some(l), None) | (None, Some(l)) => [l.from, l.to, foot(l.to), foot(l.from)],
                 (None, None) => continue,
             };
-            let Ok(global) = quad.iter().map(|&q| plan_local_to_global_xy(view, q)).collect::<Result<Vec<_>, _>>() else { continue };
-            let base: Vec<Point3> = global.iter().map(|g| Point3 { x: g.x, y: g.y, z: bottom }).collect();
-            let faces = prism_from_loop(&base, Point3 { x: 0.0, y: 0.0, z: 1.0 }, 0.0, top - bottom);
-            let solid =
-                SynthesizedSolid { entity_ids: keys.map(|k| k.0).to_vec(), provenance, faces, form: SolidForm::Shell, layer_id: layer.clone() };
-            let triangles = solid_triangles(&solid);
-            if triangles.is_empty() {
-                continue;
+            emitted |= push(&quad, layer, out);
+        }
+        let mut start = ra.bands;
+        for &count in &ra.copies {
+            let Some(copy) = ra.lines.get(start..start + count) else { break };
+            start += count;
+            if let (Some(ring), Some(head)) = (closed_loop(copy, tol), copy.first()) {
+                push(&ring, head.layer.clone(), out);
             }
-            out.strips.push(LayerStrip { sources: keys.map(|k| k.0), provenance, layer, triangles });
-            emitted = true;
         }
         if emitted {
             out.replaced.extend(keys);
         }
     }
+}
+
+/// `lines` chained end to start into one closed loop of at least three distinct points (the closing
+/// point not repeated), or `None` when they do not close or include an arc.
+fn closed_loop(lines: &[AssemblyLine], tol: f64) -> Option<Vec<Point2>> {
+    let near = |a: Point2, b: Point2| (a.x - b.x).hypot(a.y - b.y) <= tol;
+    let first = lines.first()?;
+    let mut ring = vec![first.from];
+    let mut end = first.from;
+    for l in lines {
+        if l.arc.is_some() || !near(l.from, end) {
+            return None;
+        }
+        if !near(l.to, l.from) {
+            ring.push(l.to);
+        }
+        end = l.to;
+    }
+    if !near(end, first.from) {
+        return None;
+    }
+    ring.pop();
+    let mut distinct: Vec<Point2> = Vec::new();
+    for q in &ring {
+        if !distinct.iter().any(|d| near(*d, *q)) {
+            distinct.push(*q);
+        }
+    }
+    (distinct.len() >= 3).then_some(ring)
 }
 
 #[cfg(test)]
@@ -192,6 +235,7 @@ mod tests {
 
     use crate::assembly::tests::room;
     use crate::scene::{SceneMeshKind, pick, scene};
+    use lamb_core::derivation::read::ProjectRead;
     use lamb_core::model::Id;
 
     type R = Result<(), Box<dyn std::error::Error>>;
@@ -276,6 +320,98 @@ mod tests {
         let after = scene(s.doc()?)?;
         assert!(after.meshes.iter().all(|m| m.kind != SceneMeshKind::Layer));
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    fn handles(s: &Session) -> T<std::collections::HashSet<Handle>> {
+        let d = s.doc()?;
+        Ok(d.model.iter().map(|e| e.handle).chain(d.blocks.values().flat_map(|b| b.entities.iter().map(|e| e.handle))).collect())
+    }
+
+    fn drawn(s: &mut Session, cmd: &str, p: serde_json::Value) -> T<Handle> {
+        let before = handles(s)?;
+        s.execute(cmd, &p)?;
+        Ok(handles(s)?.into_iter().find(|h| !before.contains(h)).ok_or("nothing drawn")?)
+    }
+
+    /// [`placed`] (tagged) with a STUD repeat in detail D1 at a 400 mm pitch — the closed stud
+    /// outline, or with `open` a single stud line — then ASSEMBLYPLAN.
+    fn studded(open: bool) -> T<(Session, Id)> {
+        let (mut s, plan) = placed(true)?;
+        let detail = {
+            let p = crate::project::DrawingProject::new(s.doc()?)?;
+            p.views().find(|v| v.kind == lamb_core::derivation::read::ViewKind::Detail).ok_or("no detail")?.id
+        };
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
+        let stud = if open {
+            drawn(&mut s, "line", json!({ "points": [[100, 50], [100, 200]] }))?
+        } else {
+            drawn(&mut s, "pline", json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?
+        };
+        let pitch = drawn(&mut s, "dimaligned", json!({ "p1": [100, 0], "p2": [500, 0], "at": [300, -300] }))?;
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()] }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        Ok((s, plan))
+    }
+
+    fn range(sc: &crate::scene::Scene, m: &crate::scene::SceneMesh, axis: usize) -> (f64, f64) {
+        let v = m.positions.iter().map(|p| sc.origin[axis] + f64::from(p[axis]));
+        (v.clone().fold(f64::INFINITY, f64::min), v.fold(f64::NEG_INFINITY, f64::max))
+    }
+
+    #[test]
+    fn each_closed_stud_copy_becomes_a_prism_over_the_strips_z_range() -> R {
+        let (s, plan) = studded(false)?;
+        let d = s.doc()?;
+        let copies: usize = crate::assembly::assembly_lines(d, plan)?.iter().map(|r| r.copies.len()).sum();
+        assert!(copies >= 4, "{copies} copies");
+        let sc = scene(d)?;
+        let layers: Vec<_> = sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).collect();
+        let studs: Vec<_> = layers.iter().filter(|m| m.layer == "STUD").collect();
+        assert_eq!(studs.len(), copies, "one mesh per copy");
+        let faces = plines(&s, plan)?;
+        assert!(studs.iter().all(|m| m.sources.len() == 2 && m.sources.iter().all(|h| faces.contains(h))));
+
+        // The strips are T487's, unchanged.
+        let (mut plain, plain_plan) = placed(true)?;
+        plain.execute("assemblyplan", &json!({ "viewId": plain_plan.0 }))?;
+        let base = scene(plain.doc()?)?;
+        let strips: Vec<_> = layers.iter().filter(|m| m.layer != "STUD").collect();
+        let want: Vec<_> = base.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).collect();
+        assert_eq!(strips.len(), want.len());
+        let clad = strips.iter().find(|m| m.layer == "CLAD").ok_or("no CLAD")?;
+        let (zlo, zhi) = range(&sc, clad, 2);
+        for (a, b) in strips.iter().zip(&want) {
+            assert_eq!(a.layer, b.layer);
+            for k in 0..3 {
+                let (x, y) = (range(&sc, a, k), range(&base, b, k));
+                assert!((x.0 - y.0).abs() < 0.01 && (x.1 - y.1).abs() < 0.01, "{x:?} vs {y:?}");
+            }
+        }
+
+        // The bottom run's studs: 38 mm along x, plan y 50..200, over the strips' z range.
+        let bottom: Vec<_> = studs.iter().filter(|m| range(&sc, m, 1).1 < 250.0).collect();
+        assert!(!bottom.is_empty());
+        let first = bottom.iter().min_by(|a, b| range(&sc, a, 0).0.total_cmp(&range(&sc, b, 0).0)).ok_or("no stud")?;
+        let (xlo, xhi) = range(&sc, first, 0);
+        let (ylo, yhi) = range(&sc, first, 1);
+        let (lo, hi) = range(&sc, first, 2);
+        assert!((xhi - xlo - 38.0).abs() < 0.01, "{xlo}..{xhi}");
+        assert!((ylo - 50.0).abs() < 0.01 && (yhi - 200.0).abs() < 0.01, "{ylo}..{yhi}");
+        assert!((lo - zlo).abs() < 0.01 && (hi - zhi).abs() < 0.01, "{lo}..{hi} vs {zlo}..{zhi}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_repeat_of_one_open_line_adds_no_mesh() -> R {
+        let (s, plan) = studded(true)?;
+        let d = s.doc()?;
+        assert!(crate::assembly::assembly_lines(d, plan)?.iter().any(|r| !r.copies.is_empty()), "copies laid");
+        let sc = scene(d)?;
+        assert!(sc.meshes.iter().all(|m| m.layer != "STUD"));
+        assert_eq!(sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).count(), 12);
         Ok(())
     }
 }
