@@ -4,7 +4,8 @@
 //! (plus `<n>/<layout>` when a sheet shows the section, [`crate::sheets::sheet_refs`]) — and every
 //! placed section or elevation gets a plotted level line for each LEVEL (LAMB T473): a LINE at the
 //! level's projected floor elevation spanning the view block's extents ±[`LEVEL_OVERRUN_MM`], and
-//! `"<name> <±elev>"` left-aligned past its right end. Plan cut elevations stay overlay-only.
+//! `"<name> <±elev>"` left-aligned past its right end, plus a vertical floor-to-floor dimension per
+//! pair of consecutive levels by elevation (LAMB T500). Plan cut elevations stay overlay-only.
 //!
 //! The annotation lives in its own block per view, [`annotation_block_name`]`(view)`, never in the
 //! view block, so derivation, the wall graph, links and LAMBSAVE never see them. The block's one
@@ -15,7 +16,7 @@
 
 use std::sync::Arc;
 
-use cadcraft_doc::{Block, Common, Drawing, Entity, EntityKind, HAlign, Insert, Line, Space, Text, VAlign};
+use cadcraft_doc::{Block, Common, DimKind, Dimension, Drawing, Entity, EntityKind, HAlign, Insert, Line, Space, Text, VAlign};
 use cadcraft_engine::Session;
 use cadcraft_geom::Vec3;
 use lamb_core::derivation::markers::compute_cut_lines_for_view;
@@ -42,6 +43,9 @@ pub const LEVEL_OVERRUN_MM: f64 = 1000.0;
 pub const LEVEL_TEXT_MM: f64 = 250.0;
 /// The level label starts this far past the line's right end.
 const LEVEL_TEXT_GAP_MM: f64 = 200.0;
+/// A floor-to-floor dimension's line sits this far right of the level lines' right end, clear of
+/// the labels.
+pub const LEVEL_DIM_OFFSET_MM: f64 = 1200.0;
 /// Every generated entity's layer inside the block.
 const LAYER: &str = "0";
 
@@ -53,6 +57,9 @@ enum Item {
     Text(Vec3, String),
     /// A level label: left-aligned, [`LEVEL_TEXT_MM`] high.
     Label(Vec3, String),
+    /// A floor-to-floor dimension: vertical rotated-linear, measuring from the lower to the upper
+    /// level line's right end, its dimension line [`LEVEL_DIM_OFFSET_MM`] further right.
+    Dim(Vec3, Vec3),
 }
 
 fn v(x: f64, y: f64) -> Vec3 {
@@ -116,12 +123,20 @@ fn level_lines(d: &Drawing, dp: &DrawingProject, id: Id) -> Vec<Item> {
     let (x0, x1) = (ext.min.x - LEVEL_OVERRUN_MM, ext.max.x + LEVEL_OVERRUN_MM);
     let mut levels: Vec<_> = dp.document().levels.iter().collect();
     levels.sort_by(|a, b| a.order.total_cmp(&b.order).then(a.id.0.cmp(&b.id.0)));
+    let y_of = |z: f64| vertical_uz_to_local(&view, Uz { u: 0.0, z }).y;
     let mut out = Vec::new();
-    for l in levels {
+    for l in &levels {
         let z = l.floor_elevation.value;
-        let y = vertical_uz_to_local(&view, Uz { u: 0.0, z }).y;
+        let y = y_of(z);
         out.push(Item::Line(v(x0, y), v(x1, y)));
         out.push(Item::Label(v(x1 + LEVEL_TEXT_GAP_MM, y), format!("{} {}", l.name, signed_mm(z))));
+    }
+    let mut zs: Vec<f64> = levels.iter().map(|l| l.floor_elevation.value).collect();
+    zs.sort_by(f64::total_cmp);
+    for w in zs.windows(2) {
+        if w[1] - w[0] > TOLERANCE.coincidence_mm {
+            out.push(Item::Dim(v(x1, y_of(w[0])), v(x1, y_of(w[1]))));
+        }
     }
     out
 }
@@ -146,11 +161,45 @@ fn entity_of(i: &Item) -> EntityKind {
         Item::Line(a, b) => EntityKind::Line(Line { a: *a, b: *b }),
         Item::Text(at, s) => EntityKind::Text(text(*at, s, CUT_TEXT_MM, HAlign::Center)),
         Item::Label(at, s) => EntityKind::Text(text(*at, s, LEVEL_TEXT_MM, HAlign::Left)),
+        Item::Dim(a, b) => EntityKind::Dimension(level_dim(*a, *b)),
     }
 }
 
-/// `true` when `block` holds exactly `want`, in order: each on layer `0`, LINE ends and TEXT
-/// alignment points within [`TOLERANCE`]`.coincidence_mm`, the same text strings.
+/// Where a floor-to-floor dimension's line passes: level with `b`, [`LEVEL_DIM_OFFSET_MM`] right.
+fn dim_line_pt(b: Vec3) -> Vec3 {
+    v(b.x + LEVEL_DIM_OFFSET_MM, b.y)
+}
+
+/// A vertical (rotation π/2) linear dimension from `a` to `b`, as DIMLINEAR draws one: `defpt` on
+/// the dimension line, measured text, style `Standard`, no overrides, never associative.
+fn level_dim(a: Vec3, b: Vec3) -> Dimension {
+    Dimension {
+        kind: DimKind::Linear { rotation: std::f64::consts::FRAC_PI_2 },
+        defpt: dim_line_pt(b),
+        text_mid: Vec3::ZERO,
+        p13: a,
+        p14: b,
+        p15: Vec3::ZERO,
+        p16: Vec3::ZERO,
+        text: String::new(),
+        style: "Standard".into(),
+        measurement: 0.0,
+        text_rotation: 0.0,
+        user_text_pos: false,
+        block: None,
+        overrides: Default::default(),
+        assoc: Vec::new(),
+        marks: Default::default(),
+    }
+}
+
+fn is_vertical(k: &DimKind) -> bool {
+    matches!(k, DimKind::Linear { rotation } if (rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9)
+}
+
+/// `true` when `block` holds exactly `want`, in order: each on layer `0`, LINE ends, TEXT
+/// alignment points and DIMENSION points within [`TOLERANCE`]`.coincidence_mm`, the same text
+/// strings, and every dimension vertical with measured text.
 fn block_matches(block: &Block, want: &[Item]) -> bool {
     block.entities.len() == want.len()
         && block.entities.iter().zip(want).all(|(e, w)| {
@@ -162,6 +211,13 @@ fn block_matches(block: &Block, want: &[Item]) -> bool {
                     }
                     (EntityKind::Text(t), Item::Label(at, s)) => {
                         t.halign == HAlign::Left && near(t.align_pt.unwrap_or(t.insert), *at) && t.value == *s
+                    }
+                    (EntityKind::Dimension(dm), Item::Dim(a, b)) => {
+                        is_vertical(&dm.kind)
+                            && near(dm.p13, *a)
+                            && near(dm.p14, *b)
+                            && (dm.defpt.x - dim_line_pt(*b).x).abs() <= TOLERANCE.coincidence_mm
+                            && dm.text.is_empty()
                     }
                     _ => false,
                 }
@@ -289,6 +345,7 @@ mod tests {
                     EntityKind::Line(l) => Ok(Item::Line(l.a, l.b)),
                     EntityKind::Text(t) if t.halign == HAlign::Left => Ok(Item::Label(t.align_pt.unwrap_or(t.insert), t.value.clone())),
                     EntityKind::Text(t) => Ok(Item::Text(t.align_pt.unwrap_or(t.insert), t.value.clone())),
+                    EntityKind::Dimension(dm) if is_vertical(&dm.kind) => Ok(Item::Dim(dm.p13, dm.p14)),
                     _ => Err("unexpected kind".into()),
                 }
             })
@@ -429,7 +486,7 @@ mod tests {
 
     /// The level lines' (y, x0, x1, label) per level, in block order.
     fn levels_of(s: &Session, view: Id) -> T<Vec<(f64, f64, f64, String)>> {
-        let it = items(s, view)?;
+        let it: Vec<Item> = items(s, view)?.into_iter().filter(|i| !matches!(i, Item::Dim(..))).collect();
         it.chunks(2)
             .map(|c| match c {
                 [Item::Line(a, b), Item::Label(at, t)] => {
@@ -542,6 +599,109 @@ mod tests {
         assert_eq!(all(&with), all(&without));
         let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(d).as_bytes()).map_err(|e| format!("{e:?}"))?;
         assert!(plan_changes(&back)?.is_empty(), "level labels survive a DXF round trip unchanged");
+        Ok(())
+    }
+
+    /// The view's floor-to-floor dimensions, in block order.
+    fn dims_of(s: &Session, view: Id) -> T<Vec<Dimension>> {
+        let b = block_of(s, view).ok_or("no annotation block")?;
+        Ok(b.entities.iter().filter_map(|e| if let EntityKind::Dimension(d) = &e.kind { Some(d.clone()) } else { None }).collect())
+    }
+
+    /// The value CADCraft displays for `dm`, under the drawing's own `Standard` style.
+    fn measured(s: &Session, dm: &Dimension) -> T<f64> {
+        let st = s.doc()?.dim_style(&dm.style).cloned().unwrap_or_default();
+        Ok(cadcraft_render::dimension_geometry(dm, &st, 1.0).measurement)
+    }
+
+    /// The right end of the section's level lines.
+    fn x1_of(s: &Session, view: Id) -> T<f64> {
+        Ok(s.doc()?.extents(&Space::Block(view_block_name(view))).max.x + LEVEL_OVERRUN_MM)
+    }
+
+    #[test]
+    fn consecutive_levels_get_a_vertical_floor_to_floor_dimension_measuring_their_height() -> R {
+        let (s, _plan, sec, _l1, _l2) = levelled()?;
+        let dims = dims_of(&s, sec)?;
+        assert_eq!(dims.len(), 1, "{dims:?}");
+        let (dm, x1) = (&dims[0], x1_of(&s, sec)?);
+        assert!(close(dm.p13, x1, local_y(&s, sec, 0.0)?) && close(dm.p14, x1, local_y(&s, sec, 3000.0)?), "{dm:?}");
+        assert!((dm.defpt.x - (x1 + LEVEL_DIM_OFFSET_MM)).abs() < 1e-6);
+        assert!(is_vertical(&dm.kind) && dm.text.is_empty() && dm.style == "Standard" && dm.assoc.is_empty() && dm.block.is_none());
+        assert!((measured(&s, dm)? - 3000.0).abs() < 1e-6, "{}", measured(&s, dm)?);
+        // The section's own block still holds only what was drawn.
+        assert_eq!(s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn levels_out_of_order_are_dimensioned_by_elevation() -> R {
+        let (mut s, _plan, sec) = fixture()?;
+        // Level 1 (order 0) at 0; then order 1 at 6000 and order 2 at 3000.
+        s.execute("level", &json!({ "mode": "create", "name": "Roof", "floorElevationMm": 6000, "order": 1 }))?;
+        s.execute("level", &json!({ "mode": "create", "name": "Level 2", "floorElevationMm": 3000, "order": 2 }))?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("line", &json!({ "points": [[0, 0], [4000, 0]] }))?;
+        let dims = dims_of(&s, sec)?;
+        let spans: Vec<(f64, f64, f64)> = dims.iter().map(|d| (d.p13.y, d.p14.y, measured(&s, d).unwrap_or(f64::NAN))).collect();
+        let want = [(0.0, 3000.0), (3000.0, 6000.0)].map(|(a, b)| (local_y(&s, sec, a), local_y(&s, sec, b)));
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        for ((a, b, m), (wa, wb)) in spans.iter().zip(want) {
+            assert!((a - wa?).abs() < 1e-6 && (b - wb?).abs() < 1e-6 && (m - 3000.0).abs() < 1e-6, "{spans:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_level_edit_moves_the_dimension_in_one_undo_step_and_unrelated_commands_leave_it() -> R {
+        let (mut s, _plan, sec, _l1, l2) = levelled()?;
+        let before = dims_of(&s, sec)?;
+        let b0 = block_of(&s, sec).ok_or("no block")?;
+        s.execute("line", &json!({ "points": [[100, 100], [200, 100]] }))?;
+        assert!(Arc::ptr_eq(&b0, &block_of(&s, sec).ok_or("no block")?), "an unrelated command leaves the block alone");
+
+        let n = undo_len(&s)?;
+        s.execute("level", &json!({ "mode": "elevation", "levelId": l2.0, "floorElevationMm": 3200 }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        let moved = dims_of(&s, sec)?;
+        assert_eq!(moved.len(), 1);
+        assert!((moved[0].p14.y - local_y(&s, sec, 3200.0)?).abs() < 1e-6 && (measured(&s, &moved[0])? - 3200.0).abs() < 1e-6);
+        s.undo()?;
+        assert_eq!(dims_of(&s, sec)?, before);
+
+        s.execute("level", &json!({ "mode": "elevation", "levelId": l2.0, "floorElevationMm": 0 }))?;
+        assert!(dims_of(&s, sec)?.is_empty(), "two levels at one elevation get no dimension");
+        assert_eq!(levels_of(&s, sec)?.len(), 2, "but keep both level lines");
+        Ok(())
+    }
+
+    #[test]
+    fn one_level_gets_no_dimension() -> R {
+        let (mut s, _plan, sec) = fixture()?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("line", &json!({ "points": [[0, 0], [4000, 0]] }))?;
+        assert_eq!(levels_of(&s, sec)?.len(), 1);
+        assert!(dims_of(&s, sec)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_dimensioned_section_survives_a_dxf_round_trip_and_derivation_ignores_it() -> R {
+        let (s, _plan, sec, _l1, _l2) = levelled()?;
+        let d = s.doc()?;
+        assert_eq!(dims_of(&s, sec)?.len(), 1);
+        let mut bare = d.clone();
+        bare.blocks.remove(&annotation_block_name(sec));
+        let (with, without) = (DrawingProject::new(d)?, DrawingProject::new(&bare)?);
+        let all = |p: &DrawingProject| -> String {
+            let ids: Vec<Id> = p.views().map(|v| v.id).collect();
+            let ents: String = ids.iter().map(|id| format!("{:?}", p.entities(*id).collect::<Vec<_>>())).collect();
+            let marks: String = ids.iter().map(|id| format!("{:?}", lamb_core::derivation::markers::compute_markers_for_view(p, *id))).collect();
+            format!("{ents}|{marks}|{:?}", p.document().links)
+        };
+        assert_eq!(all(&with), all(&without));
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(d).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert!(plan_changes(&back)?.is_empty(), "the observer would change nothing after a round trip");
         Ok(())
     }
 }
