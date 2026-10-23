@@ -87,6 +87,9 @@
 //! - `cutline {planViewId, elevation}` (`cl`, View ▸ LAMB ▸ Cut Line): move a placed plan's cut
 //!   elevation by picking its cut line in a placed section, then placing it — see
 //!   [`crate::cutlinecmd`].
+//! - `levelline {levelId, elevation}` (`lvl`, View ▸ LAMB ▸ Level Line): move a level (and every
+//!   plan on it) by picking its level line in a placed section, then placing it — see
+//!   [`crate::levellinecmd`].
 //!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
@@ -918,6 +921,11 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{planViewId, elevation}")
             .menu(MENU)
             .interactive(crate::cutlinecmd::cutline_machine),
+        CommandSpec::new("levelline", "Level Line", crate::levellinecmd::levelline)
+            .alias(&["lvl"])
+            .params("{levelId, elevation}")
+            .menu(MENU)
+            .interactive(crate::levellinecmd::levelline_machine),
     ]
 }
 
@@ -979,6 +987,7 @@ mod tests {
             "setrole",
             "layerrole",
             "cutline",
+            "levelline",
         ];
         for id in ids {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;

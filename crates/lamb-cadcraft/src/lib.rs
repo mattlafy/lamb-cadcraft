@@ -49,6 +49,7 @@ pub mod fillet_matrix;
 pub mod import;
 mod lambopen;
 mod layered;
+mod levellinecmd;
 mod linkcmds;
 pub mod maintain;
 mod newviews;
