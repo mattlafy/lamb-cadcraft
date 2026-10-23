@@ -24,8 +24,12 @@
 //! over the gaze range of the solid of either face's entity, which is then dropped, else over
 //! `default_surface_depth_mm` centred on the cut plane, `Defaulted`. Corner and jamb details placed
 //! in a section add nothing.
+//! Each run those views lay or skip (a section's off-vertical ones only) also records a construction
+//! state on its two face segments (LAMB T493): laid → resolved, or detail-conflicted with a width
+//! conflict; skipped for conflicting details → detail-conflicted; skipped otherwise → massing. A
+//! run's strips take its state; corner and jamb strips are resolved.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cadcraft_doc::Drawing;
 use lamb_core::derivation::assembly::{AssemblyLine, Band, FaceRef, lay_bands};
@@ -42,9 +46,10 @@ use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::geometry::{Point2, Point3};
 use lamb_core::model::Id;
 
-use crate::assembly::{assembly_lines, corner_assembly, opening_assembly};
+use crate::assembly::{RunAssembly, assembly_lines, corner_assembly, opening_assembly};
 use crate::detailtags::graph_and_sides;
 use crate::project::DrawingProject;
+use crate::scene::ConstructionState;
 use crate::schema::assembly_block_name;
 
 /// One layer prism of one run.
@@ -53,6 +58,8 @@ pub(crate) struct LayerStrip {
     pub sources: [Id; 2],
     pub provenance: ProvenanceKind,
     pub layer: String,
+    /// Its run's state; a corner or jamb strip is resolved.
+    pub state: ConstructionState,
     /// Triangle list, project-global mm.
     pub triangles: Vec<Point3>,
 }
@@ -65,6 +72,28 @@ pub(crate) struct Layered {
     pub replaced: BTreeSet<(Id, usize)>,
     /// Indices into `SynthesisResult::solids` the strips replace.
     pub dropped_solids: BTreeSet<usize>,
+    /// Each face segment `(entity, segment)` of every run laid or skipped, with its run's state (the
+    /// worst, when two runs share a segment).
+    pub states: BTreeMap<(Id, usize), ConstructionState>,
+}
+
+impl Layered {
+    /// Records `ra`'s state on `run`'s face segments and stamps it on the strips from `first` on.
+    fn record(&mut self, ra: &RunAssembly, run: &WallRun, first: usize) {
+        let state = match (&ra.skipped, ra.conflict.is_some()) {
+            (None, false) => ConstructionState::Resolved,
+            (None, true) => ConstructionState::DetailConflicted,
+            (Some(why), _) if why == "conflict" => ConstructionState::DetailConflicted,
+            (Some(_), _) => ConstructionState::Massing,
+        };
+        for f in &run.faces {
+            let slot = self.states.entry((f.from.entity_id, f.from.segment_index)).or_insert(state);
+            *slot = (*slot).max(state);
+        }
+        for strip in self.strips.iter_mut().skip(first) {
+            strip.state = state;
+        }
+    }
 }
 
 fn sub(a: Point2, b: Point2) -> Point2 {
@@ -222,7 +251,7 @@ fn push_extrusion(
     if triangles.is_empty() {
         return false;
     }
-    out.strips.push(LayerStrip { sources, provenance, layer, triangles });
+    out.strips.push(LayerStrip { sources, provenance, layer, state: ConstructionState::Resolved, triangles });
     true
 }
 
@@ -263,31 +292,35 @@ fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, result: 
     let Ok(runs) = assembly_lines(d, view.id) else { return };
     let (graph, sides) = graph_and_sides(p, view.id);
     let tol = TOLERANCE.coincidence_mm;
-    for ra in runs.iter().filter(|r| r.skipped.is_none() && r.bands > 0) {
-        let Some(face) = ra.face else { continue };
-        let (Some(run), Some(side)) = (graph.runs.get(ra.run), sides.runs.get(ra.run)) else { continue };
-        let Some(bands) = ra.lines.get(..ra.bands) else { continue };
-        let loops = match run.centreline {
-            RunCurve::Line { .. } => straight_loops(run, side, face, bands),
-            RunCurve::Arc { radius, .. } => arc_loops(run, side, face, bands, radius),
-        };
-        let Some(loops) = loops else { continue };
-        let Some(z) = run_z(run, result) else { continue };
-        let mut emitted = false;
-        for (ring, layer) in loops {
-            emitted |= push_prism(view, &ring, layer, &z, out);
-        }
-        let mut start = ra.bands;
-        for &count in &ra.copies {
-            let Some(copy) = ra.lines.get(start..start + count) else { break };
-            start += count;
-            if let (Some(ring), Some(head)) = (closed_loop(copy, tol), copy.first()) {
-                push_prism(view, &ring, head.layer.clone(), &z, out);
+    for ra in &runs {
+        let Some(run) = graph.runs.get(ra.run) else { continue };
+        let first = out.strips.len();
+        'lay: {
+            let (None, Some(face), Some(side), true) = (&ra.skipped, ra.face, sides.runs.get(ra.run), ra.bands > 0) else { break 'lay };
+            let Some(bands) = ra.lines.get(..ra.bands) else { break 'lay };
+            let loops = match run.centreline {
+                RunCurve::Line { .. } => straight_loops(run, side, face, bands),
+                RunCurve::Arc { radius, .. } => arc_loops(run, side, face, bands, radius),
+            };
+            let Some(loops) = loops else { break 'lay };
+            let Some(z) = run_z(run, result) else { break 'lay };
+            let mut emitted = false;
+            for (ring, layer) in loops {
+                emitted |= push_prism(view, &ring, layer, &z, out);
+            }
+            let mut start = ra.bands;
+            for &count in &ra.copies {
+                let Some(copy) = ra.lines.get(start..start + count) else { break };
+                start += count;
+                if let (Some(ring), Some(head)) = (closed_loop(copy, tol), copy.first()) {
+                    push_prism(view, &ring, head.layer.clone(), &z, out);
+                }
+            }
+            if emitted {
+                out.replaced.extend(z.keys);
             }
         }
-        if emitted {
-            out.replaced.extend(z.keys);
-        }
+        out.record(ra, run, first);
     }
 
     // Placed corner and jamb details (LAMB T491): after the runs' strips, replacing nothing.
@@ -322,44 +355,48 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
     let sin_vertical = 1f64.to_radians().sin();
     let depth = p.defaults().default_surface_depth_mm;
     let lift = |ring: &[Point2]| ring.iter().map(|&q| vertical_local_to_global3(view, host, q)).collect::<Result<Vec<_>, _>>().ok();
-    for ra in runs.iter().filter(|r| r.skipped.is_none() && r.bands > 0) {
-        let Some(face) = ra.face else { continue };
-        let (Some(run), Some(side)) = (graph.runs.get(ra.run), sides.runs.get(ra.run)) else { continue };
+    for ra in &runs {
+        let Some(run) = graph.runs.get(ra.run) else { continue };
         let RunCurve::Line { from: c0, to: c1 } = run.centreline else { continue };
         let (a, b) = (vertical_local_to_uz(view, c0), vertical_local_to_uz(view, c1));
         let len = (b.u - a.u).hypot(b.z - a.z);
         if len <= tol || (b.u - a.u).abs() / len <= sin_vertical {
             continue;
         }
-        let Some(bands) = ra.lines.get(..ra.bands) else { continue };
-        let Some(loops) = straight_loops(run, side, face, bands) else { continue };
-        let Some(origin) = lift(&[c0]).and_then(|o| o.first().copied()) else { continue };
-        let sources = [run.faces[0].from.entity_id, run.faces[1].from.entity_id];
-        let solid = result.solids.iter().position(|s| s.entity_ids.iter().any(|e| sources.contains(e)));
-        let along = |q: &Point3| (q.x - origin.x) * axis.x + (q.y - origin.y) * axis.y;
-        let span = solid.and_then(|i| result.solids.get(i)).and_then(|s| {
-            let v: Vec<f64> = s.faces.iter().flatten().map(along).filter(|t| t.is_finite()).collect();
-            let (lo, hi) = (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
-            (hi - lo > tol).then_some(((lo, hi), s.provenance))
-        });
-        let (range, provenance) = span.unwrap_or(((-depth / 2.0, depth / 2.0), ProvenanceKind::Defaulted));
-        let mut emitted = false;
-        for (ring, layer) in loops {
-            if let Some(base) = lift(&ring) {
-                emitted |= push_extrusion(&base, axis, range, sources, provenance, layer, out);
+        let first = out.strips.len();
+        'lay: {
+            let (None, Some(face), Some(side), true) = (&ra.skipped, ra.face, sides.runs.get(ra.run), ra.bands > 0) else { break 'lay };
+            let Some(bands) = ra.lines.get(..ra.bands) else { break 'lay };
+            let Some(loops) = straight_loops(run, side, face, bands) else { break 'lay };
+            let Some(origin) = lift(&[c0]).and_then(|o| o.first().copied()) else { break 'lay };
+            let sources = [run.faces[0].from.entity_id, run.faces[1].from.entity_id];
+            let solid = result.solids.iter().position(|s| s.entity_ids.iter().any(|e| sources.contains(e)));
+            let along = |q: &Point3| (q.x - origin.x) * axis.x + (q.y - origin.y) * axis.y;
+            let span = solid.and_then(|i| result.solids.get(i)).and_then(|s| {
+                let v: Vec<f64> = s.faces.iter().flatten().map(along).filter(|t| t.is_finite()).collect();
+                let (lo, hi) = (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+                (hi - lo > tol).then_some(((lo, hi), s.provenance))
+            });
+            let (range, provenance) = span.unwrap_or(((-depth / 2.0, depth / 2.0), ProvenanceKind::Defaulted));
+            let mut emitted = false;
+            for (ring, layer) in loops {
+                if let Some(base) = lift(&ring) {
+                    emitted |= push_extrusion(&base, axis, range, sources, provenance, layer, out);
+                }
+            }
+            let mut start = ra.bands;
+            for &count in &ra.copies {
+                let Some(copy) = ra.lines.get(start..start + count) else { break };
+                start += count;
+                if let (Some(base), Some(head)) = (closed_loop(copy, tol).and_then(|r| lift(&r)), copy.first()) {
+                    push_extrusion(&base, axis, range, sources, provenance, head.layer.clone(), out);
+                }
+            }
+            if let (true, Some(i), Some(_)) = (emitted, solid, span) {
+                out.dropped_solids.insert(i);
             }
         }
-        let mut start = ra.bands;
-        for &count in &ra.copies {
-            let Some(copy) = ra.lines.get(start..start + count) else { break };
-            start += count;
-            if let (Some(base), Some(head)) = (closed_loop(copy, tol).and_then(|r| lift(&r)), copy.first()) {
-                push_extrusion(&base, axis, range, sources, provenance, head.layer.clone(), out);
-            }
-        }
-        if let (true, Some(i), Some(_)) = (emitted, solid, span) {
-            out.dropped_solids.insert(i);
-        }
+        out.record(ra, run, first);
     }
 }
 
@@ -560,7 +597,7 @@ mod tests {
     use serde_json::json;
 
     use crate::assembly::tests::room;
-    use crate::scene::{SceneMeshKind, pick, scene};
+    use crate::scene::{ConstructionState, SceneMeshKind, pick, scene};
     use lamb_core::derivation::read::ProjectRead;
     use lamb_core::model::Id;
 
@@ -638,12 +675,91 @@ mod tests {
         let synth = lamb_core::derivation::synthesis::synthesize(&crate::project::DrawingProject::new(s.doc()?)?)?;
         assert_eq!(sc.meshes.len(), synth.surfaces.len() + synth.solids.len());
 
+        assert!(sc.meshes.iter().all(|m| m.construction.is_none()), "no assembly block, no construction state");
+
         let (mut s, plan) = placed(false)?;
         let before = scene(s.doc()?)?;
         s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
-        let after = scene(s.doc()?)?;
+        let mut after = scene(s.doc()?)?;
         assert!(after.meshes.iter().all(|m| m.kind != SceneMeshKind::Layer));
+        // Every run untyped: all of it is massing still to detail.
+        assert!(after.meshes.iter().all(|m| m.construction == Some(ConstructionState::Massing)));
+        after.meshes.iter_mut().for_each(|m| m.construction = None);
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    fn states(sc: &crate::scene::Scene, kind: SceneMeshKind) -> Vec<Option<ConstructionState>> {
+        sc.meshes.iter().filter(|m| m.kind == kind).map(|m| m.construction).collect()
+    }
+
+    #[test]
+    fn a_fully_laid_room_is_resolved_with_no_massing_left() -> R {
+        let (mut s, plan) = placed(true)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let sc = scene(s.doc()?)?;
+        let layers = states(&sc, SceneMeshKind::Layer);
+        assert_eq!(layers.len(), 12);
+        assert!(layers.iter().all(|st| *st == Some(ConstructionState::Resolved)), "{layers:?}");
+        assert!(sc.meshes.iter().all(|m| m.kind == SceneMeshKind::Layer), "no massing left");
+        Ok(())
+    }
+
+    #[test]
+    fn an_untyped_run_leaves_its_room_massing_partly_layered() -> R {
+        // The top wall 300 thick, a class of its own with no tag: untyped.
+        let (mut s, plan) = crate::assembly::tests::room("exterior_face", true)?;
+        let old: Vec<String> = plines(&s, plan)?.iter().map(|h| h.hex()).collect();
+        s.execute("erase", &json!({ "handles": old }))?;
+        s.execute("layer.current", &json!({ "name": "WALL-EXT" }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [5000, 0], [5000, 4000], [0, 4000]], "closed": true }))?;
+        s.execute("pline", &json!({ "vertices": [[200, 200], [4800, 200], [4800, 3700], [200, 3700]], "closed": true }))?;
+        place(&mut s, plan)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let skipped: Vec<_> = crate::assembly::assembly_lines(s.doc()?, plan)?.into_iter().filter_map(|r| r.skipped).collect();
+        assert_eq!(skipped, ["untyped"]);
+        let sc = scene(s.doc()?)?;
+        let layers = states(&sc, SceneMeshKind::Layer);
+        assert_eq!(layers.len(), 9, "three laid runs");
+        assert!(layers.iter().all(|st| *st == Some(ConstructionState::Resolved)), "{layers:?}");
+        let solids = states(&sc, SceneMeshKind::Solid);
+        assert_eq!(solids, [Some(ConstructionState::Massing); 2], "both plines survive partly layered");
+        assert!(states(&sc, SceneMeshKind::Surface).iter().all(|st| *st == Some(ConstructionState::Massing)));
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_details_and_width_conflicts_are_detail_conflicted() -> R {
+        // A second detail D2 tagged on the bottom run beside D1: that run is skipped as "conflict",
+        // and with two details in the class the rest are untyped.
+        let (mut s, plan) = crate::assembly::tests::room("exterior_face", true)?;
+        let d2 = Id(s.execute("newdetail", &json!({ "name": "D2" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": d2.0 }))?;
+        let r = drawn(&mut s, "line", json!({ "points": [[0, 0], [1000, 0]] }))?;
+        s.execute("detailref", &json!({ "handle": r.hex(), "kind": "exterior_face" }))?;
+        s.execute("layer.current", &json!({ "name": "GYP" }))?;
+        drawn(&mut s, "line", json!({ "points": [[0, 200], [1000, 200]] }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.current", &json!({ "name": "TAGS" }))?;
+        s.execute("detailtag", &json!({ "detailViewId": d2.0, "tip": {"x": 1000.0, "y": 0.0}, "bubble": {"x": 500.0, "y": -1000.0} }))?;
+        place(&mut s, plan)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let mut skipped: Vec<_> = crate::assembly::assembly_lines(s.doc()?, plan)?.into_iter().filter_map(|r| r.skipped).collect();
+        skipped.sort();
+        assert_eq!(skipped, ["conflict", "untyped", "untyped", "untyped"]);
+        let sc = scene(s.doc()?)?;
+        assert!(states(&sc, SceneMeshKind::Layer).is_empty());
+        assert_eq!(states(&sc, SceneMeshKind::Solid), [Some(ConstructionState::DetailConflicted); 2]);
+
+        // A 210 wall under a 200 detail: every run laid with a width conflict.
+        let (mut s, plan) = crate::assembly::tests::room_with("exterior_face", true, 210.0)?;
+        place(&mut s, plan)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert!(crate::assembly::assembly_lines(s.doc()?, plan)?.iter().all(|r| r.skipped.is_none() && r.conflict.is_some()));
+        let sc = scene(s.doc()?)?;
+        let layers = states(&sc, SceneMeshKind::Layer);
+        assert_eq!(layers.len(), 12);
+        assert!(layers.iter().all(|st| *st == Some(ConstructionState::DetailConflicted)), "{layers:?}");
         Ok(())
     }
 
@@ -999,6 +1115,9 @@ mod tests {
         assert!(!layers.is_empty());
         // Every Layer mesh is the floor's: the cut wall run (z 0..3000) gets none.
         assert!(layers.iter().all(|m| m.sources.iter().all(|h| fl.contains(h))), "only floor meshes");
+        // The 300 detail in a 250 floor: laid with a width conflict, so every strip is flagged.
+        assert!(floor.conflict.is_some());
+        assert!(layers.iter().all(|m| m.construction == Some(ConstructionState::DetailConflicted)));
         let (g, at) = (gaze(&s, sec)?, global_of(&s, sec, [300.0, 1000.0])?);
         let depth = crate::project::DrawingProject::new(s.doc()?)?.defaults().default_surface_depth_mm;
         for m in &layers {

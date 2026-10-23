@@ -1,18 +1,22 @@
 //! LAMB (fork, T341): the 3D pane's scene source. `lamb_cadcraft::scene` derives LAMB's 3D model
 //! from the drawing; this converts it into the pane's [`Scene3`], coloured as the TS app colours it
 //! (`Viewport3D.tsx` `materialForForm` and `PROVENANCE_MATERIAL`): a solid is opaque in its layer's
-//! colour, a surface is ghosted grey, a conflicted mesh gets red edges.
+//! colour, a surface is ghosted grey, a conflicted mesh gets red edges. With an assembly plan
+//! (LAMB T493, `ghosting-and-visualization.md` "Construction states"), massing still standing in
+//! for an undetailed wall is ghosted in its own colour and a detail-conflicted mesh gets red edges.
 
 use cadcraft_engine::doc::color::{Color, Rgb};
 use cadcraft_engine::doc::{Drawing, Handle};
 use cadcraft_ui_egui::scene3d::{Mesh3, Path3, Scene3, SceneSource, register_scene_source};
-use lamb_cadcraft::{Scene, SceneMeshKind};
+use lamb_cadcraft::{ConstructionState, Scene, SceneMeshKind};
 use lamb_core::derivation::resolve::ProvenanceKind;
 
 /// A solid whose layer is missing (TS `materialForForm`'s default fill).
 const SOLID_FALLBACK: u32 = 0xd8d8d8;
 /// A surface: ghosted grey.
 const SURFACE: (u32, f32) = (0x888888, 0.28);
+/// Undetailed massing's alpha (the `Defaulted` ghost).
+const MASSING_ALPHA: f32 = 0.28;
 /// A conflicted mesh's edges.
 const CONFLICT_EDGES: u32 = 0xe2543a;
 
@@ -62,11 +66,14 @@ pub fn to_scene3(s: &Scene, d: &Drawing) -> Scene3 {
         .meshes
         .iter()
         .map(|m| {
-            let rgba = match m.kind {
-                SceneMeshKind::Solid | SceneMeshKind::Layer => rgba(layer_rgb(d, &m.layer).unwrap_or(SOLID_FALLBACK), 1.0),
-                SceneMeshKind::Surface => rgba(SURFACE.0, SURFACE.1),
+            let (rgb, alpha) = match m.kind {
+                SceneMeshKind::Solid | SceneMeshKind::Layer => (layer_rgb(d, &m.layer).unwrap_or(SOLID_FALLBACK), 1.0),
+                SceneMeshKind::Surface => SURFACE,
             };
-            let edges_rgba = (m.provenance == ProvenanceKind::Conflicted).then(|| rgba_opaque(CONFLICT_EDGES));
+            let alpha = if m.construction == Some(ConstructionState::Massing) { MASSING_ALPHA } else { alpha };
+            let rgba = rgba(rgb, alpha);
+            let conflicted = m.provenance == ProvenanceKind::Conflicted || m.construction == Some(ConstructionState::DetailConflicted);
+            let edges_rgba = conflicted.then(|| rgba_opaque(CONFLICT_EDGES));
             Mesh3 { positions: m.positions.clone(), indices: m.indices.clone(), rgba, edges_rgba, sources: m.sources.clone() }
         })
         .collect();
@@ -92,7 +99,7 @@ mod tests {
 
     use cadcraft_engine::doc::Drawing;
     use cadcraft_engine::doc::color::Color;
-    use lamb_cadcraft::{SceneMeshKind, project_to_drawing, scene};
+    use lamb_cadcraft::{ConstructionState, SceneMeshKind, project_to_drawing, scene};
     use lamb_core::persistence::files_to_project;
 
     use super::{build, pick, to_scene3};
@@ -151,6 +158,55 @@ mod tests {
         assert!(surfaces > 0, "the U wall derives ribbons");
         assert_eq!(s3.meshes[solid].rgba, [10, 200, 30, 255]);
         assert_eq!(to_scene3(&s, &d), s3);
+        Ok(())
+    }
+
+    /// `with_room`'s scene converted with every mesh in `state`, beside the stateless conversion,
+    /// its solid's layer a distinctive true colour.
+    fn with_state(state: Option<ConstructionState>) -> Result<Vec<(SceneMeshKind, [u8; 4], Option<[u8; 4]>, [u8; 4])>, Box<dyn std::error::Error>> {
+        let mut d = with_room()?;
+        let mut s = scene(&d)?;
+        assert!(s.meshes.iter().all(|m| m.construction.is_none()), "no assembly block, no state");
+        let solid = s.meshes.iter().find(|m| m.kind == SceneMeshKind::Solid).ok_or("no solid")?.layer.clone();
+        d.layer_mut(&solid).ok_or("solid's layer is missing")?.color = Color::True(cadcraft_engine::doc::color::Rgb(10, 200, 30));
+        let plain = to_scene3(&s, &d);
+        for m in &mut s.meshes {
+            m.construction = state;
+        }
+        let stated = to_scene3(&s, &d);
+        Ok(s.meshes.iter().zip(stated.meshes.iter().zip(&plain.meshes)).map(|(m, (a, b))| (m.kind, a.rgba, a.edges_rgba, b.rgba)).collect())
+    }
+
+    #[test]
+    fn massing_keeps_its_colour_at_the_ghost_alpha() -> R {
+        let got = with_state(Some(ConstructionState::Massing))?;
+        assert!(got.iter().any(|g| g.0 == SceneMeshKind::Solid));
+        for (_, rgba, edges, plain) in got {
+            assert_eq!(rgba, [plain[0], plain[1], plain[2], 71]);
+            assert_eq!(edges, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn detail_conflicted_keeps_its_colour_and_gets_conflict_edges() -> R {
+        for (_, rgba, edges, plain) in with_state(Some(ConstructionState::DetailConflicted))? {
+            assert_eq!(rgba, plain);
+            assert_eq!(edges, Some([0xe2, 0x54, 0x3a, 255]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_and_stateless_meshes_draw_as_before() -> R {
+        for state in [Some(ConstructionState::Resolved), None] {
+            let got = with_state(state)?;
+            assert!(got.iter().any(|g| g.0 == SceneMeshKind::Solid && g.1 == [10, 200, 30, 255]));
+            for (_, rgba, edges, plain) in got {
+                assert_eq!(rgba, plain);
+                assert_eq!(edges, None);
+            }
+        }
         Ok(())
     }
 

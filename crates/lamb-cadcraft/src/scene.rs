@@ -13,6 +13,9 @@
 //! surfaces of the run's face segments, and a solid whose every plan segment is replaced is dropped.
 //! In a placed section with an assembly block, each laid floor or roof run is layered the same way
 //! (LAMB T494), extruded along the section's gaze, replacing its entity's section solid.
+//!
+//! Every mesh of such a view carries its [`ConstructionState`] (LAMB T493,
+//! `ghosting-and-visualization.md` "Construction states"); a mesh of any other view carries none.
 
 use std::fmt;
 
@@ -37,6 +40,17 @@ pub enum SceneMeshKind {
     Layer,
 }
 
+/// How far a wall's construction has got, for a mesh of a view with an assembly block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConstructionState {
+    /// Laid as layers.
+    Resolved,
+    /// Massing still standing in for a run no detail was laid along, or a partly layered solid.
+    Massing,
+    /// Contradicted: a run skipped for conflicting details, or laid with a width conflict.
+    DetailConflicted,
+}
+
 /// One flat-shaded triangle mesh.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneMesh {
@@ -48,6 +62,8 @@ pub struct SceneMesh {
     pub segment_index: Option<usize>,
     pub provenance: ProvenanceKind,
     pub layer: String,
+    /// `None` outside a view with an assembly block.
+    pub construction: Option<ConstructionState>,
     /// Offsets from [`Scene::origin`], three per triangle, unshared.
     pub positions: Vec<[f32; 3]>,
     /// The triangle's unit face normal, repeated on each of its corners.
@@ -163,7 +179,18 @@ struct Pending {
     segment_index: Option<usize>,
     provenance: ProvenanceKind,
     layer: String,
+    construction: Option<ConstructionState>,
     triangles: Vec<Point3>,
+}
+
+/// A surviving solid's state over its plan entity `e`'s segments that have one: any conflicted →
+/// conflicted; else any massing, or some segment layered (partly layered) → massing; else none.
+fn solid_state(layers: &crate::layered::Layered, e: Id) -> Option<ConstructionState> {
+    let worst = layers.states.range((e, 0)..=(e, usize::MAX)).map(|(_, &st)| st).max()?;
+    if worst > ConstructionState::Resolved {
+        return Some(worst);
+    }
+    layers.replaced.range((e, 0)..=(e, usize::MAX)).next().map(|_| ConstructionState::Massing)
 }
 
 /// The derived 3D scene of `d`.
@@ -180,16 +207,20 @@ pub fn scene(d: &Drawing) -> Result<Scene, SceneError> {
             segment_index: Some(s.segment_index),
             provenance: s.provenance,
             layer: s.layer_id.clone(),
+            // A surviving surface of a laid run was never layered, so it is still massing.
+            construction: layers.states.get(&(s.entity_id, s.segment_index)).map(|&st| st.max(ConstructionState::Massing)),
             triangles: s.triangles.clone(),
         });
     }
     for (_, s) in result.solids.iter().enumerate().filter(|(i, _)| !layers.dropped_solids.contains(i)) {
+        let construction = s.entity_ids.first().and_then(|&e| solid_state(&layers, e));
         pending.push(Pending {
             kind: SceneMeshKind::Solid,
             sources: s.entity_ids.iter().copied().map(handle).collect(),
             segment_index: None,
             provenance: s.provenance,
             layer: s.layer_id.clone(),
+            construction,
             triangles: solid_triangles(s),
         });
     }
@@ -200,6 +231,7 @@ pub fn scene(d: &Drawing) -> Result<Scene, SceneError> {
             segment_index: None,
             provenance: l.provenance,
             layer: l.layer,
+            construction: Some(l.state),
             triangles: l.triangles,
         });
     }
@@ -237,6 +269,7 @@ pub fn scene(d: &Drawing) -> Result<Scene, SceneError> {
             segment_index: p.segment_index,
             provenance: p.provenance,
             layer: p.layer,
+            construction: p.construction,
             positions,
             normals,
             indices,
