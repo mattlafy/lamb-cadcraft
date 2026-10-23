@@ -26,6 +26,8 @@
 //!
 //! - `newoffsetplan` (`np`) and `newplanline` (`npln`): placed plans at a new level — see
 //!   [`crate::newviews`]. NEWSECTIONLINE in a placed section takes one click for a perpendicular cut.
+//! - `newoffsetsection` (`nos`) and `newoffsetelevation` (`noe`): a parallel section/elevation a
+//!   typed distance from the edited one — see [`crate::offsetviews`].
 //!
 //! - `refpane {on?, viewId?}` (View ▸ LAMB ▸ Reference Pane): the reference pane — two tiles, the
 //!   edited view's reference in the other one, chosen for you and overridable; see [`crate::refpane`].
@@ -784,6 +786,16 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{mode: \"offset\"|\"height\", fromViewId, floorToFloorMm | floorElevationMm, name?, cutHeightMm?}")
             .menu(MENU)
             .interactive(newviews::newoffsetplan_machine),
+        CommandSpec::new("newoffsetsection", "New Offset Section", crate::offsetviews::newoffsetsection)
+            .alias(&["nos"])
+            .params("{fromViewId, offsetMm, name?}")
+            .menu(MENU)
+            .interactive(crate::offsetviews::newoffsetsection_machine),
+        CommandSpec::new("newoffsetelevation", "New Offset Elevation", crate::offsetviews::newoffsetelevation)
+            .alias(&["noe"])
+            .params("{fromViewId, offsetMm, name?}")
+            .menu(MENU)
+            .interactive(crate::offsetviews::newoffsetelevation_machine),
         CommandSpec::new("newplanline", "Plan Here", newviews::newplanline)
             .alias(&["npln"])
             .params("{fromVerticalViewId, localPoint:{x,y}, name?, cutHeightMm?}")
@@ -948,6 +960,8 @@ mod tests {
             "editview",
             "newoffsetplan",
             "newplanline",
+            "newoffsetsection",
+            "newoffsetelevation",
             "link",
             "unlink",
             "viewprops",

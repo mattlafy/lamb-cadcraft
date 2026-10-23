@@ -52,6 +52,7 @@ mod layered;
 mod linkcmds;
 pub mod maintain;
 mod newviews;
+mod offsetviews;
 pub mod oneclick_cli;
 mod outside;
 pub mod overlays;
