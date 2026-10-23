@@ -38,6 +38,9 @@
 //! - `underlay {viewId?}` (View ▸ LAMB ▸ Underlay): another placed view of the edited view's kind
 //!   drawn pale and snappable under it; the current one again, or none, turns it off — see
 //!   [`crate::overlays::underlay`].
+//! - `viewhole {boundary?, source?, remove?}` (`vhole`, View ▸ LAMB ▸ View Hole): a closed polyline
+//!   in a placed section or elevation showing a parallel placed view's line work through it — see
+//!   [`crate::holes`].
 //! - `resolve {}` (`res`, View ▸ LAMB ▸ Resolve): the project's issues; interactively, step through
 //!   them, each one's view edited, centred and haloed — see [`crate::resolvecmd`].
 //!
@@ -803,6 +806,11 @@ pub fn commands() -> Vec<CommandSpec> {
             .noundo()
             .menu(MENU)
             .interactive(crate::overlays::underlay::underlay_machine),
+        CommandSpec::new("viewhole", "View Hole", crate::holes::viewhole)
+            .alias(&["vhole"])
+            .params("{boundary?, source?, remove?: bool} → {holes} | {boundary, source, sourceName}")
+            .menu(MENU)
+            .interactive(crate::holes::viewhole_machine),
         CommandSpec::new("resolve", "Resolve", crate::resolvecmd::resolve)
             .alias(&["res"])
             .params("{}")
@@ -1019,6 +1027,7 @@ mod tests {
             "cutline",
             "levelline",
             "makeview",
+            "viewhole",
         ];
         for id in ids {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;

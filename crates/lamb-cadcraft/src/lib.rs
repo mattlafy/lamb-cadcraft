@@ -18,7 +18,7 @@
 //! that pick back to their source lines ([`scene`]), lamb-core's `ProjectWrite` over a `Drawing`
 //! ([`project_mut`]) and the after-command AI-line / solid-cut sweeps written through it ([`sweeps`]), and
 //! each plan's assembly lines, written by ASSEMBLYPLAN into a block that an after-command observer
-//! keeps regenerated ([`assembly`]), each detail tag's bubble — a `LAMB_DTAG` insert naming its detail — kept by an after-command observer ([`bubbles`]), each placed plan's plotted section cut symbols and each placed vertical view's level lines in a `LAMB_ANNO` block kept by an after-command observer ([`annotations`]), and ACCEPT /
+//! keeps regenerated ([`assembly`]), each detail tag's bubble — a `LAMB_DTAG` insert naming its detail — kept by an after-command observer ([`bubbles`]), each placed plan's plotted section cut symbols and each placed vertical view's level lines in a `LAMB_ANNO` block kept by an after-command observer ([`annotations`]), each section or elevation hole's revealed parallel-view line work in a `LAMB_HOLE` block kept the same way ([`holes`]), and ACCEPT /
 //! SETROLE / LAYERROLE ([`entitycmds`]), the read-only SHOWLINKS / QUERY ([`querycmds`]), and
 //! DUPLICATEVIEW / PLACEVIEW / UNPLACEVIEW / LEVEL ([`viewlife`]), and CUTLINE ([`cutlinecmd`]), MAKEVIEW turning loose model-space entities into a plan view ([`makeview`]), and the Properties palette's LAMB group — Role, cut/seen height source per segment ([`props`]), and clicking a cut line in a plan picks that view ([`viewpick`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
@@ -46,6 +46,7 @@ mod entitycmds;
 pub mod export;
 pub mod fillet;
 pub mod fillet_matrix;
+pub mod holes;
 pub mod import;
 mod lambopen;
 mod layered;
@@ -94,6 +95,7 @@ pub use convert::{Converted, Flattened, Unsupported, UnsupportedReason, from_pol
 pub use corners::{corner_observer, maintain_corners};
 pub use entitycmds::{LayerRoleCell, layer_role_cell};
 pub use export::{ExportReport, drawing_to_project};
+pub use holes::hole_observer;
 pub use import::{IdMap, ImportError, ImportReport, project_to_drawing};
 pub use maintain::{MaintenanceReport, install, link_observer, maintain_links, travel_box_observer};
 pub use overlays::{lamb_overlay, lamb_snaps, register_providers};

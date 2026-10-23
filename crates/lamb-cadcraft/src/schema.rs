@@ -45,6 +45,12 @@ pub fn annotation_block_name(id: Id) -> String {
     format!("LAMB_ANNO_{}", id.0)
 }
 
+/// The block holding vertical view `id`'s hole content (the line work its holes reveal,
+/// [`crate::holes`]): `LAMB_HOLE_<id>`, id in decimal. Not a view.
+pub fn hole_block_name(id: Id) -> String {
+    format!("LAMB_HOLE_{}", id.0)
+}
+
 /// Why a LAMB slot could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SchemaError {
@@ -172,6 +178,17 @@ pub struct EntityData {
     /// of the run whose band holds it is laid centred on it ([`crate::studgrid`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stud_move: bool,
+    /// On a closed straight-edged `LwPolyline` in a placed section or elevation's block: a hole
+    /// showing the source view's line work through it ([`crate::holes`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hole: Option<HoleTag>,
+}
+
+/// A view hole's source: the parallel placed vertical view whose line work it reveals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoleTag {
+    pub source: Id,
 }
 
 /// How a wall-scoped stud-grid point overrules the project grid for its run: `Phase` lays the run's
@@ -228,6 +245,7 @@ impl Default for EntityData {
             stud_grid: None,
             stud_grid_wall: None,
             stud_move: false,
+            hole: None,
         }
     }
 }
