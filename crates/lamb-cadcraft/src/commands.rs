@@ -94,6 +94,8 @@
 //! - `levelline {levelId, elevation}` (`lvl`, View ▸ LAMB ▸ Level Line): move a level (and every
 //!   plan on it) by picking its level line in a placed section, then placing it — see
 //!   [`crate::levellinecmd`].
+//! - `makeview {handles, viewId?, name?}` (`mkv`, View ▸ LAMB ▸ Make View): loose model-space
+//!   entities move into a new floating plan or an existing plan view — see [`crate::makeview`].
 //!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
 //! document entry together). Refusals use the TS command engine's wording.
@@ -949,6 +951,11 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{levelId, elevation}")
             .menu(MENU)
             .interactive(crate::levellinecmd::levelline_machine),
+        CommandSpec::new("makeview", "Make View", crate::makeview::makeview)
+            .alias(&["mkv"])
+            .params("{handles: [hex], viewId?, name?} → {viewId, moved}")
+            .menu(MENU)
+            .interactive(crate::makeview::makeview_machine),
     ]
 }
 
@@ -1011,6 +1018,7 @@ mod tests {
             "layerrole",
             "cutline",
             "levelline",
+            "makeview",
         ];
         for id in ids {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;

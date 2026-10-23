@@ -20,7 +20,7 @@
 //! each plan's assembly lines, written by ASSEMBLYPLAN into a block that an after-command observer
 //! keeps regenerated ([`assembly`]), each detail tag's bubble — a `LAMB_DTAG` insert naming its detail — kept by an after-command observer ([`bubbles`]), each placed plan's plotted section cut symbols and each placed vertical view's level lines in a `LAMB_ANNO` block kept by an after-command observer ([`annotations`]), and ACCEPT /
 //! SETROLE / LAYERROLE ([`entitycmds`]), the read-only SHOWLINKS / QUERY ([`querycmds`]), and
-//! DUPLICATEVIEW / PLACEVIEW / UNPLACEVIEW / LEVEL ([`viewlife`]), and CUTLINE ([`cutlinecmd`]), and the Properties palette's LAMB group — Role, cut/seen height source per segment ([`props`]), and clicking a cut line in a plan picks that view ([`viewpick`]).
+//! DUPLICATEVIEW / PLACEVIEW / UNPLACEVIEW / LEVEL ([`viewlife`]), and CUTLINE ([`cutlinecmd`]), MAKEVIEW turning loose model-space entities into a plan view ([`makeview`]), and the Properties palette's LAMB group — Role, cut/seen height source per segment ([`props`]), and clicking a cut line in a plan picks that view ([`viewpick`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
 //! the remaining overlay display lists (datums, repeat ghosts). Sits above
 //! `cadcraft-engine` and below the UI shells and MCP.
@@ -52,6 +52,7 @@ mod layered;
 mod levellinecmd;
 mod linkcmds;
 pub mod maintain;
+mod makeview;
 mod newviews;
 mod offsetviews;
 pub mod oneclick_cli;
