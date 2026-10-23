@@ -209,6 +209,9 @@ fn is_false(b: &bool) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct RepeatTag {
     pub members: Vec<Id>,
+    /// The drawing's user parameter (Parameters Manager) that drives the pitch length (LAMB T503).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<String>,
 }
 
 /// What a detail view's reference line stands for, which the sweep aligns to a run.

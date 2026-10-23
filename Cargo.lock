@@ -2111,6 +2111,7 @@ name = "lamb-cadcraft"
 version = "0.12.0"
 dependencies = [
  "cadcraft-color",
+ "cadcraft-constraints",
  "cadcraft-doc",
  "cadcraft-engine",
  "cadcraft-geom",

@@ -511,19 +511,21 @@ pub fn travel_box_observer(s: &mut Session, handles: &[Handle], crossing: bool) 
 
 /// Registers [`crate::corners::corner_observer`], [`link_observer`],
 /// [`crate::tagfollow::tag_follow_observer`] (detail tag tips follow their walls, LAMB T495),
-/// [`crate::sweeps::sweep_observer`], [`crate::asmview::assembly_edit_observer`], [`crate::assembly::assembly_observer`], [`crate::bubbles::bubble_observer`] then
+/// [`crate::sweeps::sweep_observer`], [`crate::asmview::assembly_edit_observer`], [`crate::repeats::repeat_parameter_observer`] (a
+/// repeat's pitch follows its named parameter, LAMB T503), [`crate::assembly::assembly_observer`], [`crate::bubbles::bubble_observer`] then
 /// [`crate::annotations::annotation_observer`] then [`crate::holes::hole_observer`] on `s` (each
 /// once), so link travel reads corner tags already re-seated by the same command, the AI /
 /// solid-cut sweeps see the links already maintained, and the assembly blocks regenerate from all
 /// of it; and [`travel_box_observer`] once per process.
 pub fn install(s: &mut Session) {
     let _ = cadcraft_engine::travel::register_box_observer(travel_box_observer);
-    let fs: [cadcraft_engine::AfterCommand; 9] = [
+    let fs: [cadcraft_engine::AfterCommand; 10] = [
         crate::corners::corner_observer,
         link_observer,
         crate::tagfollow::tag_follow_observer,
         crate::sweeps::sweep_observer,
         crate::asmview::assembly_edit_observer,
+        crate::repeats::repeat_parameter_observer,
         crate::assembly::assembly_observer,
         crate::bubbles::bubble_observer,
         crate::annotations::annotation_observer,

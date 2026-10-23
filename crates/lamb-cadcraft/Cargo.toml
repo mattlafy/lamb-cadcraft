@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 cadcraft-color = { workspace = true }
+cadcraft-constraints = { workspace = true }
 cadcraft-doc = { workspace = true }
 cadcraft-engine = { workspace = true }
 cadcraft-geom = { workspace = true }

@@ -20,8 +20,17 @@
 //! - [`draw`], through LAMB's overlay provider, draws one ghosted copy of each repeat's members at
 //!   the pitch while the detail is edited (LAMB T383). Overlay only: nothing is added to the
 //!   drawing.
+//! - `repeat {dimension, handles, parameter: "stud_oc"}` (or `repeat {dimension, parameter}` on a
+//!   tagged dimension) binds the pitch to a drawing user parameter (LAMB T503): created at the
+//!   current pitch if absent ("LAMB repeat pitch"), otherwise the parameter wins and the dimension
+//!   is resized at once; `parameter: null` unbinds. A name owned by a dimensional constraint
+//!   refuses. [`repeat_parameter_observer`] keeps the two in step after every command: a stretched
+//!   dimension writes its length back when the parameter's expression is a plain number, otherwise
+//!   the parameter wins and the dimension snaps to it; a PARAMETERS edit resizes every repeat bound
+//!   to it. The ghost and assembly arrays read the dimension, so they follow.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use cadcraft_color::Rgb;
 use cadcraft_doc::{DimKind, Drawing, Entity, EntityKind, Handle, Space};
@@ -53,6 +62,8 @@ pub struct Repeat {
     pub members: Vec<Handle>,
     pub pitch: Point2,
     pub parallel: Option<bool>,
+    /// The user parameter driving the pitch length, if bound.
+    pub parameter: Option<String>,
 }
 
 /// The pitch vector of a linear or aligned dimension, or `None` for any other entity.
@@ -110,7 +121,7 @@ pub fn detail_repeats(d: &Drawing, detail: Id) -> std::result::Result<Vec<Repeat
             continue;
         }
         let parallel = reference.map(|r| is_parallel(pitch, r.from, r.to));
-        out.push(Repeat { dimension: e.handle, members, pitch, parallel });
+        out.push(Repeat { dimension: e.handle, members, pitch, parallel, parameter: tag.parameter });
     }
     Ok(out)
 }
@@ -127,6 +138,7 @@ fn repeat_json(r: &Repeat) -> Value {
         "pitch": [r.pitch.x, r.pitch.y],
         "pitchLength": length(r.pitch),
         "parallel": r.parallel,
+        "parameter": r.parameter,
     })
 }
 
@@ -193,8 +205,31 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
         let all = detail_repeats(s.doc()?, detail).map_err(other)?;
         Ok(all.iter().find(|r| r.dimension == dim).map_or(Value::Null, repeat_json))
     };
-    let Some(hv) = p.get("handles").filter(|v| !v.is_null()) else { return find(s) };
-    let members = parse_handles(hv, "handles")?;
+    // `parameter` absent keeps the tag's binding; `null` unbinds.
+    let parameter: Option<Option<String>> = match p.get("parameter") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(n)) if is_identifier(n.trim()) => Some(Some(n.trim().to_string())),
+        Some(_) => return Err(bad("repeat", "`parameter` must be a name ([A-Za-z_][A-Za-z0-9_]*) or null")),
+    };
+    let existing = match s.doc()?.entity(dim) {
+        Some(e) => read_entity_data(&e.common).map_err(other)?.repeat,
+        None => None,
+    };
+    let members = match p.get("handles").filter(|v| !v.is_null()) {
+        Some(hv) => parse_handles(hv, "handles")?,
+        None if parameter.is_none() => return find(s),
+        None => existing.as_ref().ok_or_else(|| other("Not a repeat"))?.members.iter().map(|id| Handle(id.0)).collect(),
+    };
+    let parameter = match parameter {
+        Some(p) => p,
+        None => existing.and_then(|t| t.parameter),
+    };
+    if let Some(name) = &parameter
+        && s.doc()?.constraints.iter().any(|c| &c.name == name)
+    {
+        return Err(other(format!("`{name}` belongs to a dimensional constraint")));
+    }
     let copies = match p.get("copies").filter(|v| !v.is_null()) {
         Some(cv) => Some(parse_handles(cv, "copies")?),
         None => None,
@@ -261,7 +296,14 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
         }
     };
 
-    let tag = (!members.is_empty()).then(|| RepeatTag { members: members.iter().map(|h| Id(h.0)).collect() });
+    let tag = (!members.is_empty()).then(|| RepeatTag { members: members.iter().map(|h| Id(h.0)).collect(), parameter: parameter.clone() });
+    // The parameter's value when it already exists (it wins); `None` means it is created at the pitch.
+    let bound_value = match &parameter {
+        Some(name) if tag.is_some() && s.doc()?.parametric.parameters.iter().any(|q| &q.name == name) => {
+            Some(cadcraft_constraints::env(s.doc()?).value(name).map_err(|e| other(format!("`{name}`: {e}")))?)
+        }
+        _ => None,
+    };
     let d = s.doc_mut()?;
     for c in copies.iter().flatten() {
         d.remove_entity(*c);
@@ -269,12 +311,30 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
     let mut res = Ok(());
     d.modify_entity(dim, |e| {
         res = read_entity_data(&e.common).and_then(|mut data| {
-            data.repeat = tag;
+            data.repeat = tag.clone();
             set_entity_data(&mut e.common, &data)
         });
     })
     .map_err(other)?;
     res.map_err(other)?;
+    if let Some(name) = tag.as_ref().and_then(|t| t.parameter.clone()) {
+        match bound_value {
+            Some(v) => {
+                d.modify_entity(dim, |e| {
+                    resize_pitch(e, v);
+                })
+                .map_err(other)?;
+            }
+            None => {
+                let len = d.entity(dim).and_then(|e| pitch_of(e)).map_or(0.0, length);
+                d.parametric.parameters.push(cadcraft_doc::Parameter {
+                    name,
+                    expr: cadcraft_constraints::format_value(len),
+                    description: "LAMB repeat pitch".into(),
+                });
+            }
+        }
+    }
     if parallel == Some(false) {
         s.echo("Repeat is not parallel to the reference line");
     }
@@ -285,6 +345,103 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
         m.insert("erased".into(), json!(copies.iter().map(|h| h.hex()).collect::<Vec<_>>()));
     }
     Ok(out)
+}
+
+/// Whether `n` is `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_identifier(n: &str) -> bool {
+    let mut cs = n.chars();
+    cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `expr` is a plain number: it evaluates without names and holds no identifier (an
+/// exponent's `e` right after a digit is not one).
+fn is_plain_number(expr: &str) -> bool {
+    if cadcraft_constraints::expr::eval_const(expr).is_err() {
+        return false;
+    }
+    let mut prev: Option<char> = None;
+    for c in expr.chars() {
+        let after_number = prev.is_some_and(|p| p.is_ascii_digit() || p == '.');
+        if (c.is_ascii_alphabetic() || c == '_') && !(after_number && (c == 'e' || c == 'E')) {
+            return false;
+        }
+        prev = Some(c);
+    }
+    true
+}
+
+/// Moves a linear or aligned dimension's `p14` along its pitch direction so the pitch length is
+/// `value`, keeping `p13`, direction and sign; `defpt` and `text_mid` shift with it so the
+/// dimension line keeps its offset. Returns whether anything moved.
+fn resize_pitch(e: &mut Entity, value: f64) -> bool {
+    let Some(pitch) = pitch_of(e) else { return false };
+    let len = length(pitch);
+    if len <= TOLERANCE.coincidence_mm || (len - value).abs() <= TOLERANCE.coincidence_mm {
+        return false;
+    }
+    let k = value / len - 1.0;
+    let (dx, dy) = (pitch.x * k, pitch.y * k);
+    let EntityKind::Dimension(dim) = &mut e.kind else { return false };
+    for p in [&mut dim.p14, &mut dim.defpt, &mut dim.text_mid] {
+        p.x += dx;
+        p.y += dy;
+    }
+    dim.block = None;
+    true
+}
+
+/// The after-command observer that keeps every bound repeat's pitch and its parameter in step
+/// (LAMB T503). A dimension stretched by this command, whose parameter's expression did not change
+/// and is a plain number, writes its length back; otherwise the parameter's value wins and the
+/// dimension is resized. An unevaluable parameter leaves the dimension alone. Writes only on
+/// change, so the edit lands in the command's undo step.
+pub fn repeat_parameter_observer(s: &mut Session, before: &Arc<Drawing>) {
+    let Ok(d) = s.doc() else { return };
+    let Ok(doc) = read_document(d) else { return };
+    let tol = TOLERANCE.coincidence_mm;
+    let expr_of = |d: &Drawing, n: &str| d.parametric.parameters.iter().find(|q| q.name == n).map(|q| q.expr.clone());
+    let mut bound: Vec<(Handle, String)> = Vec::new();
+    for v in doc.views.iter().filter(|v| matches!(v, AnyView::Detail(_))) {
+        let Ok(t) = tagged(d, v.id()) else { continue };
+        bound.extend(t.into_iter().filter_map(|(e, t)| t.parameter.map(|n| (e.handle, n))));
+    }
+    if bound.is_empty() {
+        return;
+    }
+    let mut after = d.clone();
+    let mut changed = false;
+    // Pass 1: a stretched dimension writes back to a plain-number parameter.
+    let mut written: HashSet<String> = HashSet::new();
+    let mut env = cadcraft_constraints::env(d);
+    for (h, name) in &bound {
+        let (Some(now), Some(was)) = (d.entity(*h).and_then(|e| pitch_of(e)), before.entity(*h).and_then(|e| pitch_of(e))) else { continue };
+        let (l, lb) = (length(now), length(was));
+        let Some(expr) = expr_of(d, name) else { continue };
+        if (l - lb).abs() <= tol || expr_of(before, name).as_deref() != Some(expr.as_str()) || !is_plain_number(&expr) || written.contains(name) {
+            continue;
+        }
+        if env.value(name).is_ok_and(|v| (v - l).abs() <= tol) {
+            continue;
+        }
+        if let Some(q) = after.parametric.parameters.iter_mut().find(|q| &q.name == name) {
+            q.expr = cadcraft_constraints::format_value(l);
+            written.insert(name.clone());
+            changed = true;
+        }
+    }
+    // Pass 2: the parameter wins everywhere else.
+    let mut env = cadcraft_constraints::env(&after);
+    let values: HashMap<&str, f64> = bound.iter().filter_map(|(_, n)| env.value(n).ok().map(|v| (n.as_str(), v))).collect();
+    for (h, name) in &bound {
+        let Some(&v) = values.get(name.as_str()) else { continue };
+        let mut moved = false;
+        if after.modify_entity(*h, |e| moved = resize_pitch(e, v)).is_ok() && moved {
+            changed = true;
+        }
+    }
+    if changed && let Ok(dm) = s.doc_mut() {
+        *dm = after;
+    }
 }
 
 /// The overlay: in a detail view's block, each repeat's members drawn once more, shifted by the
@@ -587,6 +744,112 @@ mod tests {
                 assert!(s.doc()?.entity(h).is_some(), "{want}: copy kept");
             }
         }
+        Ok(())
+    }
+
+    fn pitch_len(s: &Session, h: Handle) -> T<f64> {
+        Ok(length(pitch_of(s.doc()?.entity(h).ok_or("no dim")?).ok_or("no pitch")?))
+    }
+
+    fn param_expr(s: &Session, n: &str) -> T<String> {
+        Ok(s.doc()?.parametric.parameters.iter().find(|q| q.name == n).ok_or("no parameter")?.expr.clone())
+    }
+
+    #[test]
+    fn binding_a_parameter_creates_it_at_the_pitch_and_reads_back() -> R {
+        let Fixture { mut s, stud, pitch, .. } = fixture()?;
+        let undo = undo_len(&s)?;
+        let r = s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()], "parameter": "stud_oc" }))?;
+        assert_eq!(r["parameter"], json!("stud_oc"));
+        assert_eq!(param_expr(&s, "stud_oc")?, "406.4");
+        assert_eq!(undo_len(&s)?, undo + 1);
+        assert_eq!(s.execute("repeat", &json!({ "dimension": pitch.hex() }))?["parameter"], json!("stud_oc"));
+        // Unbinding keeps the members.
+        let r = s.execute("repeat", &json!({ "dimension": pitch.hex(), "parameter": null }))?;
+        assert_eq!(r["parameter"], Value::Null);
+        assert_eq!(r["members"], json!([stud.hex()]));
+        let e = s.execute("repeat", &json!({ "dimension": pitch.hex(), "parameter": "1bad" })).err().ok_or("bad name accepted")?;
+        assert!(e.to_string().contains("must be a name"), "{e}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_parameters_edit_resizes_dimension_ghost_and_assembly_and_undoes_in_one_step() -> R {
+        let (mut s, plan) = crate::assembly::tests::room_with("exterior_face", true, 200.0)?;
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| v.name() == "D1").ok_or("no D1")?.id();
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let stud = stud_at(&mut s, 0.0, 50.0)?;
+        let pitch = draw(&mut s, "dimaligned", json!({ "p1": [0, 0], "p2": [406.4, 0], "at": [200, -300] }))?;
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()], "parameter": "stud_oc" }))?;
+        crate::maintain::install(&mut s);
+        let laid_406 = crate::assembly::assembly_lines(s.doc()?, plan)?;
+        let ghost_406 = ghost_points(&s, &Space::Block(view_block_name(detail)))?.0;
+
+        s.execute("parameters", &json!({ "name": "stud_oc", "value": 600 }))?;
+        assert!((pitch_len(&s, pitch)? - 600.0).abs() < 1e-9);
+        let r = s.execute("repeat", &json!({ "dimension": pitch.hex() }))?;
+        assert_eq!(r["pitch"], json!([600.0, 0.0]), "same direction");
+        let ghost = ghost_points(&s, &Space::Block(view_block_name(detail)))?.0;
+        assert!(has(&ghost, 600.0, 50.0) && has(&ghost, 638.0, 140.0), "{ghost:?}");
+        // The assembly arrays at 600: a copy of the stud sits 600 along from another.
+        let laid = crate::assembly::assembly_lines(s.doc()?, plan)?;
+        assert_ne!(laid, laid_406);
+        let ys: Vec<f64> = laid[0]
+            .lines
+            .iter()
+            .filter(|l| (l.to.x - l.from.x).hypot(l.to.y - l.from.y) < 100.0)
+            .map(|l| l.from.x.min(l.to.x) + l.from.y.min(l.to.y))
+            .collect();
+        assert!(ys.iter().any(|a| ys.iter().any(|b| ((b - a) - 600.0).abs() < 1e-6)), "{ys:?}");
+
+        s.undo()?;
+        assert!((pitch_len(&s, pitch)? - 406.4).abs() < 1e-9);
+        assert_eq!(param_expr(&s, "stud_oc")?, "406.4");
+        assert_eq!(ghost_points(&s, &Space::Block(view_block_name(detail)))?.0, ghost_406);
+        assert_eq!(crate::assembly::assembly_lines(s.doc()?, plan)?, laid_406);
+        Ok(())
+    }
+
+    #[test]
+    fn stretching_writes_back_a_plain_number_but_snaps_back_to_an_expression() -> R {
+        let Fixture { mut s, stud, pitch, .. } = fixture()?;
+        crate::maintain::install(&mut s);
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()], "parameter": "stud_oc" }))?;
+        s.execute("grip.move", &json!({ "handle": pitch.hex(), "index": 1, "to": [500, 0] }))?;
+        assert!((pitch_len(&s, pitch)? - 500.0).abs() < 1e-9);
+        assert_eq!(param_expr(&s, "stud_oc")?, "500");
+
+        s.execute("parameters", &json!({ "name": "w", "value": 900 }))?;
+        s.execute("parameters", &json!({ "name": "stud_oc", "expr": "w/2" }))?;
+        assert!((pitch_len(&s, pitch)? - 450.0).abs() < 1e-9);
+        s.execute("grip.move", &json!({ "handle": pitch.hex(), "index": 1, "to": [500, 0] }))?;
+        assert!((pitch_len(&s, pitch)? - 450.0).abs() < 1e-9, "snapped back");
+        assert_eq!(param_expr(&s, "stud_oc")?, "w/2");
+        Ok(())
+    }
+
+    #[test]
+    fn two_repeats_share_a_parameter_and_a_constraint_name_refuses() -> R {
+        let Fixture { mut s, stud, edge, pitch, .. } = fixture()?;
+        crate::maintain::install(&mut s);
+        let second = draw(&mut s, "dimaligned", json!({ "p1": [0, 0], "p2": [0, 406.4], "at": [-300, 200] }))?;
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex()], "parameter": "stud_oc" }))?;
+        s.execute("repeat", &json!({ "dimension": second.hex(), "handles": [edge.hex()], "parameter": "stud_oc" }))?;
+        s.execute("parameters", &json!({ "name": "stud_oc", "value": 600 }))?;
+        assert!((pitch_len(&s, pitch)? - 600.0).abs() < 1e-9);
+        assert!((pitch_len(&s, second)? - 600.0).abs() < 1e-9);
+
+        s.doc_mut()?.constraints.push(cadcraft_doc::Constraint {
+            id: 1,
+            kind: cadcraft_doc::ConstraintKind::Radius,
+            refs: Vec::new(),
+            name: "d1".into(),
+            expr: "5".into(),
+        });
+        let undo = undo_len(&s)?;
+        let e = s.execute("repeat", &json!({ "dimension": second.hex(), "parameter": "d1" })).err().ok_or("constraint name accepted")?;
+        assert!(e.to_string().contains("`d1` belongs to a dimensional constraint"), "{e}");
+        assert_eq!(undo_len(&s)?, undo);
         Ok(())
     }
 
