@@ -14,6 +14,7 @@ use std::sync::{Mutex, PoisonError};
 use cadcraft_doc::Space;
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step, units::parse_distance};
 use lamb_core::geometry::Point2;
+use lamb_core::geometry::polyline::Polyline2;
 use lamb_core::model::{AnyView, Id, Placement, VerticalIntent, VerticalView};
 use serde_json::{Value, json};
 
@@ -29,7 +30,7 @@ fn cmd_name(intent: VerticalIntent) -> &'static str {
 }
 
 /// `+1200` / `-1200`, whole millimetres (as `annotations.rs`'s private `signed_mm`).
-fn signed_mm(z: f64) -> String {
+pub(crate) fn signed_mm(z: f64) -> String {
     let r = z.round();
     format!("{:+.0}", if r == 0.0 { 0.0 } else { r })
 }
@@ -41,6 +42,26 @@ fn placed_vertical(s: &Session, id: Id, intent: VerticalIntent) -> Option<Vertic
         AnyView::Vertical(v) if v.id == id && v.intent == intent && matches!(v.placement, Some(Placement::Vertical { .. })) => Some(v),
         _ => None,
     })
+}
+
+/// `cut` shifted `offset` mm along the CCW perpendicular of its first segment's from→to direction
+/// (positive = left of the cut's own direction), every point by the same vector. Shared by
+/// NEWOFFSETSECTION/ELEVATION and VIEWPROPS `cutOffset` (CUTLINE in a plan).
+pub(crate) fn shifted_cut_line(cut: &Polyline2, offset: f64) -> Result<Polyline2> {
+    let first_to = cut.segments.first().map(|g| g.to).ok_or_else(|| other("The cut line has no segment"))?;
+    let (dx, dy) = (first_to.x - cut.start.x, first_to.y - cut.start.y);
+    let len = dx.hypot(dy);
+    if len == 0.0 {
+        return Err(other("The cut line has a zero-length first segment"));
+    }
+    let (ox, oy) = (-dy / len * offset, dx / len * offset);
+    let shift = |q: Point2| Point2 { x: q.x + ox, y: q.y + oy };
+    let mut moved = cut.clone();
+    moved.start = shift(moved.start);
+    for g in &mut moved.segments {
+        g.to = shift(g.to);
+    }
+    Ok(moved)
 }
 
 fn offset_view(s: &mut Session, p: &Value, intent: VerticalIntent) -> Result<Value> {
@@ -55,19 +76,7 @@ fn offset_view(s: &mut Session, p: &Value, intent: VerticalIntent) -> Result<Val
     let Some(Placement::Vertical { cut_line, host_view_id, transform, flipped }) = src.placement else {
         return Err(other(format!("fromViewId must be a placed {}", word(intent).to_lowercase())));
     };
-    let first_to = cut_line.segments.first().map(|g| g.to).ok_or_else(|| other("The from-view's cut line has no segment"))?;
-    let (dx, dy) = (first_to.x - cut_line.start.x, first_to.y - cut_line.start.y);
-    let len = dx.hypot(dy);
-    if len == 0.0 {
-        return Err(other("The from-view's cut line has a zero-length first segment"));
-    }
-    let (ox, oy) = (-dy / len * offset, dx / len * offset);
-    let shift = |q: Point2| Point2 { x: q.x + ox, y: q.y + oy };
-    let mut moved = cut_line.clone();
-    moved.start = shift(moved.start);
-    for g in &mut moved.segments {
-        g.to = shift(g.to);
-    }
+    let moved = shifted_cut_line(&cut_line, offset)?;
     let name = p.get("name").and_then(Value::as_str).map_or_else(|| format!("{} offset {}", src.name, signed_mm(offset)), str::to_owned);
     let placement = Placement::Vertical { cut_line: moved, host_view_id, transform, flipped };
     let r = create(s, AnyView::Vertical(VerticalView { id: Id(0), name: name.clone(), intent, entities: Vec::new(), placement: Some(placement) }))?;

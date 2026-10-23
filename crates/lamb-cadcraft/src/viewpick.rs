@@ -30,7 +30,7 @@ use crate::overlays::{marker_radius_at, semi_axes, view_id, view_of};
 use crate::schema::view_block_name;
 
 /// Distance from `p` to segment `a`–`b` (TS `distToSegment`).
-fn dist_to_segment(p: Vec2, a: Point2, b: Point2) -> f64 {
+pub(crate) fn dist_to_segment(p: Vec2, a: Point2, b: Point2) -> f64 {
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     let len2 = dx * dx + dy * dy;
     let t = if len2 > 0.0 { (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };

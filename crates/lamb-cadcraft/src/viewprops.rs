@@ -1,5 +1,6 @@
 //! VIEWPROPS (LAMB T347): a view's own properties — rename, a placed plan's cut elevation, a
-//! vertical view's intent (section / elevation) and flip. The backend is the TS command engine's
+//! vertical view's intent (section / elevation) and flip, and (LAMB T499, fork-only) `cutOffset`: a
+//! placed vertical view's cut line moved parallel to itself — CUTLINE in its host plan. The backend is the TS command engine's
 //! `applyViewProps` (`packages/command-engine/src/commands/viewEdits.ts`) case for case, refusals
 //! word for word; undo is the engine's snapshot of the LAMB slot, so no inverse is written here.
 //!
@@ -21,10 +22,10 @@ fn intent_word(i: VerticalIntent) -> &'static str {
     if i == VerticalIntent::Elevation { "Elevation" } else { "Section" }
 }
 
-/// VIEWPROPS `{mode, viewId, name | cutElevation | intent | flipped}`. Every refusal is decided on
+/// VIEWPROPS `{mode, viewId, name | cutElevation | intent | flipped | offsetMm}`. Every refusal is decided on
 /// a read of the document before anything is written, so a refusal records no undo step.
 pub(crate) fn viewprops(s: &mut Session, p: &Value) -> Result<Value> {
-    let mode = p.get("mode").and_then(Value::as_str).ok_or_else(|| bad(CMD, "`mode` must be rename|cutElevation|intent|flip"))?;
+    let mode = p.get("mode").and_then(Value::as_str).ok_or_else(|| bad(CMD, "`mode` must be rename|cutElevation|intent|flip|cutOffset"))?;
     let raw_id = p.get("viewId").ok_or_else(|| bad(CMD, "`viewId` is required"))?;
     let shown_id = raw_id.as_str().map_or_else(|| raw_id.to_string(), str::to_owned);
     let mut doc = read_document(s.doc()?).map_err(other)?;
@@ -68,7 +69,19 @@ pub(crate) fn viewprops(s: &mut Session, p: &Value) -> Result<Value> {
             };
             *flipped = Some(value);
         }
-        _ => return Err(bad(CMD, "`mode` must be rename|cutElevation|intent|flip")),
+        "cutOffset" => {
+            let offset = p
+                .get("offsetMm")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v != 0.0)
+                .ok_or_else(|| bad(CMD, "`offsetMm` must be a finite, non-zero number"))?;
+            let AnyView::Vertical(v) = view else { return Err(other(format!("View {shown_id} is not a section or elevation"))) };
+            let Some(Placement::Vertical { cut_line, .. }) = &mut v.placement else {
+                return Err(other(format!("View {shown_id} is floating; it has no cut line")));
+            };
+            *cut_line = crate::offsetviews::shifted_cut_line(cut_line, offset)?;
+        }
+        _ => return Err(bad(CMD, "`mode` must be rename|cutElevation|intent|flip|cutOffset")),
     }
     write_document(s.doc_mut()?, &doc).map_err(other)?;
     Ok(Value::Null)
@@ -352,6 +365,63 @@ mod tests {
         assert_eq!(flipped(&s)?, Some(true));
         s.undo()?;
         assert_eq!(flipped(&s)?, None, "undo restores never-flipped, not false");
+        Ok(())
+    }
+
+    fn cut(s: &Session, id: Id) -> std::result::Result<(lamb_core::geometry::polyline::Polyline2, Option<Placement>), E> {
+        match view(s, id)? {
+            AnyView::Vertical(lamb_core::model::VerticalView { placement: Some(pl @ Placement::Vertical { .. }), .. }) => {
+                let Placement::Vertical { cut_line, .. } = &pl else { return Err("unreachable".into()) };
+                Ok((cut_line.clone(), Some(pl.clone())))
+            }
+            _ => Err("not a placed vertical".into()),
+        }
+    }
+
+    #[test]
+    fn cut_offset_shifts_the_cut_line_only_and_undoes() -> R {
+        let (mut s, plan, sec, loose, free) = project()?;
+        let (before, Some(Placement::Vertical { host_view_id, transform, flipped, .. })) = cut(&s, sec)? else { return Err("no placement".into()) };
+        let entities = match view(&s, sec)? {
+            AnyView::Vertical(v) => v.entities,
+            _ => return Err("not vertical".into()),
+        };
+        let undo = s.state()?.undo.len();
+        s.execute(CMD, &json!({ "mode": "cutOffset", "viewId": sec.0, "offsetMm": 500 }))?;
+        let (after, Some(Placement::Vertical { host_view_id: h2, transform: t2, flipped: f2, .. })) = cut(&s, sec)? else {
+            return Err("no placement".into());
+        };
+        // A cut along +X moves to its left: y 1000 → 1500, x untouched.
+        let pts = |c: &lamb_core::geometry::polyline::Polyline2| {
+            std::iter::once(c.start).chain(c.segments.iter().map(|g| g.to)).map(|q| (q.x, q.y)).collect::<Vec<_>>()
+        };
+        assert_eq!(pts(&before), vec![(0.0, 1000.0), (5000.0, 1000.0)]);
+        assert_eq!(pts(&after), vec![(0.0, 1500.0), (5000.0, 1500.0)]);
+        assert_eq!((h2, t2, f2), (host_view_id, transform, flipped), "host, transform and flip untouched");
+        assert_eq!(host_view_id, plan);
+        assert!(matches!(view(&s, sec)?, AnyView::Vertical(v) if v.entities == entities), "entities untouched");
+        assert_eq!(s.state()?.undo.len(), undo + 1, "one undo step");
+        s.undo()?;
+        assert_eq!(cut(&s, sec)?.0, before);
+
+        let doc = s.doc()?.clone();
+        let undo = s.state()?.undo.len();
+        assert!(
+            err(&mut s, json!({ "mode": "cutOffset", "viewId": loose.0, "offsetMm": 10 }))?
+                .contains(&format!("View {} is not a section or elevation", loose.0))
+        );
+        assert!(
+            err(&mut s, json!({ "mode": "cutOffset", "viewId": free.0, "offsetMm": 10 }))?
+                .contains(&format!("View {} is floating; it has no cut line", free.0))
+        );
+        for bad in [json!(0), json!("x"), Value::Null] {
+            assert!(
+                err(&mut s, json!({ "mode": "cutOffset", "viewId": sec.0, "offsetMm": bad }))?
+                    .contains("`offsetMm` must be a finite, non-zero number")
+            );
+        }
+        assert_eq!(read_document(s.doc()?)?, read_document(&doc)?, "refusals change nothing");
+        assert_eq!(s.state()?.undo.len(), undo, "refusals record no undo step");
         Ok(())
     }
 

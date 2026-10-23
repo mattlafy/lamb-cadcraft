@@ -828,7 +828,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .menu(MENU)
             .interactive(newviews::newplanline_machine),
         CommandSpec::new("viewprops", "View Properties", crate::viewprops::viewprops)
-            .params("{mode: rename|cutElevation|intent|flip, viewId, name | cutElevation | intent: section|elevation | flipped}")
+            .params("{mode: rename|cutElevation|intent|flip|cutOffset, viewId, name | cutElevation | intent: section|elevation | flipped | offsetMm}")
             .menu(MENU)
             .interactive(crate::viewprops::viewprops_machine),
         CommandSpec::new("newdetail", "New Detail", newdetail).params("{name, cutDirection?}").menu(MENU).interactive(newdetail_machine),
@@ -941,7 +941,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .interactive(crate::viewlife::level_machine),
         CommandSpec::new("cutline", "Cut Line", crate::cutlinecmd::cutline)
             .alias(&["cl"])
-            .params("{planViewId, elevation}")
+            .params("{planViewId, elevation} | {viewId, offsetMm}")
             .menu(MENU)
             .interactive(crate::cutlinecmd::cutline_machine),
         CommandSpec::new("levelline", "Level Line", crate::levellinecmd::levelline)
