@@ -16,8 +16,13 @@
 //!
 //! Every mesh of such a view carries its [`ConstructionState`] (LAMB T493,
 //! `ghosting-and-visualization.md` "Construction states"); a mesh of any other view carries none.
+//!
+//! GHOSTHIDE / GHOSTSHOW (LAMB T498, "Nothing is silently hidden") set a process-wide, unsaved
+//! display flag, [`ghosts_hidden`]; a 3D pane drawing [`without_ghosts`] while it is set. [`scene`]
+//! itself never filters, so RESOLVE and every count still see the ghosts.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cadcraft_doc::{Drawing, Handle};
 use lamb_core::derivation::resolve::ProvenanceKind;
@@ -290,6 +295,33 @@ pub fn scene(d: &Drawing) -> Result<Scene, SceneError> {
     Ok(Scene { origin, meshes, paths })
 }
 
+static GHOSTS_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Whether a 3D pane leaves ghosted geometry undrawn (GHOSTHIDE); off by default.
+pub fn ghosts_hidden() -> bool {
+    GHOSTS_HIDDEN.load(Ordering::Relaxed)
+}
+
+/// Set the GHOSTHIDE / GHOSTSHOW display flag. Session-only: never saved, never an undo step.
+pub fn set_ghosts_hidden(hidden: bool) {
+    GHOSTS_HIDDEN.store(hidden, Ordering::Relaxed);
+}
+
+/// Whether a mesh is ghosted: a surface, or massing still standing in for an undetailed wall.
+fn ghosted_mesh(m: &SceneMesh) -> bool {
+    m.kind == SceneMeshKind::Surface || m.construction == Some(ConstructionState::Massing)
+}
+
+/// `scene` without its ghosted geometry: surfaces, massing meshes, and `Defaulted` / `NotThreeD`
+/// paths. The origin is unchanged.
+pub fn without_ghosts(scene: &Scene) -> Scene {
+    Scene {
+        origin: scene.origin,
+        meshes: scene.meshes.iter().filter(|m| !ghosted_mesh(m)).cloned().collect(),
+        paths: scene.paths.iter().filter(|p| !matches!(p.provenance, ProvenanceKind::Defaulted | ProvenanceKind::NotThreeD)).cloned().collect(),
+    }
+}
+
 /// Möller–Trumbore, double-sided: the ray parameter `t > 0` of the hit, if any.
 fn ray_triangle(o: [f64; 3], dir: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> Option<f64> {
     let (e1, e2) = (sub(b, a), sub(c, a));
@@ -340,4 +372,41 @@ pub fn pick(scene: &Scene, origin: [f64; 3], dir: [f64; 3]) -> Option<ScenePick>
         distance: t,
         point: [origin[0] + t * dir[0], origin[1] + t * dir[1], origin[2] + t * dir[2]],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use cadcraft_doc::Handle;
+    use lamb_core::derivation::resolve::ProvenanceKind;
+
+    use super::{ConstructionState, Scene, SceneMesh, SceneMeshKind, ScenePath, without_ghosts};
+
+    fn mesh(kind: SceneMeshKind, construction: Option<ConstructionState>) -> SceneMesh {
+        SceneMesh {
+            kind,
+            sources: vec![Handle(1)],
+            segment_index: None,
+            provenance: ProvenanceKind::Authored,
+            layer: "0".into(),
+            construction,
+            positions: Vec::new(),
+            normals: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn without_ghosts_keeps_only_unghosted_geometry() {
+        let path = |provenance| ScenePath { source: Handle(2), segment_index: 0, provenance, points: vec![[0.0; 3], [1.0; 3]] };
+        let layer = mesh(SceneMeshKind::Layer, Some(ConstructionState::Resolved));
+        let s = Scene {
+            origin: [1.0, 2.0, 3.0],
+            meshes: vec![mesh(SceneMeshKind::Surface, None), mesh(SceneMeshKind::Solid, Some(ConstructionState::Massing)), layer.clone()],
+            paths: vec![path(ProvenanceKind::Defaulted), path(ProvenanceKind::NotThreeD)],
+        };
+        let kept = without_ghosts(&s);
+        assert_eq!(kept, Scene { origin: [1.0, 2.0, 3.0], meshes: vec![layer], paths: Vec::new() });
+        let authored = Scene { paths: vec![path(ProvenanceKind::Authored)], ..Scene::default() };
+        assert_eq!(without_ghosts(&authored), authored);
+    }
 }

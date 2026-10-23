@@ -20,6 +20,10 @@
 //! - `panelock {on?}`: camera lock for VPORTS panes (absent `on` toggles; off by default) — panning
 //!   or zooming the current tile re-centres every related tile at the same scale. Returns
 //!   `{on, message}` (`<Pane lock on>` / `<Pane lock off>`); not an undo step.
+//! - `ghosthide {}` / `ghostshow {}`: the 3D pane leaves ghosted geometry (surfaces, massing,
+//!   defaulted paths) undrawn / draws it again — see [`crate::scene::without_ghosts`]. Display only:
+//!   no element's state changes, RESOLVE still lists them; session-only, not an undo step. Returns
+//!   `{hidden, message}` (`<Ghosted geometry hidden: N of M meshes>` / `<Ghosted geometry shown>`).
 //! - `ucsalign {on?}`: ORTHO and direct distance entry follow the current pane's rotation (on, the
 //!   default) or keep to world X/Y (off); absent `on` toggles. Transparent, session-only, not an
 //!   undo step; returns `{on, message}` (`<UCS align on>` / `<UCS align off>`).
@@ -686,6 +690,23 @@ fn panelock(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "on": on, "message": format!("<Pane lock {}>", if on { "on" } else { "off" }) }))
 }
 
+/// GHOSTHIDE: the 3D pane stops drawing ghosted geometry; the message says how much it hides.
+fn ghosthide(s: &mut Session, _: &Value) -> Result<Value> {
+    crate::scene::set_ghosts_hidden(true);
+    let (n, m) = s
+        .doc()
+        .ok()
+        .and_then(|d| crate::scene::scene(d).ok())
+        .map_or((0, 0), |sc| (sc.meshes.len() - crate::scene::without_ghosts(&sc).meshes.len(), sc.meshes.len()));
+    Ok(json!({ "hidden": true, "message": format!("<Ghosted geometry hidden: {n} of {m} meshes>") }))
+}
+
+/// GHOSTSHOW: the 3D pane draws ghosted geometry again.
+fn ghostshow(_: &mut Session, _: &Value) -> Result<Value> {
+    crate::scene::set_ghosts_hidden(false);
+    Ok(json!({ "hidden": false, "message": "<Ghosted geometry shown>" }))
+}
+
 /// UCSALIGN: toggle (or set, with `on`) whether ORTHO follows the current pane's rotation.
 fn ucsalign(s: &mut Session, p: &Value) -> Result<Value> {
     let on = p.get("on").and_then(Value::as_bool).unwrap_or(s.world_ortho());
@@ -766,6 +787,8 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("link.apply", "Link", link).params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}"),
         CommandSpec::new("unlink.apply", "Unlink", unlink).params("{linkId}"),
         CommandSpec::new("panelock", "Pane Lock", panelock).params("{on?: bool}").noundo().menu(MENU),
+        CommandSpec::new("ghosthide", "Ghost Hide", ghosthide).params("{}").noundo().menu(MENU),
+        CommandSpec::new("ghostshow", "Ghost Show", ghostshow).params("{}").noundo().menu(MENU),
         CommandSpec::new("ucsalign", "UCS Align", ucsalign).params("{on?: bool}").key("F6").noundo().transparent().menu(MENU),
         CommandSpec::new("lambproject", "Start Project", lambproject).menu(MENU),
         CommandSpec::new("refpane", "Reference Pane", crate::refpane::refpane)
@@ -1213,6 +1236,62 @@ mod tests {
             s.execute(&t.command.0, &t.command.1)?;
         }
         assert_eq!(state(&s), vec![("LOCK".to_string(), true), ("UCS".to_string(), false)]);
+        Ok(())
+    }
+
+    /// GHOSTHIDE / GHOSTSHOW on T493's room whose top wall is untyped (three runs laid, the rest
+    /// massing). One test touches the process-wide flag, and leaves it off.
+    #[test]
+    fn ghosthide_and_ghostshow_only_toggle_the_display_flag() -> R {
+        install_app()?;
+        let (mut s, plan) = crate::assembly::tests::room("exterior_face", true)?;
+        let old: Vec<String> = crate::layered::tests::plines(&s, plan)?.iter().map(|h| h.hex()).collect();
+        s.execute("erase", &json!({ "handles": old }))?;
+        s.execute("layer.current", &json!({ "name": "WALL-EXT" }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [5000, 0], [5000, 4000], [0, 4000]], "closed": true }))?;
+        s.execute("pline", &json!({ "vertices": [[200, 200], [4800, 200], [4800, 3700], [200, 3700]], "closed": true }))?;
+        let level = s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].as_u64().ok_or("no id")?;
+        let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
+        s.execute("placeview", &json!({ "viewId": plan.0, "kind": "plan", "levelId": level, "cutElevation": 1200, "transform": t }))?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+
+        let before = crate::scene::scene(s.doc()?)?;
+        let massing = before
+            .meshes
+            .iter()
+            .filter(|m| m.kind == crate::scene::SceneMeshKind::Surface || m.construction == Some(crate::scene::ConstructionState::Massing))
+            .count();
+        assert!(massing > 0 && massing < before.meshes.len(), "some massing, some laid layers");
+        let issues = s.execute("resolve", &json!({}))?;
+        let undo = s.state()?.undo.len();
+
+        let r = s.execute("ghosthide", &json!({}));
+        let hidden = crate::scene::ghosts_hidden();
+        let after = crate::scene::scene(s.doc()?);
+        let issues_after = s.execute("resolve", &json!({}));
+        let undo_after = s.state()?.undo.len();
+        let shown = s.execute("ghostshow", &json!({}));
+        let hidden_after_show = crate::scene::ghosts_hidden();
+        crate::scene::set_ghosts_hidden(false);
+
+        let r = r?;
+        assert_eq!(r["hidden"], json!(true));
+        assert_eq!(r["message"], json!(format!("<Ghosted geometry hidden: {massing} of {} meshes>", before.meshes.len())));
+        assert!(hidden);
+        assert_eq!(after?, before, "scene() never filters");
+        assert_eq!(issues_after?, issues, "RESOLVE still lists everything");
+        assert_eq!(undo_after, undo);
+        let shown = shown?;
+        assert_eq!(shown["hidden"], json!(false));
+        assert_eq!(shown["message"], json!("<Ghosted geometry shown>"));
+        assert!(!hidden_after_show);
+        assert_eq!(s.state()?.undo.len(), undo, "neither is an undo step");
+
+        // A drawing with no LAMB model hides nothing.
+        let mut plain = session()?;
+        let r = plain.execute("ghosthide", &json!({}));
+        crate::scene::set_ghosts_hidden(false);
+        assert_eq!(r?["message"], json!("<Ghosted geometry hidden: 0 of 0 meshes>"));
         Ok(())
     }
 }

@@ -98,7 +98,10 @@ pub use maintain::{MaintenanceReport, install, link_observer, maintain_links, tr
 pub use overlays::{lamb_overlay, lamb_snaps, register_providers};
 pub use project::DrawingProject;
 pub use project_mut::DrawingProjectMut;
-pub use scene::{ConstructionState, Scene, SceneError, SceneMesh, SceneMeshKind, ScenePath, ScenePick, pick, scene};
+pub use scene::{
+    ConstructionState, Scene, SceneError, SceneMesh, SceneMeshKind, ScenePath, ScenePick, ghosts_hidden, pick, scene, set_ghosts_hidden,
+    without_ghosts,
+};
 pub use schema::{
     EXT_KEY, EntityData, LambDocument, LayerData, SchemaError, read_document, read_entity_data, set_entity_data, view_block_name, write_document,
 };

@@ -42,11 +42,13 @@ pub struct Path3 {
 }
 
 /// The registered scene: `build` the scene for a drawing; `pick` the entities a ray (global
-/// origin, direction) hits, nearest first.
+/// origin, direction) hits, nearest first; `stamp` changes whenever the source's own display
+/// settings change what `build` returns, so the pane rebuilds without a drawing edit.
 #[derive(Clone, Copy)]
 pub struct SceneSource {
     pub build: fn(&Drawing) -> Option<Scene3>,
     pub pick: fn(&Drawing, [f64; 3], [f64; 3]) -> Vec<Handle>,
+    pub stamp: fn() -> u64,
 }
 
 static SOURCE: OnceLock<SceneSource> = OnceLock::new();
@@ -328,10 +330,10 @@ fn draw(painter: &egui::Painter, scene: Option<&Scene3>, cam: &Camera, rect: Rec
 
 // ---- state, pick, panel ----
 
-/// The pane's session state: the scene built for (drawing uid, revision), and the camera.
+/// The pane's session state: the scene built for (drawing uid, revision, source stamp), and the camera.
 #[derive(Default)]
 pub struct Scene3dState {
-    built: Option<((u64, u64), Option<Arc<Scene3>>)>,
+    built: Option<((u64, u64, u64), Option<Arc<Scene3>>)>,
     pub camera: Option<Camera>,
     press: Option<Pos2>,
 }
@@ -340,7 +342,7 @@ pub struct Scene3dState {
 pub fn scene(app: &mut CadApp) -> Option<Arc<Scene3>> {
     let src = SOURCE.get()?;
     let st = app.session.state().ok()?;
-    let key = (st.uid, st.revision);
+    let key = (st.uid, st.revision, (src.stamp)());
     if app.scene3d.built.as_ref().is_none_or(|(k, _)| *k != key) {
         let s = (src.build)(&st.doc).map(Arc::new);
         app.scene3d.built = Some((key, s));
@@ -488,6 +490,11 @@ mod tests {
     }
 
     static H: AtomicU64 = AtomicU64::new(0);
+    static STAMP: AtomicU64 = AtomicU64::new(0);
+
+    fn stamp() -> u64 {
+        STAMP.load(Ordering::SeqCst)
+    }
 
     fn build(_: &Drawing) -> Option<Scene3> {
         Some(Scene3 { origin: [0.0; 3], meshes: vec![quad(0.0, [200, 200, 200, 255])], paths: Vec::new() })
@@ -504,8 +511,8 @@ mod tests {
 
     #[test]
     fn a_click_on_the_quad_selects_its_source_and_a_miss_leaves_the_selection() {
-        let _ = register_scene_source(SceneSource { build, pick });
-        assert!(register_scene_source(SceneSource { build, pick }).is_err(), "one source per process");
+        let _ = register_scene_source(SceneSource { build, pick, stamp });
+        assert!(register_scene_source(SceneSource { build, pick, stamp }).is_err(), "one source per process");
         let mut s = Session::new();
         s.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
         let h = s.doc().unwrap().model.iter().next().unwrap().handle;
@@ -522,5 +529,8 @@ mod tests {
         assert_eq!(app.session.selection(), vec![h], "a miss leaves the selection alone");
         // The cached scene is reused until the drawing changes.
         assert!(Arc::ptr_eq(&sc, &scene(&mut app).unwrap()));
+        // ... or the source's stamp does.
+        STAMP.store(1, Ordering::SeqCst);
+        assert!(!Arc::ptr_eq(&sc, &scene(&mut app).unwrap()));
     }
 }

@@ -4,6 +4,7 @@
 //! colour, a surface is ghosted grey, a conflicted mesh gets red edges. With an assembly plan
 //! (LAMB T493, `ghosting-and-visualization.md` "Construction states"), massing still standing in
 //! for an undetailed wall is ghosted in its own colour and a detail-conflicted mesh gets red edges.
+//! While GHOSTHIDE is in force (LAMB T498) the pane draws and picks `without_ghosts`.
 
 use cadcraft_engine::doc::color::{Color, Rgb};
 use cadcraft_engine::doc::{Drawing, Handle};
@@ -22,20 +23,37 @@ const CONFLICT_EDGES: u32 = 0xe2543a;
 
 /// Register LAMB's derived model as the 3D pane's scene.
 pub fn register() -> Result<(), &'static str> {
-    register_scene_source(SceneSource { build, pick })
+    register_scene_source(SceneSource { build, pick, stamp })
+}
+
+/// GHOSTHIDE / GHOSTSHOW change what `build` returns without editing the drawing.
+fn stamp() -> u64 {
+    u64::from(lamb_cadcraft::ghosts_hidden())
+}
+
+/// `s`, without its ghosts when `hidden`.
+fn shown(s: Scene, hidden: bool) -> Scene {
+    if hidden { lamb_cadcraft::without_ghosts(&s) } else { s }
 }
 
 fn build(d: &Drawing) -> Option<Scene3> {
-    let s = lamb_cadcraft::scene(d).ok()?;
-    // The pane treats `None` as "nothing to draw": a drawing with no LAMB model derives nothing.
+    let s = shown(lamb_cadcraft::scene(d).ok()?, lamb_cadcraft::ghosts_hidden());
+    built(&s, d)
+}
+
+/// The pane treats `None` as "nothing to draw": a drawing with no LAMB model derives nothing,
+/// and neither does one whose every mesh is a hidden ghost.
+fn built(s: &Scene, d: &Drawing) -> Option<Scene3> {
     if s.meshes.is_empty() && s.paths.is_empty() {
         return None;
     }
-    Some(to_scene3(&s, d))
+    Some(to_scene3(s, d))
 }
 
+/// A hidden ghost cannot be picked through.
 fn pick(d: &Drawing, o: [f64; 3], dir: [f64; 3]) -> Vec<Handle> {
-    lamb_cadcraft::scene(d).ok().and_then(|s| lamb_cadcraft::pick(&s, o, dir)).map(|p| p.sources).unwrap_or_default()
+    let Ok(s) = lamb_cadcraft::scene(d) else { return Vec::new() };
+    lamb_cadcraft::pick(&shown(s, lamb_cadcraft::ghosts_hidden()), o, dir).map(|p| p.sources).unwrap_or_default()
 }
 
 fn rgba(rgb: u32, alpha: f32) -> [u8; 4] {
@@ -102,7 +120,7 @@ mod tests {
     use lamb_cadcraft::{ConstructionState, SceneMeshKind, project_to_drawing, scene};
     use lamb_core::persistence::files_to_project;
 
-    use super::{build, pick, to_scene3};
+    use super::{MASSING_ALPHA, build, built, pick, rgba, shown, to_scene3};
 
     type R = Result<(), Box<dyn std::error::Error>>;
 
@@ -239,5 +257,33 @@ mod tests {
         let d = Drawing::new_metric();
         assert!(build(&d).is_none());
         assert!(pick(&d, [0.0, 0.0, 100.0], [0.0, 0.0, -1.0]).is_empty());
+    }
+
+    /// The room's scene with every mesh massing (as T493 states an undetailed room): shown, the
+    /// solid draws at the ghost alpha and a ray down through the room picks it; hidden, nothing is
+    /// left to draw or pick. The flag is passed to `shown` directly, so this test never races the
+    /// others through the process-wide static, which stays off: `build`/`pick` draw everything.
+    #[test]
+    fn hidden_ghosts_neither_draw_nor_pick() -> R {
+        let d = with_room()?;
+        let s = scene(&d)?;
+        let mut massing = s.clone();
+        massing.meshes.iter_mut().for_each(|m| m.construction = Some(ConstructionState::Massing));
+        let solid = massing.meshes.iter().find(|m| m.kind == SceneMeshKind::Solid).ok_or("no solid")?.sources.clone();
+        let ghost_alpha = rgba(0, MASSING_ALPHA)[3];
+        // A ray straight down through the room's middle (20000..24000 × 0..3000).
+        let (o, dir) = ([22_000.0, 1_500.0, 100_000.0], [0.0, 0.0, -1.0]);
+
+        let on = shown(massing.clone(), false);
+        assert!(built(&on, &d).ok_or("nothing built")?.meshes.iter().any(|m| m.rgba[3] == ghost_alpha));
+        assert_eq!(lamb_cadcraft::pick(&on, o, dir).map(|p| p.sources), Some(solid));
+
+        let off = shown(massing, true);
+        assert!(built(&off, &d).is_none_or(|s3| s3.meshes.iter().all(|m| m.rgba[3] != ghost_alpha)));
+        assert!(lamb_cadcraft::pick(&off, o, dir).is_none(), "a hidden ghost cannot be picked through");
+
+        assert_eq!(build(&d), built(&s, &d), "the flag is off by default");
+        assert_eq!(pick(&d, o, dir), lamb_cadcraft::pick(&s, o, dir).map(|p| p.sources).unwrap_or_default());
+        Ok(())
     }
 }

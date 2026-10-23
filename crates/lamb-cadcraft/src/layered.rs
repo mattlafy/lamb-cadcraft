@@ -591,7 +591,7 @@ fn closed_loop(lines: &[AssemblyLine], tol: f64) -> Option<Vec<Point2>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use cadcraft_doc::Handle;
     use cadcraft_engine::Session;
     use serde_json::json;
@@ -610,7 +610,7 @@ mod tests {
         Ok((s, plan))
     }
 
-    fn plines(s: &Session, plan: Id) -> T<Vec<Handle>> {
+    pub(crate) fn plines(s: &Session, plan: Id) -> T<Vec<Handle>> {
         let d = s.doc()?;
         let b = d.block(&crate::schema::view_block_name(plan)).ok_or("no view block")?;
         Ok(b.entities.iter().filter(|e| matches!(e.kind, cadcraft_doc::EntityKind::LwPolyline(_))).map(|e| e.handle).collect())
