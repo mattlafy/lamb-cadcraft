@@ -75,6 +75,7 @@ pub mod sheets;
 pub mod solids_cli;
 mod studgrid;
 pub mod sweeps;
+pub mod tagfollow;
 mod viewlife;
 pub mod viewpick;
 mod viewprops;

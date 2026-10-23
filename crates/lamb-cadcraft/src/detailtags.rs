@@ -81,13 +81,13 @@ fn curve_distance(c: &RunCurve, p: Point2) -> f64 {
 }
 
 /// The run an edge tag at `tip` attaches to.
-fn attach_run(graph: &WallGraph, tip: Point2) -> Option<usize> {
+pub(crate) fn attach_run(graph: &WallGraph, tip: Point2) -> Option<usize> {
     let (i, d) = graph.runs.iter().enumerate().map(|(i, r)| (i, curve_distance(&r.centreline, tip))).min_by(|a, b| a.1.total_cmp(&b.1))?;
     (d <= graph.runs[i].width / 2.0 + TOLERANCE.grouping_mm).then_some(i)
 }
 
 /// The junction a corner tag at `tip` attaches to: the nearest one whose reach covers it.
-fn attach_junction(graph: &WallGraph, tip: Point2) -> Option<usize> {
+pub(crate) fn attach_junction(graph: &WallGraph, tip: Point2) -> Option<usize> {
     graph
         .junctions
         .iter()
@@ -104,7 +104,7 @@ fn attach_junction(graph: &WallGraph, tip: Point2) -> Option<usize> {
 /// The opening bridge a corner-shaped tag at `tip` attaches to when no junction does (LAMB T486):
 /// the nearest bridge whose segment `from → to` is within `max(its two runs' widths) / 2 +
 /// TOLERANCE.grouping_mm` of the tip.
-fn attach_bridge(graph: &WallGraph, tip: Point2) -> Option<usize> {
+pub(crate) fn attach_bridge(graph: &WallGraph, tip: Point2) -> Option<usize> {
     graph
         .bridges
         .iter()
@@ -129,7 +129,7 @@ pub(crate) fn graph_and_sides(p: &DrawingProject<'_>, view: Id) -> (WallGraph, W
 
 /// What counts as a wall face in `view`: [`WallRunParams::for_vertical`] in a vertical view, else
 /// [`WallRunParams::defaults`].
-fn wall_params(p: &DrawingProject<'_>, view: Id) -> WallRunParams {
+pub(crate) fn wall_params(p: &DrawingProject<'_>, view: Id) -> WallRunParams {
     let vertical = read_document(p.drawing()).is_ok_and(|doc| doc.views.iter().any(|v| matches!(v, AnyView::Vertical(_)) && v.id() == view));
     if vertical { WallRunParams::for_vertical(p.layers()) } else { WallRunParams::defaults(p.layers()) }
 }
@@ -141,7 +141,7 @@ fn view_direction(d: &Drawing, view: Id) -> CutDirection {
 }
 
 /// Every tagged leader in `view`'s block: (handle, tip, tag).
-fn tags_in(d: &Drawing, view: Id) -> std::result::Result<Vec<(Handle, Point2, DetailTag)>, String> {
+pub(crate) fn tags_in(d: &Drawing, view: Id) -> std::result::Result<Vec<(Handle, Point2, DetailTag)>, String> {
     let Some(block) = d.block(&view_block_name(view)) else { return Ok(Vec::new()) };
     let mut out = Vec::new();
     for e in block.entities.iter() {
