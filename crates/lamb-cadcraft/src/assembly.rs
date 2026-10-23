@@ -2096,7 +2096,7 @@ pub(crate) mod tests {
 
     /// `section_wall`'s plan, section and `SD` detail with the section's cut faces drawn by `faces`,
     /// an `outsidepoint` at `outside` if given, and `SD` edge-tagged at (`tip_u`, 2000).
-    fn section_fixture(tip_u: f64, outside: Option<(f64, f64)>, faces: impl FnOnce(&mut Session) -> R) -> T<(Session, Id)> {
+    pub(crate) fn section_fixture(tip_u: f64, outside: Option<(f64, f64)>, faces: impl FnOnce(&mut Session) -> R) -> T<(Session, Id)> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);
@@ -2219,7 +2219,7 @@ pub(crate) mod tests {
     /// T463's joists: [`open_section`] with its host plan placed at a rotated, moved transform, an
     /// outside point below the floor and `SD` also tagged on the floor, so the floor run lays the
     /// stud repeat (pitch 400) as joists. Returns (session, section, plan), editing the section.
-    fn joist_section() -> T<(Session, Id, Id)> {
+    pub(crate) fn joist_section() -> T<(Session, Id, Id)> {
         let (mut s, sec) = open_section(Some((-1000.0, 1500.0)))?;
         s.execute("outsidepoint", &json!({ "point": {"x": 2000.0, "y": 500.0} }))?;
         let doc = read_document(s.doc()?)?;
@@ -2232,7 +2232,7 @@ pub(crate) mod tests {
     }
 
     /// The section's floor run (horizontal centreline) and its laid assembly.
-    fn floor_run(d: &Drawing, sec: Id) -> T<RunAssembly> {
+    pub(crate) fn floor_run(d: &Drawing, sec: Id) -> T<RunAssembly> {
         let p = DrawingProject::new(d)?;
         let (graph, _) = graph_and_sides(&p, sec);
         let i = graph

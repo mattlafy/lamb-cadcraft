@@ -18,12 +18,20 @@
 //! range, strips from its lines parallel to that run (same boundary rule, each strip over the
 //! overlap of its two boundaries' extents) and a prism per closed chain of its lines (whose lines
 //! bound no strip), replacing nothing.
+//! A placed vertical view (section) with an assembly block (LAMB T494) does the same for its laid
+//! straight runs that are not within 1° of vertical — the floors and roofs it cuts; walls cut in
+//! section are left to the plan — each strip and closed repeat copy (joists) extruded along the gaze
+//! over the gaze range of the solid of either face's entity, which is then dropped, else over
+//! `default_surface_depth_mm` centred on the cut plane, `Defaulted`. Corner and jamb details placed
+//! in a section add nothing.
 
 use std::collections::BTreeSet;
 
 use cadcraft_doc::Drawing;
 use lamb_core::derivation::assembly::{AssemblyLine, Band, FaceRef, lay_bands};
-use lamb_core::derivation::projection::plan_local_to_global_xy;
+use lamb_core::derivation::projection::{
+    plan_local_to_global_xy, vertical_basis, vertical_gaze_dir, vertical_local_to_global3, vertical_local_to_uz,
+};
 use lamb_core::derivation::read::{ProjectRead, ViewKind, ViewRef};
 use lamb_core::derivation::resolve::ProvenanceKind;
 use lamb_core::derivation::solids::{SolidForm, SynthesizedSolid, most_doubtful, prism_from_loop, solid_triangles};
@@ -76,6 +84,16 @@ pub(crate) fn layered(p: &DrawingProject<'_>, result: &SynthesisResult) -> Layer
             continue;
         }
         plan_strips(d, p, &view, result, &mut out);
+    }
+    for view in p.views().filter(|v| v.kind == ViewKind::Vertical) {
+        if d.block(&assembly_block_name(view.id)).is_none() {
+            continue;
+        }
+        let Some(host) = view.host_view_id().and_then(|h| p.view(h)) else { continue };
+        if host.kind == ViewKind::Plan && host.placement.is_none() {
+            continue;
+        }
+        section_strips(d, p, &view, &host, result, &mut out);
     }
     if out.replaced.is_empty() {
         return out;
@@ -183,14 +201,28 @@ fn run_z(run: &WallRun, result: &SynthesisResult) -> Option<ZRange> {
 fn push_prism(view: &ViewRef<'_>, local: &[Point2], layer: String, z: &ZRange, out: &mut Layered) -> bool {
     let Ok(global) = local.iter().map(|&q| plan_local_to_global_xy(view, q)).collect::<Result<Vec<_>, _>>() else { return false };
     let base: Vec<Point3> = global.iter().map(|g| Point3 { x: g.x, y: g.y, z: z.bottom }).collect();
-    let faces = prism_from_loop(&base, Point3 { x: 0.0, y: 0.0, z: 1.0 }, 0.0, z.top - z.bottom);
-    let sources = z.keys.map(|k| k.0);
-    let solid = SynthesizedSolid { entity_ids: sources.to_vec(), provenance: z.provenance, faces, form: SolidForm::Shell, layer_id: layer.clone() };
+    let up = Point3 { x: 0.0, y: 0.0, z: 1.0 };
+    push_extrusion(&base, up, (0.0, z.top - z.bottom), z.keys.map(|k| k.0), z.provenance, layer, out)
+}
+
+/// Pushes the prism of global loop `base` along `axis` over `range` in `layer`; false when nothing
+/// was emitted.
+fn push_extrusion(
+    base: &[Point3],
+    axis: Point3,
+    range: (f64, f64),
+    sources: [Id; 2],
+    provenance: ProvenanceKind,
+    layer: String,
+    out: &mut Layered,
+) -> bool {
+    let faces = prism_from_loop(base, axis, range.0, range.1);
+    let solid = SynthesizedSolid { entity_ids: sources.to_vec(), provenance, faces, form: SolidForm::Shell, layer_id: layer.clone() };
     let triangles = solid_triangles(&solid);
     if triangles.is_empty() {
         return false;
     }
-    out.strips.push(LayerStrip { sources, provenance: z.provenance, layer, triangles });
+    out.strips.push(LayerStrip { sources, provenance, layer, triangles });
     true
 }
 
@@ -276,6 +308,58 @@ fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, result: 
     let ctx = DetailCtx { view, runs: &graph.runs, sides: &sides.runs, faces: &faces, result };
     for (lines, adjoining) in groups {
         ctx.meshes(lines, &adjoining, out);
+    }
+}
+
+/// A section's laid straight runs off vertical (floors and roofs), extruded along the gaze.
+fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host: &ViewRef<'_>, result: &SynthesisResult, out: &mut Layered) {
+    let Ok(runs) = assembly_lines(d, view.id) else { return };
+    let Ok(basis) = vertical_basis(view, host) else { return };
+    let (graph, sides) = graph_and_sides(p, view.id);
+    let g = vertical_gaze_dir(basis.c_hat, false);
+    let axis = Point3 { x: g.x, y: g.y, z: 0.0 };
+    let tol = TOLERANCE.coincidence_mm;
+    let sin_vertical = 1f64.to_radians().sin();
+    let depth = p.defaults().default_surface_depth_mm;
+    let lift = |ring: &[Point2]| ring.iter().map(|&q| vertical_local_to_global3(view, host, q)).collect::<Result<Vec<_>, _>>().ok();
+    for ra in runs.iter().filter(|r| r.skipped.is_none() && r.bands > 0) {
+        let Some(face) = ra.face else { continue };
+        let (Some(run), Some(side)) = (graph.runs.get(ra.run), sides.runs.get(ra.run)) else { continue };
+        let RunCurve::Line { from: c0, to: c1 } = run.centreline else { continue };
+        let (a, b) = (vertical_local_to_uz(view, c0), vertical_local_to_uz(view, c1));
+        let len = (b.u - a.u).hypot(b.z - a.z);
+        if len <= tol || (b.u - a.u).abs() / len <= sin_vertical {
+            continue;
+        }
+        let Some(bands) = ra.lines.get(..ra.bands) else { continue };
+        let Some(loops) = straight_loops(run, side, face, bands) else { continue };
+        let Some(origin) = lift(&[c0]).and_then(|o| o.first().copied()) else { continue };
+        let sources = [run.faces[0].from.entity_id, run.faces[1].from.entity_id];
+        let solid = result.solids.iter().position(|s| s.entity_ids.iter().any(|e| sources.contains(e)));
+        let along = |q: &Point3| (q.x - origin.x) * axis.x + (q.y - origin.y) * axis.y;
+        let span = solid.and_then(|i| result.solids.get(i)).and_then(|s| {
+            let v: Vec<f64> = s.faces.iter().flatten().map(along).filter(|t| t.is_finite()).collect();
+            let (lo, hi) = (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+            (hi - lo > tol).then_some(((lo, hi), s.provenance))
+        });
+        let (range, provenance) = span.unwrap_or(((-depth / 2.0, depth / 2.0), ProvenanceKind::Defaulted));
+        let mut emitted = false;
+        for (ring, layer) in loops {
+            if let Some(base) = lift(&ring) {
+                emitted |= push_extrusion(&base, axis, range, sources, provenance, layer, out);
+            }
+        }
+        let mut start = ra.bands;
+        for &count in &ra.copies {
+            let Some(copy) = ra.lines.get(start..start + count) else { break };
+            start += count;
+            if let (Some(base), Some(head)) = (closed_loop(copy, tol).and_then(|r| lift(&r)), copy.first()) {
+                push_extrusion(&base, axis, range, sources, provenance, head.layer.clone(), out);
+            }
+        }
+        if let (true, Some(i), Some(_)) = (emitted, solid, span) {
+            out.dropped_solids.insert(i);
+        }
     }
 }
 
@@ -867,6 +951,121 @@ mod tests {
             let (lo, hi) = radii(&sc, m);
             assert!(lo > 900.0 - 2.0 && hi < 1050.0 + 2.0, "{lo}..{hi}");
         }
+        Ok(())
+    }
+
+    /// The section's gaze direction in global XY.
+    fn gaze(s: &Session, sec: Id) -> T<[f64; 2]> {
+        let p = crate::project::DrawingProject::new(s.doc()?)?;
+        let v = p.view(sec).ok_or("no section")?;
+        let host = p.view(v.host_view_id().ok_or("no host")?).ok_or("no host view")?;
+        let b = lamb_core::derivation::projection::vertical_basis(&v, &host)?;
+        let g = lamb_core::derivation::projection::vertical_gaze_dir(b.c_hat, false);
+        Ok([g.x, g.y])
+    }
+
+    /// `m`'s vertices projected on `g`, relative to `at` (global XY): (min, max).
+    fn along(sc: &crate::scene::Scene, m: &crate::scene::SceneMesh, g: [f64; 2], at: [f64; 2]) -> (f64, f64) {
+        let t = m.positions.iter().map(|p| (sc.origin[0] + f64::from(p[0]) - at[0]) * g[0] + (sc.origin[1] + f64::from(p[1]) - at[1]) * g[1]);
+        (t.clone().fold(f64::INFINITY, f64::min), t.fold(f64::NEG_INFINITY, f64::max))
+    }
+
+    /// The global XY of section-local point `q`.
+    fn global_of(s: &Session, sec: Id, q: [f64; 2]) -> T<[f64; 2]> {
+        let p = crate::project::DrawingProject::new(s.doc()?)?;
+        let v = p.view(sec).ok_or("no section")?;
+        let host = p.view(v.host_view_id().ok_or("no host")?).ok_or("no host view")?;
+        let g = lamb_core::derivation::projection::vertical_local_to_global3(&v, &host, lamb_core::geometry::Point2 { x: q[0], y: q[1] })?;
+        Ok([g.x, g.y])
+    }
+
+    fn floor_handles(s: &Session, sec: Id) -> T<Vec<Handle>> {
+        let d = s.doc()?;
+        let b = d.block(&crate::schema::view_block_name(sec)).ok_or("no view block")?;
+        Ok(b.entities.iter().filter(|e| e.common.layer == "FLOOR").map(|e| e.handle).collect())
+    }
+
+    #[test]
+    fn a_section_s_laid_floor_shows_as_slabs_and_joists_over_the_default_depth() -> R {
+        let (mut s, sec, _) = crate::assembly::tests::joist_section()?;
+        let floor = crate::assembly::tests::floor_run(s.doc()?, sec)?;
+        let copies = floor.copies.len();
+        assert!(copies > 0);
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let sc = scene(s.doc()?)?;
+        let layers: Vec<_> = sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).collect();
+        let fl = floor_handles(&s, sec)?;
+        assert_eq!(fl.len(), 2);
+        assert!(!layers.is_empty());
+        // Every Layer mesh is the floor's: the cut wall run (z 0..3000) gets none.
+        assert!(layers.iter().all(|m| m.sources.iter().all(|h| fl.contains(h))), "only floor meshes");
+        let (g, at) = (gaze(&s, sec)?, global_of(&s, sec, [300.0, 1000.0])?);
+        let depth = crate::project::DrawingProject::new(s.doc()?)?.defaults().default_surface_depth_mm;
+        for m in &layers {
+            let (lo, hi) = along(&sc, m, g, at);
+            assert!((lo + depth / 2.0).abs() < 0.01 && (hi - depth / 2.0).abs() < 0.01, "{lo}..{hi}");
+            assert_eq!(m.provenance, lamb_core::derivation::resolve::ProvenanceKind::Defaulted);
+        }
+        let mut bands: Vec<(String, f64, f64)> = layers
+            .iter()
+            .filter(|m| m.layer != "STUD")
+            .map(|m| {
+                let z = range(&sc, m, 2);
+                (m.layer.clone(), (z.0 * 100.0).round() / 100.0, (z.1 * 100.0).round() / 100.0)
+            })
+            .collect();
+        bands.sort_by(|a, b| a.1.total_cmp(&b.1));
+        // Exterior face below (z 1000); GYP bands at offsets 50 and 300 toward the floor's top.
+        assert_eq!(bands, [("GYP".to_string(), 1000.0, 1050.0), ("GYP".to_string(), 1050.0, 1300.0)]);
+        // One prism per closed joist copy: 38 along u, z 1050..1200.
+        let joists: Vec<_> = layers.iter().filter(|m| m.layer == "STUD").collect();
+        assert_eq!(joists.len(), copies);
+        for m in &joists {
+            let z = range(&sc, m, 2);
+            assert!((z.0 - 1050.0).abs() < 0.01 && (z.1 - 1200.0).abs() < 0.01, "{z:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_closed_section_floor_s_slabs_take_its_solid_s_gaze_range_and_replace_it() -> R {
+        let (mut s, sec) = crate::assembly::tests::section_fixture(150.0, Some((-1000.0, 1500.0)), |s| {
+            s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+            s.execute("pline", &json!({ "vertices": [[0, 0], [0, 3000]] }))?;
+            s.execute("pline", &json!({ "vertices": [[300, 0], [300, 3000]] }))?;
+            s.execute("layer.new", &json!({ "name": "FLOOR", "current": true }))?;
+            s.execute("pline", &json!({ "vertices": [[300, 1000], [4000, 1000], [4000, 1250], [300, 1250]], "closed": true }))?;
+            Ok(())
+        })?;
+        s.execute("outsidepoint", &json!({ "point": {"x": 2000.0, "y": 500.0} }))?;
+        let sd = {
+            let p = crate::project::DrawingProject::new(s.doc()?)?;
+            p.views().find(|v| v.kind == lamb_core::derivation::read::ViewKind::Detail).ok_or("no detail")?.id
+        };
+        s.execute("detailtag", &json!({ "detailViewId": sd.0, "tip": {"x": 2000.0, "y": 1000.0}, "bubble": {"x": 2500.0, "y": 500.0} }))?;
+        let plan = {
+            let p = crate::project::DrawingProject::new(s.doc()?)?;
+            p.views().find(|v| v.kind == lamb_core::derivation::read::ViewKind::Plan).ok_or("no plan")?.id
+        };
+        place(&mut s, plan)?;
+        let before = scene(s.doc()?)?;
+        let fl = floor_handles(&s, sec)?;
+        let solid =
+            before.meshes.iter().find(|m| m.kind == SceneMeshKind::Solid && m.sources.iter().any(|h| fl.contains(h))).ok_or("no floor solid")?;
+        let (g, at) = (gaze(&s, sec)?, global_of(&s, sec, [300.0, 1000.0])?);
+        let want = along(&before, solid, g, at);
+        assert!(want.1 - want.0 > 1.0);
+
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let sc = scene(s.doc()?)?;
+        let layers: Vec<_> = sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer && m.sources.iter().any(|h| fl.contains(h))).collect();
+        assert!(!layers.is_empty(), "the closed floor is laid");
+        for m in &layers {
+            let (lo, hi) = along(&sc, m, g, at);
+            assert!((lo - want.0).abs() < 0.01 && (hi - want.1).abs() < 0.01, "{lo}..{hi} vs {want:?}");
+        }
+        assert!(!sc.meshes.iter().any(|m| m.kind == SceneMeshKind::Solid && m.sources.iter().any(|h| fl.contains(h))), "the floor solid is gone");
         Ok(())
     }
 }

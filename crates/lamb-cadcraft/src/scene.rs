@@ -11,6 +11,8 @@
 //! In a placed plan with an assembly block, each laid straight run is layered (LAMB T487,
 //! [`crate::layered`]): one [`SceneMeshKind::Layer`] prism per band gap replaces the massing
 //! surfaces of the run's face segments, and a solid whose every plan segment is replaced is dropped.
+//! In a placed section with an assembly block, each laid floor or roof run is layered the same way
+//! (LAMB T494), extruded along the section's gaze, replacing its entity's section solid.
 
 use std::fmt;
 
