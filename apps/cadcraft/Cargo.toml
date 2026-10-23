@@ -16,6 +16,8 @@ cadcraft-ui-egui = { workspace = true }
 cadcraft-io = { workspace = true }
 lamb-cadcraft = { workspace = true }
 lamb-core = { workspace = true }
+# For the shared per-session control-token helper (control_server.rs authentication).
+cadcraft-mcp = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "links", "persistence"] }
 egui = { workspace = true }
 serde_json = { workspace = true }
