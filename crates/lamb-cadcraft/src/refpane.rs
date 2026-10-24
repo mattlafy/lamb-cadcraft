@@ -61,8 +61,38 @@ fn view_name(d: &Drawing, id: Id) -> String {
     DrawingProject::new(d).ok().and_then(|dp| dp.view(id).map(|v| v.name.to_owned())).unwrap_or_else(|| id.0.to_string())
 }
 
+/// How the pane splits for `edit` beside `r`: side by side when both are verticals (they share Z),
+/// else stacked (lamb-core [`split_orientation_for`]).
+fn orientation(d: &Drawing, edit: Id, r: Id) -> SplitOrientation {
+    DrawingProject::new(d).map_or(SplitOrientation::Horizontal, |dp| split_orientation_for(&dp, edit, r))
+}
+
+/// The current two-tile split read from the tiles' rects: one x range (stacked) is horizontal,
+/// one y range (side by side) is vertical. `None` unless there are exactly two tiles.
+fn tiling(s: &Session) -> Option<SplitOrientation> {
+    let tiles = s.model_tiles();
+    let [a, b] = tiles.as_slice() else { return None };
+    let same = |p: f64, q: f64| (p - q).abs() <= 1e-9;
+    if same(a.min.x, b.min.x) && same(a.max.x, b.max.x) {
+        Some(SplitOrientation::Horizontal)
+    } else if same(a.min.y, b.min.y) && same(a.max.y, b.max.y) {
+        Some(SplitOrientation::Vertical)
+    } else {
+        None
+    }
+}
+
+/// Split the model area into two tiles, `orientation`-wise (VPORTS 2 on the whole display); the
+/// current tile keeps its view.
+fn split(s: &mut Session, orientation: SplitOrientation) -> Result<()> {
+    let arrangement = if orientation == SplitOrientation::Vertical { "vertical" } else { "horizontal" };
+    s.execute("-vports", &json!({ "option": "2", "arrangement": arrangement, "applyTo": "display" }))?;
+    Ok(())
+}
+
 /// While [`shown`], put the edited view's reference (see [`pick`]) into the non-current tile; the
-/// current tile and its view are left as they were. No eligible reference: echo
+/// current tile keeps its view. When the pair wants the other split ([`orientation`]) the model
+/// area is re-split first. No eligible reference: echo
 /// `No reference view for <name>.` and leave the tiles alone.
 pub(crate) fn refresh(s: &mut Session) -> Result<()> {
     if !shown(s) {
@@ -74,6 +104,16 @@ pub(crate) fn refresh(s: &mut Session) -> Result<()> {
         s.echo(format!("No reference view for {name}."));
         return Ok(());
     };
+    let wanted = orientation(s.doc()?, edit, r);
+    if tiling(s) != Some(wanted) {
+        let edit_space = Space::Block(view_block_name(edit));
+        split(s, wanted)?;
+        if s.state()?.space != edit_space {
+            let st = s.state_mut()?;
+            st.space = edit_space;
+            st.mspace = None;
+        }
+    }
     let Some(cur) = s.model_tiles().iter().position(|t| t.active) else { return Ok(()) };
     let other_tile = usize::from(cur == 0);
     let target = Space::Block(view_block_name(r));
@@ -116,12 +156,11 @@ pub(crate) fn refpane(s: &mut Session, p: &Value) -> Result<Value> {
     let edit = edited_view(s);
     let reference = edit.and_then(|e| pick(s.doc().ok()?, e).map(|(_, r)| (e, r)));
     if s.model_tiles().len() != 2 {
-        let orientation = match reference {
-            Some((e, r)) => DrawingProject::new(s.doc()?).map_or(SplitOrientation::Horizontal, |dp| split_orientation_for(&dp, e, r)),
+        let wanted = match reference {
+            Some((e, r)) => orientation(s.doc()?, e, r),
             None => SplitOrientation::Horizontal,
         };
-        let arrangement = if orientation == SplitOrientation::Vertical { "vertical" } else { "horizontal" };
-        s.execute("-vports", &json!({ "option": "2", "arrangement": arrangement, "applyTo": "display" }))?;
+        split(s, wanted)?;
     }
     SHOWN.store(true, Ordering::Relaxed);
     refresh(s)?;
@@ -306,6 +345,34 @@ pub(crate) mod tests {
         assert!(!shown(&s));
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
         assert!(s.model_tiles().len() < 2, "an off pane splits nothing");
+        Ok(())
+    }
+
+    fn stacked(s: &Session) -> bool {
+        tiling(s) == Some(SplitOrientation::Horizontal)
+    }
+
+    #[test]
+    fn the_split_follows_the_edited_pair() -> R {
+        let _g = lock();
+        let (mut s, plan, a, b) = project()?;
+        s.execute("refpane", &json!({ "on": true }))?;
+        assert!(stacked(&s), "plan over section: {:?}", s.model_tiles());
+
+        s.execute("editview", &json!({ "viewId": a.0 }))?;
+        assert!(stacked(&s), "section over its host plan");
+        s.execute("refpane", &json!({ "viewId": b.0 }))?;
+        assert_eq!(tiling(&s), Some(SplitOrientation::Vertical), "section beside section: {:?}", s.model_tiles());
+        let cur = active(&s).ok_or("no current tile")?;
+        assert_eq!(s.tile_spaces()[cur], block(a), "the edited section stays current");
+        assert_eq!(s.tile_spaces()[usize::from(cur == 0)], block(b));
+        assert!(shown(&s));
+
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        assert!(stacked(&s), "back to stacked for the plan: {:?}", s.model_tiles());
+        let cur = active(&s).ok_or("no current tile")?;
+        assert_eq!(s.tile_spaces()[cur], block(plan));
+        assert_eq!(s.tile_spaces()[usize::from(cur == 0)], block(a));
         Ok(())
     }
 
