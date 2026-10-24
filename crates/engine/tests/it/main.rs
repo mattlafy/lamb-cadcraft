@@ -106,6 +106,7 @@ mod rotate_reference;
 mod select_keywords;
 mod select_similar;
 mod select_underscore_keywords;
+mod select_window_ortho;
 mod selection_cycling;
 mod selection_modes;
 mod setvar_cecolor;

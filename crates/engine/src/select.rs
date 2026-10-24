@@ -434,7 +434,7 @@ impl SelectMode {
         };
         match last {
             None => Prompt::new(first, Accept::POINT),
-            Some(p) if self.is_box() => Prompt::new(next, Accept::POINT).base(p),
+            Some(p) if self.is_box() => Prompt::new(next, Accept::POINT).corner(p),
             Some(p) => Prompt::new(next, Accept::POINT).kw(&["Undo"]).base(p),
         }
     }
@@ -472,6 +472,22 @@ mod tests {
         d.add(&Space::Model, Common::default(), kind).unwrap();
         let f = [Vec2::new(fence[0].0, fence[0].1), Vec2::new(fence[1].0, fence[1].1)];
         select_fence(&d, &Space::Model, &f).len()
+    }
+
+    #[test]
+    fn window_second_corner_is_a_corner_and_fence_is_not() {
+        for k in ["w", "c", "box"] {
+            let mut m = SelectMode::from_keyword(k).unwrap();
+            m.push(Vec2::new(1.0, 2.0));
+            let p = m.prompt();
+            assert!(p.corner, "{k}: ortho must not bend a window's opposite corner");
+            assert_eq!(p.base, Some(Vec2::new(1.0, 2.0)), "{k}: the rubber band still starts at the first corner");
+        }
+        for k in ["f", "wp", "cp"] {
+            let mut m = SelectMode::from_keyword(k).unwrap();
+            m.push(Vec2::new(1.0, 2.0));
+            assert!(!m.prompt().corner, "{k}: fence and polygon edges are lines ortho constrains");
+        }
     }
 
     #[test]
