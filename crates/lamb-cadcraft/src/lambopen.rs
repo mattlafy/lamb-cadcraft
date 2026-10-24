@@ -1,7 +1,11 @@
+//! LAMBOPEN / LAMBSAVE are interchange with the old TypeScript app's `.lamb` folder, not LAMB's save
+//! format: LAMB's data is stored inside the DWG/DXF and ordinary Save and Open carry it. Both are
+//! typed commands, off the menu.
+//!
 //! LAMBOPEN: a TS-app project (a `.lamb` directory, or its single-file `{path: content}` JSON form)
 //! opens as a **new document tab**, as OPEN does for a DWG.
 //!
-//! - `lambopen {path}` (View ▸ LAMB ▸ Open LAMB Project): reads the project, imports it with
+//! - `lambopen {path}` (typed only, Import TS-app Project): reads the project, imports it with
 //!   [`crate::import::project_to_drawing`] and opens it titled with the project's name (else the
 //!   path's stem). The new document has no path, so QSAVE asks where to save it rather than
 //!   writing over the `.lamb`. Not an undo step. Echoes `Opened "<name>": <v> views, <e> entities`
@@ -11,7 +15,7 @@
 //!
 //! LAMBSAVE: the open drawing written as a TS-app `.lamb` **directory**.
 //!
-//! - `lambsave {path}` (View ▸ LAMB ▸ Save LAMB Project): exports the drawing with
+//! - `lambsave {path}` (typed only, Export TS-app Project): exports the drawing with
 //!   [`crate::export::drawing_to_project`] and writes it with `lamb_core::persistence::write_lamb_dir`.
 //!   Refuses a path that is an existing file, or an existing non-empty directory with no
 //!   `manifest.json`. Leaves the document's path, title and undo alone (QSAVE still writes DWG).

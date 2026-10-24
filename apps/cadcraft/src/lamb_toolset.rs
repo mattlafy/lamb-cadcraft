@@ -217,7 +217,7 @@ pub const LAMB_TAB: ExtTab = ExtTab {
                 tool(LINK, "link", "Link"),
                 tool(UNLINK, "unlink", "Unlink"),
                 tool(SHOW_LINKS, "showlinks", "Show Links"),
-                tool(RESOLVE, "resolve", "Resolve"),
+                tool(RESOLVE, "resolve", "Review Issues"),
             ],
             small: &[
                 tool(ACCEPT, "accept", "Accept AI Line"),
@@ -257,8 +257,8 @@ pub const LAMB_TAB: ExtTab = ExtTab {
             name: "Project",
             large: &[
                 tool(START_PROJECT, "lambproject", "Start Project"),
-                tool(OPEN_PROJECT, "lambopen", "Open LAMB Project"),
-                tool(SAVE_PROJECT, "lambsave", "Save LAMB Project"),
+                tool(OPEN_PROJECT, "lambopen", "Import TS-app Project"),
+                tool(SAVE_PROJECT, "lambsave", "Export TS-app Project"),
             ],
             small: &[tool(DXF_IMPORT, "dxfimport", "Import DXF as View"), tool(NEW_SHEET, "newsheet", "New Sheet")],
         },

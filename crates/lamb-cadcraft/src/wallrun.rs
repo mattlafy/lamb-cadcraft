@@ -2,7 +2,7 @@
 //! a point on a wall in a plan or section view names that wall run — its resolved detail, its two faces, its
 //! width and its width conflict — read-only, no undo step.
 //!
-//! - `wallrun {viewId, point:{x,y}}` (View ▸ LAMB ▸ Wall Run): returns `{run, width,
+//! - `wallrun {viewId, point:{x,y}}` (LAMB ▸ Walls & Framing ▸ Wall Run): returns `{run, width,
 //!   faces:[{entityId, segmentIndex}]×2, detail:{state, detailViewId?, name?}, skipped?,
 //!   conflict?}`. `state` is `tagged|spread|gap|conflict|untyped`. Refuses a view that is not a plan
 //!   or section and a point on no run (`No wall run there`).

@@ -1,7 +1,7 @@
 //! Opening a plan's or section's assembly plan and asking where its lines came from
 //! (`docs/07-architecture/cadcraft-integration.md` §10 "Generation", LAMB T482).
 //!
-//! - `assemblyview {viewId?}` (`asv`, View ▸ LAMB ▸ Assembly View): edit inside the view's
+//! - `assemblyview {viewId?}` (`asv`, LAMB ▸ Walls & Framing ▸ Assembly View): edit inside the view's
 //!   assembly block `LAMB_ASSEMBLY_<id>` (written by ASSEMBLYPLAN, [`crate::assembly`]); the view
 //!   defaults to the edited plan or section. Not an undo step; EDITVIEW leaves it.
 //! - The block stays derived: [`crate::assembly::assembly_observer`] rewrites it after any command

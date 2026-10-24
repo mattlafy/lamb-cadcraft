@@ -5,7 +5,7 @@
 //! [`crate::detailtags::graph_and_sides`], so detail-tag resolution, ASSEMBLYPLAN, WALLCONFLICTS and
 //! WALLFIT all see it. DXF/DWG see a plain point.
 //!
-//! - `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): one tagged point, on the current
+//! - `outsidepoint {point:{x,y}}` (LAMB ▸ Details ▸ Outside Point): one tagged point, on the current
 //!   layer, in the edited plan or section view; one undo step. Returns `{"handle": <hex>}`. Interactive:
 //!   `Specify a point outside the building:`.
 

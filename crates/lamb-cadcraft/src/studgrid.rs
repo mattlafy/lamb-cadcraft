@@ -12,7 +12,7 @@
 //! repeats lay as before. MOVE moves the grid and the assembly observer re-lays every view's block
 //! in that step. DXF/DWG see a plain point.
 //!
-//! - `studgrid {point:{x,y}, pitch?}` (View ▸ LAMB ▸ Stud Grid): the project's grid origin, at a
+//! - `studgrid {point:{x,y}, pitch?}` (LAMB ▸ Walls & Framing ▸ Stud Grid): the project's grid origin, at a
 //!   point of the edited plan, pitch default 406.4 mm; erases every grid point in every view and
 //!   adds the new one, one undo step; refused in a plan with no placement. Returns
 //!   `{"handle": <hex>, "pitch": P}`. Interactive: `Specify stud grid origin or [Pitch] <406.4>:`,

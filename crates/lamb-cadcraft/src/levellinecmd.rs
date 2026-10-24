@@ -2,7 +2,7 @@
 //! then placing it — `docs/02-data-model/views-and-levels.md` "Link elevation lines" (editing a
 //! level's floor elevation means moving that line), as CUTLINE's click-click idiom.
 //!
-//! - `levelline {levelId, elevation}` (`lvl`, View ▸ LAMB ▸ Level Line): a thin wrapper over LEVEL
+//! - `levelline {levelId, elevation}` (`lvl`, LAMB ▸ Levels & Cuts ▸ Level Line): a thin wrapper over LEVEL
 //!   `{mode:"elevation"}` — its refusals and its undo step are LEVEL's, so every placed plan on the
 //!   level moves with it.
 //! - Interactive, only while editing a placed vertical view: `Select level line:` (the level whose

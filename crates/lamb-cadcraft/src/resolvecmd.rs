@@ -1,4 +1,4 @@
-//! RESOLVE (LAMB T351, TS `resolveCommand.ts`, T158): step through lamb-core's [`find_issues`]
+//! RESOLVE — LAMB ▸ Walls & Framing ▸ Review Issues — (LAMB T351, TS `resolveCommand.ts`, T158): step through lamb-core's [`find_issues`]
 //! list followed by the assembly plans' own gaps ([`wall_issues`], LAMB T393: width conflicts and
 //! junctions with no corner detail, then runs with no detail (LAMB T471), for plans that have an
 //! assembly block). Each step edits the issue's view, centres the camera on its location (block coordinates

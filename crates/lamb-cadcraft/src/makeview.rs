@@ -2,7 +2,7 @@
 //! entities — a DXF's line work, or anything drawn before a LAMB view existed — move into a LAMB
 //! plan view.
 //!
-//! - `makeview {handles: [hex], viewId?, name?}` (`mkv`, View ▸ LAMB ▸ Make View) → `{viewId,
+//! - `makeview {handles: [hex], viewId?, name?}` (`mkv`, LAMB ▸ Project ▸ Make View) → `{viewId,
 //!   moved}`. Every handle must be a model-space entity that is not a LAMB-generated insert (a view's
 //!   canonical insert, a tag bubble); anything else refuses the whole call: `Only loose model-space
 //!   entities can make a view`. `viewId` absent → a new floating plan named `name` or `View <n>`

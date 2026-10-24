@@ -1,7 +1,7 @@
 //! SHOWLINKS and QUERY (TS `commands/showlinks.ts`, `commands/query.ts`): read-only lookups. Both
 //! are `.noundo()` and only ever read through [`DrawingProject`]; neither calls `doc_mut`.
 //!
-//! - `showlinks {handle?}` (`sl`, View ▸ LAMB ▸ Show Links): every entity an edit to `handle`
+//! - `showlinks {handle?}` (`sl`, typed only, off the menu): every entity an edit to `handle`
 //!   would propagate to (lamb-core `linked_entity_component`: automatic links only), the links
 //!   among them, and the boundary links (one end inside) that were not followed. No `handle` → the
 //!   one selected entity (`handles`, as `SelectRun` passes it, is accepted too). Echoes

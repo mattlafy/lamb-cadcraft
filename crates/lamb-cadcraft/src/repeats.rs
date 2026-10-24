@@ -4,7 +4,7 @@
 //! (`RepeatTag { members }`, member ids being handles), so it travels with the dimension through
 //! CADCraft edits and DXF; DXF/DWG see a plain dimension.
 //!
-//! - `repeat {}` (View ▸ LAMB ▸ Repeat): only while editing a detail view; returns
+//! - `repeat {}` (LAMB ▸ Details ▸ Repeat): only while editing a detail view; returns
 //!   `{"repeats": [...]}`. `repeat {dimension}` returns that one or `null`.
 //!   `repeat {dimension, handles: [...]}` tags (replacing that dimension's members);
 //!   `handles: []` untags. One undo step; every refusal changes nothing.

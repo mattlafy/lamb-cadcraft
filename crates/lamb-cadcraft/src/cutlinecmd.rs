@@ -15,7 +15,7 @@
 //!   itself; the view's linework stays put, and `maintain.rs` step 2 flags any link whose crossing
 //!   broke (and clears it when restored). The preview is the picked line translated through the
 //!   cursor.
-//! - `cutline {planViewId, elevation}` / `cutline {viewId, offsetMm}` (`cl`, View ▸ LAMB ▸ Cut
+//! - `cutline {planViewId, elevation}` / `cutline {viewId, offsetMm}` (`cl`, LAMB ▸ Levels & Cuts ▸ Cut
 //!   Line): thin wrappers over VIEWPROPS `cutElevation` / `cutOffset` — their refusals and their
 //!   undo step are VIEWPROPS's.
 

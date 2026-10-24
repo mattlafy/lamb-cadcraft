@@ -5,7 +5,7 @@
 //! [`EntityData::detail_ref`] on the line itself (ruling T354.1), so it travels with the line
 //! through CADCraft edits and DXF; DXF/DWG see a plain line.
 //!
-//! - `detailref {handle, kind?}` (View ▸ LAMB ▸ Detail Reference): only while editing a detail view;
+//! - `detailref {handle, kind?}` (LAMB ▸ Details ▸ Detail Reference): only while editing a detail view;
 //!   the handle must be a straight line in its block. Clears every other line's tag in the block,
 //!   then tags this one; one undo step. `kind` defaults to `exterior_face`. Returns
 //!   `{handle: <hex>, kind}`. `detailref {}` reads the current one back (`{handle, kind}` or

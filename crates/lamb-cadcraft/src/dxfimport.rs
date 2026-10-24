@@ -2,7 +2,7 @@
 //! view** holding the file's line work, rather than geometry landed in the edited view (CADCraft's
 //! IMPORT does that).
 //!
-//! - `dxfimport {path | data: base64, fileName?, name?, unitScale?}` (View ▸ LAMB ▸ Import DXF as
+//! - `dxfimport {path | data: base64, fileName?, name?, unitScale?}` (LAMB ▸ Project ▸ Import DXF as
 //!   View): every model-space entity of the file that [`to_polyline`] accepts is copied into the new
 //!   view's block, scaled by `unitScale` about the origin, on the current layer with role `Seen`;
 //!   everything else is counted as skipped by its upper-case type name. The view and its contents are one undo step.

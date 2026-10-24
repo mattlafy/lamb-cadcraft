@@ -16,7 +16,7 @@
 //!   segments in different views (the escape hatch from the same-layer auto-link rule); `entityId`
 //!   is a hex handle string or a JSON number. Returns `{"linkId": <id>}`.
 //! - `unlink {linkId}` (`ulk`): removes that link.
-//!   Both are interactive too (View ▸ LAMB ▸ Link / Unlink): pick a line then its match in another
+//!   Both are interactive too (LAMB ▸ Links ▸ Link / Unlink): pick a line then its match in another
 //!   pane, or click a filled marker — see [`crate::linkcmds`]. Both run through `link.apply` /
 //!   `unlink.apply`, which hold the undo step.
 //! - `panelock {on?}`: camera lock for VPORTS panes (absent `on` toggles; off by default) — panning
@@ -35,71 +35,73 @@
 //! - `newoffsetsection` (`nos`) and `newoffsetelevation` (`noe`): a parallel section/elevation a
 //!   typed distance from the edited one — see [`crate::offsetviews`].
 //!
-//! - `refpane {on?, viewId?}` (View ▸ LAMB ▸ Reference Pane): the reference pane — two tiles, the
+//! - `refpane {on?, viewId?}` (LAMB ▸ Display ▸ Reference Pane): the reference pane — two tiles, the
 //!   edited view's reference in the other one, chosen for you and overridable; see [`crate::refpane`].
-//! - `underlay {viewId?}` (View ▸ LAMB ▸ Underlay): another placed view of the edited view's kind
+//! - `underlay {viewId?}` (LAMB ▸ Display ▸ Underlay): another placed view of the edited view's kind
 //!   drawn pale and snappable under it; the current one again, or none, turns it off — see
 //!   [`crate::overlays::underlay`].
-//! - `viewhole {boundary?, source?, remove?}` (`vhole`, View ▸ LAMB ▸ View Hole): a closed polyline
+//! - `viewhole {boundary?, source?, remove?}` (`vhole`, LAMB ▸ Levels & Cuts ▸ View Hole): a closed polyline
 //!   in a placed section or elevation showing a parallel placed view's line work through it — see
 //!   [`crate::holes`].
-//! - `resolve {}` (`res`, View ▸ LAMB ▸ Resolve): the project's issues; interactively, step through
+//! - `resolve {}` (`res`, LAMB ▸ Walls & Framing ▸ Review Issues): the project's issues (heights that
+//!   disagree, undetailed walls, corners and openings); interactively, step through
 //!   them, each one's view edited, centred and haloed — see [`crate::resolvecmd`].
 //!
-//! - `lambproject` (View ▸ LAMB ▸ Start Project): `Level 1` and a placed `Ground Floor` plan on
+//! - `lambproject` (LAMB ▸ Project ▸ Start Project): `Level 1` and a placed `Ground Floor` plan on
 //!   it, then edit the plan; refused ("Already a LAMB project") once the drawing has views.
 //!
-//! - `newdetail {name, cutDirection?}` (View ▸ LAMB ▸ New Detail): a floating detail view drawn in
+//! - `newdetail {name, cutDirection?}` (LAMB ▸ New View ▸ New Detail): a floating detail view drawn in
 //!   `plan` (default) or `vertical` (section), entered; interactively `Enter detail name or
 //!   [Plan/Section] <Detail N>:`. `detailtag` (`dtag`) / `detailtags`: detail tags in a plan or
 //!   section view and their resolution report — see
-//!   [`crate::detailtags`]. `dxfimport {path | data, fileName?, name?, unitScale?}` (View ▸ LAMB ▸
+//!   [`crate::detailtags`]. `dxfimport {path | data, fileName?, name?, unitScale?}` (LAMB ▸ Project ▸
 //!   Import DXF as View): a DXF/DWG file's line work as a new unplaced plan view — see
-//!   [`crate::dxfimport`]. `lambopen {path}` (View ▸ LAMB ▸ Open LAMB Project): a TS-app `.lamb`
+//!   [`crate::dxfimport`]. `lambopen {path}` (typed only, Import TS-app Project): TS-app interchange, not the save format
+//!   (LAMB's data lives in the DWG/DXF and ordinary Save/Open carry it) — a TS-app `.lamb`
 //!   project (directory or its JSON file form) opened as a new document tab — see
-//!   [`crate::lambopen`]. `lambsave {path}` (View ▸ LAMB ▸ Save LAMB Project): the open drawing
-//!   written as a `.lamb` project directory — see [`crate::lambopen`]. `outsidepoint {point:{x,y}}` (View ▸ LAMB ▸ Outside Point): a tagged
-//!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `studgrid {point:{x,y}, pitch?}` (View ▸ LAMB ▸ Stud Grid): the edited
-//!   the project's stud grid origin (pitch 406.4), at a point of the edited plan, that every view's repeats line up on; with `wall: true` (and `off?`) a point inside one plan wall's band overrules it for that run only; `studmove {point:{x,y}}` (View ▸ LAMB ▸ Move Stud) a point in one plan or section run's band that its nearest stud or joist is laid centred on — see [`crate::studgrid`]. `assemblyplan {viewId, mitre?}` (View ▸ LAMB ▸ Assembly Plan): the plan's or section's laid
+//!   [`crate::lambopen`]. `lambsave {path}` (typed only, Export TS-app Project): the open drawing
+//!   written as a `.lamb` project directory — see [`crate::lambopen`]. `outsidepoint {point:{x,y}}` (LAMB ▸ Details ▸ Outside Point): a tagged
+//!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `studgrid {point:{x,y}, pitch?}` (LAMB ▸ Walls & Framing ▸ Stud Grid): the edited
+//!   the project's stud grid origin (pitch 406.4), at a point of the edited plan, that every view's repeats line up on; with `wall: true` (and `off?`) a point inside one plan wall's band overrules it for that run only; `studmove {point:{x,y}}` (LAMB ▸ Walls & Framing ▸ Move Stud) a point in one plan or section run's band that its nearest stud or joist is laid centred on — see [`crate::studgrid`]. `assemblyplan {viewId, mitre?}` (LAMB ▸ Walls & Framing ▸ Assembly Plan): the plan's or section's laid
 //!   detail bands, then each two-arm corner's placed corner detail, written into its block
 //!   `LAMB_ASSEMBLY_<id>` (`corners` counts the placed ones), `mitre` turning the plan's mitring
 //!   of undetailed corners on or off — see [`crate::assembly`]; interactive on the edited plan or section:
 //!   `Mitre missing corner details [Yes/No]`, Enter keeping the current setting.
-//!   `assemblyview {viewId?}` (`asv`, View ▸ LAMB ▸ Assembly View) edits inside that block,
+//!   `assemblyview {viewId?}` (`asv`, LAMB ▸ Walls & Framing ▸ Assembly View) edits inside that block,
 //!   read-only (edits regenerate away), and `assemblysource {point:{x,y}, viewId?, aperture?}` names
 //!   the run or junction, detail and faces an assembly line came from — see [`crate::asmview`].
-//!   `wallconflicts {viewId}` (View ▸ LAMB ▸ Wall Conflicts): each run whose detail is thicker or
+//!   `wallconflicts {viewId}` (LAMB ▸ Walls & Framing ▸ Wall Conflicts): each run whose detail is thicker or
 //!   thinner than the drawn wall, read-only, in a plan or section; interactive, the edited view's conflicts one per line.
-//!   `wallrun {viewId, point:{x,y}}` (View ▸ LAMB ▸ Wall Run): the wall run under a point — its
+//!   `wallrun {viewId, point:{x,y}}` (LAMB ▸ Walls & Framing ▸ Wall Run): the wall run under a point — its
 //!   resolved detail, faces, width and conflict, read-only — see [`crate::wallrun`]; interactive on
 //!   the edited plan or section, each pick echoed and its faces haloed.
-//!   `wallfit {viewId, runs?, hold?}` (View ▸ LAMB ▸ Wall Fit): moves each conflicted run's faces to
+//!   `wallfit {viewId, runs?, hold?}` (LAMB ▸ Walls & Framing ▸ Wall Fit): moves each conflicted run's faces to
 //!   its detail's width, holding the reference face, the exterior, the interior or the centre — see
 //!   [`crate::wallfit`]; interactive on the edited plan: `Hold [Reference/Exterior/Interior/Centre]`,
 //!   then every conflicted run is fitted.
-//!   `detailref {handle?, kind?}` (View ▸ LAMB ▸ Detail Reference): the
+//!   `detailref {handle?, kind?}` (LAMB ▸ Details ▸ Detail Reference): the
 //!   edited detail view's reference line and its kind — see [`crate::detailref`].
-//!   `repeat {dimension?, handles?}` (View ▸ LAMB ▸ Repeat): in the edited detail view, a linear or
+//!   `repeat {dimension?, handles?}` (LAMB ▸ Details ▸ Repeat): in the edited detail view, a linear or
 //!   aligned dimension tagged as the pitch of the geometry it repeats — see [`crate::repeats`].
 //!
-//! - `viewprops {mode, viewId, …}` (View ▸ LAMB ▸ View Properties): rename a view, a placed plan's
+//! - `viewprops {mode, viewId, …}` (LAMB ▸ View Setup ▸ View Properties): rename a view, a placed plan's
 //!   cut elevation, a vertical view's intent or flip — see [`crate::viewprops`].
 //!
 //! - `accept {handles?}` (`acc`), `setrole {handles?, role}`, `layerrole {layer, role}` (View ▸
 //!   LAMB): take ownership of AI lines, an entity's role, a layer's default role — see
 //!   [`crate::entitycmds`].
-//! - `showlinks {handle?}` (`sl`, View ▸ LAMB ▸ Show Links) and `query {…}` (parameter-only):
+//! - `showlinks {handle?}` (`sl`, typed only, off the menu) and `query {…}` (parameter-only):
 //!   read-only — an edit's link blast radius, and the filter lookup; see [`crate::querycmds`].
 //! - `duplicateview {viewId?, name?}`, `placeview {viewId, kind, …}` (parameter-only),
-//!   `unplaceview {viewId?}` and `level {mode, …}` (View ▸ LAMB): a view's lifecycle and the level
+//!   `unplaceview {viewId?}` and `level {mode, …}` (LAMB ▸ View Setup, LAMB ▸ Levels & Cuts): a view's lifecycle and the level
 //!   cascade — see [`crate::viewlife`].
-//! - `cutline {planViewId, elevation}` (`cl`, View ▸ LAMB ▸ Cut Line): move a placed plan's cut
+//! - `cutline {planViewId, elevation}` (`cl`, LAMB ▸ Levels & Cuts ▸ Cut Line): move a placed plan's cut
 //!   elevation by picking its cut line in a placed section, then placing it — see
 //!   [`crate::cutlinecmd`].
-//! - `levelline {levelId, elevation}` (`lvl`, View ▸ LAMB ▸ Level Line): move a level (and every
+//! - `levelline {levelId, elevation}` (`lvl`, LAMB ▸ Levels & Cuts ▸ Level Line): move a level (and every
 //!   plan on it) by picking its level line in a placed section, then placing it — see
 //!   [`crate::levellinecmd`].
-//! - `makeview {handles, viewId?, name?}` (`mkv`, View ▸ LAMB ▸ Make View): loose model-space
+//! - `makeview {handles, viewId?, name?}` (`mkv`, LAMB ▸ Project ▸ Make View): loose model-space
 //!   entities move into a new floating plan or an existing plan view — see [`crate::makeview`].
 //!
 //! Creating commands return `{"viewId": <id>}`; each is one undo step (block, layer, insert and
@@ -754,214 +756,220 @@ pub fn scale_bar_wanted(d: &cadcraft_doc::Drawing) -> bool {
     DrawingProject::new(d).ok().is_some_and(|p| p.views().next().is_some())
 }
 
-/// View ▸ LAMB ▸ <the command's label>.
-const MENU: &[&str] = &["View", "LAMB", ""];
+/// LAMB ▸ <submenu> ▸ <the command's label>: the top-level LAMB menu, grouped by task. Item order
+/// inside a submenu is registration order in [`commands`].
+const MENU_PROJECT: &[&str] = &["LAMB", "Project", ""];
+const MENU_NEW_VIEW: &[&str] = &["LAMB", "New View", ""];
+const MENU_VIEW_SETUP: &[&str] = &["LAMB", "View Setup", ""];
+const MENU_LEVELS: &[&str] = &["LAMB", "Levels & Cuts", ""];
+const MENU_DISPLAY: &[&str] = &["LAMB", "Display", ""];
+const MENU_LINKS: &[&str] = &["LAMB", "Links", ""];
+const MENU_DETAILS: &[&str] = &["LAMB", "Details", ""];
+const MENU_WALLS: &[&str] = &["LAMB", "Walls & Framing", ""];
+const MENU_ROLES: &[&str] = &["LAMB", "Line Roles", ""];
 
 /// The LAMB commands, for `register_command_provider`.
 pub fn commands() -> Vec<CommandSpec> {
     vec![
-        CommandSpec::new("newplan", "New Plan", newplan).alias(&["npl"]).params("{name}").menu(MENU).interactive(newviews::newplan_machine),
+        CommandSpec::new("lambproject", "Start Project", lambproject).menu(MENU_PROJECT),
+        CommandSpec::new("dxfimport", "Import DXF as View", crate::dxfimport::dxfimport)
+            .params("{path | data: base64, fileName?, name?, unitScale?} → {viewId, imported, skipped: {TYPE: n}}")
+            .menu(MENU_PROJECT)
+            .interactive(crate::dxfimport::dxfimport_machine),
+        CommandSpec::new("makeview", "Make View", crate::makeview::makeview)
+            .alias(&["mkv"])
+            .params("{handles: [hex], viewId?, name?} → {viewId, moved}")
+            .menu(MENU_PROJECT)
+            .interactive(crate::makeview::makeview_machine),
+        CommandSpec::new("newplan", "New Plan", newplan).alias(&["npl"]).params("{name}").menu(MENU_NEW_VIEW).interactive(newviews::newplan_machine),
+        CommandSpec::new("newoffsetplan", "New Offset Plan", newviews::newoffsetplan)
+            .alias(&["np"])
+            .params("{mode: \"offset\"|\"height\", fromViewId, floorToFloorMm | floorElevationMm, name?, cutHeightMm?}")
+            .menu(MENU_NEW_VIEW)
+            .interactive(newviews::newoffsetplan_machine),
+        CommandSpec::new("newplanline", "Plan Here", newviews::newplanline)
+            .alias(&["npln"])
+            .params("{fromVerticalViewId, localPoint:{x,y}, name?, cutHeightMm?}")
+            .menu(MENU_NEW_VIEW)
+            .interactive(newviews::newplanline_machine),
         CommandSpec::new("newsectionline", "New Section Line", newsectionline)
             .alias(&["nsl"])
             .params("{name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}")
-            .menu(MENU)
+            .menu(MENU_NEW_VIEW)
             .interactive(newsectionline_machine),
         CommandSpec::new("newelevationline", "New Elevation Line", newelevationline)
             .alias(&["nel"])
             .params("{name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}")
-            .menu(MENU)
+            .menu(MENU_NEW_VIEW)
             .interactive(newelevationline_machine),
-        CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?, assemblyIds?}").menu(MENU).interactive(newsheet_machine),
-        CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU).interactive(editview_machine),
+        CommandSpec::new("newoffsetsection", "New Offset Section", crate::offsetviews::newoffsetsection)
+            .alias(&["nos"])
+            .params("{fromViewId, offsetMm, name?}")
+            .menu(MENU_NEW_VIEW)
+            .interactive(crate::offsetviews::newoffsetsection_machine),
+        CommandSpec::new("newoffsetelevation", "New Offset Elevation", crate::offsetviews::newoffsetelevation)
+            .alias(&["noe"])
+            .params("{fromViewId, offsetMm, name?}")
+            .menu(MENU_NEW_VIEW)
+            .interactive(crate::offsetviews::newoffsetelevation_machine),
+        CommandSpec::new("newdetail", "New Detail", newdetail).params("{name, cutDirection?}").menu(MENU_NEW_VIEW).interactive(newdetail_machine),
+        CommandSpec::new("duplicateview", "Duplicate View", crate::viewlife::duplicateview)
+            .params("{viewId?, name?}")
+            .menu(MENU_NEW_VIEW)
+            .interactive(crate::viewlife::duplicateview_machine),
+        CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?, assemblyIds?}").menu(MENU_NEW_VIEW).interactive(newsheet_machine),
+        CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU_VIEW_SETUP).interactive(editview_machine),
+        CommandSpec::new("viewprops", "View Properties", crate::viewprops::viewprops)
+            .params("{mode: rename|cutElevation|intent|flip|cutOffset, viewId, name | cutElevation | intent: section|elevation | flipped | offsetMm}")
+            .menu(MENU_VIEW_SETUP)
+            .interactive(crate::viewprops::viewprops_machine),
+        CommandSpec::new("unplaceview", "Unplace View", crate::viewlife::unplaceview)
+            .params("{viewId?}")
+            .menu(MENU_VIEW_SETUP)
+            .interactive(crate::viewlife::unplaceview_machine),
+        CommandSpec::new("level", "Level", crate::viewlife::level)
+            .params("{mode: \"create\", name, floorElevationMm, order?} | {mode: \"rename\", levelId, name} | {mode: \"elevation\", levelId, floorElevationMm}")
+            .menu(MENU_LEVELS)
+            .interactive(crate::viewlife::level_machine),
+        CommandSpec::new("levelline", "Level Line", crate::levellinecmd::levelline)
+            .alias(&["lvl"])
+            .params("{levelId, elevation}")
+            .menu(MENU_LEVELS)
+            .interactive(crate::levellinecmd::levelline_machine),
+        CommandSpec::new("cutline", "Cut Line", crate::cutlinecmd::cutline)
+            .alias(&["cl"])
+            .params("{planViewId, elevation} | {viewId, offsetMm}")
+            .menu(MENU_LEVELS)
+            .interactive(crate::cutlinecmd::cutline_machine),
+        CommandSpec::new("viewhole", "View Hole", crate::holes::viewhole)
+            .alias(&["vhole"])
+            .params("{boundary?, source?, remove?: bool} → {holes} | {boundary, source, sourceName}")
+            .menu(MENU_LEVELS)
+            .interactive(crate::holes::viewhole_machine),
+        CommandSpec::new("refpane", "Reference Pane", crate::refpane::refpane)
+            .params("{on?: bool, viewId?}")
+            .noundo()
+            .menu(MENU_DISPLAY)
+            .interactive(crate::refpane::refpane_machine),
+        CommandSpec::new("underlay", "Underlay", crate::overlays::underlay::underlay)
+            .params("{viewId?}")
+            .noundo()
+            .menu(MENU_DISPLAY)
+            .interactive(crate::overlays::underlay::underlay_machine),
+        CommandSpec::new("panelock", "Pane Lock", panelock).params("{on?: bool}").noundo().menu(MENU_DISPLAY),
+        CommandSpec::new("ucsalign", "UCS Align", ucsalign).params("{on?: bool}").key("F6").noundo().transparent().menu(MENU_DISPLAY),
+        CommandSpec::new("ghosthide", "Ghost Hide", ghosthide).params("{}").noundo().menu(MENU_DISPLAY),
+        CommandSpec::new("ghostshow", "Ghost Show", ghostshow).params("{}").noundo().menu(MENU_DISPLAY),
         // The typed/menu forms are outside undo; each link or unlink they make is its own step,
         // recorded by the `.apply` spec they run through (see `crate::linkcmds`).
         CommandSpec::new("link", "Link", link_json)
             .alias(&["lk"])
             .params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}")
             .noundo()
-            .menu(MENU)
+            .menu(MENU_LINKS)
             .interactive(crate::linkcmds::link_machine),
         CommandSpec::new("unlink", "Unlink", unlink_json)
             .alias(&["ulk"])
             .params("{linkId}")
             .noundo()
-            .menu(MENU)
+            .menu(MENU_LINKS)
             .interactive(crate::linkcmds::unlink_machine),
-        CommandSpec::new("link.apply", "Link", link).params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}"),
-        CommandSpec::new("unlink.apply", "Unlink", unlink).params("{linkId}"),
-        CommandSpec::new("panelock", "Pane Lock", panelock).params("{on?: bool}").noundo().menu(MENU),
-        CommandSpec::new("ghosthide", "Ghost Hide", ghosthide).params("{}").noundo().menu(MENU),
-        CommandSpec::new("ghostshow", "Ghost Show", ghostshow).params("{}").noundo().menu(MENU),
-        CommandSpec::new("ucsalign", "UCS Align", ucsalign).params("{on?: bool}").key("F6").noundo().transparent().menu(MENU),
-        CommandSpec::new("lambproject", "Start Project", lambproject).menu(MENU),
-        CommandSpec::new("refpane", "Reference Pane", crate::refpane::refpane)
-            .params("{on?: bool, viewId?}")
-            .noundo()
-            .menu(MENU)
-            .interactive(crate::refpane::refpane_machine),
-        CommandSpec::new("underlay", "Underlay", crate::overlays::underlay::underlay)
-            .params("{viewId?}")
-            .noundo()
-            .menu(MENU)
-            .interactive(crate::overlays::underlay::underlay_machine),
-        CommandSpec::new("viewhole", "View Hole", crate::holes::viewhole)
-            .alias(&["vhole"])
-            .params("{boundary?, source?, remove?: bool} → {holes} | {boundary, source, sourceName}")
-            .menu(MENU)
-            .interactive(crate::holes::viewhole_machine),
-        CommandSpec::new("resolve", "Resolve", crate::resolvecmd::resolve)
-            .alias(&["res"])
-            .params("{}")
-            .noundo()
-            .menu(MENU)
-            .interactive(crate::resolvecmd::resolve_machine),
-        CommandSpec::new("newoffsetplan", "New Offset Plan", newviews::newoffsetplan)
-            .alias(&["np"])
-            .params("{mode: \"offset\"|\"height\", fromViewId, floorToFloorMm | floorElevationMm, name?, cutHeightMm?}")
-            .menu(MENU)
-            .interactive(newviews::newoffsetplan_machine),
-        CommandSpec::new("newoffsetsection", "New Offset Section", crate::offsetviews::newoffsetsection)
-            .alias(&["nos"])
-            .params("{fromViewId, offsetMm, name?}")
-            .menu(MENU)
-            .interactive(crate::offsetviews::newoffsetsection_machine),
-        CommandSpec::new("newoffsetelevation", "New Offset Elevation", crate::offsetviews::newoffsetelevation)
-            .alias(&["noe"])
-            .params("{fromViewId, offsetMm, name?}")
-            .menu(MENU)
-            .interactive(crate::offsetviews::newoffsetelevation_machine),
-        CommandSpec::new("newplanline", "Plan Here", newviews::newplanline)
-            .alias(&["npln"])
-            .params("{fromVerticalViewId, localPoint:{x,y}, name?, cutHeightMm?}")
-            .menu(MENU)
-            .interactive(newviews::newplanline_machine),
-        CommandSpec::new("viewprops", "View Properties", crate::viewprops::viewprops)
-            .params("{mode: rename|cutElevation|intent|flip|cutOffset, viewId, name | cutElevation | intent: section|elevation | flipped | offsetMm}")
-            .menu(MENU)
-            .interactive(crate::viewprops::viewprops_machine),
-        CommandSpec::new("newdetail", "New Detail", newdetail).params("{name, cutDirection?}").menu(MENU).interactive(newdetail_machine),
         CommandSpec::new("detailtag", "Detail Tag", crate::detailtags::detailtag)
             .alias(&["dtag"])
             .params("{detailViewId, corner?: bool, tip:{x,y}, bubble:{x,y}}")
-            .menu(MENU)
+            .menu(MENU_DETAILS)
             .interactive(crate::detailtags::detailtag_machine),
-        CommandSpec::new("dxfimport", "Import DXF as View", crate::dxfimport::dxfimport)
-            .params("{path | data: base64, fileName?, name?, unitScale?} → {viewId, imported, skipped: {TYPE: n}}")
-            .menu(MENU)
-            .interactive(crate::dxfimport::dxfimport_machine),
-        CommandSpec::new("lambopen", "Open LAMB Project", crate::lambopen::lambopen)
-            .params("{path} → {views, entities, skipped: {kind: n}, droppedLinks, unknownLayers, document}")
-            .noundo()
-            .menu(MENU)
-            .interactive(crate::lambopen::lambopen_machine),
-        CommandSpec::new("lambsave", "Save LAMB Project", crate::lambopen::lambsave)
-            .params("{path} → {views, entities, skipped: {kind: n}, droppedTags, unknownPatterns, path}")
-            .noundo()
-            .menu(MENU)
-            .interactive(crate::lambopen::lambsave_machine),
+        CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU_DETAILS),
+        CommandSpec::new("detailref", "Detail Reference", crate::detailref::detailref)
+            .params("{handle?, kind?: exterior_face|interior_face|structural_centre|grid}")
+            .menu(MENU_DETAILS)
+            .interactive(crate::detailref::detailref_machine),
+        CommandSpec::new("repeat", "Repeat", crate::repeats::repeat).params("{dimension?, handles?: [handle], copies?: [handle]}").menu(MENU_DETAILS),
         CommandSpec::new("outsidepoint", "Outside Point", crate::outside::outsidepoint)
             .params("{point:{x,y}}")
-            .menu(MENU)
+            .menu(MENU_DETAILS)
             .interactive(crate::outside::outsidepoint_machine),
-        CommandSpec::new("studgrid", "Stud Grid", crate::studgrid::studgrid)
-            .params("{point:{x,y}, pitch?: mm} → {handle, pitch}")
-            .menu(MENU)
-            .interactive(crate::studgrid::studgrid_machine),
-        CommandSpec::new("studmove", "Move Stud", crate::studgrid::studmove)
-            .alias(&["smv"])
-            .params("{point:{x,y}} → {handle}")
-            .menu(MENU)
-            .interactive(crate::studgrid::studmove_machine),
-        CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU),
         CommandSpec::new("assemblyplan", "Assembly Plan", crate::assembly::assemblyplan)
             .params("{viewId, mitre?: bool}")
-            .menu(MENU)
+            .menu(MENU_WALLS)
             .interactive(crate::assembly::assemblyplan_machine),
         CommandSpec::new("assemblyview", "Assembly View", crate::asmview::assemblyview)
             .alias(&["asv"])
             .params("{viewId?} → {block}")
             .noundo()
-            .menu(MENU)
+            .menu(MENU_WALLS)
             .interactive(crate::asmview::assemblyview_machine),
-        CommandSpec::new("assemblysource", "Assembly Source", crate::asmview::assemblysource)
-            .params("{point:{x,y}, viewId?, aperture?: mm} → {view, run, junction, detail, kind, layer, sources} | null")
-            .noundo(),
-        CommandSpec::new("wallconflicts", "Wall Conflicts", crate::assembly::wallconflicts)
-            .params("{viewId}")
-            .noundo()
-            .menu(MENU)
-            .interactive(crate::assembly::wallconflicts_machine),
         CommandSpec::new("wallrun", "Wall Run", crate::wallrun::wallrun)
             .params("{viewId, point}")
             .noundo()
-            .menu(MENU)
+            .menu(MENU_WALLS)
             .interactive(crate::wallrun::wallrun_machine),
         CommandSpec::new("wallfit", "Wall Fit", crate::wallfit::wallfit)
             .params("{viewId, runs?: [index], hold?: reference|exterior|interior|centre}")
-            .menu(MENU)
+            .menu(MENU_WALLS)
             .interactive(crate::wallfit::wallfit_machine),
-        CommandSpec::new("detailref", "Detail Reference", crate::detailref::detailref)
-            .params("{handle?, kind?: exterior_face|interior_face|structural_centre|grid}")
-            .menu(MENU)
-            .interactive(crate::detailref::detailref_machine),
-        CommandSpec::new("repeat", "Repeat", crate::repeats::repeat).params("{dimension?, handles?: [handle], copies?: [handle]}").menu(MENU),
+        CommandSpec::new("wallconflicts", "Wall Conflicts", crate::assembly::wallconflicts)
+            .params("{viewId}")
+            .noundo()
+            .menu(MENU_WALLS)
+            .interactive(crate::assembly::wallconflicts_machine),
+        CommandSpec::new("studgrid", "Stud Grid", crate::studgrid::studgrid)
+            .params("{point:{x,y}, pitch?: mm} → {handle, pitch}")
+            .menu(MENU_WALLS)
+            .interactive(crate::studgrid::studgrid_machine),
+        CommandSpec::new("studmove", "Move Stud", crate::studgrid::studmove)
+            .alias(&["smv"])
+            .params("{point:{x,y}} → {handle}")
+            .menu(MENU_WALLS)
+            .interactive(crate::studgrid::studmove_machine),
+        CommandSpec::new("resolve", "Review Issues", crate::resolvecmd::resolve)
+            .alias(&["res"])
+            .params("{}")
+            .noundo()
+            .menu(MENU_WALLS)
+            .interactive(crate::resolvecmd::resolve_machine),
+        CommandSpec::new("setrole", "Set Role", crate::entitycmds::setrole)
+            .params("{handles?, role: cut|seen|datum|view_clip|annotation|reference|bylayer}")
+            .menu(MENU_ROLES)
+            .interactive(crate::entitycmds::setrole_machine),
+        CommandSpec::new("layerrole", "Layer Default Role", crate::entitycmds::layerrole)
+            .params("{layer, role: cut|seen|datum|view_clip|annotation|reference}")
+            .menu(MENU_ROLES)
+            .interactive(crate::entitycmds::layerrole_machine),
+        CommandSpec::new("accept", "Accept AI Line", crate::entitycmds::accept)
+            .alias(&["acc"])
+            .params("{handles?}")
+            .menu(MENU_ROLES)
+            .interactive(crate::entitycmds::accept_machine),
+        CommandSpec::new("link.apply", "Link", link).params("{a:{entityId, segmentIndex, segmentParam}, b:{…}}"),
+        CommandSpec::new("unlink.apply", "Unlink", unlink).params("{linkId}"),
+        CommandSpec::new("lambopen", "Import TS-app Project", crate::lambopen::lambopen)
+            .params("{path} → {views, entities, skipped: {kind: n}, droppedLinks, unknownLayers, document}")
+            .noundo()
+            .interactive(crate::lambopen::lambopen_machine),
+        CommandSpec::new("lambsave", "Export TS-app Project", crate::lambopen::lambsave)
+            .params("{path} → {views, entities, skipped: {kind: n}, droppedTags, unknownPatterns, path}")
+            .noundo()
+            .interactive(crate::lambopen::lambsave_machine),
+        CommandSpec::new("assemblysource", "Assembly Source", crate::asmview::assemblysource)
+            .params("{point:{x,y}, viewId?, aperture?: mm} → {view, run, junction, detail, kind, layer, sources} | null")
+            .noundo(),
         CommandSpec::new(crate::assistant::ID, "Apply Assistant Script", crate::assistant::apply).params("{steps:[{command, params}], proposalId?}"),
         CommandSpec::new(crate::assistant::PROMPT_ID, "Assistant Prompt", crate::assistant::prompt_cmd).params("{message}").noundo(),
         CommandSpec::new(crate::assistant::START_ID, "Assistant Start", crate::assistant::start_cmd).params("{message, dryRun?}").noundo(),
         CommandSpec::new(crate::assistant::RESUME_ID, "Assistant Resume", crate::assistant::resume_cmd).params("{turn, reply}").noundo(),
         CommandSpec::new(crate::assistant::GHOST_ID, "Assistant Ghost", crate::assistant::ghost_cmd).params("{steps?}").noundo(),
-        CommandSpec::new("accept", "Accept AI Line", crate::entitycmds::accept)
-            .alias(&["acc"])
-            .params("{handles?}")
-            .menu(MENU)
-            .interactive(crate::entitycmds::accept_machine),
-        CommandSpec::new("setrole", "Set Role", crate::entitycmds::setrole)
-            .params("{handles?, role: cut|seen|datum|view_clip|annotation|reference|bylayer}")
-            .menu(MENU)
-            .interactive(crate::entitycmds::setrole_machine),
-        CommandSpec::new("layerrole", "Layer Default Role", crate::entitycmds::layerrole)
-            .params("{layer, role: cut|seen|datum|view_clip|annotation|reference}")
-            .menu(MENU)
-            .interactive(crate::entitycmds::layerrole_machine),
         CommandSpec::new("showlinks", "Show Links", crate::querycmds::showlinks)
             .alias(&["sl"])
             .params("{handle?}")
             .noundo()
-            .menu(MENU)
             .interactive(crate::querycmds::showlinks_machine),
         CommandSpec::new("query", "Query", crate::querycmds::query)
             .params("{viewId?, layerName?, role?, kind?, closed?, near?: {entityIds?, layerName?, minMm?, maxMm?}, include?: \"geometry\", limit?}")
             .noundo(),
-        CommandSpec::new("duplicateview", "Duplicate View", crate::viewlife::duplicateview)
-            .params("{viewId?, name?}")
-            .menu(MENU)
-            .interactive(crate::viewlife::duplicateview_machine),
         CommandSpec::new("placeview", "Place View", crate::viewlife::placeview).params(
             "{viewId, kind: \"plan\", levelId, cutElevation, transform} | {viewId, kind: \"vertical\", cutLine, hostViewId, transform, intent?}",
         ),
-        CommandSpec::new("unplaceview", "Unplace View", crate::viewlife::unplaceview)
-            .params("{viewId?}")
-            .menu(MENU)
-            .interactive(crate::viewlife::unplaceview_machine),
-        CommandSpec::new("level", "Level", crate::viewlife::level)
-            .params("{mode: \"create\", name, floorElevationMm, order?} | {mode: \"rename\", levelId, name} | {mode: \"elevation\", levelId, floorElevationMm}")
-            .menu(MENU)
-            .interactive(crate::viewlife::level_machine),
-        CommandSpec::new("cutline", "Cut Line", crate::cutlinecmd::cutline)
-            .alias(&["cl"])
-            .params("{planViewId, elevation} | {viewId, offsetMm}")
-            .menu(MENU)
-            .interactive(crate::cutlinecmd::cutline_machine),
-        CommandSpec::new("levelline", "Level Line", crate::levellinecmd::levelline)
-            .alias(&["lvl"])
-            .params("{levelId, elevation}")
-            .menu(MENU)
-            .interactive(crate::levellinecmd::levelline_machine),
-        CommandSpec::new("makeview", "Make View", crate::makeview::makeview)
-            .alias(&["mkv"])
-            .params("{handles: [hex], viewId?, name?} → {viewId, moved}")
-            .menu(MENU)
-            .interactive(crate::makeview::makeview_machine),
     ]
 }
 
@@ -1001,44 +1009,59 @@ mod tests {
     }
 
     #[test]
-    fn every_spec_has_a_menu_path_and_a_factory() -> R {
+    fn the_lamb_menu_groups_every_command_by_task() -> R {
         install_app()?;
-        let ids = [
-            "newplan",
-            "newsectionline",
-            "newelevationline",
-            "newsheet",
-            "editview",
-            "newoffsetplan",
-            "newplanline",
-            "newoffsetsection",
-            "newoffsetelevation",
-            "link",
-            "unlink",
-            "viewprops",
-            "newdetail",
-            "detailtag",
-            "outsidepoint",
-            "studgrid",
-            "studmove",
-            "wallrun",
-            "dxfimport",
-            "lambopen",
-            "lambsave",
-            "detailref",
-            "accept",
-            "setrole",
-            "layerrole",
-            "cutline",
-            "levelline",
-            "makeview",
-            "viewhole",
+        let groups: [(&str, &[&str]); 9] = [
+            ("Project", &["lambproject", "dxfimport", "makeview"]),
+            (
+                "New View",
+                &[
+                    "newplan",
+                    "newoffsetplan",
+                    "newplanline",
+                    "newsectionline",
+                    "newelevationline",
+                    "newoffsetsection",
+                    "newoffsetelevation",
+                    "newdetail",
+                    "duplicateview",
+                    "newsheet",
+                ],
+            ),
+            ("View Setup", &["editview", "viewprops", "unplaceview"]),
+            ("Levels & Cuts", &["level", "levelline", "cutline", "viewhole"]),
+            ("Display", &["refpane", "underlay", "panelock", "ucsalign", "ghosthide", "ghostshow"]),
+            ("Links", &["link", "unlink"]),
+            ("Details", &["detailtag", "detailtags", "detailref", "repeat", "outsidepoint"]),
+            ("Walls & Framing", &["assemblyplan", "assemblyview", "wallrun", "wallfit", "wallconflicts", "studgrid", "studmove", "resolve"]),
+            ("Line Roles", &["setrole", "layerrole", "accept"]),
         ];
-        for id in ids {
+        let ours: Vec<&str> = commands().iter().map(|c| c.id).collect();
+        let specs: Vec<_> = command_specs().iter().filter(|c| ours.contains(&c.id)).collect();
+        for (sub, ids) in groups {
+            let got: Vec<&str> = specs.iter().filter(|c| c.menu.first() == Some(&"LAMB") && c.menu.get(1) == Some(&sub)).map(|c| c.id).collect();
+            assert_eq!(got, ids, "{sub}");
+            for c in specs.iter().filter(|c| ids.contains(&c.id)) {
+                assert_eq!(c.menu, ["LAMB", sub, ""], "{}", c.id);
+            }
+        }
+        let menued = specs.iter().filter(|c| !c.menu.is_empty()).count();
+        assert_eq!(menued, groups.iter().map(|(_, ids)| ids.len()).sum::<usize>(), "every menu item is in a listed submenu");
+        assert!(specs.iter().all(|c| c.menu.first() != Some(&"View")), "View ▸ LAMB is gone");
+        for id in ["showlinks", "lambopen", "lambsave"] {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
-            assert_eq!(c.menu, MENU, "{id}");
+            assert!(c.menu.is_empty(), "{id} is typed only");
             assert!(c.interactive.is_some(), "{id}");
         }
+        // One-shot commands with no prompts; everything else on the menu prompts.
+        let one_shot = ["lambproject", "panelock", "ucsalign", "ghosthide", "ghostshow", "detailtags", "repeat"];
+        for (sub, ids) in groups {
+            for id in ids.iter().filter(|id| !one_shot.contains(id)) {
+                let c = command_specs().iter().find(|c| c.id == *id).ok_or(*id)?;
+                assert!(c.interactive.is_some(), "{sub} ▸ {id} has an interactive form");
+            }
+        }
+        assert_eq!(command_specs().iter().find(|c| c.id == "resolve").map(|c| c.label), Some("Review Issues"));
         Ok(())
     }
 

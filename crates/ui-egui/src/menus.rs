@@ -503,12 +503,27 @@ pub enum Entry {
     Sub { label: String, children: Vec<Entry> },
 }
 
+/// Adds top-level menu `top` when it isn't there yet: a top not in [`MENUS`] goes in once, in
+/// first-seen order, immediately before `Window` (at the end when there is no `Window`).
+fn ensure_top(out: &mut Vec<(String, Vec<Entry>)>, top: &str) {
+    if !out.iter().any(|(m, _)| m == top) {
+        let i = out.iter().position(|(m, _)| m == "Window").unwrap_or(out.len());
+        out.insert(i, (top.to_string(), Vec::new()));
+    }
+}
+
+/// The entries of top-level menu `top`, added first per [`ensure_top`].
+fn top_entries<'a>(out: &'a mut Vec<(String, Vec<Entry>)>, top: &str) -> Option<&'a mut Vec<Entry>> {
+    ensure_top(out, top);
+    out.iter_mut().find(|(m, _)| m == top).map(|(_, e)| e)
+}
+
 /// The full menu tree from the command registry plus UI commands, in registration order.
 pub fn tree(app: &CadApp) -> Vec<(String, Vec<Entry>)> {
     let mut out: Vec<(String, Vec<Entry>)> = MENUS.iter().map(|m| (m.to_string(), Vec::new())).collect();
     let mut add = |path: &[&str], label: &str, id: &str, shortcut: Option<&str>, enabled: bool| {
         let Some((top, rest)) = path.split_first() else { return };
-        let Some((_, entries)) = out.iter_mut().find(|(m, _)| m == top) else { return };
+        let Some(entries) = top_entries(&mut out, top) else { return };
         let mut cur = entries;
         let n = rest.len();
         for (i, seg) in rest.iter().enumerate() {
@@ -849,6 +864,36 @@ mod tests {
         app.start("exportpdf");
         assert_eq!(asked.borrow().len(), 1);
         assert!(app.session.running.is_none());
+    }
+}
+
+#[cfg(test)]
+mod top_entries_tests {
+    use super::{Entry, MENUS, top_entries};
+
+    fn item(label: &str) -> Entry {
+        Entry::Item { label: label.into(), id: label.into(), shortcut: None, enabled: true }
+    }
+
+    #[test]
+    fn a_new_top_goes_once_right_before_window_and_existing_tops_stay() {
+        let mut out: Vec<(String, Vec<Entry>)> = MENUS.iter().map(|m| (m.to_string(), Vec::new())).collect();
+        top_entries(&mut out, "LAMB").unwrap().push(Entry::Sub { label: "Links".into(), children: vec![item("Link")] });
+        top_entries(&mut out, "Other").unwrap().push(item("x"));
+        top_entries(&mut out, "LAMB").unwrap().push(item("y"));
+        top_entries(&mut out, "View").unwrap().push(item("z"));
+        let names: Vec<&str> = out.iter().map(|(m, _)| m.as_str()).collect();
+        let mut want: Vec<&str> = MENUS.to_vec();
+        let w = want.iter().position(|m| *m == "Window").unwrap_or(want.len());
+        want.splice(w..w, ["LAMB", "Other"]);
+        assert_eq!(names, want);
+        let lamb = &out.iter().find(|(m, _)| m == "LAMB").map(|(_, e)| e).cloned().unwrap_or_default();
+        assert_eq!(lamb.len(), 2);
+        assert!(
+            matches!(&lamb[0], Entry::Sub { label, children } if label == "Links" && matches!(&children[..], [Entry::Item { label, .. }] if label == "Link"))
+        );
+        let view = out.iter().find(|(m, _)| m == "View").map(|(_, e)| e.len());
+        assert_eq!(view, Some(1));
     }
 }
 

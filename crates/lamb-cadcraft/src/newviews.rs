@@ -3,7 +3,7 @@
 //! `command-engine/src/commands/views.ts`):
 //!
 //! - `newoffsetplan {mode:"offset"|"height", fromViewId, floorToFloorMm | floorElevationMm, name?,
-//!   cutHeightMm?}` (`np`, View ▸ LAMB ▸ New Offset Plan): a new level and a placed plan on it, a
+//!   cutHeightMm?}` (`np`, LAMB ▸ New View ▸ New Offset Plan): a new level and a placed plan on it, a
 //!   floor-to-floor distance above the from-plan's level or at an absolute floor elevation, with
 //!   the from-plan's transform; then edit the new plan. In `height` mode `fromViewId` may be
 //!   omitted: identity transform, level order one past the highest.

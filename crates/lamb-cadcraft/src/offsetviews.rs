@@ -1,4 +1,4 @@
-//! NEWOFFSETSECTION (`nos`) and NEWOFFSETELEVATION (`noe`), View ▸ LAMB: a new section or
+//! NEWOFFSETSECTION (`nos`) and NEWOFFSETELEVATION (`noe`), LAMB ▸ New View: a new section or
 //! elevation parallel to the edited one, a typed distance away — a series of parallel cuts through
 //! a repeating condition (`docs/01-core-concept/view-creation-and-placement.md` §2, §6).
 //!
