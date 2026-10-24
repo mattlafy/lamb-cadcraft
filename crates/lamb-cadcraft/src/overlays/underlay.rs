@@ -194,6 +194,12 @@ pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     out
 }
 
+/// The bounds of the underlay's mapped linework in `space` (EMPTY without one): ZOOM Extents
+/// fits it with the edited view's own entities.
+pub(super) fn extents(d: &Drawing, space: &Space) -> Bounds2 {
+    draw(d, space, &Options::default()).bounds
+}
+
 /// Resets [`NESTED`] when dropped.
 struct NestedGuard;
 
@@ -323,6 +329,36 @@ pub(crate) mod tests {
         assert!(mid.iter().any(|h| near(h.point, Vec2::new(10000.0, 5500.0))), "{mid:?}");
         s.execute("underlay", &json!({}))?;
         assert!(lamb_snaps(s.doc()?, &block(a), cursor, 10.0).is_empty(), "no viewId turns it off");
+        Ok(())
+    }
+
+    /// The zoomed view's visible box (untwisted), as (min, max).
+    fn visible(s: &Session) -> std::result::Result<(Vec2, Vec2), E> {
+        let v = s.state()?.view();
+        let (w, h) = s.viewport_px;
+        let half = Vec2::new(v.height * w / h / 2.0, v.height / 2.0);
+        Ok((v.center - half, v.center + half))
+    }
+
+    fn inside(b: (Vec2, Vec2), p: Vec2) -> bool {
+        p.x >= b.0.x && p.x <= b.1.x && p.y >= b.0.y && p.y <= b.1.y
+    }
+
+    #[test]
+    fn zoom_extents_fits_the_visible_underlay_and_ignores_it_when_off() -> R {
+        let _g = lock();
+        let (mut s, _a, b) = plans()?;
+        s.execute("underlay", &json!({ "viewId": b.0 }))?;
+        s.execute("zoom.extents", &json!({}))?;
+        let box_on = visible(&s)?;
+        for p in [Vec2::new(-3000.0, -3000.0), Vec2::new(-2000.0, -3000.0), Vec2::new(10000.0, 5000.0), Vec2::new(10000.0, 6000.0)] {
+            assert!(inside(box_on, p), "{p:?} outside {box_on:?}");
+        }
+        s.execute("underlay", &json!({}))?;
+        s.execute("zoom.extents", &json!({}))?;
+        let box_off = visible(&s)?;
+        assert!(inside(box_off, Vec2::new(-3000.0, -3000.0)) && inside(box_off, Vec2::new(-2000.0, -3000.0)));
+        assert!(!inside(box_off, Vec2::new(10000.0, 5000.0)), "underlay off: only A's own line ({box_off:?})");
         Ok(())
     }
 

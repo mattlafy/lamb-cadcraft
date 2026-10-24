@@ -18,6 +18,7 @@ pub mod blockedit;
 pub mod capped_read;
 pub mod cmd;
 pub mod doc_path;
+pub mod extents_ext;
 mod finite;
 pub mod grip_dims;
 pub mod grips;
@@ -2018,7 +2019,8 @@ impl Session {
 
     pub fn zoom_extents(&mut self) -> Result<()> {
         let space = self.space();
-        let ext = self.doc()?.extents(&space);
+        let d = self.doc()?;
+        let ext = extents_ext::with_sources(d, &space, d.extents(&space));
         let (w, h) = self.viewport_px;
         let ext = if ext.is_empty() { self.zoom_limits()? } else { ext };
         let st = self.state_mut()?;
