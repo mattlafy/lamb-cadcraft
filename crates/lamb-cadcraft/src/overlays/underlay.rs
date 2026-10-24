@@ -5,12 +5,13 @@
 //! [`find_underlay_candidates`] and [`map_view_local_point`] — an affine map for both supported
 //! pairings (plan↔plan, parallel vertical↔vertical), so mapping display-list vertices is exact.
 //!
-//! Session UI state, never saved (ruling T350.1): each edited view's underlay ([`CHOSEN`], block
-//! name → block name). A choice that is no longer a candidate reads as off. UNDERLAY changes no
+//! Session UI state, never saved (ruling T350.1): each edited view's underlays ([`CHOSEN`], block
+//! name → set of block names; LAMB T522: any number at once). A choice that is no longer a
+//! candidate reads as off. UNDERLAY changes no
 //! drawing revision, so it bumps [`cadcraft_render::bump_overlays`] for the canvas's overlay cache.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use cadcraft_color::Rgb;
@@ -36,8 +37,8 @@ const UNDERLAY_TRANSPARENCY: u8 = 65;
 /// What TS `collectSnapPoints` offers from the underlay.
 const UNDERLAY_SNAPS: u32 = mode::END | mode::MID | mode::CEN | mode::INT | mode::NOD;
 
-/// Edited view's block name -> its underlay's block name.
-static CHOSEN: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+/// Edited view's block name -> its underlays' block names.
+static CHOSEN: Mutex<BTreeMap<String, BTreeSet<String>>> = Mutex::new(BTreeMap::new());
 
 thread_local! {
     /// Set while [`snaps`] runs CADCraft's `osnap` in the underlay's space: that call asks the snap
@@ -45,7 +46,7 @@ thread_local! {
     static NESTED: Cell<bool> = const { Cell::new(false) };
 }
 
-fn chosen() -> std::sync::MutexGuard<'static, BTreeMap<String, String>> {
+fn chosen() -> std::sync::MutexGuard<'static, BTreeMap<String, BTreeSet<String>>> {
     CHOSEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -59,10 +60,11 @@ pub(crate) fn candidates(d: &Drawing, edit: Id) -> Vec<UnderlayCandidate> {
     DrawingProject::new(d).ok().and_then(|dp| find_underlay_candidates(&dp, edit).ok()).unwrap_or_default()
 }
 
-/// `edit`'s underlay: the remembered choice while it is still a candidate.
-pub(crate) fn current(d: &Drawing, edit: Id) -> Option<Id> {
-    let u = chosen().get(&view_block_name(edit)).and_then(|n| view_id(&Space::Block(n.clone())))?;
-    candidates(d, edit).iter().any(|c| c.view_id == u).then_some(u)
+/// `edit`'s underlays: the remembered choices still among its candidates, in candidate order.
+pub(crate) fn current(d: &Drawing, edit: Id) -> Vec<Id> {
+    let Some(set) = chosen().get(&view_block_name(edit)).cloned() else { return Vec::new() };
+    let on: BTreeSet<Id> = set.iter().filter_map(|n| view_id(&Space::Block(n.clone()))).collect();
+    candidates(d, edit).into_iter().map(|c| c.view_id).filter(|id| on.contains(id)).collect()
 }
 
 fn view_name(d: &Drawing, id: Id) -> String {
@@ -77,24 +79,39 @@ fn map(dp: &DrawingProject<'_>, from: Id, to: Id, p: Vec2) -> Option<Vec2> {
     q.is_finite().then_some(q)
 }
 
-fn set(d: &Drawing, edit: Id, to: Option<Id>) -> Value {
-    match to {
+/// Toggle `toggle` in or out of `edit`'s underlays, or clear them all (`None`). Choices no longer
+/// among the candidates are forgotten. Returns `{viewIds, message}` for the resulting set.
+fn set(d: &Drawing, edit: Id, toggle: Option<Id>) -> Value {
+    let mut next: BTreeSet<Id> = current(d, edit).into_iter().collect();
+    match toggle {
         Some(u) => {
-            chosen().insert(view_block_name(edit), view_block_name(u));
+            if !next.remove(&u) {
+                next.insert(u);
+            }
         }
-        None => {
-            chosen().remove(&view_block_name(edit));
+        None => next.clear(),
+    }
+    {
+        let mut map = chosen();
+        let key = view_block_name(edit);
+        if next.is_empty() {
+            map.remove(&key);
+        } else {
+            map.insert(key, next.iter().map(|u| view_block_name(*u)).collect());
         }
     }
     cadcraft_render::bump_overlays();
-    match to {
-        Some(u) => json!({ "viewId": u.0, "message": format!("<Underlay: {}>", view_name(d, u)) }),
-        None => json!({ "viewId": null, "message": "<Underlay off>" }),
-    }
+    let on = current(d, edit);
+    let message = if on.is_empty() {
+        "<Underlay off>".to_owned()
+    } else {
+        format!("<Underlay: {}>", on.iter().map(|u| view_name(d, *u)).collect::<Vec<_>>().join(", "))
+    };
+    json!({ "viewIds": on.iter().map(|u| u.0).collect::<Vec<_>>(), "message": message })
 }
 
-/// UNDERLAY `{viewId?}`: an underlay candidate of the edited view becomes its underlay; the current
-/// one again, or no `viewId`, turns it off. Returns `{viewId, message}`; not an undo step.
+/// UNDERLAY `{viewId?}`: toggles an underlay candidate of the edited view in or out of its
+/// underlays; no `viewId` (or `null`) clears them. Returns `{viewIds, message}`; not an undo step.
 pub(crate) fn underlay(s: &mut Session, p: &Value) -> Result<Value> {
     let edit = edited_view(s).ok_or_else(|| other("Edit a plan or section first (EDITVIEW)."))?;
     let d = s.doc()?;
@@ -103,12 +120,11 @@ pub(crate) fn underlay(s: &mut Session, p: &Value) -> Result<Value> {
     if !candidates(d, edit).iter().any(|c| c.view_id == id) {
         return Err(other(format!("Not an underlay view for {}", view_name(d, edit))));
     }
-    let to = (current(d, edit) != Some(id)).then_some(id);
-    Ok(set(d, edit, to))
+    Ok(set(d, edit, Some(id)))
 }
 
-/// UNDERLAY: `Enter underlay view name or [Off/?]:` — a candidate's name or id sets it, `Off`
-/// clears it, `?` lists the candidates, Enter leaves it as it is.
+/// UNDERLAY: `Enter underlay view name or [Off/?]:` — a candidate's name or id toggles it, `Off`
+/// clears them all, `?` lists the candidates, Enter leaves it as it is.
 struct UnderlayMachine;
 
 impl Interactive for UnderlayMachine {
@@ -163,26 +179,35 @@ pub(crate) fn underlay_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::new(UnderlayMachine))
 }
 
-/// The edited view and its underlay, for `space`.
-fn pair<'a>(d: &'a Drawing, space: &Space) -> Option<(DrawingProject<'a>, Id, Id)> {
+/// The edited view and its underlays, for `space` (`None` without any).
+fn pairs<'a>(d: &'a Drawing, space: &Space) -> Option<(DrawingProject<'a>, Id, Vec<Id>)> {
     let (dp, edit) = view_of(d, space)?;
-    let u = current(d, edit)?;
-    Some((dp, edit, u))
+    let us = current(d, edit);
+    (!us.is_empty()).then_some((dp, edit, us))
 }
 
-/// The underlay's linework for `space`, mapped into the edited view's local coordinates, pale.
-/// Infinite lines and wipeout masks are left out. Empty without an underlay.
+/// Every underlay's linework for `space`, mapped into the edited view's local coordinates, pale,
+/// one pass per underlay in candidate order. Infinite lines and wipeout masks are left out. Empty
+/// without an underlay.
 pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let mut out = DisplayList { bounds: Bounds2::EMPTY, ..DisplayList::default() };
-    let Some((dp, edit, u)) = pair(d, space) else { return out };
-    let Some(block) = d.block(&view_block_name(u)) else { return out };
+    let Some((dp, edit, us)) = pairs(d, space) else { return out };
     let opts = Options { view: None, ..opts.clone() };
-    let src = cadcraft_render::build_entities(d, block.entities.iter().map(|e| &**e), &opts);
+    for u in us {
+        draw_one(d, &dp, edit, u, &opts, &mut out);
+    }
+    out
+}
+
+/// Append underlay `u`'s mapped, pale linework to `out`.
+fn draw_one(d: &Drawing, dp: &DrawingProject<'_>, edit: Id, u: Id, opts: &Options, out: &mut DisplayList) {
+    let Some(block) = d.block(&view_block_name(u)) else { return };
+    let src = cadcraft_render::build_entities(d, block.entities.iter().map(|e| &**e), opts);
     for prim in &src.prims {
         if matches!(prim.kind, Kind::Infinite { .. } | Kind::Mask) {
             continue;
         }
-        let Some(pts) = src.points(prim).iter().map(|p| map(&dp, u, edit, *p)).collect::<Option<Vec<Vec2>>>() else { continue };
+        let Some(pts) = src.points(prim).iter().map(|p| map(dp, u, edit, *p)).collect::<Option<Vec<Vec2>>>() else { continue };
         let buf = if prim.kind == Kind::Tris { &mut out.tris } else { &mut out.verts };
         let start = buf.len() as u32;
         buf.extend_from_slice(&pts);
@@ -191,10 +216,9 @@ pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
         }
         out.prims.push(DPrim { color: UNDERLAY_COLOR, aci7: false, transparency: UNDERLAY_TRANSPARENCY, start, len: pts.len() as u32, ..*prim });
     }
-    out
 }
 
-/// The bounds of the underlay's mapped linework in `space` (EMPTY without one): ZOOM Extents
+/// The bounds of every underlay's mapped linework in `space` (EMPTY without one): ZOOM Extents
 /// fits it with the edited view's own entities.
 pub(super) fn extents(d: &Drawing, space: &Space) -> Bounds2 {
     draw(d, space, &Options::default()).bounds
@@ -209,24 +233,29 @@ impl Drop for NestedGuard {
     }
 }
 
-/// CADCraft's own snap in the underlay's block at the cursor (mapped edited → underlay, the
-/// aperture scaled by the map), mapped back. Empty without an underlay, or inside such a call.
+/// CADCraft's own snap in each underlay's block at the cursor (mapped edited → underlay, the
+/// aperture scaled by the map), mapped back: at most one hit per underlay. Empty without an
+/// underlay, or inside such a call.
 pub(super) fn snaps(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64) -> Vec<SnapHit> {
     if nested() {
         return Vec::new();
     }
-    let Some((dp, edit, u)) = pair(d, space) else { return Vec::new() };
-    let Some(c) = map(&dp, edit, u, cursor) else { return Vec::new() };
-    let Some(edge) = map(&dp, edit, u, cursor + Vec2::new(aperture, 0.0)) else { return Vec::new() };
+    let Some((dp, edit, us)) = pairs(d, space) else { return Vec::new() };
+    us.into_iter().filter_map(|u| snap_one(d, &dp, edit, u, cursor, aperture)).collect()
+}
+
+/// [`snaps`] for one underlay `u`.
+fn snap_one(d: &Drawing, dp: &DrawingProject<'_>, edit: Id, u: Id, cursor: Vec2, aperture: f64) -> Option<SnapHit> {
+    let c = map(dp, edit, u, cursor)?;
+    let edge = map(dp, edit, u, cursor + Vec2::new(aperture, 0.0))?;
     let ap = c.dist(edge);
     NESTED.with(|n| n.set(true));
     let hit = {
         let _g = NestedGuard;
         osnap(d, &Space::Block(view_block_name(u)), c, ap, UNDERLAY_SNAPS, None, false)
-    };
-    let Some(hit) = hit else { return Vec::new() };
-    let Some(point) = map(&dp, u, edit, hit.point) else { return Vec::new() };
-    vec![SnapHit { point, mode: hit.mode, name: hit.name, viewport: None, deferred: None }]
+    }?;
+    let point = map(dp, u, edit, hit.point)?;
+    Some(SnapHit { point, mode: hit.mode, name: hit.name, viewport: None, deferred: None })
 }
 
 #[cfg(test)]
@@ -299,7 +328,7 @@ pub(crate) mod tests {
         let gen0 = cadcraft_render::overlays_generation();
         let r = s.execute("underlay", &json!({ "viewId": b.0 }))?;
         assert_eq!(r["message"], json!(format!("<Underlay: {}>", view_name(s.doc()?, b))));
-        assert_eq!(r["viewId"], json!(b.0));
+        assert_eq!(r["viewIds"], json!([b.0]));
         assert!(cadcraft_render::overlays_generation() > gen0, "UNDERLAY bumps the overlay generation");
         let list = lamb_overlay(s.doc()?, &block(a), &opts);
         assert_eq!(list.prims.len(), before.prims.len() + 1, "one line added");
@@ -442,10 +471,56 @@ pub(crate) mod tests {
         assert!(s.log.iter().any(|l| l == &format!("{}  B-B (mirrored)", b.0)), "{:?}", s.log);
         s.input(Input::Text("b-b".into()))?;
         assert!(s.running.is_none());
-        assert_eq!(current(s.doc()?, a), Some(b));
+        assert_eq!(current(s.doc()?, a), [b]);
         s.start("underlay")?;
         s.input(Input::Keyword("Off".into()))?;
-        assert_eq!(current(s.doc()?, a), None);
+        assert!(current(s.doc()?, a).is_empty());
+        Ok(())
+    }
+
+    /// LAMB T522: plan A with two other placed plans B (rotated, offset) and C (identity, 6 m up),
+    /// each with its own line; any number of them are underlays at once.
+    #[test]
+    fn several_underlays_draw_and_snap_together_and_toggle_one_at_a_time() -> R {
+        let _g = lock();
+        let (mut s, a, b) = plans()?;
+        let r = s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": a.0, "floorToFloorMm": 6000 }))?;
+        let c = Id(r["viewId"].as_u64().ok_or("no plan C")?);
+        s.execute("editview", &json!({ "viewId": c.0 }))?;
+        s.execute("line", &json!({ "points": [[0, 2000], [0, 3000]] }))?;
+        s.execute("editview", &json!({ "viewId": a.0 }))?;
+        let cands: Vec<Id> = candidates(s.doc()?, a).iter().map(|c| c.view_id).collect();
+        assert!(cands.contains(&b) && cands.contains(&c), "{cands:?}");
+        let opts = Options { view_height: 10000.0, ..Options::default() };
+        let base = lamb_overlay(s.doc()?, &block(a), &opts).prims.len();
+        let b_end = Vec2::new(10000.0, 6000.0);
+        let c_end = Vec2::new(0.0, 3000.0);
+        let snaps_at = |s: &Session, p: Vec2| -> std::result::Result<bool, E> {
+            Ok(lamb_snaps(s.doc()?, &block(a), p + Vec2::new(2.0, 1.0), 10.0).iter().any(|h| near(h.point, p)))
+        };
+
+        s.execute("underlay", &json!({ "viewId": b.0 }))?;
+        let r = s.execute("underlay", &json!({ "viewId": c.0 }))?;
+        let both: Vec<u64> = cands.iter().filter(|id| **id == b || **id == c).map(|id| id.0).collect();
+        assert_eq!(r["viewIds"], json!(both), "both on, in candidate order");
+        assert!(r["message"].as_str().is_some_and(|m| m.starts_with("<Underlay: ") && m.contains(", ")), "{}", r["message"]);
+        let list = lamb_overlay(s.doc()?, &block(a), &opts);
+        assert_eq!(list.prims.len(), base + 2, "both underlays' lines drawn");
+        let lines: Vec<Vec<Vec2>> = polylines(&list).into_iter().filter(|(p, _)| p.color == UNDERLAY_COLOR).map(|(_, pts)| pts).collect();
+        assert!(lines.iter().any(|l| l.iter().any(|p| near(*p, b_end))), "B's line: {lines:?}");
+        assert!(lines.iter().any(|l| l.iter().any(|p| near(*p, c_end))), "C's line: {lines:?}");
+        assert!(snaps_at(&s, b_end)? && snaps_at(&s, c_end)?, "both snappable");
+        assert_eq!(current(s.doc()?, a).len(), 2);
+
+        let r = s.execute("underlay", &json!({ "viewId": b.0 }))?;
+        assert_eq!(r["viewIds"], json!([c.0]), "B toggled off, C stays");
+        assert_eq!(lamb_overlay(s.doc()?, &block(a), &opts).prims.len(), base + 1);
+        assert!(!snaps_at(&s, b_end)? && snaps_at(&s, c_end)?);
+
+        let r = s.execute("underlay", &json!({}))?;
+        assert_eq!((r["viewIds"].clone(), r["message"].clone()), (json!([]), json!("<Underlay off>")));
+        assert_eq!(lamb_overlay(s.doc()?, &block(a), &opts).prims.len(), base);
+        assert!(!snaps_at(&s, c_end)?);
         Ok(())
     }
 }

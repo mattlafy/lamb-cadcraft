@@ -99,8 +99,8 @@ fn row(label: String, active: bool, command: &str, params: serde_json::Value) ->
 /// view has eligible reference views: a `Reference pane` heading, `Show reference pane` (active
 /// while shown, toggling REFPANE) and one row per eligible view, active when the pane shows it,
 /// running `refpane {viewId}`. When it has underlay candidates: an `Underlay` heading and one row
-/// per candidate (`" (mirrored)"` when it renders mirrored), active when it is the underlay,
-/// running `underlay {viewId}` (clicking the active one turns it off). An unreadable LAMB slot
+/// per candidate (`" (mirrored)"` when it renders mirrored), active while it is one of the underlays
+/// (any number at once), running `underlay {viewId}` (a click toggles it). An unreadable LAMB slot
 /// gives just the Model row.
 pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     let mut rows = vec![row("Model".into(), *edit == Space::Model, "editview", serde_json::json!({}))];
@@ -125,12 +125,12 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     if let Some(e) = crate::overlays::view_id(edit) {
         let candidates = crate::overlays::underlay::candidates(d, e);
         if !candidates.is_empty() {
-            let current = crate::overlays::underlay::current(d, e);
+            let on = crate::overlays::underlay::current(d, e);
             rows.push(BrowserRow { label: "Underlay".into(), active: false, heading: true, command: None });
             for c in &candidates {
                 let Some(v) = doc.views.iter().find(|v| v.id() == c.view_id) else { continue };
                 let label = if c.mirrored { format!("{} (mirrored)", view_label(&doc, v)) } else { view_label(&doc, v) };
-                rows.push(row(label, current == Some(c.view_id), "underlay", serde_json::json!({ "viewId": c.view_id.0 })));
+                rows.push(row(label, on.contains(&c.view_id), "underlay", serde_json::json!({ "viewId": c.view_id.0 })));
             }
         }
     }
@@ -287,8 +287,13 @@ mod tests {
         s.execute(&cmd, &params)?;
         let r = rows(&s)?;
         assert!(r[at + 1].active && !r[at + 2].active, "B-B is the underlay");
+        let (cmd2, params2) = r[at + 2].command.clone().ok_or("no command")?;
+        s.execute(&cmd2, &params2)?;
+        let r = rows(&s)?;
+        assert!(r[at + 1].active && r[at + 2].active, "B-B and C-C are both underlays (LAMB T522)");
         s.execute(&cmd, &params)?;
-        assert!(!rows(&s)?[at + 1].active, "clicking the active row turns it off");
+        let r = rows(&s)?;
+        assert!(!r[at + 1].active && r[at + 2].active, "clicking an active row turns only it off");
         Ok(())
     }
 
