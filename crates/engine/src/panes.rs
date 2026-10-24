@@ -15,6 +15,8 @@
 //! Camera lock ([`Panes::locked`], off by default, toggled by LAMB's `panelock`): every view change
 //! of the current tile ([`after_view`], from `DocState::set_view`/`set_view_quiet`) re-centres each
 //! related tile through [`PaneRelations::centre`] at the same screen scale; unrelated tiles stay.
+//! [`Panes::follow`] does the same whatever `locked` says, for an adapter that wants two tiles
+//! always aligned (LAMB's reference pane).
 
 use std::sync::OnceLock;
 
@@ -35,6 +37,9 @@ pub struct Panes {
     /// ([`Session::ortho_rotation`]; LAMB's `ucsalign`, off = follow the pane, by default). Kept
     /// across re-tiling, never saved.
     pub world_ortho: bool,
+    /// The tiles follow each other as under `locked`, whatever `locked` says; set by an adapter
+    /// (LAMB's reference pane), kept across re-tiling, never saved.
+    pub follow: bool,
 }
 
 /// Where a point in one tile's space lands in another's: a point, or (when the other space has an
@@ -93,6 +98,7 @@ pub fn on_activate(st: &mut DocState, old: usize, new: usize) {
             spaces: vec![Space::Model; st.tiles.rects.len()],
             locked: st.panes.locked,
             world_ortho: st.panes.world_ortho,
+            follow: st.panes.follow,
         };
     }
     let here = st.space.clone();
@@ -104,14 +110,20 @@ pub fn on_activate(st: &mut DocState, old: usize, new: usize) {
 }
 
 /// Hook in `DocState::set_view` / `set_view_quiet`, after the view is stored: with the camera
-/// lock on, each other tile related to the current one's space takes the centre
+/// lock (or [`Panes::follow`]) on, each other tile related to the current one's space takes the centre
 /// [`PaneRelations::centre`] gives it and the current view's px per mm (heights scaled by the
 /// tiles' fraction heights). Unrelated tiles, and everything with no relations registered, stay.
 pub fn after_view(st: &mut DocState) {
-    if !st.panes.locked || st.mspace.is_some() || !tiles_space(&st.space) {
+    if let Some(rel) = pane_relations() {
+        follow_view(st, rel);
+    }
+}
+
+/// [`after_view`] for the relations `rel`.
+fn follow_view(st: &mut DocState, rel: &PaneRelations) {
+    if !(st.panes.locked || st.panes.follow) || st.mspace.is_some() || !tiles_space(&st.space) {
         return;
     }
-    let Some(rel) = pane_relations() else { return };
     let (tiles, active) = crate::cmd::view::vports::live(st, (1.0, 1.0));
     if tiles.len() < 2 {
         return;
@@ -159,6 +171,24 @@ impl Session {
     /// Whether the camera lock is on.
     pub fn panes_locked(&self) -> bool {
         self.state().is_ok_and(|st| st.panes.locked)
+    }
+
+    /// Make the tiles follow each other whatever the camera lock says ([`Panes::follow`]);
+    /// turning it on aligns them at once. Nothing without a drawing.
+    pub fn set_panes_follow(&mut self, on: bool) {
+        if let Ok(st) = self.state_mut() {
+            st.panes.follow = on;
+            if on {
+                let v = st.view();
+                st.set_view_quiet(v);
+            }
+        }
+        self.touch();
+    }
+
+    /// Whether the tiles follow each other regardless of the camera lock.
+    pub fn panes_follow(&self) -> bool {
+        self.state().is_ok_and(|st| st.panes.follow)
     }
 
     /// ORTHO keeps to world X/Y ([`Panes::world_ortho`]) instead of the current tile's rotation;
@@ -395,6 +425,46 @@ mod tests {
         s.activate_tile(1).unwrap();
         assert!(s.world_ortho(), "kept across re-tiling");
         assert_eq!(s.ortho_rotation(), 0.0);
+    }
+
+    #[test]
+    fn follow_aligns_the_other_tile_whatever_the_lock() {
+        // A local relation: B's centre is Model's shifted by (100, 0), keeping B's previous y.
+        let rel = super::PaneRelations {
+            rotation: |_, _, _| None,
+            map: |_, _, _, _| None,
+            centre: |_, from, p, to, prev| match (from, to) {
+                (Space::Model, Space::Block(_)) => Some(Vec2::new(p.x + 100.0, prev.y)),
+                _ => None,
+            },
+        };
+        let mut s = two_tiles_with_block();
+        s.activate_tile(1).unwrap();
+        enter(&mut s, b());
+        s.activate_tile(0).unwrap();
+        assert_eq!(s.tile_spaces(), vec![Space::Model, b()]);
+        let before = s.model_tiles()[1].view;
+        let v = View { center: Vec2::new(3.0, -7.0), height: 40.0, twist: 0.0 };
+        let st = s.state_mut().unwrap();
+        st.set_view_quiet(v);
+        super::follow_view(st, &rel);
+        assert_eq!(s.model_tiles()[1].view, before, "neither lock nor follow: untouched");
+
+        assert!(!s.panes_locked());
+        s.set_panes_follow(true);
+        assert!(s.panes_follow());
+        let st = s.state_mut().unwrap();
+        st.set_view_quiet(v);
+        super::follow_view(st, &rel);
+        let t = s.model_tiles();
+        let fh = |i: usize| t[i].max.y - t[i].min.y;
+        assert_eq!(t[1].view.center, Vec2::new(103.0, before.center.y), "the shared axis follows, the other keeps its value");
+        assert!((t[1].view.height / fh(1) - 40.0 / fh(0)).abs() < 1e-9, "same px per mm");
+
+        s.execute("-vports", &json!({"option": "3"})).unwrap();
+        assert!(s.panes_follow(), "kept across re-tiling");
+        s.set_panes_follow(false);
+        assert!(!s.panes_follow());
     }
 
     #[test]

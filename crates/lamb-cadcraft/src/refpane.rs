@@ -93,8 +93,20 @@ fn split(s: &mut Session, orientation: SplitOrientation) -> Result<()> {
 /// While [`shown`], put the edited view's reference (see [`pick`]) into the non-current tile; the
 /// current tile keeps its view. When the pair wants the other split ([`orientation`]) the model
 /// area is re-split first. No eligible reference: echo
-/// `No reference view for <name>.` and leave the tiles alone.
+/// `No reference view for <name>.` and leave the tiles alone. Ends by making the two tiles follow
+/// each other's pan and zoom while [`shown`] (engine `Panes::follow`, whatever PANELOCK says), and
+/// stop when not — TS `ReferenceView`'s camera, which always shares the main view's scale and
+/// shared axis.
 pub(crate) fn refresh(s: &mut Session) -> Result<()> {
+    let r = place_reference(s);
+    let on = shown(s);
+    if on || s.panes_follow() {
+        s.set_panes_follow(on);
+    }
+    r
+}
+
+fn place_reference(s: &mut Session) -> Result<()> {
     if !shown(s) {
         return Ok(());
     }
@@ -148,6 +160,7 @@ pub(crate) fn refpane(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if !on {
         SHOWN.store(false, Ordering::Relaxed);
+        s.set_panes_follow(false);
         if s.model_tiles().len() > 1 {
             s.execute("-vports", &json!({ "option": "single" }))?;
         }
@@ -402,6 +415,55 @@ pub(crate) mod tests {
         s.start("refpane")?;
         s.input(Input::Enter)?;
         assert_eq!(s.tile_spaces(), [block(a), block(plan)], "Enter takes the default");
+        Ok(())
+    }
+
+    #[test]
+    fn the_reference_follows_pan_and_zoom_without_panelock() -> R {
+        use cadcraft_engine::View;
+        use cadcraft_geom::Vec2;
+        let _g = lock();
+        let (mut s, plan, a, _) = project()?;
+        s.execute("refpane", &json!({ "on": true }))?;
+        assert!(!s.panes_locked(), "PANELOCK stays off");
+        assert!(s.panes_follow());
+        assert_eq!(s.tile_spaces(), [block(plan), block(a)]);
+        let fh = |s: &Session, i: usize| {
+            let t = &s.model_tiles()[i];
+            t.max.y - t.min.y
+        };
+        let view = |s: &Session, i: usize| s.model_tiles()[i].view;
+
+        // Zoom and pan the plan (tile 0): Y-asymmetric centre.
+        let set = |s: &mut Session, c: Vec2, h: f64| -> R {
+            let twist = s.state()?.view().twist;
+            s.state_mut()?.set_view(View { center: c, height: h, twist });
+            Ok(())
+        };
+        set(&mut s, Vec2::new(1200.0, 3700.0), 6000.0)?;
+        let s1 = view(&s, 1);
+        assert!((s1.height / fh(&s, 1) - 6000.0 / fh(&s, 0)).abs() < 1e-6, "same scale: {s1:?}");
+        // Along the cut line (plan x) the section follows by the same distance; across it, nothing.
+        set(&mut s, Vec2::new(1700.0, 3700.0), 6000.0)?;
+        let s2 = view(&s, 1);
+        assert!(((s2.center.x - s1.center.x).abs() - 500.0).abs() < 1e-6, "u follows: {s1:?} -> {s2:?}");
+        assert!((s2.center.y - s1.center.y).abs() < 1e-6, "the section keeps its own height");
+        set(&mut s, Vec2::new(1700.0, -900.0), 3000.0)?;
+        let s3 = view(&s, 1);
+        assert!((s3.center - s2.center).len() < 1e-6, "a pan across the cut moves nothing: {s3:?}");
+        assert!((s3.height / fh(&s, 1) - 3000.0 / fh(&s, 0)).abs() < 1e-6);
+
+        // Pan the section: the plan follows along the cut, keeping its own across-cut value.
+        s.activate_tile(1)?;
+        let p0 = view(&s, 0);
+        let c = s.state()?.view().center;
+        set(&mut s, Vec2::new(c.x + 250.0, c.y + 40.0), 3000.0)?;
+        let p1 = view(&s, 0);
+        assert!(((p1.center.x - p0.center.x).abs() - 250.0).abs() < 1e-6, "plan follows: {p0:?} -> {p1:?}");
+        assert!((p1.center.y - p0.center.y).abs() < 1e-6);
+
+        s.execute("refpane", &json!({ "on": false }))?;
+        assert!(!s.panes_follow());
         Ok(())
     }
 }
