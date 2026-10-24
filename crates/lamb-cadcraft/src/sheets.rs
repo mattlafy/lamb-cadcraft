@@ -286,70 +286,86 @@ mod tests {
         Ok(())
     }
 
-    /// The objects of an uncompressed PDF by number (`crates/io/tests/pdf_layers.rs`'s helper).
-    fn pdf_objects(bytes: &[u8]) -> T<Vec<(usize, String)>> {
-        assert!(bytes.starts_with(b"%PDF-1."), "not a PDF");
-        let text: String = bytes.iter().map(|b| if b.is_ascii() { char::from(*b) } else { '?' }).collect();
-        let sx = text
-            .rfind(
-                "startxref
-",
-            )
-            .ok_or("no startxref")?;
-        let xref: usize = text[sx + 10..].lines().next().ok_or("no xref offset")?.trim().parse()?;
-        let mut lines = text[xref..].lines().skip(1);
-        let count: usize = lines.next().ok_or("no xref")?.split_whitespace().nth(1).ok_or("no count")?.parse()?;
-        let mut out = Vec::new();
-        for (i, e) in lines.take(count).enumerate().skip(1) {
-            let off: usize = e[..10].parse()?;
-            let body = &text[off
-                + format!(
-                    "{i} 0 obj
-"
-                )
-                .len()..];
-            out.push((
-                i,
-                body[..body
-                    .find(
-                        "
-endobj
-",
-                    )
-                    .ok_or("no endobj")?]
-                    .to_owned(),
-            ));
-        }
-        Ok(out)
-    }
-
-    /// Plots layout `sheet` uncompressed and returns, per optional content group (by layer name)
-    /// whose marked content holds a path operator, the number of path operators.
+    /// Plots layout `sheet` and returns, per optional content group (by layer name) whose marked
+    /// content holds a path operator, the number of path operators. Read back with craft-pdf's
+    /// reader, as `crates/io/tests/support/pdf_read.rs` does.
     fn plotted_groups(d: &Drawing, sheet: &str) -> T<Vec<(String, usize)>> {
+        use craft_pdf::syntax::object::{Dict, String as PdfString};
+        use std::ops::Deref;
         let bytes = cadcraft_io::plot(d, &Space::Paper(sheet.into()), &json!({ "compress": false }))?;
-        let objs = pdf_objects(&bytes)?;
-        let object = |n: usize| objs.iter().find(|(i, _)| *i == n).map(|(_, b)| b.as_str()).ok_or("no object");
-        let reference = |dict: &str, key: &str| -> T<usize> {
-            let i = dict.find(&format!("{key} ")).ok_or("no key")? + key.len() + 1;
-            Ok(dict[i..].split_whitespace().next().ok_or("no ref")?.parse()?)
+        let pdf = craft_pdf::open_slice(&bytes, None).map_err(|e| format!("the PDF opens: {e:?}"))?;
+        let pages = pdf.pages();
+        let page = pages.iter().next().ok_or("no page")?;
+        let raw = page.raw();
+        let resources = raw.get::<Dict<'_>>(b"Resources");
+        // Marked-content property name -> the name of the optional content group it refers to.
+        let props: Vec<(String, String)> = match resources.as_ref().and_then(|r| r.get::<Dict<'_>>(b"Properties")) {
+            Some(p) => p
+                .keys()
+                .filter_map(|k| {
+                    let ocg = p.get::<Dict<'_>>(k.deref())?;
+                    let name = ocg.get::<PdfString<'_>>(b"Name").map(|n| String::from_utf8_lossy(n.as_bytes()).into_owned())?;
+                    Some((k.as_str().to_string(), name))
+                })
+                .collect(),
+            None => Vec::new(),
         };
-        let page = objs.iter().find(|(_, b)| b.starts_with("<< /Type /Page ")).ok_or("no page")?.1.as_str();
-        let content = object(reference(page, "/Contents")?)?;
+        let content = String::from_utf8_lossy(page.page_stream().ok_or("no content")?).into_owned();
+        // Operators and the names before them; text strings are skipped whole.
         let mut out: Vec<(String, usize)> = Vec::new();
         let mut group: Option<String> = None;
-        for line in content.lines() {
-            if let Some(tag) = line.strip_prefix("/OC /").and_then(|r| r.strip_suffix(" BDC")) {
-                let ocg = object(reference(page, &format!("/{tag}"))?)?;
-                let name = ocg.strip_prefix("<< /Type /OCG /Name (").and_then(|r| r.strip_suffix(") >>")).ok_or("not an OCG")?;
-                group = Some(name.to_owned());
-            } else if line == "EMC" {
-                group = None;
-            } else if let Some(g) = &group
-                && matches!(line.rsplit(' ').next(), Some("m" | "l" | "c"))
-            {
-                match out.iter_mut().find(|(n, _)| n == g) {
-                    Some((_, k)) => *k += 1,
-                    None => out.push((g.clone(), 1)),
+        let mut names: Vec<String> = Vec::new();
+        let b: Vec<char> = content.chars().collect();
+        let mut i = 0;
+        let delim = |c: char| c.is_whitespace() || "()<>[]{}/%".contains(c);
+        while i < b.len() {
+            let c = b[i];
+            if c == '(' {
+                let mut depth = 0;
+                while i < b.len() {
+                    match b[i] {
+                        '\\' => i += 1,
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                i += 1;
+            } else if delim(c) && c != '/' {
+                i += 1;
+            } else {
+                let start = i;
+                i += 1;
+                while i < b.len() && !delim(b[i]) {
+                    i += 1;
+                }
+                let tok: String = b[start..i].iter().collect();
+                if let Some(n) = tok.strip_prefix('/') {
+                    names.push(n.to_string());
+                } else if tok.parse::<f64>().is_err() {
+                    match tok.as_str() {
+                        "BDC" => {
+                            let tag = names.last().ok_or("no property")?;
+                            group = Some(props.iter().find(|(k, _)| k == tag).map(|(_, n)| n.clone()).ok_or("not an OCG")?);
+                        }
+                        "EMC" => group = None,
+                        "m" | "l" | "c" => {
+                            if let Some(g) = &group {
+                                match out.iter_mut().find(|(n, _)| n == g) {
+                                    Some((_, k)) => *k += 1,
+                                    None => out.push((g.clone(), 1)),
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    names.clear();
                 }
             }
         }

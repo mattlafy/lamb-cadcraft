@@ -216,7 +216,7 @@ pub(super) fn draw_hover(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, ModelTile)
     if let Some(hit) = src.snap {
         draw_snap_marker(&p, tile_xf(*r, tile, rotation(rots, src.tile)).to_screen(hit.point), &hit);
     }
-    draw_crosshair(app, &p, *r, src.at, false);
+    draw_crosshair(app, &p, *r, src.at, false, Tokens::get().crosshair);
 }
 
 #[cfg(test)]

@@ -19,3 +19,6 @@ cadcraft-render = { workspace = true }
 lamb-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+craft-pdf = { workspace = true, features = ["read"] }
