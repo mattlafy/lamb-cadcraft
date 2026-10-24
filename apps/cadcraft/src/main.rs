@@ -238,7 +238,17 @@ fn control_flag(current: Option<u16>, value: Option<String>) -> Option<u16> {
 fn lamb_view_rows(d: &cadcraft_engine::doc::Drawing, edit: &cadcraft_engine::doc::Space) -> Vec<cadcraft_ui_egui::viewlist::Row> {
     lamb_cadcraft::views::browser_rows(d, edit)
         .into_iter()
-        .map(|r| cadcraft_ui_egui::viewlist::Row { label: r.label, active: r.active, heading: r.heading, command: r.command })
+        .map(|r| {
+            use cadcraft_ui_egui::{icons::Icon, viewlist};
+            // The columns of `lamb_cadcraft::views::BROWSER_COLUMNS`: Ref (a split pane), Underlay.
+            let cells = r
+                .cells
+                .into_iter()
+                .zip([Icon::Workspace, Icon::Layers])
+                .map(|(c, icon)| c.map(|c| viewlist::Cell { icon, on: c.on, tip: c.tip, command: c.command }))
+                .collect();
+            viewlist::Row { label: r.label, active: r.active, heading: r.heading, command: r.command, cells }
+        })
         .collect()
 }
 
@@ -385,6 +395,9 @@ fn main() -> eframe::Result {
     }
     if let Err(e) = cadcraft_ui_egui::viewlist::register_row_source(lamb_view_rows) {
         log::warn!("LAMB Views palette not installed: {e}");
+    }
+    if let Err(e) = cadcraft_ui_egui::viewlist::register_columns(&lamb_cadcraft::views::BROWSER_COLUMNS) {
+        log::warn!("LAMB Views palette columns not installed: {e}");
     }
     if let Err(e) = cadcraft_ui_egui::chatpane::register_backend(LAMB_CHAT) {
         log::warn!("LAMB Assistant palette not installed: {e}");

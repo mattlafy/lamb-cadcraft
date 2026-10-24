@@ -79,60 +79,77 @@ pub fn create_view(d: &mut Drawing, mut view: AnyView) -> Result<Id, ViewError> 
     Ok(id)
 }
 
+/// The Views palette's icon columns, left to right: index 0 is the reference pane, 1 the underlay.
+pub const BROWSER_COLUMNS: [&str; 2] = ["Ref", "Underlay"];
+
+/// One icon cell of a [`BrowserRow`] (`cadcraft_ui_egui::viewlist::Cell` without the icon, which
+/// the column picks): `on` draws it full-strength; a click runs `command`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrowserCell {
+    pub on: bool,
+    pub tip: String,
+    pub command: (String, serde_json::Value),
+}
+
 /// One row of the desktop app's Views palette (`cadcraft_ui_egui::viewlist::Row`, same fields):
-/// the TS app's Views panel (`ViewsPanel.tsx`) as data.
+/// the TS app's Views panel (`ViewsPanel.tsx`) as data. `cells` holds one entry per
+/// [`BROWSER_COLUMNS`] column, `None` where that mode is not valid for the row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BrowserRow {
     pub label: String,
     pub active: bool,
     pub heading: bool,
     pub command: Option<(String, serde_json::Value)>,
+    pub cells: Vec<Option<BrowserCell>>,
 }
 
 fn row(label: String, active: bool, command: &str, params: serde_json::Value) -> BrowserRow {
-    BrowserRow { label, active, heading: false, command: Some((command.to_owned(), params)) }
+    BrowserRow { label, active, heading: false, command: Some((command.to_owned(), params)), cells: Vec::new() }
+}
+
+fn cell(on: bool, tip: String, command: &str, params: serde_json::Value) -> Option<BrowserCell> {
+    Some(BrowserCell { on, tip, command: (command.to_owned(), params) })
 }
 
 /// The Views palette for `d` while editing `edit`: `Model`, then each view in document order as
 /// [`view_label`] (its level and floor, its host plan, or `(unplaced)`), the edited one active, each running
-/// `editview`; a drawing with no views offers `Start LAMB project` (LAMBPROJECT). When the edited
-/// view has eligible reference views: a `Reference pane` heading, `Show reference pane` (active
-/// while shown, toggling REFPANE) and one row per eligible view, active when the pane shows it,
-/// running `refpane {viewId}`. When it has underlay candidates: an `Underlay` heading and one row
-/// per candidate (`" (mirrored)"` when it renders mirrored), active while it is one of the underlays
-/// (any number at once), running `underlay {viewId}` (a click toggles it). An unreadable LAMB slot
-/// gives just the Model row.
+/// `editview`; a drawing with no views offers `Start LAMB project` (LAMBPROJECT). Each view row has
+/// two cells ([`BROWSER_COLUMNS`]), `None` unless the mode is valid for it while editing a view:
+/// **Ref** for the edited view's eligible reference views — on for the one the shown pane displays
+/// (at most one), clicking an off one runs `refpane {viewId}` (which also turns the pane on), the on
+/// one `refpane {on: false}`; **Underlay** for its underlay candidates — on while it is one of the
+/// underlays (any number), a click runs `underlay {viewId}` (toggle), the tip noting `(mirrored)`.
+/// The edited view's own row has neither. An unreadable LAMB slot gives just the Model row.
 pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     let mut rows = vec![row("Model".into(), *edit == Space::Model, "editview", serde_json::json!({}))];
     let Ok(doc) = read_document(d) else { return rows };
+    let edited = crate::overlays::view_id(edit);
+    // The reference pane (LAMB T345): (eligible views, the one shown) when the pane is on.
+    let reference = edited.and_then(|e| crate::refpane::pick(d, e));
+    let shown = crate::refpane::shown_in(d);
+    // The underlays (LAMB T350, T522).
+    let candidates = edited.map(|e| crate::overlays::underlay::candidates(d, e)).unwrap_or_default();
+    let under = edited.map(|e| crate::overlays::underlay::current(d, e)).unwrap_or_default();
     for v in &doc.views {
         let active = matches!(edit, Space::Block(name) if *name == view_block_name(v.id()));
-        rows.push(row(view_label(&doc, v), active, "editview", serde_json::json!({ "viewId": v.id().0 })));
+        let label = view_label(&doc, v);
+        let mut r = row(label.clone(), active, "editview", serde_json::json!({ "viewId": v.id().0 }));
+        let ref_cell = reference.as_ref().filter(|(eligible, _)| eligible.contains(&v.id())).and_then(|(_, pick)| {
+            if shown && *pick == v.id() {
+                cell(true, format!("Reference pane off ({label})"), "refpane", serde_json::json!({ "on": false }))
+            } else {
+                cell(false, format!("Show {label} in the reference pane"), "refpane", serde_json::json!({ "viewId": v.id().0 }))
+            }
+        });
+        let under_cell = candidates.iter().find(|c| c.view_id == v.id()).and_then(|c| {
+            let mirrored = if c.mirrored { " (mirrored)" } else { "" };
+            cell(under.contains(&c.view_id), format!("Underlay {label}{mirrored}"), "underlay", serde_json::json!({ "viewId": c.view_id.0 }))
+        });
+        r.cells = vec![ref_cell, under_cell];
+        rows.push(r);
     }
     if doc.views.is_empty() {
         rows.push(row("Start LAMB project".into(), false, "lambproject", serde_json::json!({})));
-    }
-    // The reference pane (LAMB T345), when the edited view has a reference to show.
-    if let Some((eligible, pick)) = crate::overlays::view_id(edit).and_then(|e| crate::refpane::pick(d, e)) {
-        let shown = crate::refpane::shown_in(d);
-        rows.push(BrowserRow { label: "Reference pane".into(), active: false, heading: true, command: None });
-        rows.push(row("Show reference pane".into(), shown, "refpane", serde_json::json!({ "on": !shown })));
-        for v in eligible.iter().filter_map(|id| doc.views.iter().find(|v| v.id() == *id)) {
-            rows.push(row(view_label(&doc, v), shown && v.id() == pick, "refpane", serde_json::json!({ "viewId": v.id().0 })));
-        }
-    }
-    // The underlay (LAMB T350).
-    if let Some(e) = crate::overlays::view_id(edit) {
-        let candidates = crate::overlays::underlay::candidates(d, e);
-        if !candidates.is_empty() {
-            let on = crate::overlays::underlay::current(d, e);
-            rows.push(BrowserRow { label: "Underlay".into(), active: false, heading: true, command: None });
-            for c in &candidates {
-                let Some(v) = doc.views.iter().find(|v| v.id() == c.view_id) else { continue };
-                let label = if c.mirrored { format!("{} (mirrored)", view_label(&doc, v)) } else { view_label(&doc, v) };
-                rows.push(row(label, on.contains(&c.view_id), "underlay", serde_json::json!({ "viewId": c.view_id.0 })));
-            }
-        }
     }
     rows
 }
@@ -219,58 +236,66 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn reference_rows_toggle_the_pane_and_pick_its_view() -> R {
-        let _g = crate::overlays::underlay::tests::lock();
-        let (mut s, plan, a, b) = crate::refpane::tests::project()?;
-        let r = rows(&s)?;
-        let tail: Vec<_> = r[4..].iter().map(|r| (r.label.as_str(), r.active, r.heading)).collect();
-        assert_eq!(
-            tail,
-            [
-                ("Reference pane", false, true),
-                ("Show reference pane", false, false),
-                ("A-A — Section · on Ground Floor", false, false),
-                ("B-B — Section · on Ground Floor", false, false)
-            ]
-        );
-        assert_eq!(r[4].command, None);
-        assert_eq!(r[5].command, Some(("refpane".into(), json!({ "on": true }))));
-        assert_eq!(r[7].command, Some(("refpane".into(), json!({ "viewId": b.0 }))));
+    /// (label, Ref cell on?, Underlay cell on?) per view row; `None` where there is no cell.
+    fn cells(r: &[BrowserRow]) -> Vec<(&str, Option<bool>, Option<bool>)> {
+        r[1..]
+            .iter()
+            .map(|r| {
+                let on = |i: usize| r.cells.get(i).and_then(Option::as_ref).map(|c| c.on);
+                (r.label.as_str(), on(0), on(1))
+            })
+            .collect()
+    }
 
-        let (cmd, params) = r[7].command.clone().ok_or("no command")?;
-        s.execute(&cmd, &params)?;
-        let r = rows(&s)?;
-        assert_eq!(r[4..].iter().map(|r| r.active).collect::<Vec<_>>(), [false, true, false, true], "shown, showing B-B");
-        assert_eq!(r[5].command, Some(("refpane".into(), json!({ "on": false }))));
-
-        s.execute("editview", &json!({ "viewId": a.0 }))?;
-        let r = rows(&s)?;
-        let tail: Vec<_> = r[4..].iter().map(|r| (r.label.as_str(), r.active)).collect();
-        assert_eq!(
-            tail,
-            [
-                ("Reference pane", false),
-                ("Show reference pane", true),
-                ("Ground Floor — Plan · Level 1 +0", true),
-                ("B-B — Section · on Ground Floor", false),
-                ("Underlay", false),
-                ("B-B — Section · on Ground Floor", false)
-            ],
-            "a section's parallel sibling is also an underlay candidate"
-        );
-        assert_eq!(r[6].command, Some(("refpane".into(), json!({ "viewId": plan.0 }))));
-
-        s.execute("editview", &json!({}))?;
-        assert_eq!(rows(&s)?.len(), 4, "Model has no reference rows");
+    fn click(s: &mut Session, r: &BrowserRow, col: usize) -> R {
+        let c = r.cells.get(col).and_then(Option::as_ref).ok_or("no cell")?;
+        s.execute(&c.command.0, &c.command.1)?;
         Ok(())
     }
 
     #[test]
-    fn underlay_rows_mark_mirroring_and_toggle_it() -> R {
+    fn ref_cells_pick_the_reference_view_like_a_radio_button() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, plan, a, b) = crate::refpane::tests::project()?;
+        let r = rows(&s)?;
+        assert!(!r.iter().any(|r| r.heading), "no heading rows: {r:?}");
+        let (gf, aa, bb) = ("Ground Floor — Plan · Level 1 +0", "A-A — Section · on Ground Floor", "B-B — Section · on Ground Floor");
+        assert_eq!(cells(&r), [(gf, None, None), (aa, Some(false), None), (bb, Some(false), None)], "the edited plan has no cells");
+        let c = r[3].cells[0].as_ref().ok_or("no B-B Ref cell")?;
+        assert_eq!(c.command, ("refpane".into(), json!({ "viewId": b.0 })));
+        assert!(rows(&s)?[0].cells.is_empty(), "Model has no cells");
+
+        click(&mut s, &r[3], 0)?;
+        let r = rows(&s)?;
+        assert_eq!(cells(&r), [(gf, None, None), (aa, Some(false), None), (bb, Some(true), None)], "shown, showing B-B");
+        assert_eq!(r[3].cells[0].as_ref().map(|c| c.command.clone()), Some(("refpane".into(), json!({ "on": false }))));
+
+        click(&mut s, &r[2], 0)?;
+        let r = rows(&s)?;
+        assert_eq!(cells(&r), [(gf, None, None), (aa, Some(true), None), (bb, Some(false), None)], "one on at most");
+        click(&mut s, &r[2], 0)?;
+        assert_eq!(cells(&rows(&s)?)[1], (aa, Some(false), None), "clicking the on one turns the pane off");
+        assert!(!crate::refpane::shown(&s));
+
+        s.execute("editview", &json!({ "viewId": a.0 }))?;
+        let r = rows(&s)?;
+        assert_eq!(
+            cells(&r),
+            [(gf, Some(false), None), (aa, None, None), (bb, Some(false), Some(false))],
+            "a section's parallel sibling is also an underlay candidate"
+        );
+        assert_eq!(r[1].cells[0].as_ref().map(|c| c.command.clone()), Some(("refpane".into(), json!({ "viewId": plan.0 }))));
+
+        s.execute("editview", &json!({}))?;
+        assert!(rows(&s)?.iter().all(|r| r.cells.iter().all(Option::is_none)), "Model edits no view: no cells");
+        Ok(())
+    }
+
+    #[test]
+    fn underlay_cells_mark_mirroring_and_toggle_several() -> R {
         let _g = crate::overlays::underlay::tests::lock();
         let (mut s, plan, a, _b) = crate::refpane::tests::project()?;
-        assert!(!rows(&s)?.iter().any(|r| r.label == "Underlay"), "a lone plan has no underlay rows");
+        assert!(rows(&s)?.iter().all(|r| r.cells.get(1).is_none_or(Option::is_none)), "a lone plan has no underlay cells");
         let c = s.execute(
             "newsectionline",
             &json!({ "name": "C-C", "hostViewId": plan.0, "cutFrom": {"x": 5000, "y": 3000}, "cutTo": {"x": 0, "y": 3000} }),
@@ -278,22 +303,23 @@ mod tests {
         let c = c["viewId"].as_u64().ok_or("no C-C")?;
         s.execute("editview", &json!({ "viewId": a.0 }))?;
         let r = rows(&s)?;
-        let at = r.iter().position(|r| r.label == "Underlay" && r.heading).ok_or("no Underlay heading")?;
-        let under: Vec<_> = r[at + 1..].iter().map(|r| (r.label.as_str(), r.active)).collect();
-        assert_eq!(under, [("B-B — Section · on Ground Floor", false), ("C-C — Section · on Ground Floor (mirrored)", false)]);
-        assert_eq!(r[at + 2].command, Some(("underlay".into(), json!({ "viewId": c }))));
+        let u = |r: &BrowserRow| r.cells[1].clone();
+        assert_eq!(u(&r[3]).map(|c| c.tip), Some("Underlay B-B — Section · on Ground Floor".into()));
+        let cc = u(&r[4]).ok_or("no C-C underlay cell")?;
+        assert_eq!(
+            (cc.tip.as_str(), cc.command),
+            ("Underlay C-C — Section · on Ground Floor (mirrored)", ("underlay".into(), json!({ "viewId": c })))
+        );
 
-        let (cmd, params) = r[at + 1].command.clone().ok_or("no command")?;
-        s.execute(&cmd, &params)?;
+        click(&mut s, &r[3], 1)?;
         let r = rows(&s)?;
-        assert!(r[at + 1].active && !r[at + 2].active, "B-B is the underlay");
-        let (cmd2, params2) = r[at + 2].command.clone().ok_or("no command")?;
-        s.execute(&cmd2, &params2)?;
+        assert_eq!((u(&r[3]).map(|c| c.on), u(&r[4]).map(|c| c.on)), (Some(true), Some(false)), "B-B is the underlay");
+        click(&mut s, &r[4], 1)?;
         let r = rows(&s)?;
-        assert!(r[at + 1].active && r[at + 2].active, "B-B and C-C are both underlays (LAMB T522)");
-        s.execute(&cmd, &params)?;
+        assert_eq!((u(&r[3]).map(|c| c.on), u(&r[4]).map(|c| c.on)), (Some(true), Some(true)), "B-B and C-C both (LAMB T522)");
+        click(&mut s, &r[3], 1)?;
         let r = rows(&s)?;
-        assert!(!r[at + 1].active && r[at + 2].active, "clicking an active row turns only it off");
+        assert_eq!((u(&r[3]).map(|c| c.on), u(&r[4]).map(|c| c.on)), (Some(false), Some(true)), "a click turns only that one off");
         Ok(())
     }
 
