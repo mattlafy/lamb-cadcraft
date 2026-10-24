@@ -225,7 +225,8 @@ pub fn stretch_grip(kind: &EntityKind, index: usize, to: Vec2) -> Option<EntityK
             if index == 0 {
                 return Some(translated(kind, delta));
             }
-            let a = i.attribs.get_mut(index - 1)?;
+            // Grip k ≥ 1 is the k-th attribute without Lock position, matching `EntityKind::grips`.
+            let a = i.attribs.iter_mut().filter(|a| !a.modes.lock_position).nth(index - 1)?;
             let ip = a.text.insert.xy() + delta;
             set_xy(&mut a.text.insert, ip);
             if let Some(al) = &mut a.text.align_pt {

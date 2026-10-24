@@ -5,14 +5,20 @@
 //! sheet that shows the detail (`<n>/<layout>`, [`crate::sheets::sheet_refs`]; empty when none).
 //! DXF/DWG see an ordinary callout.
 //!
-//! Nothing links a bubble to its leader: a bubble belongs to the tag leader whose last vertex
-//! coincides with its insert point in the same view block. [`bubble_observer`] reconciles every
-//! plan view's bubbles with its tag leaders after every command, writing the drawing back only when
-//! something changed, so the bubble change lands in the command's own undo step.
+//! A tag leader and its bubble are the two members of one unnamed, selectable group
+//! ([`GROUP_DESCRIPTION`], LAMB T509), so picking either selects both and MOVE/COPY/ERASE act on
+//! the pair. The group is the bubble's identity: [`bubble_observer`] reconciles every plan view's
+//! bubbles with its tag leaders after every command, updating a leader's bubble in place (same
+//! handle), and writes the drawing back only when something changed, so the bubble change lands in
+//! the command's own undo step. A bubble moved on its own (its grip) drags the leader's last vertex
+//! with it; otherwise the bubble goes to the leader's last vertex. The bubble's attributes have
+//! Lock position set, so they have no grips: the text can't be dragged off the bubble.
 
 use std::sync::Arc;
 
-use cadcraft_doc::{Attrib, Block, Circle, Common, Drawing, Entity, EntityKind, HAlign, Handle, Insert, Line, Space, Text, VAlign};
+use cadcraft_doc::{
+    Attrib, AttribModes, Block, Circle, Common, Drawing, Entity, EntityKind, Group, HAlign, Handle, Insert, Line, Space, Text, VAlign,
+};
 use cadcraft_engine::Session;
 use cadcraft_geom::Vec3;
 use lamb_core::geometry::tolerance::TOLERANCE;
@@ -25,6 +31,8 @@ use crate::sheets::sheet_refs;
 pub const BUBBLE_BLOCK: &str = "LAMB_DTAG";
 /// The bubble circle's radius.
 pub const BUBBLE_RADIUS_MM: f64 = 250.0;
+/// The description of the unnamed group holding a tag leader and its bubble.
+pub const GROUP_DESCRIPTION: &str = "LAMB detail tag";
 /// The bubble attributes' text height.
 pub const BUBBLE_TEXT_MM: f64 = 120.0;
 /// `DETAIL` sits centred just above the bubble's line, `SHEET` centred below it.
@@ -65,7 +73,7 @@ fn attrib(tag: &str, at: Vec3, dy: f64, value: &str) -> Attrib {
         prompt: String::new(),
         props: Default::default(),
         multiline: None,
-        modes: Default::default(),
+        modes: AttribModes { lock_position: true, ..AttribModes::default() },
     }
 }
 
@@ -93,6 +101,8 @@ fn matches(e: &Entity, i: &Insert, w: &Wanted) -> bool {
         && near(i.insert, w.at)
         && attrib_value(i, "DETAIL") == Some(w.detail.as_str())
         && attrib_value(i, "SHEET") == Some(w.sheet.as_str())
+        && i.attribs.len() == 2
+        && i.attribs.iter().all(|a| a.modes.lock_position)
 }
 
 /// The block definition: a circle and a horizontal line across it, on layer `0`.
@@ -109,71 +119,225 @@ fn ensure_block(d: &mut Drawing) -> Result<(), String> {
     Ok(())
 }
 
-/// Per plan view block: the bubbles to remove and the ones to add.
-type Plan = Vec<(String, Vec<Handle>, Vec<Wanted>)>;
+/// Whether `g` is a tag leader's group (made by this module).
+fn is_tag_group(g: &Group) -> bool {
+    g.name.starts_with('*') && g.description == GROUP_DESCRIPTION
+}
 
-fn plan(d: &Drawing) -> Result<Plan, String> {
+/// The first free unnamed group name, `*A1`, `*A2`… (the engine's scheme).
+fn next_unnamed(groups: &[Group]) -> String {
+    let used: std::collections::HashSet<String> = groups.iter().map(|g| g.name.to_ascii_uppercase()).collect();
+    (1..=groups.len() + 1).map(|n| format!("*A{n}")).find(|n| !used.contains(n)).unwrap_or_else(|| format!("*A{}", groups.len() + 1))
+}
+
+/// A tag leader's bubble: one already in the view block, or the `k`-th one [`apply`] adds there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Bubble {
+    Kept(Handle),
+    Added(usize),
+}
+
+/// One view block's changes.
+#[derive(Debug, Default)]
+struct BlockPlan {
+    block: String,
+    remove: Vec<Handle>,
+    /// Bubbles rewritten in place.
+    update: Vec<(Handle, Wanted)>,
+    add: Vec<Wanted>,
+    /// Leaders whose last vertex moves to their dragged bubble.
+    leader_ends: Vec<(Handle, Vec3)>,
+}
+
+impl BlockPlan {
+    fn is_empty(&self) -> bool {
+        self.remove.is_empty() && self.update.is_empty() && self.add.is_empty() && self.leader_ends.is_empty()
+    }
+}
+
+/// Every plan view block's changes, plus each tag leader's (block index, leader, bubble) — the
+/// pairs the tag groups must hold — and whether the groups need rewriting.
+#[derive(Debug, Default)]
+struct Plan {
+    blocks: Vec<BlockPlan>,
+    pairs: Vec<(usize, Handle, Bubble)>,
+    groups_dirty: bool,
+}
+
+impl Plan {
+    fn is_empty(&self) -> bool {
+        !self.groups_dirty && self.blocks.iter().all(BlockPlan::is_empty)
+    }
+}
+
+fn insert_at(d: &Drawing, h: Handle) -> Option<Vec3> {
+    match &d.entity(h)?.kind {
+        EntityKind::Insert(i) => Some(i.insert),
+        _ => None,
+    }
+}
+
+fn leader_end(d: &Drawing, h: Handle) -> Option<Vec3> {
+    match &d.entity(h)?.kind {
+        EntityKind::Leader(l) => l.vertices.last().copied(),
+        _ => None,
+    }
+}
+
+fn is_bubble(e: &Entity) -> bool {
+    matches!(&e.kind, EntityKind::Insert(i) if i.block.eq_ignore_ascii_case(BUBBLE_BLOCK))
+}
+
+/// The changes that make every plan view's bubbles and tag groups equal what its tag leaders want.
+/// `before` (the drawing before the command) decides who drives: a bubble that moved while its
+/// leader's last vertex did not drags that vertex; otherwise the bubble follows the leader.
+fn plan(d: &Drawing, before: Option<&Drawing>) -> Result<Plan, String> {
     let doc = read_document(d).map_err(|e| e.to_string())?;
     let name_of = |id| doc.views.iter().find(|v| matches!(v, AnyView::Detail(_)) && v.id() == id).map(|v| v.name().to_owned());
     let blocks: Vec<(Id, String)> = doc.views.iter().map(|v| (v.id(), view_block_name(v.id()))).collect();
     let refs = sheet_refs(d, &blocks);
     let sheet_of = |id: Id| refs.iter().find(|(v, _, _)| *v == id).map_or_else(String::new, |(_, n, l)| format!("{n}/{l}"));
-    let mut out = Vec::new();
+    let grouped = |h: Handle| d.groups.iter().any(|g| is_tag_group(g) && g.members.contains(&h));
+    let mut out = Plan::default();
+    // Each view block is reconciled on its own; section views extend the filter.
     for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_))) {
         let block_name = view_block_name(v.id());
         let Some(block) = d.block(&block_name) else { continue };
-        let mut wanted = Vec::new();
+        let bi = out.blocks.len();
+        let mut bp = BlockPlan { block: block_name, ..BlockPlan::default() };
+        let mut claimed: Vec<Handle> = Vec::new();
+        let mut orphans = Vec::new();
         for e in block.entities.iter() {
             let EntityKind::Leader(l) = &e.kind else { continue };
             let Some(tag) = read_entity_data(&e.common).map_err(|e| e.to_string())?.detail_tag else { continue };
-            let Some(&at) = l.vertices.last() else { continue };
-            let detail = name_of(tag.detail_view_id).unwrap_or_else(|| "?".into());
-            let sheet = sheet_of(tag.detail_view_id);
-            wanted.push(Wanted { at, layer: e.common.layer.clone(), detail, sheet });
-        }
-        let mut remove = Vec::new();
-        for e in block.entities.iter() {
-            let EntityKind::Insert(i) = &e.kind else { continue };
-            if !i.block.eq_ignore_ascii_case(BUBBLE_BLOCK) {
+            let Some(&end) = l.vertices.last() else { continue };
+            let wanted_at = |at: Vec3| Wanted {
+                at,
+                layer: e.common.layer.clone(),
+                detail: name_of(tag.detail_view_id).unwrap_or_else(|| "?".into()),
+                sheet: sheet_of(tag.detail_view_id),
+            };
+            let mine = d
+                .groups
+                .iter()
+                .filter(|g| is_tag_group(g) && g.members.contains(&e.handle))
+                .flat_map(|g| g.members.iter().copied())
+                .find(|h| *h != e.handle && !claimed.contains(h) && block.entities.get(*h).is_some_and(|e| is_bubble(e)));
+            let Some(hb) = mine else {
+                orphans.push((e.handle, wanted_at(end)));
                 continue;
+            };
+            claimed.push(hb);
+            let at = insert_at(d, hb).unwrap_or(end);
+            let dragged = before
+                .is_some_and(|b| insert_at(b, hb).is_some_and(|was| !near(was, at)) && leader_end(b, e.handle).is_some_and(|was| near(was, end)));
+            let w = if dragged && !near(at, end) {
+                bp.leader_ends.push((e.handle, at));
+                wanted_at(at)
+            } else {
+                wanted_at(end)
+            };
+            if let Some(be) = block.entities.get(hb)
+                && let EntityKind::Insert(i) = &be.kind
+                && !matches(be, i, &w)
+            {
+                bp.update.push((hb, w));
             }
-            match wanted.iter().position(|w| matches(e, i, w)) {
-                Some(k) => {
-                    wanted.remove(k);
+            out.pairs.push((bi, e.handle, Bubble::Kept(hb)));
+        }
+        // A leader without a grouped bubble adopts an ungrouped one at its last vertex, or gets one.
+        for (hl, w) in orphans {
+            let adopt = block.entities.iter().find(|be| {
+                is_bubble(be) && !claimed.contains(&be.handle) && !grouped(be.handle) && insert_at(d, be.handle).is_some_and(|p| near(p, w.at))
+            });
+            match adopt {
+                Some(be) => {
+                    claimed.push(be.handle);
+                    if let EntityKind::Insert(i) = &be.kind
+                        && !matches(be, i, &w)
+                    {
+                        bp.update.push((be.handle, w));
+                    }
+                    out.pairs.push((bi, hl, Bubble::Kept(be.handle)));
                 }
-                None => remove.push(e.handle),
+                None => {
+                    out.pairs.push((bi, hl, Bubble::Added(bp.add.len())));
+                    bp.add.push(w);
+                }
             }
         }
-        if !remove.is_empty() || !wanted.is_empty() {
-            out.push((block_name, remove, wanted));
-        }
+        bp.remove = block.entities.iter().filter(|e| is_bubble(e) && !claimed.contains(&e.handle)).map(|e| e.handle).collect();
+        out.blocks.push(bp);
     }
+    // The tag groups must be exactly one selectable {leader, bubble} group per pair.
+    let tag_groups: Vec<&Group> = d.groups.iter().filter(|g| is_tag_group(g)).collect();
+    out.groups_dirty = tag_groups.len() != out.pairs.len()
+        || out.pairs.iter().any(|(_, hl, b)| match b {
+            Bubble::Added(_) => true,
+            Bubble::Kept(hb) => !tag_groups.iter().any(|g| g.selectable && g.members == [*hl, *hb]),
+        });
     Ok(out)
 }
 
 fn apply(d: &mut Drawing, plan: &Plan) -> Result<(), String> {
-    if plan.iter().any(|(_, _, add)| !add.is_empty()) {
+    if plan.blocks.iter().any(|b| !b.add.is_empty()) {
         ensure_block(d)?;
     }
-    for (block, remove, add) in plan {
-        let space = Space::Block(block.clone());
+    let mut added: Vec<Vec<Handle>> = Vec::new();
+    for bp in &plan.blocks {
+        let space = Space::Block(bp.block.clone());
         let store = d.space_mut(&space).ok_or("view block gone")?;
-        for h in remove {
+        for h in &bp.remove {
             store.remove(*h);
         }
-        for w in add {
+        for (h, w) in &bp.update {
+            store.modify(*h, |e| {
+                e.common.layer = w.layer.clone();
+                e.kind = EntityKind::Insert(insert_of(w));
+            });
+        }
+        for (h, to) in &bp.leader_ends {
+            store.modify(*h, |e| {
+                if let EntityKind::Leader(l) = &mut e.kind
+                    && let Some(v) = l.vertices.last_mut()
+                {
+                    *v = *to;
+                }
+            });
+        }
+        let mut hs = Vec::new();
+        for w in &bp.add {
             let common = Common { layer: w.layer.clone(), ..Common::default() };
-            d.add(&space, common, EntityKind::Insert(insert_of(w))).map_err(|e| e.to_string())?;
+            hs.push(d.add(&space, common, EntityKind::Insert(insert_of(w))).map_err(|e| e.to_string())?);
+        }
+        added.push(hs);
+    }
+    if plan.groups_dirty {
+        // Each leader keeps its group's name; the groups of leaders that are gone go too.
+        let old: Vec<Group> = d.groups.iter().filter(|g| is_tag_group(g)).cloned().collect();
+        d.groups.retain(|g| !is_tag_group(g));
+        for (bi, hl, b) in &plan.pairs {
+            let hb = match b {
+                Bubble::Kept(h) => *h,
+                Bubble::Added(k) => *added.get(*bi).and_then(|hs| hs.get(*k)).ok_or("added bubble missing")?,
+            };
+            let name = old
+                .iter()
+                .find(|g| g.members.contains(hl))
+                .map(|g| g.name.clone())
+                .filter(|n| !d.groups.iter().any(|g| g.name.eq_ignore_ascii_case(n)))
+                .unwrap_or_else(|| next_unnamed(&d.groups));
+            d.groups.push(Group { name, description: GROUP_DESCRIPTION.into(), selectable: true, members: vec![*hl, hb] });
         }
     }
     Ok(())
 }
 
-/// The after-command observer: every plan view's `LAMB_DTAG` inserts made to equal its tag
-/// leaders' wanted bubbles — matching ones kept, the rest erased, missing ones added. The drawing
-/// is written back only when something changed.
-pub fn bubble_observer(s: &mut Session, _before: &Arc<Drawing>) {
-    let todo = match s.doc().map_err(|e| e.to_string()).and_then(plan) {
+/// The after-command observer: every plan view's `LAMB_DTAG` inserts and tag groups made to equal
+/// its tag leaders' wanted bubbles — grouped ones updated in place, the rest erased, missing ones
+/// added. The drawing is written back only when something changed.
+pub fn bubble_observer(s: &mut Session, before: &Arc<Drawing>) {
+    let todo = match s.doc().map_err(|e| e.to_string()).and_then(|d| plan(d, Some(before))) {
         Ok(p) if p.is_empty() => return,
         Ok(p) => p,
         Err(e) => {
@@ -327,7 +491,9 @@ mod tests {
     fn a_dxf_round_trip_keeps_the_bubble_and_its_attributes() -> R {
         let (mut s, plan, detail) = room()?;
         tag(&mut s, detail, (2500.0, 0.0))?;
-        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        // The drawing's own save version keeps attribute Lock position (R2000 DXF has no group for it).
+        let bytes = cadcraft_io::write(s.doc()?, "t.dxf").map_err(|e| format!("{e:?}"))?;
+        let back = cadcraft_io::read(&bytes, "t.dxf").map_err(|e| format!("{e:?}"))?;
         assert!(back.block(BUBBLE_BLOCK).is_some_and(|b| b.entities.len() == 2));
         let wanted = plan_for(&back)?;
         assert!(wanted.is_empty(), "the observer would change nothing after a round trip: {wanted:?}");
@@ -374,7 +540,102 @@ mod tests {
         Ok(())
     }
 
+    fn hx(h: &str) -> T<Handle> {
+        Ok(Handle::parse_hex(h).ok_or("bad handle")?)
+    }
+
+    fn tag_groups(s: &Session) -> T<Vec<Group>> {
+        Ok(s.doc()?.groups.iter().filter(|g| is_tag_group(g)).cloned().collect())
+    }
+
+    fn end_of(s: &Session, leader: Handle) -> T<(f64, f64)> {
+        let v = leader_end(s.doc()?, leader).ok_or("no leader")?;
+        Ok((v.x, v.y))
+    }
+
+    #[test]
+    fn a_tag_and_its_bubble_are_one_selectable_group() -> R {
+        let (mut s, plan, detail) = room()?;
+        let leader = hx(&tag(&mut s, detail, (2500.0, 0.0))?)?;
+        let b = bubbles(&s, plan)?;
+        let g = tag_groups(&s)?;
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert!(g[0].selectable && g[0].name.starts_with("*A") && g[0].description == GROUP_DESCRIPTION);
+        assert_eq!(g[0].members, [leader, b[0].0]);
+        // Picking the leader (halfway along it, clear of the walls) selects both.
+        s.idle_click(cadcraft_geom::Vec2::new(2000.0, -500.0), false)?;
+        assert_eq!(s.selection(), vec![leader, b[0].0]);
+        // An unrelated command keeps the group as it is.
+        s.execute("line", &json!({ "points": [[9000, 9000], [9500, 9000]] }))?;
+        assert_eq!(tag_groups(&s)?, g);
+        Ok(())
+    }
+
+    #[test]
+    fn the_bubble_grip_drags_the_leader_end_and_the_leader_grip_drags_the_bubble() -> R {
+        let (mut s, plan, detail) = room()?;
+        let leader = hx(&tag(&mut s, detail, (2500.0, 0.0))?)?;
+        let hb = bubbles(&s, plan)?[0].0;
+        s.set_selection(Vec::new());
+        let n = undo_len(&s)?;
+        s.grip_edit(hb, 0, cadcraft_geom::Vec2::new(1900.0, -1250.0), cadcraft_engine::grips::GripMode::Stretch)?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert_eq!(end_of(&s, leader)?, (1900.0, -1250.0), "the leader's end follows the bubble");
+        let b = bubbles(&s, plan)?;
+        assert_eq!((b.len(), b[0].0, b[0].1), (1, hb, (1900.0, -1250.0)), "same bubble, where it was dragged");
+        let EntityKind::Insert(i) = &s.doc()?.entity(hb).ok_or("gone")?.kind else { return Err("not an insert".into()) };
+        assert_eq!(i.attribs[0].text.align_pt, Some(Vec3::new(1900.0, -1190.0, 0.0)), "the attributes went with it");
+        s.undo()?;
+        assert_eq!((end_of(&s, leader)?, bubbles(&s, plan)?[0].1), ((1500.0, -1000.0), (1500.0, -1000.0)));
+
+        // The leader's last-vertex grip carries the bubble.
+        let g = s.grips_of(leader)?;
+        let k = g.iter().position(|p| p.near(cadcraft_geom::Vec2::new(1500.0, -1000.0), 1e-6)).ok_or("no end grip")?;
+        s.grip_edit(leader, k, cadcraft_geom::Vec2::new(1000.0, -800.0), cadcraft_engine::grips::GripMode::Stretch)?;
+        let b = bubbles(&s, plan)?;
+        assert_eq!((b.len(), b[0].0, b[0].1), (1, hb, (1000.0, -800.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn move_carries_the_pair_and_erasing_the_leader_takes_bubble_and_group() -> R {
+        let (mut s, plan, detail) = room()?;
+        let leader = hx(&tag(&mut s, detail, (2500.0, 0.0))?)?;
+        let hb = bubbles(&s, plan)?[0].0;
+        s.execute("move", &json!({ "handles": [leader.hex(), hb.hex()], "delta": [300, 200] }))?;
+        let b = bubbles(&s, plan)?;
+        assert_eq!((b.len(), b[0].0, b[0].1), (1, hb, (1800.0, -800.0)), "moved, not re-created");
+        assert_eq!(end_of(&s, leader)?, (1800.0, -800.0));
+        assert_eq!(tag_groups(&s)?.len(), 1);
+        s.execute("erase", &json!({ "handles": [leader.hex()] }))?;
+        assert!(bubbles(&s, plan)?.is_empty());
+        assert!(tag_groups(&s)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bubble_text_has_no_grips_and_old_ungrouped_bubbles_are_adopted() -> R {
+        let (mut s, plan, detail) = room()?;
+        let leader = hx(&tag(&mut s, detail, (2500.0, 0.0))?)?;
+        let hb = bubbles(&s, plan)?[0].0;
+        assert_eq!(s.grips_of(hb)?.len(), 1, "locked attributes have no grips");
+        // A drawing from before the groups: the bubble at the leader's end is adopted, unlocked
+        // attributes are locked, and the handle stays.
+        let d = s.doc_mut()?;
+        d.groups.clear();
+        d.space_mut(&Space::Block(view_block_name(plan))).ok_or("no block")?.modify(hb, |e| {
+            if let EntityKind::Insert(i) = &mut e.kind {
+                i.attribs.iter_mut().for_each(|a| a.modes.lock_position = false);
+            }
+        });
+        s.execute("line", &json!({ "points": [[9000, 9000], [9500, 9000]] }))?;
+        assert_eq!(tag_groups(&s)?.iter().map(|g| g.members.clone()).collect::<Vec<_>>(), [vec![leader, hb]]);
+        assert_eq!(s.grips_of(hb)?.len(), 1);
+        Ok(())
+    }
+
     fn plan_for(d: &Drawing) -> T<Vec<Value>> {
-        Ok(plan(d)?.into_iter().map(|(b, r, a)| json!([b, r.len(), a.len()])).collect())
+        let p = plan(d, None)?;
+        Ok(if p.is_empty() { Vec::new() } else { vec![json!(format!("{p:?}"))] })
     }
 }

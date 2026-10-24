@@ -1471,7 +1471,10 @@ impl EntityKind {
             EntityKind::Text(t) => vec![t.justify_point()],
             EntityKind::MText(t) => vec![t.insert.xy()],
             EntityKind::AttDef(a) => vec![a.text.justify_point()],
-            EntityKind::Insert(i) => std::iter::once(i.insert.xy()).chain(i.attribs.iter().map(|a| a.text.justify_point())).collect(),
+            // An attribute whose Lock position mode is set has no grip of its own.
+            EntityKind::Insert(i) => {
+                std::iter::once(i.insert.xy()).chain(i.attribs.iter().filter(|a| !a.modes.lock_position).map(|a| a.text.justify_point())).collect()
+            }
             EntityKind::Dimension(d) => vec![d.p13.xy(), d.p14.xy(), d.defpt.xy(), d.text_mid.xy()],
             EntityKind::MLine(m) => m.points(),
             EntityKind::Leader(l) => l.vertices.iter().map(|v| v.xy()).collect(),

@@ -222,3 +222,49 @@ fn grips_on_locked_layers_and_hostile_values() {
         }
     }
 }
+
+#[test]
+fn locked_attributes_have_no_grips_and_later_grips_still_reach_their_attribute() {
+    use cadcraft_doc::{Attrib, AttribModes, HAlign, Space, Text, VAlign};
+    use cadcraft_geom::Vec3;
+    let mut s = Session::new();
+    let dot = h(&s.execute("circle", &json!({"center": [0, 0], "radius": 0.1})).unwrap());
+    s.execute("block", &json!({"name": "B", "base": [0, 0], "handles": [dot.hex()], "keep": "delete"})).unwrap();
+    let ins = h(&s.execute("insert", &json!({"name": "B", "at": [5, 5]})).unwrap());
+    let attrib = |tag: &str, y: f64, locked: bool| {
+        let p = Vec3::new(5.0, y, 0.0);
+        Attrib {
+            tag: tag.into(),
+            text: Text {
+                insert: p,
+                align_pt: None,
+                height: 1.0,
+                value: tag.into(),
+                rotation: 0.0,
+                width_factor: 1.0,
+                oblique: 0.0,
+                style: "Standard".into(),
+                halign: HAlign::Left,
+                valign: VAlign::Baseline,
+            },
+            invisible: false,
+            constant: false,
+            prompt: String::new(),
+            props: Default::default(),
+            multiline: None,
+            modes: AttribModes { lock_position: locked, ..AttribModes::default() },
+        }
+    };
+    s.doc_mut().unwrap().space_mut(&Space::Model).unwrap().modify(ins, |e| {
+        if let EntityKind::Insert(i) = &mut e.kind {
+            i.attribs = vec![attrib("A", 6.0, true), attrib("B", 8.0, false)];
+        }
+    });
+    let g = s.grips_of(ins).unwrap();
+    assert_eq!(g.len(), 2, "the insert point and the unlocked attribute only");
+    assert!(near(g[1], 5.0, 8.0));
+    s.grip_edit(ins, 1, v(9.0, 9.0), GripMode::Stretch).unwrap();
+    let EntityKind::Insert(i) = kind(&s, ins) else { panic!() };
+    assert!(near(i.attribs[0].text.insert.xy(), 5.0, 6.0), "the locked attribute stays");
+    assert!(near(i.attribs[1].text.insert.xy(), 9.0, 9.0), "grip 1 is the unlocked attribute");
+}
