@@ -490,8 +490,10 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
     // Current layer combo.
     let Ok(d) = app.session.doc() else { return };
     let cur = d.header.str("CLAYER", "0");
-    let layers: Vec<(String, bool, bool, bool, Color)> = d.layers.iter().map(|l| (l.name.clone(), l.on, l.frozen, l.locked, l.color)).collect();
-    let cur_info = layers.iter().find(|l| l.0.eq_ignore_ascii_case(&cur)).cloned();
+    let layers: Vec<(String, bool, bool, bool, Color)> =
+        layer_ext::visible_layers(d).map(|l| (l.name.clone(), l.on, l.frozen, l.locked, l.color)).collect();
+    // The current layer shows even when it is one the app keeps for itself; it just isn't offered.
+    let cur_info = d.layer(&cur).map(|l| (l.name.clone(), l.on, l.frozen, l.locked, l.color));
     let cells: Vec<_> = layers.iter().map(|l| layer_ext::cell_for(d, &l.0)).collect();
     let mut cell_action = None;
     let mut set_current = None;
@@ -817,7 +819,7 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
     let mut bad: Option<String> = None;
     if sel.is_empty() {
         // Current properties for new objects; each row runs the command that sets it.
-        let layers: Vec<String> = d.layers.iter().map(|l| l.name.clone()).collect();
+        let layers: Vec<String> = layer_ext::visible_layers(d).map(|l| l.name.clone()).collect();
         let linetypes: Vec<String> = d.linetypes.iter().map(|l| l.name.clone()).collect();
         let text_styles: Vec<String> = d.text_styles.iter().map(|l| l.name.clone()).collect();
         let dim_styles: Vec<String> = d.dim_styles.iter().map(|l| l.name.clone()).collect();
@@ -976,7 +978,7 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
     let lts = same(&|e| format!("{:.4}", e.common.ltscale));
     let lw = same(&|e| e.common.lineweight.name());
     let tr = same(&|e| e.common.transparency.name());
-    let layers: Vec<String> = d.layers.iter().map(|l| l.name.clone()).collect();
+    let layers: Vec<String> = layer_ext::visible_layers(d).map(|l| l.name.clone()).collect();
     let linetypes: Vec<String> = d.linetypes.iter().map(|l| l.name.clone()).collect();
     let ids: Vec<String> = sel.iter().map(|h| h.hex()).collect();
     let mut set: Option<Value> = None;

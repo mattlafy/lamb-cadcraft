@@ -420,6 +420,9 @@ fn main() -> eframe::Result {
     if let Err(e) = cadcraft_ui_egui::palettes::layer_ext::register_layer_cell(lamb_layer_cell) {
         log::warn!("LAMB Layers role column not installed: {e}");
     }
+    if let Err(e) = cadcraft_ui_egui::palettes::layer_ext::register_layer_hidden(lamb_cadcraft::views::internal_layer) {
+        log::warn!("LAMB internal layers not hidden: {e}");
+    }
     if let Err(e) = cadcraft_ui_egui::canvas::scalebar::register_scale_bar(lamb_cadcraft::commands::scale_bar_wanted) {
         log::warn!("LAMB scale bar not installed: {e}");
     }

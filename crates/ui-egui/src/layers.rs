@@ -232,7 +232,7 @@ pub fn dialog(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
     let linetypes: Vec<cadcraft_doc::Linetype> = d.linetypes.clone();
     let library: Vec<String> = cadcraft_doc::library::standard_linetypes().into_iter().map(|l| l.name).filter(|n| d.linetype(n).is_none()).collect();
     let states: Vec<String> = d.layer_states.iter().map(|s| s.name.clone()).collect();
-    let mut layers: Vec<Layer> = d.layers.clone();
+    let mut layers: Vec<Layer> = crate::palettes::layer_ext::visible_layers(d).cloned().collect();
     layers.sort_by_key(|l| natural_lower(&l.name));
     if st.sort_desc {
         layers.reverse();

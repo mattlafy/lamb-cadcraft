@@ -175,6 +175,15 @@ fn view_label(doc: &LambDocument, v: &AnyView) -> String {
     }
 }
 
+/// Whether `name` is a layer LAMB keeps for itself: `LAMB_VIEW_<id>` or `LAMB_ASSEMBLY_<id>`
+/// (any case) with a block of that name in the drawing. Such layers exist for outside software to
+/// display sheets; layer lists leave them out (registered as the fork's hidden-layer predicate).
+pub fn internal_layer(d: &Drawing, name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let id = upper.strip_prefix("LAMB_VIEW_").or_else(|| upper.strip_prefix("LAMB_ASSEMBLY_"));
+    id.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())) && d.block(name).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +213,20 @@ mod tests {
         assert_eq!(r[1].label, "Start LAMB project");
         assert_eq!(r[1].command, Some(("lambproject".into(), json!({}))));
         assert!(!r[1].active && !r[1].heading);
+        Ok(())
+    }
+
+    #[test]
+    fn view_layers_are_internal_only_while_their_block_exists() -> R {
+        let mut s = session()?;
+        s.execute("lambproject", &json!({}))?;
+        let plan = read_document(s.doc()?)?.views[0].id();
+        let d = s.doc()?;
+        assert!(internal_layer(d, &view_block_name(plan)));
+        assert!(internal_layer(d, &view_block_name(plan).to_lowercase()));
+        assert!(!internal_layer(d, "0"));
+        assert!(!internal_layer(d, "LAMB_VIEW_999999"), "no such block");
+        assert!(!internal_layer(d, "LAMB_VIEW_"));
         Ok(())
     }
 
