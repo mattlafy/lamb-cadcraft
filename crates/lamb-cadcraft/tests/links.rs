@@ -1,5 +1,5 @@
 //! The explicit link commands `link` / `unlink` on the imported `u-wall-two-sections` fixture: a
-//! forced link across layers is recorded `Explicit` and survives the link observer, each command is
+//! link between two crossing lines is recorded `Explicit`, two lines that do not cross are refused, each command is
 //! one undo step restoring `ext["LAMB"]` byte-identical, and every refusal leaves the drawing as it was.
 //!
 //! The command registry is process-global, so registration goes through one `Once`.
@@ -83,7 +83,7 @@ fn link_and_unlink() -> R {
     let original = read_document(&d)?.links;
     assert_eq!(original.len(), 3, "fixture has 3 links");
     // A section line and its view, from an imported link's non-plan end; the plan view from the other.
-    let (sec_e, sec_view, plan_view) = {
+    let (sec_e, _sec_view, plan_view) = {
         let l = &original[0];
         let (va, vb) = (view_of(&d, l.a.entity_id)?, view_of(&d, l.b.entity_id)?);
         if is_plan(&d, va)? { (l.b.entity_id, vb, va) } else { (l.a.entity_id, va, vb) }
@@ -100,23 +100,36 @@ fn link_and_unlink() -> R {
     s.execute("line", &json!({"points": [[-90000, -90000], [-85000, -90000]]}))?;
     let line = block_handles(s.doc()?, plan_view).into_iter().find(|h| !before.contains(h)).ok_or("line not drawn")?;
     assert_eq!(links(&s)?, original, "the layer-0 line links nothing");
-    let line_id = Id(line.0);
 
-    // --- LINK it to the section line: hex handle on one end, raw number on the other.
+    // --- LINK refuses two lines that do not cross (LAMB T514), with no undo step of its own.
+    let target = original[1].clone();
+    s.execute("unlink", &json!({"linkId": target.id.0}))?;
+    let unlinked = links(&s)?;
+    let far = json!({"a": anchor(json!(line.hex()), json!(0), 0.25), "b": anchor(json!(sec_e.0), json!(0), 0.5)});
+    refuses(&mut s, "link", &far, "Those lines do not cross at a marker")?;
+    s.undo()?;
+    assert_eq!(links(&s)?, original, "the refusal left no undo step: one undo reverts the UNLINK");
+    s.redo()?;
+    assert_eq!(links(&s)?, unlinked);
+
+    // --- LINK the unlinked crossing again: hex handle on one end, raw number on the other.
     let ext_before = ext(&s)?;
-    let r = s.execute(&resolve_alias("lk"), &json!({"a": anchor(json!(line.hex()), json!(0), 0.25), "b": anchor(json!(sec_e.0), json!(0), 0.5)}))?;
+    let (ta, tb) = (&target.a, &target.b);
+    let args = json!({
+        "a": anchor(json!(Handle(ta.entity_id.0).hex()), json!(ta.segment_index), ta.segment_param),
+        "b": anchor(json!(tb.entity_id.0), json!(tb.segment_index), tb.segment_param),
+    });
+    let r = s.execute(&resolve_alias("lk"), &args)?;
     let link_id = Id(r.get("linkId").and_then(Value::as_u64).ok_or("no linkId")?);
     let now = links(&s)?;
-    assert_eq!(now.len(), original.len() + 1, "link count +1");
-    assert_eq!(&now[..original.len()], &original[..], "the imported links are untouched");
+    assert_eq!(now.len(), unlinked.len() + 1, "link count +1");
+    assert_eq!(&now[..unlinked.len()], &unlinked[..], "the other links are untouched");
     let l = now.last().ok_or("no link")?;
     assert_eq!(l.id, link_id, "the returned linkId is the record's");
-    assert_eq!((l.a.entity_id, l.a.segment_index, l.a.segment_param), (line_id, 0, 0.25));
-    assert_eq!((l.b.entity_id, l.b.segment_index, l.b.segment_param), (sec_e, 0, 0.5));
+    assert_eq!((&l.a, &l.b), (ta, tb));
     assert_eq!(l.origin, LinkOrigin::Explicit);
     assert_eq!(l.created_by, Actor::User { user_id: "local".into() });
-    assert_eq!(l.stale, None, "the observer leaves a non-coinciding explicit link alone");
-    assert!(view_of(s.doc()?, line_id)? != sec_view);
+    assert_eq!(l.stale, None);
     let linked = s.doc()?.clone();
     s.undo()?;
     assert_eq!(ext(&s)?, ext_before, "undo restores ext[LAMB] byte-identical");
@@ -124,13 +137,13 @@ fn link_and_unlink() -> R {
     assert_eq!(links(&s)?, now, "redo brings it back");
     assert!(*s.doc()? == linked);
 
-    // --- UNLINK an imported link (decimal string id), undo, and an unknown id.
-    let gone = original[1].id;
+    // --- UNLINK the new link (decimal string id), undo, and an unknown id.
+    let gone = link_id;
     let ext_linked = ext(&s)?;
     assert_eq!(s.execute(&resolve_alias("ulk"), &json!({"linkId": gone.0.to_string()}))?, Value::Null);
     let after = links(&s)?;
     assert_eq!(after.len(), now.len() - 1);
-    assert!(!after.iter().any(|l| l.id == gone), "the imported link is gone");
+    assert!(!after.iter().any(|l| l.id == gone), "the link is gone");
     s.undo()?;
     assert_eq!(ext(&s)?, ext_linked, "undo: back byte-identical");
     refuses(&mut s, "unlink", &json!({"linkId": 987_654_321u64}), "No such link")?;

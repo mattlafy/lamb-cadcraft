@@ -17,7 +17,7 @@ use super::synthesis::synthesize;
 use crate::geometry::halfspace::{HalfSpace, section_convex_polyhedron};
 use crate::geometry::intersect::{crossing_angle_deg, intersect_segment_with_infinite_line, intersect_segments, tangent_at_hit};
 use crate::geometry::point::{normalize2, sub2};
-use crate::geometry::polyline::resolved_segments;
+use crate::geometry::polyline::{point_at_param, resolved_segments};
 use crate::geometry::tolerance::TOLERANCE;
 use crate::geometry::transform2d::{world_to_local_dir2, world_to_local2};
 use crate::geometry::triangulate::polygon_area_signed;
@@ -83,6 +83,24 @@ fn crossing_role(doc: &impl ProjectRead, e: &EntityRef<'_>) -> Option<LineRole> 
     }
 }
 
+/// A marker is filled when some link joins `entity` to an entity in `view` with its anchor on
+/// `entity` within coincidence of the marker's source point `at` (in `entity`'s own view space),
+/// whatever segment that anchor names — so a link on one segment of a closed loop's corner, or of
+/// a line ending on a cut plane, fills the marker its neighbouring segment makes there too, in both
+/// views (LAMB T514).
+fn marker_filled(doc: &impl ProjectRead, entity: Id, segments: &[ResolvedSegment], view: Id, at: Point2) -> bool {
+    doc.links().any(|l| {
+        [(&l.a, &l.b), (&l.b, &l.a)].into_iter().any(|(mine, other)| {
+            mine.entity_id == entity
+                && doc.entity_view_id(other.entity_id) == Some(view)
+                && segments.get(mine.segment_index).is_some_and(|s| {
+                    let p = point_at_param(s, mine.segment_param);
+                    (p.x - at.x).hypot(p.y - at.y) <= TOLERANCE.coincidence_mm
+                })
+        })
+    })
+}
+
 /// Markers in a placed vertical view where every placed plan view's `cut`/`seen` lines cross its
 /// cut line (taken as an infinite line in plan).
 pub fn compute_markers_for_vertical_view(doc: &impl ProjectRead, view: &ViewRef<'_>) -> Result<Vec<Marker>, String> {
@@ -101,7 +119,8 @@ pub fn compute_markers_for_vertical_view(doc: &impl ProjectRead, view: &ViewRef<
         for entity in doc.entities(other_view.id) {
             let Some(role) = crossing_role(doc, &entity) else { continue };
             let Some(poly) = entity.polyline.as_deref() else { continue };
-            for seg in resolved_segments(poly) {
+            let segments = resolved_segments(poly);
+            for seg in &segments {
                 let global_seg = ResolvedSegment {
                     index: seg.index,
                     from: plan_local_to_global_xy(&other_view, seg.from)?,
@@ -127,7 +146,7 @@ pub fn compute_markers_for_vertical_view(doc: &impl ProjectRead, view: &ViewRef<
                         position: world_to_local2(transform, Point2 { x: u, y: z }),
                         theta_deg,
                         shape: shape_for_theta(theta_deg),
-                        filled: doc.has_link_to_view(entity.id, seg.index, view.id),
+                        filled: marker_filled(doc, entity.id, &segments, view.id, point_at_param(seg, hit.t_a)),
                         assumed_z,
                     });
                 }
@@ -154,7 +173,8 @@ pub fn compute_markers_for_plan_view(doc: &impl ProjectRead, plan_view: &ViewRef
                 continue;
             }
             let Some(poly) = entity.polyline.as_deref() else { continue };
-            for seg in resolved_segments(poly) {
+            let segments = resolved_segments(poly);
+            for seg in &segments {
                 let from_uz = vertical_local_to_uz(&other_view, seg.from);
                 let to_uz = vertical_local_to_uz(&other_view, seg.to);
                 let seg_uz = ResolvedSegment {
@@ -188,7 +208,7 @@ pub fn compute_markers_for_plan_view(doc: &impl ProjectRead, plan_view: &ViewRef
                         position: plan_global_to_local_xy(plan_view, global_xy)?,
                         theta_deg,
                         shape: shape_for_theta(theta_deg),
-                        filled: doc.has_link_to_view(entity.id, seg.index, plan_view.id),
+                        filled: marker_filled(doc, entity.id, &segments, plan_view.id, point_at_param(seg, hit.t_a)),
                         assumed_z: false,
                     });
                 }

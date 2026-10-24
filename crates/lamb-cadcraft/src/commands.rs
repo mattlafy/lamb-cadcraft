@@ -114,6 +114,7 @@ use std::sync::OnceLock;
 use cadcraft_doc::{EntityKind, Handle, Line, Space};
 use cadcraft_engine::{Accept, CommandSpec, EngineError, Input, Interactive, Prompt, Result, Session, Step, register_command_provider};
 use cadcraft_geom::Vec2;
+use lamb_core::derivation::linking::link_still_coincides;
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::geometry::polyline::line2;
 use lamb_core::geometry::polyline::resolved_segments;
@@ -317,7 +318,7 @@ fn anchor_range(p: &DrawingProject<'_>, end: &str, a: &RawAnchor) -> Result<Link
 
 fn link(s: &mut Session, p: &Value) -> Result<Value> {
     let (ra, rb) = (raw_anchor(p, "a")?, raw_anchor(p, "b")?);
-    let (a, b) = {
+    let record = {
         let proj = DrawingProject::new(s.doc()?).map_err(other)?;
         let (a, b) = (anchor_range(&proj, "a", &ra)?, anchor_range(&proj, "b", &rb)?);
         let (va, vb) = (proj.entity_view_id(a.entity_id), proj.entity_view_id(b.entity_id));
@@ -325,20 +326,25 @@ fn link(s: &mut Session, p: &Value) -> Result<Value> {
         if va == vb {
             return Err(other("Link ends must be in different views"));
         }
-        (a, b)
+        // LAMB T514: a link exists only where its two lines cross.
+        let probe = LinkRecord {
+            id: Id(0),
+            a,
+            b,
+            origin: LinkOrigin::Explicit,
+            created_at: String::new(),
+            created_by: Actor::User { user_id: "local".into() },
+            stale: None,
+        };
+        if !link_still_coincides(&proj, &probe).map_err(other)? {
+            return Err(other("Those lines do not cross at a marker"));
+        }
+        probe
     };
     let d = s.doc_mut()?;
     let mut doc = read_document(d).map_err(other)?;
     let id = Id(d.new_handle().0);
-    doc.links.push(LinkRecord {
-        id,
-        a,
-        b,
-        origin: LinkOrigin::Explicit,
-        created_at: now(),
-        created_by: Actor::User { user_id: "local".into() },
-        stale: None,
-    });
+    doc.links.push(LinkRecord { id, created_at: now(), ..record });
     write_document(d, &doc).map_err(other)?;
     Ok(json!({ "linkId": id.0 }))
 }

@@ -167,6 +167,7 @@ mod tests {
         plan_line: Id,
         /// Plan line (0,2000)–(10000,2000): crosses the cut line too, never linked.
         other_line: Id,
+        /// Section line (5000,-5000)–(5000,5000): through the plan line's marker in the section.
         section_line: Id,
     }
 
@@ -192,7 +193,9 @@ mod tests {
         )?;
         let section = Id(r["viewId"].as_u64().ok_or("no section")?);
         enter_space(&mut s, Space::Block(view_block_name(section)))?;
-        let section_line = new_entity(&mut s, section, json!([[0, 0], [10000, 0]]))?;
+        // Vertical through u = 5000 (plan (3000, 0)), so it crosses the plan cut where the plan
+        // line crosses the section's cut line (a link needs its lines to cross, LAMB T514).
+        let section_line = new_entity(&mut s, section, json!([[5000, -5000], [5000, 5000]]))?;
         enter_space(&mut s, Space::Block(view_block_name(plan)))?;
         Ok(Fixture { s, plan, section, plan_line, other_line, section_line })
     }
@@ -203,6 +206,13 @@ mod tests {
 
     fn prompt(s: &Session) -> Option<String> {
         s.current_prompt().map(|p| p.message)
+    }
+
+    /// Where `source` crosses `view`'s cut, in `view`'s local space.
+    fn marker_at(s: &Session, view: Id, source: Id) -> E<Vec2> {
+        let markers = compute_markers_for_view(&DrawingProject::new(s.doc()?)?, view)?;
+        let m = markers.iter().find(|m| m.source_entity_id == source).ok_or("no marker")?;
+        Ok(Vec2::new(m.position.x, m.position.y))
     }
 
     const FIRST: &str = "Select a line to link (Esc/Enter to end)";
@@ -217,9 +227,10 @@ mod tests {
         assert_eq!(prompt(s).as_deref(), Some(FIRST));
         s.input(Input::Point(Vec2::new(3000.0, 0.0)))?;
         assert_eq!(prompt(s).as_deref(), Some(SECOND));
-        // Mid-command, the user clicks the section's tile.
+        // Mid-command, the user clicks the section's tile, then the crossing.
+        let crossing = marker_at(s, f.section, f.plan_line)?;
         enter_space(s, Space::Block(view_block_name(f.section)))?;
-        s.input(Input::Point(Vec2::new(5000.0, 0.0)))?;
+        s.input(Input::Point(crossing))?;
         assert!(s.log.iter().any(|l| l == "Linked"), "{:?}", s.log);
         let now = links(s)?;
         assert_eq!(now.len(), base + 1);
@@ -228,20 +239,22 @@ mod tests {
         assert_eq!((l.a.entity_id, l.a.segment_index), (f.plan_line, 0));
         assert!((l.a.segment_param - 0.3).abs() < 1e-9, "{}", l.a.segment_param);
         assert_eq!((l.b.entity_id, l.b.segment_index), (f.section_line, 0));
-        assert!((l.b.segment_param - 0.5).abs() < 1e-9, "{}", l.b.segment_param);
+        let want = (crossing.y + 5000.0) / 10000.0;
+        assert!((l.b.segment_param - want).abs() < 1e-9, "{} vs {want}", l.b.segment_param);
         assert_eq!(prompt(s).as_deref(), Some(FIRST), "repeatable");
         assert!(s.running.is_some());
-        // A second pair in the same run, back from the section to the plan.
-        s.input(Input::Point(Vec2::new(2000.0, 0.0)))?;
+        // A second pair in the same run, back from the section to a plan line it does not cross:
+        // refused (LAMB T514), and the run goes on.
+        s.input(Input::Point(Vec2::new(5000.0, 4000.0)))?;
         enter_space(s, Space::Block(view_block_name(f.plan)))?;
         s.input(Input::Point(Vec2::new(8000.0, 2000.0)))?;
-        assert_eq!(links(s)?.len(), base + 2);
+        assert!(s.log.iter().any(|l| l.contains("Those lines do not cross at a marker")), "{:?}", s.log);
+        assert_eq!(links(s)?.len(), base + 1);
+        assert_eq!(prompt(s).as_deref(), Some(FIRST), "still repeatable");
         s.input(Input::Enter)?;
         assert!(s.running.is_none(), "Enter ends it");
         s.undo()?;
-        assert_eq!(links(s)?.len(), base + 1, "one undo step per link");
-        s.undo()?;
-        assert_eq!(links(s)?.len(), base);
+        assert_eq!(links(s)?.len(), base, "one undo step for the link, none for the refusal");
         Ok(())
     }
 
@@ -267,10 +280,11 @@ mod tests {
     fn unlink_clicks_a_filled_marker_and_undo_restores_it() -> R {
         let mut f = fixture()?;
         let s = &mut f.s;
+        let crossing = marker_at(s, f.section, f.plan_line)?;
         s.start("link")?;
         s.input(Input::Point(Vec2::new(3000.0, 0.0)))?;
         enter_space(s, Space::Block(view_block_name(f.section)))?;
-        s.input(Input::Point(Vec2::new(5000.0, 0.0)))?;
+        s.input(Input::Point(crossing))?;
         s.input(Input::Enter)?;
         let linked = links(s)?;
         let link = linked.last().ok_or("no link")?.clone();

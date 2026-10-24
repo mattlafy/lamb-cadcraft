@@ -834,7 +834,8 @@ mod tests {
             Ok(s.doc()?.block(&crate::schema::view_block_name(plan)).ok_or("no plan block")?.entities.iter().map(|e| e.handle.hex()).collect())
         };
         let before = handles(&s)?;
-        s.execute("line", &json!({ "points": [[290.0, 500.0], [290.0, 1500.0]] }))?;
+        // Across the section cut (plan y = 0), so it crosses the inner face's marker (LAMB T514).
+        s.execute("line", &json!({ "points": [[290.0, -500.0], [290.0, 500.0]] }))?;
         let h =
             handles(&s)?.into_iter().find(|h| !before.contains(h) && us(&s, &[h]).is_ok_and(|x| x == [(290.0, 290.0)])).ok_or("line not drawn")?;
         let a = json!({ "entityId": inner, "segmentIndex": 3, "segmentParam": 0.5 });

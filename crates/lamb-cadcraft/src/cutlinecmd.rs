@@ -379,9 +379,9 @@ mod tests {
     }
 
     /// T499: a parallel move that still crosses the wall keeps the link and moves the marker's
-    /// plan crossing; one past the wall's end flags it stale; moving back clears it.
+    /// plan crossing; one past the wall's end drops it; undo restores it.
     #[test]
-    fn moving_a_cut_line_keeps_crossing_links_and_flags_broken_ones() -> E<()> {
+    fn moving_a_cut_line_keeps_crossing_links_and_drops_broken_ones() -> E<()> {
         let (mut s, plan, crossbar) = editing_plan()?;
         let legs = view_named(&s, "Legs")?;
         assert_eq!(cut_start(&s, crossbar)?, Point2 { x: 5000.0, y: -1000.0 });
@@ -404,19 +404,16 @@ mod tests {
         s.undo()?;
         assert_eq!(cut_start(&s, crossbar)?, Point2 { x: 5000.0, y: -1000.0 }, "undo restores it");
 
-        // -6000 → x 11000, past the wall's end at 10000: the link goes stale, in one undo step.
+        // -6000 → x 11000, past the wall's end at 10000: the link is dropped (a link exists only
+        // where its lines cross, LAMB T514), in one undo step; undo brings it back.
         let undo = s.state()?.undo.len();
+        let before = links_of(&s, crossbar)?;
         s.execute("cutline", &json!({ "viewId": crossbar.0, "offsetMm": -6000 }))?;
         assert_eq!(s.state()?.undo.len(), undo + 1);
-        assert_eq!(links_of(&s, crossbar)?.first().and_then(|l| l.stale), Some(true), "flagged stale");
+        assert!(links_of(&s, crossbar)?.is_empty(), "dropped");
         assert!(links_of(&s, legs)?.iter().all(|l| l.stale.is_none()), "other views' links untouched");
-        // And back: cleared.
-        s.execute("cutline", &json!({ "viewId": crossbar.0, "offsetMm": 6000 }))?;
-        assert_eq!(s.state()?.undo.len(), undo + 2);
-        assert_eq!(cut_start(&s, crossbar)?, Point2 { x: 5000.0, y: -1000.0 });
-        assert_eq!(links_of(&s, crossbar)?.first().map(|l| l.stale), Some(None), "cleared when restored");
         s.undo()?;
-        assert_eq!(links_of(&s, crossbar)?.first().and_then(|l| l.stale), Some(true), "undo restores the flag");
+        assert_eq!(links_of(&s, crossbar)?, before, "undo restores the link");
         Ok(())
     }
 

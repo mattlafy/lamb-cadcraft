@@ -1,9 +1,10 @@
 //! The link-maintenance observer (`maintain`): on the imported `u-wall-two-sections` fixture, ERASE
-//! drops exactly the erased entity's links, a non-rigid STRETCH off a crossing flags stale and back
-//! clears, a line drawn through a hollow marker auto-links, an unlinked MOVE leaves links alone, and
+//! drops exactly the erased entity's links, a non-rigid STRETCH off a crossing drops the link (a
+//! link exists only where its lines cross, LAMB T514), a line drawn through a hollow marker auto-links, an unlinked MOVE leaves links alone, and
 //! a rigidly moved linked segment carries its partner across views (travel) only when the link is
 //! in the selection's travel set — seeded by an idle crossing box, emptied by a window box or Esc —
-//! and is flagged stale otherwise, erasing a travel-set line erases its partner, each in the command's own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`).
+//! and is dropped otherwise, erasing a line never erases its partner, a marker fills in both views
+//! whichever segment of its source the link names, each in the command's own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`).
 //!
 //! The command registry is process-global, so registration goes through one `Once`.
 
@@ -13,7 +14,6 @@ use std::path::Path;
 use cadcraft_doc::{Drawing, Handle};
 use cadcraft_engine::Session;
 use lamb_cadcraft::{DrawingProject, commands, install, maintain_links, project_to_drawing, read_document, view_block_name};
-use lamb_core::derivation::issues::{IssueKind, find_issues};
 use lamb_core::derivation::linking::link_still_coincides;
 use lamb_core::derivation::markers::compute_markers_for_view;
 use lamb_core::derivation::read::ProjectRead;
@@ -58,11 +58,6 @@ fn is_plan(d: &Drawing, view: Id) -> Result<bool, String> {
 
 fn on(link: &LinkRecord, e: Id) -> bool {
     link.a.entity_id == e || link.b.entity_id == e
-}
-
-fn stale_issue_count(s: &Session) -> Result<usize, Box<dyn std::error::Error>> {
-    let p = DrawingProject::new(s.doc()?)?;
-    Ok(find_issues(&p)?.iter().filter(|i| i.kind == IssueKind::StaleLink).count())
 }
 
 /// The LAMB commands plus the process-global hooks (FILLET's virtual corners, rounded drawing).
@@ -125,7 +120,8 @@ fn link_observer_maintains_links() -> R {
     assert!(s.doc()?.entity(Handle(plan_end.0)).is_some(), "undo restores the entity");
     assert_eq!(links(&s)?, original, "and its links");
 
-    // --- STRETCH one end of a linked section line (non-rigid, so no travel): stale; back: cleared.
+    // --- STRETCH one end of a linked section line (non-rigid, so no travel): its links are
+    // dropped; one undo brings them back.
     // One undo step each. A rigid MOVE along the cut travels instead (`rigid_move_travels_partner`).
     let (sec_end, sec_view) = {
         let d = s.doc()?;
@@ -142,7 +138,6 @@ fn link_observer_maintains_links() -> R {
     };
     let sec_links: Vec<Id> = original.iter().filter(|l| on(l, sec_end)).map(|l| l.id).collect();
     s.execute("editview", &json!({"viewId": sec_view.0}))?;
-    assert_eq!(stale_issue_count(&s)?, 0);
     let plan_poly = poly(s.doc()?, plan_end)?;
     let top = {
         let segs = resolved_segments(&poly(s.doc()?, sec_end)?);
@@ -152,19 +147,10 @@ fn link_observer_maintains_links() -> R {
     let window = |x: f64, y: f64| json!([[x - 50.0, y - 50.0], [x + 50.0, y + 50.0]]);
     s.execute("stretch", &json!({"window": window(top.x, top.y), "delta": [3000, 0]}))?;
     assert_eq!(poly(s.doc()?, plan_end)?, plan_poly, "a non-rigid edit travels nothing");
-    let after_move = links(&s)?;
-    assert_eq!(after_move.len(), original.len(), "a broken crossing is flagged, not dropped");
-    for l in &after_move {
-        let expect = if sec_links.contains(&l.id) { Some(true) } else { None };
-        assert_eq!(l.stale, expect, "link {} stale flag after the move", l.id);
-    }
-    assert_eq!(stale_issue_count(&s)?, sec_links.len(), "find_issues reports StaleLink");
-    s.execute("stretch", &json!({"window": window(top.x + 3000.0, top.y), "delta": [-3000, 0]}))?;
-    assert_eq!(links(&s)?, original, "moving back clears the flags");
+    let kept: Vec<LinkRecord> = original.iter().filter(|l| !sec_links.contains(&l.id)).cloned().collect();
+    assert_eq!(links(&s)?, kept, "a broken crossing drops the link");
     s.undo()?;
-    assert_eq!(links(&s)?, after_move, "one undo: stale again");
-    s.undo()?;
-    assert_eq!(links(&s)?, original, "second undo: as imported");
+    assert_eq!(links(&s)?, original, "one undo: as imported");
 
     // --- A line drawn through a hollow marker auto-links; undo removes line and link together.
     // The fixture's markers are all filled, so erase the section end first to hollow its markers.
@@ -339,19 +325,28 @@ fn crossbar(d: &Drawing) -> Result<(LinkRecord, Id, Id, Id), Box<dyn std::error:
     Ok((link, plan_e, sec_e, plan_view))
 }
 
-/// T367: the same rigid STRETCH with the link outside the travel set leaves the section partner
-/// where it is and flags the link stale; one undo restores both.
+/// Every marker `source` makes in `view` — hollow or filled.
+fn markers_from(d: &Drawing, view: Id, source: Id) -> Result<Vec<lamb_core::derivation::markers::Marker>, Box<dyn std::error::Error>> {
+    let p = DrawingProject::new(d)?;
+    Ok(compute_markers_for_view(&p, view)?.into_iter().filter(|m| m.source_entity_id == source).collect())
+}
+
+/// T367 + LAMB T514: the same rigid STRETCH with the link outside the travel set leaves the section
+/// partner where it is and drops the link — a link exists only where its lines cross; one undo
+/// restores both. A section line MOVEd off its marker the same way drops its link and leaves both
+/// markers hollow.
 #[test]
-fn outside_the_travel_set_a_rigid_move_flags_stale() -> R {
+fn outside_the_travel_set_a_rigid_move_drops_the_link() -> R {
     register();
     let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
     let original = read_document(&d)?.links;
     let (link, plan_e, sec_e, plan_view) = crossbar(&d)?;
+    let sec_view = view_of(&d, sec_e)?;
     let stretch = json!({"window": [[-100, -100], [10100, 100]], "delta": [0, 1000]});
 
     let (_, report) = raw_report(&d, plan_view, "stretch", &stretch, &[])?;
     assert!(report.travelled.is_empty(), "{report:?}");
-    assert!(report.staled.contains(&link.id), "{report:?}");
+    assert!(report.separated.contains(&link.id), "{report:?}");
 
     let mut s = Session::new();
     s.open_drawing(d.clone(), "u-wall", None);
@@ -362,10 +357,27 @@ fn outside_the_travel_set_a_rigid_move_flags_stale() -> R {
     s.execute("stretch", &stretch)?;
     assert!(s.doc()?.entity(Handle(plan_e.0)).cloned() != plan_ent, "the plan wall moved");
     assert_eq!(poly(s.doc()?, sec_e)?, sec_poly, "the section partner did not travel");
-    assert_eq!(find_link(&links(&s)?, link.id)?.stale, Some(true), "the link is flagged, not dropped");
+    assert!(find_link(&links(&s)?, link.id).is_err(), "the link is dropped");
     s.undo()?;
     assert_eq!(s.doc()?.entity(Handle(plan_e.0)).cloned(), plan_ent);
-    assert_eq!(links(&s)?, original, "undo clears the flag");
+    assert_eq!(links(&s)?, original, "undo brings the link back");
+
+    // The section line moved along u, off its marker: link gone, both markers hollow; undo: back.
+    let filled = |d: &Drawing| -> Result<(bool, bool), Box<dyn std::error::Error>> {
+        let plan_side = markers_from(d, plan_view, sec_e)?;
+        let sec_side = markers_from(d, sec_view, plan_e)?;
+        assert!(!plan_side.is_empty() && !sec_side.is_empty(), "a marker on each side");
+        Ok((plan_side.iter().any(|m| m.filled), sec_side.iter().any(|m| m.filled)))
+    };
+    assert_eq!(filled(s.doc()?)?, (true, true), "linked: filled on both sides");
+    s.execute("editview", &json!({"viewId": sec_view.0}))?;
+    s.execute("move", &json!({"handles": [hex(sec_e)], "delta": [500, 0]}))?;
+    let now = links(&s)?;
+    assert!(!now.iter().any(|l| on(l, sec_e)), "every link on the moved line is dropped: {now:?}");
+    assert_eq!(filled(s.doc()?)?, (false, false), "both markers hollow");
+    s.undo()?;
+    assert_eq!(links(&s)?, original, "undo brings the link back");
+    assert_eq!(filled(s.doc()?)?, (true, true));
     Ok(())
 }
 
@@ -537,60 +549,91 @@ fn trim_reanchors_links() -> R {
     Ok(())
 }
 
-/// T370 (TS T109 ERASE): erasing a line whose link is in the travel set erases the partner in the
-/// other view too, in one undo step; with an empty travel set the partner stays; a TRIM or BREAK
-/// that cuts the anchor away is not an erase and leaves the partner.
+/// LAMB T514: erasing a line never erases its partner, travel set or not — the link is dropped and
+/// the partner's marker turns hollow; one undo restores line and link.
 #[test]
-fn erase_takes_travelling_partners() -> R {
+fn erase_never_takes_partners() -> R {
     register();
     let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
     let original = read_document(&d)?.links;
-    let (link, plan_e, sec_e, plan_view) = crossbar(&d)?;
-    let erase = json!({"handles": [hex(plan_e)]});
-
-    let (after, report) = raw_report(&d, plan_view, "erase", &erase, &[link.id])?;
-    assert_eq!(report.erased, vec![sec_e], "{report:?}");
-    assert!(after.entity(Handle(sec_e.0)).is_none(), "the section partner is gone");
-    let gone: Vec<Id> = original.iter().filter(|l| on(l, plan_e) || on(l, sec_e)).map(|l| l.id).collect();
-    assert_eq!(report.dropped, gone, "every link touching either is dropped");
-    assert_eq!(read_document(&after)?.links, original.iter().filter(|l| !gone.contains(&l.id)).cloned().collect::<Vec<_>>());
+    let (link, plan_e, sec_e, _) = crossbar(&d)?;
+    let sec_view = view_of(&d, sec_e)?;
+    let erase = json!({"handles": [hex(sec_e)]});
+    let plan_anchor = if link.a.entity_id == plan_e { link.a.clone() } else { link.b.clone() };
+    // The marker the plan wall makes in the section, at the link's plan anchor segment.
+    let plan_marker_filled = |d: &Drawing| -> Result<bool, Box<dyn std::error::Error>> {
+        let ms = markers_from(d, sec_view, plan_e)?;
+        let m = ms.iter().find(|m| m.source_segment_index == plan_anchor.segment_index).ok_or("no plan-wall marker in the section")?;
+        Ok(m.filled)
+    };
 
     let mut s = Session::new();
     s.open_drawing(d.clone(), "u-wall", None);
     install_link_maintenance(&mut s);
+    assert!(plan_marker_filled(s.doc()?)?);
     let ext_before = s.doc()?.ext.get(lamb_cadcraft::EXT_KEY).cloned();
-    let (plan_ent, sec_ent) = (s.doc()?.entity(Handle(plan_e.0)).cloned(), s.doc()?.entity(Handle(sec_e.0)).cloned());
-    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    let plan_ent = s.doc()?.entity(Handle(plan_e.0)).cloned();
+    s.execute("editview", &json!({"viewId": sec_view.0}))?;
     s.set_travel(vec![link.id.0]);
     s.execute("erase", &erase)?;
-    assert!(s.doc()?.entity(Handle(plan_e.0)).is_none() && s.doc()?.entity(Handle(sec_e.0)).is_none(), "both erased");
-    assert!(!links(&s)?.iter().any(|l| on(l, plan_e) || on(l, sec_e)));
+    assert!(s.doc()?.entity(Handle(sec_e.0)).is_none(), "the section line is erased");
+    assert_eq!(s.doc()?.entity(Handle(plan_e.0)).cloned(), plan_ent, "its plan partner stays, unchanged");
+    assert!(find_link(&links(&s)?, link.id).is_err(), "the link is gone");
+    assert!(!plan_marker_filled(s.doc()?)?, "the plan wall's marker is hollow");
     s.undo()?;
-    assert_eq!(s.doc()?.entity(Handle(plan_e.0)).cloned(), plan_ent, "one undo restores the plan entity");
-    assert_eq!(s.doc()?.entity(Handle(sec_e.0)).cloned(), sec_ent, "and the section partner");
+    assert!(s.doc()?.entity(Handle(sec_e.0)).is_some(), "one undo restores the line");
+    assert_eq!(links(&s)?, original, "and its link");
     assert_eq!(s.doc()?.ext.get(lamb_cadcraft::EXT_KEY).cloned(), ext_before, "and the LAMB slot, byte-identical");
+    Ok(())
+}
 
-    // Empty travel set: the link is dropped, the partner stays.
-    let (after, report) = raw_report(&d, plan_view, "erase", &erase, &[])?;
-    assert!(report.erased.is_empty(), "{report:?}");
-    assert!(after.entity(Handle(sec_e.0)).is_some(), "the partner stays");
-    assert!(report.dropped.contains(&link.id), "{report:?}");
-
-    // TRIM / BREAK cutting the anchor away, link in the travel set: not an erase.
+/// LAMB T514: a section polyline whose vertex sits on the plan cut makes two plan markers at one
+/// point (segment 0 ends there, segment 1 starts there). Linked on segment 0 only, both are filled,
+/// and so is the section-side marker: a link fills its marker in both views.
+#[test]
+fn a_link_fills_its_marker_in_both_views_whatever_the_segment() -> R {
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let (link, plan_e, sec_e, plan_view) = crossbar(&d)?;
+    let sec_view = view_of(&d, sec_e)?;
+    let plan_anchor = if link.a.entity_id == plan_e { link.a.clone() } else { link.b.clone() };
     let mut s = Session::new();
     s.open_drawing(d.clone(), "u-wall", None);
     install_link_maintenance(&mut s);
-    let e1 = draw_edge(&mut s, plan_view, [4000.0, -500.0], [4000.0, 500.0])?;
-    let e2 = draw_edge(&mut s, plan_view, [6000.0, -500.0], [6000.0, 500.0])?;
-    let base = s.doc()?.clone();
-    let near = json!({"handle": hex(plan_e), "pick": [5000, 0], "edges": [e1.hex(), e2.hex()]});
-    let (after, report) = raw_report(&base, plan_view, "trim", &near, &[link.id])?;
-    assert_eq!(report.dropped, vec![link.id], "{report:?}");
-    assert!(report.erased.is_empty() && after.entity(Handle(sec_e.0)).is_some(), "trim erases no partner: {report:?}");
-    let brk = json!({"handle": hex(plan_e), "p1": [4000, 0], "p2": [6000, 0]});
-    let (after, report) = raw_report(&base, plan_view, "break", &brk, &[link.id])?;
-    assert_eq!(report.dropped, vec![link.id], "{report:?}");
-    assert!(report.erased.is_empty() && after.entity(Handle(sec_e.0)).is_some(), "break erases no partner: {report:?}");
+    // Where the plan wall crosses the section, in the section's local space: (u, plan cut z).
+    let sec_marker = |d: &Drawing| -> Result<lamb_core::derivation::markers::Marker, Box<dyn std::error::Error>> {
+        Ok(markers_from(d, sec_view, plan_e)?.into_iter().find(|m| m.source_segment_index == plan_anchor.segment_index).ok_or("no marker")?)
+    };
+    let at = sec_marker(s.doc()?)?.position;
+    let layer = {
+        let p = DrawingProject::new(s.doc()?)?;
+        p.entity(sec_e).ok_or("no section line")?.layer_id.to_owned()
+    };
+    // Replace the section line by a polyline through the same point, bent there.
+    s.execute("editview", &json!({"viewId": sec_view.0}))?;
+    s.execute("erase", &json!({"handles": [hex(sec_e)]}))?;
+    s.execute("layer.current", &json!({"name": layer}))?;
+    let before = block_handles(s.doc()?, sec_view);
+    s.execute("pline", &json!({"vertices": [[at.x, at.y - 1000.0], [at.x, at.y], [at.x + 600.0, at.y + 1000.0]]}))?;
+    let pl = Id(block_handles(s.doc()?, sec_view).into_iter().find(|h| !before.contains(h)).ok_or("pline not drawn")?.0);
+    // Clear whatever auto-linked, then link segment 0 alone.
+    for l in links(&s)?.into_iter().filter(|l| on(l, pl)) {
+        s.execute("unlink", &json!({"linkId": l.id.0}))?;
+    }
+    let plan_markers = markers_from(s.doc()?, plan_view, pl)?;
+    assert_eq!(plan_markers.len(), 2, "segments 0 and 1 each make a plan marker: {plan_markers:?}");
+    assert!(plan_markers.iter().all(|m| !m.filled), "unlinked: hollow");
+    assert!(!sec_marker(s.doc()?)?.filled, "unlinked: the section-side marker hollow too");
+    s.execute(
+        "link",
+        &json!({
+            "a": {"entityId": pl.0, "segmentIndex": 0, "segmentParam": 1.0},
+            "b": {"entityId": plan_e.0, "segmentIndex": plan_anchor.segment_index, "segmentParam": plan_anchor.segment_param},
+        }),
+    )?;
+    let plan_markers = markers_from(s.doc()?, plan_view, pl)?;
+    assert!(plan_markers.iter().all(|m| m.filled), "both plan markers filled: {plan_markers:?}");
+    assert!(sec_marker(s.doc()?)?.filled, "and the section-side marker");
     Ok(())
 }
 
@@ -848,7 +891,8 @@ fn layers_by_entity(d: &Drawing) -> Result<BTreeMap<Id, String>, Box<dyn std::er
 fn a_layer_change_carries_the_automatic_link_component() -> R {
     register();
     let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
-    let (_, plan_e, sec_e, plan_view) = crossbar(&d)?;
+    let (link, plan_e, sec_e, plan_view) = crossbar(&d)?;
+    let plan_anchor = if link.a.entity_id == plan_e { link.a.clone() } else { link.b.clone() };
     let component = lamb_core::derivation::linking::linked_entity_component(&DrawingProject::new(&d)?, plan_e);
     let views: std::collections::BTreeSet<Id> = component.iter().map(|m| view_of(&d, *m)).collect::<Result<_, _>>()?;
     assert!(views.len() >= 3, "the component spans the plan and both sections: {views:?}");
@@ -857,11 +901,17 @@ fn a_layer_change_carries_the_automatic_link_component() -> R {
     install_link_maintenance(&mut s);
     s.execute("layer.new", &json!({"name": "WALLS"}))?;
 
-    // --- An explicit link from the plan wall to an otherwise unlinked section line.
+    // --- An explicit link from the plan wall to an otherwise unlinked section line through the
+    // wall's marker (a link needs its lines to cross, LAMB T514).
     let sec_view = view_of(s.doc()?, sec_e)?;
-    let edge = Id(draw_edge(&mut s, sec_view, [-90000.0, -90000.0], [-85000.0, -90000.0])?.0);
-    let anchor = |e: Id, i: usize| json!({"entityId": hex(e), "segmentIndex": i, "segmentParam": 0.5});
-    s.execute("link", &json!({"a": anchor(plan_e, 1), "b": anchor(edge, 0)}))?;
+    let at = markers_from(s.doc()?, sec_view, plan_e)?
+        .into_iter()
+        .find(|m| m.source_segment_index == plan_anchor.segment_index)
+        .ok_or("no plan-wall marker in the section")?
+        .position;
+    let edge = Id(draw_edge(&mut s, sec_view, [at.x, at.y - 500.0], [at.x, at.y + 500.0])?.0);
+    let anchor = |e: Id, i: usize, t: f64| json!({"entityId": hex(e), "segmentIndex": i, "segmentParam": t});
+    s.execute("link", &json!({"a": anchor(plan_e, plan_anchor.segment_index, plan_anchor.segment_param), "b": anchor(edge, 0, 0.5)}))?;
     let before = layers_by_entity(s.doc()?)?;
     assert!(component.iter().all(|m| before[m] != "WALLS"));
 

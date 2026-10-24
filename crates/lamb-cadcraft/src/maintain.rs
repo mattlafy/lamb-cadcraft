@@ -1,6 +1,6 @@
 //! The after-command observer that keeps `LambDocument.links` true (`cadcraft-integration.md` §7
 //! "link formation runs in the after-command hook", §13 phase 3 "TRIM a linked line → links
-//! maintained or stale").
+//! maintained or dropped").
 //!
 //! [`maintain_links`] compares the drawing before and after one command and, in order:
 //! 0. travels: a linked segment the command rigidly translated carries its unchanged partner in the
@@ -9,29 +9,28 @@
 //!    with the selection; [`travel_box_observer`] seeds it, engine patch 19 holds it). Any command
 //!    whose rigid translation this step detects travels (MOVE, STRETCH, grips) — a superset of TS's
 //!    MOVE, kept because §13 phase 3's gate is STRETCH. A touched link outside the set is left to
-//!    step 2, which flags it stale rather than deleting it as TS does on separation (visible and
-//!    reversible; RESOLVE lists it) (`selection-and-link-editing.md` §4b ray-sliding, lamb-core
-//!    `travel_segment_move`), so the link stays live — §13 phase 3 "STRETCH a linked plan line → the
-//!    section follows in one undo step"; an unaccepted AI line never travels — the after-command
-//!    sweep ([`crate::sweeps`]) re-seats it on its slot instead;
+//!    step 2, which drops it once its lines no longer cross (TS separation parity; LAMB T514)
+//!    (`selection-and-link-editing.md` §4b ray-sliding, lamb-core `travel_segment_move`), so a
+//!    travelled link stays live — §13 phase 3 "STRETCH a linked plan line → the section follows in
+//!    one undo step"; an unaccepted AI line never travels — the after-command sweep
+//!    ([`crate::sweeps`]) re-seats it on its slot instead;
 //! 0b. re-anchors: a link end whose entity the command replaced (TRIM, BREAK erase the original
 //!    handle and add a new one per piece) moves onto the new piece in the same view whose segment
 //!    is a sub-span of the old one and still holds the anchor point — same link id, origin and
 //!    creation stamp (§13 phase 3 "TRIM a linked line → links maintained"). No such piece: the
 //!    anchor was cut away and step 1 drops the link (TS `break.ts` `remapAnchor` parity);
-//! 0c. erases travelling partners: an entity the command erased outright (its view gained no
-//!    entity, so not a TRIM/BREAK cut-away) takes the partner of every travel-set link on it with it
-//!    — one hop, no cascade, unaccepted AI partners included (TS T109 `erase.ts` parity);
 //! 0d. remaps vertex edits: a polyline that gained, lost or reversed vertices in place (grips' Add/
 //!    Remove Vertex, `pedit` insert / straighten / reverse — same handle, so 0b never runs) keeps
 //!    each anchor on its segment; one exactly at a removed vertex drops its link (TS `vertex.ts`
 //!    parity, [`crate::revertex`]);
-//! 1. drops every link with an anchor whose entity is no longer in any view block (ERASE);
+//! 1. drops every link with an anchor whose entity is no longer in any view block (ERASE) — the
+//!    partner in the other view stays, its marker hollow (LAMB T514: erasing a line never erases its
+//!    partner);
 //! 2. re-checks every link with an anchor on a touched entity (new, or a different polyline) or in
 //!    a touched view (its document entry, or its host's, changed) with lamb-core's
-//!    `link_still_coincides`: a broken crossing is flagged `stale: Some(true)`, a restored one is
-//!    cleared back to `None` — a moved line is flagged, never dropped, because a flag is visible and
-//!    reversible (`link-maintenance.md`: "visible flags beat silent resolution");
+//!    `link_still_coincides`: a link whose lines no longer cross is dropped — a link exists only
+//!    where its lines cross (LAMB T514); a holding link still carrying an old `stale` flag has it
+//!    cleared back to `None`;
 //!    Then, 2b, stamps each entity new to a view block whose stored role is `Bylayer` and whose layer's
 //!    default is `Cut` with a concrete role: `Cut` in a plan, `Seen` in a vertical or detail view
 //!    (TS T256 `createEntity.ts` `pushEntity`), so later layer-role edits leave it alone;
@@ -42,7 +41,7 @@
 //!    the new layer, stopping at explicit links (TS SETLAYER, [`crate::relayer`]).
 //!
 //! [`install`] registers [`link_observer`] on a `Session`, so all of this lands in the command's own
-//! undo step. Out of scope: travel or erase cascading past the first partner, Tier 2 declarations.
+//! undo step. Out of scope: travel cascading past the first partner, Tier 2 declarations.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -68,8 +67,8 @@ use crate::schema::{SchemaError, read_document, read_entity_data, set_entity_dat
 pub struct MaintenanceReport {
     /// Links removed because an anchored entity was erased.
     pub dropped: Vec<Id>,
-    /// Links newly flagged stale (the crossing no longer holds).
-    pub staled: Vec<Id>,
+    /// Links removed because their lines no longer cross.
+    pub separated: Vec<Id>,
     /// Stale links whose crossing holds again, flag cleared.
     pub cleared: Vec<Id>,
     /// Automatic links formed by newly drawn entities.
@@ -78,8 +77,6 @@ pub struct MaintenanceReport {
     pub travelled: Vec<Id>,
     /// Links moved onto a new piece of an entity the command replaced (TRIM, BREAK).
     pub reanchored: Vec<Id>,
-    /// Partner entities (not links) erased with an erased entity across a travel-set link.
-    pub erased: Vec<Id>,
     /// New entities (not links) given a concrete `Cut`/`Seen` role from a cut-default layer.
     pub stamped: Vec<Id>,
     /// Entities (not links) moved to the new layer of a relayered entity in their automatic-link component.
@@ -89,12 +86,11 @@ pub struct MaintenanceReport {
 impl MaintenanceReport {
     pub fn is_empty(&self) -> bool {
         self.dropped.is_empty()
-            && self.staled.is_empty()
+            && self.separated.is_empty()
             && self.cleared.is_empty()
             && self.created.is_empty()
             && self.travelled.is_empty()
             && self.reanchored.is_empty()
-            && self.erased.is_empty()
             && self.stamped.is_empty()
             && self.relayered.is_empty()
     }
@@ -149,11 +145,11 @@ fn rigid_delta(before: &Polyline2, after: &Polyline2, index: usize) -> Option<Po
 /// slides the partner by `travel_segment_move` and writes its new geometry into `after` (keeping
 /// the entity's handle, layer and `ext`). Each partner travels at most once, first link in
 /// `doc.links` order; nothing cascades — the partner's other links are left to step 2's re-check.
-/// A partial slide (`unreachable`) is still applied; step 2 decides stale.
+/// A partial slide (`unreachable`) is still applied; step 2 drops the link if the lines no longer cross.
 ///
 /// Known limitation, TS parity: an oblique segment slid along its own direction is a translation
 /// whose crossing does not move, yet travel shifts the partner by the delta's component along the
-/// cut; step 2 then flags that link stale.
+/// cut; step 2 then drops that link.
 fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -> Result<Vec<Id>, SchemaError> {
     let writes: Vec<(Id, Polyline2)> = {
         let p = DrawingProject::new(after)?;
@@ -289,38 +285,6 @@ fn reanchor(before_entities: &EntityMap, after: &mut Drawing) -> Result<Vec<Id>,
     Ok(moved)
 }
 
-/// Step 0c, erase cascade. For each link in `travel` with one end's entity gone from `after` (after
-/// step 0b) and the other still there, removes that partner — unless the gone entity's view gained an
-/// entity this command, which is TRIM/BREAK replacing it with pieces, not an erase. One hop: the
-/// partners are chosen against `after` as the command left it, so a partner's own links never
-/// cascade. An unaccepted AI partner goes too — the line it mirrors is gone.
-fn erase_partners(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -> Result<Vec<Id>, SchemaError> {
-    let erased = {
-        let p = DrawingProject::new(after)?;
-        let after_entities = entity_map(&p);
-        let grown: BTreeSet<Id> = after_entities.iter().filter(|(id, _)| !before_entities.contains_key(id)).map(|(_, (v, _))| *v).collect();
-        let mut out: Vec<Id> = Vec::new();
-        for link in p.document().links.iter().filter(|l| travel_set.contains(&l.id)) {
-            for (mine, other) in [(&link.a, &link.b), (&link.b, &link.a)] {
-                let Some((view, _)) = before_entities.get(&mine.entity_id) else { continue };
-                if after_entities.contains_key(&mine.entity_id)
-                    || grown.contains(view)
-                    || !after_entities.contains_key(&other.entity_id)
-                    || out.contains(&other.entity_id)
-                {
-                    continue;
-                }
-                out.push(other.entity_id);
-            }
-        }
-        out
-    };
-    for id in &erased {
-        after.remove_entity(Handle(id.0));
-    }
-    Ok(erased)
-}
-
 /// Step 2b, creation-time role (TS T256 `pushEntity`): each of `new_entities` stored as `Bylayer`
 /// on a layer whose default is `Cut` gets `Cut` in a plan view and `Seen` in a vertical or detail
 /// view, written into its `EntityData`. Any other layer default, or a concrete stored role, is left.
@@ -385,8 +349,6 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
     report.travelled = travel(&before_entities, after, travel_set)?;
     // 0b: re-anchor ends whose entity was replaced by pieces, before step 1 would drop them.
     report.reanchored = reanchor(&before_entities, after)?;
-    // 0c: an erased entity takes its travel-set partners with it; step 1 drops their links.
-    report.erased = erase_partners(&before_entities, after, travel_set)?;
     // 0d: vertex inserts, removals and reversals on the same handle keep anchors on their segments.
     let (remapped, dropped) = crate::revertex::remap_vertex_edits(&before_entities, after)?;
     report.reanchored.extend(remapped);
@@ -413,12 +375,12 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
             let mut link = link.clone();
             if touched(a) || touched(b) {
                 let holds = link_still_coincides(&p, &link).map_err(derivation_error)?;
-                let stale = link.stale == Some(true);
-                if !holds && !stale {
-                    link.stale = Some(true);
-                    report.staled.push(link.id);
+                if !holds {
+                    report.separated.push(link.id);
                     changed = true;
-                } else if holds && stale {
+                    continue;
+                }
+                if link.stale == Some(true) {
                     link.stale = None;
                     report.cleared.push(link.id);
                     changed = true;
