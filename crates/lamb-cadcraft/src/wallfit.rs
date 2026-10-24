@@ -833,6 +833,8 @@ mod tests {
         let handles = |s: &Session| -> T<Vec<String>> {
             Ok(s.doc()?.block(&crate::schema::view_block_name(plan)).ok_or("no plan block")?.entities.iter().map(|e| e.handle.hex()).collect())
         };
+        // The inner face spans z 250..2750, so the plan cuts it at 1000 rather than at its floor.
+        s.execute("viewprops", &json!({ "mode": "cutElevation", "viewId": plan.0, "cutElevation": 1000.0 }))?;
         let before = handles(&s)?;
         // Across the section cut (plan y = 0), so it crosses the inner face's marker (LAMB T514).
         s.execute("line", &json!({ "points": [[290.0, -500.0], [290.0, 500.0]] }))?;

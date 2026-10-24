@@ -419,3 +419,155 @@ pub fn compute_solid_cuts_for_view(doc: &impl ProjectRead, view_id: Id, solids: 
     }
     Ok(cuts)
 }
+
+#[cfg(test)]
+mod floor_cut_tests {
+    //! LAMB T516: a new plan cuts at its level's floor, so a section's wall lines drawn from the floor
+    //! up end on the cut plane and link there, and an unlinked wall spans floor → floor + 2700.
+    use super::*;
+    use crate::geometry::transform2d::IDENTITY_TRANSFORM;
+    use crate::geometry::{PolySegment, Polyline2};
+    use crate::model::{
+        AnyView, DEFAULT_CUT_HEIGHT_MM, DrawingEntity, EntityGeometry, Field, Level, PlanView, Project, Provenance, VerticalIntent, VerticalView,
+        empty_project,
+    };
+
+    const PLAN: Id = Id(10);
+    const SEC: Id = Id(20);
+    const LEVEL: Id = Id(5);
+    const FLOOR: f64 = 3000.0;
+
+    fn pl(pts: &[(f64, f64)], closed: bool) -> Polyline2 {
+        Polyline2 {
+            start: Point2 { x: pts[0].0, y: pts[0].1 },
+            segments: pts[1..].iter().map(|&(x, y)| PolySegment { to: Point2 { x, y }, bulge: 0.0, corner_at_to: None }).collect(),
+            closed,
+        }
+    }
+
+    fn ent(id: u64, view_id: Id, layer: &str, geometry: Polyline2) -> DrawingEntity {
+        DrawingEntity {
+            id: Id(id),
+            view_id,
+            role: LineRole::Cut,
+            layer_id: layer.into(),
+            geometry: EntityGeometry::Polyline { geometry },
+            color_override: None,
+            lineweight_override: None,
+            ai_origin: None,
+        }
+    }
+
+    /// A plan placed on a level at +3000 with the default cut height, and a section along plan
+    /// y = 0 (identity transforms: section local = (u, z)).
+    fn project(plan: Vec<DrawingEntity>, sec: Vec<DrawingEntity>) -> Project {
+        let mut p = empty_project(None);
+        p.levels.push(Level {
+            id: LEVEL,
+            name: "L1".into(),
+            order: 1.0,
+            floor_elevation: Field { value: FLOOR, provenance: Provenance::Defaulted { source_default_id: "test".into() } },
+        });
+        let cut_elevation = FLOOR + p.defaults.default_cut_height_mm;
+        p.views.push(AnyView::Plan(PlanView {
+            id: PLAN,
+            name: "plan".into(),
+            entities: plan,
+            placement: Some(Placement::Plan { level_id: LEVEL, cut_elevation, transform: IDENTITY_TRANSFORM }),
+        }));
+        p.views.push(AnyView::Vertical(VerticalView {
+            id: SEC,
+            name: "A-A".into(),
+            intent: VerticalIntent::Section,
+            entities: sec,
+            placement: Some(Placement::Vertical {
+                cut_line: pl(&[(0.0, 0.0), (5000.0, 0.0)], false),
+                host_view_id: PLAN,
+                transform: IDENTITY_TRANSFORM,
+                flipped: None,
+            }),
+        }));
+        p
+    }
+
+    fn at(markers: &[Marker]) -> Vec<(f64, f64, usize)> {
+        let mut v: Vec<_> = markers.iter().map(|m| (m.position.x, m.position.y, m.source_segment_index)).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v
+    }
+
+    #[test]
+    fn the_default_cut_height_is_the_floor() {
+        assert_eq!(DEFAULT_CUT_HEIGHT_MM, 0.0);
+        assert_eq!(crate::model::default_project_defaults().default_cut_height_mm, 0.0);
+    }
+
+    #[test]
+    fn a_plan_line_marks_the_section_on_the_floor_line() -> Result<(), String> {
+        let p = project(vec![ent(1, PLAN, "layer-wall-ext", pl(&[(1000.0, -500.0), (1000.0, 500.0)], false))], vec![]);
+        let m = compute_markers_for_view(&p, SEC)?;
+        assert_eq!(at(&m), [(1000.0, FLOOR, 0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_wall_line_from_the_floor_up_marks_the_plan_at_its_end() -> Result<(), String> {
+        let up = ent(2, SEC, "layer-wall-ext", pl(&[(1000.0, FLOOR), (1000.0, FLOOR + 2700.0)], false));
+        let down = ent(3, SEC, "layer-wall-ext", pl(&[(2000.0, FLOOR + 2700.0), (2000.0, FLOOR)], false));
+        let p = project(vec![], vec![up, down]);
+        let m = compute_markers_for_view(&p, PLAN)?;
+        assert_eq!(at(&m), [(1000.0, 0.0, 0), (2000.0, 0.0, 0)], "{m:?}");
+        assert_eq!(m.iter().find(|m| m.position.x == 1000.0).map(|m| m.source_segment_param), Some(0.0));
+        assert_eq!(m.iter().find(|m| m.position.x == 2000.0).map(|m| m.source_segment_param), Some(1.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_loops_bottom_edge_in_the_cut_plane_makes_no_marker_of_its_own() -> Result<(), String> {
+        let lp = ent(
+            4,
+            SEC,
+            "layer-wall-ext",
+            pl(&[(500.0, FLOOR), (1500.0, FLOOR), (1500.0, FLOOR + 2700.0), (500.0, FLOOR + 2700.0), (500.0, FLOOR)], true),
+        );
+        let p = project(vec![], vec![lp]);
+        let m = compute_markers_for_view(&p, PLAN)?;
+        // Only the two uprights, each where it ends on the floor; the bottom edge (segment 0) none.
+        assert_eq!(at(&m), [(500.0, 0.0, 3), (1500.0, 0.0, 1)], "{m:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_floor_wall_line_auto_links_and_both_markers_fill() -> Result<(), String> {
+        let plan_line = ent(1, PLAN, "layer-wall-ext", pl(&[(1000.0, -500.0), (1000.0, 500.0)], false));
+        let up = ent(2, SEC, "layer-wall-ext", pl(&[(1000.0, FLOOR), (1000.0, FLOOR + 2700.0)], false));
+        let mut p = project(vec![plan_line], vec![up]);
+        let mut n = 100u64;
+        let mut mint = || {
+            n += 1;
+            Id(n)
+        };
+        let actor = crate::model::Actor::User { user_id: "t".into() };
+        let e = p.entity(Id(2)).ok_or("no line")?;
+        let links = super::super::linking::find_auto_links(&p, &e, &actor, "t", &mut mint)?;
+        drop(e);
+        assert_eq!(links.len(), 1, "{links:?}");
+        p.links.extend(links);
+        assert!(compute_markers_for_view(&p, PLAN)?.iter().all(|m| m.filled), "plan marker filled");
+        assert!(compute_markers_for_view(&p, SEC)?.iter().all(|m| m.filled), "section marker filled");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unlinked_wall_spans_floor_to_floor_plus_default_height() -> Result<(), String> {
+        let wall = ent(1, PLAN, "layer-wall-ext", pl(&[(0.0, 1000.0), (4000.0, 1000.0), (4000.0, 3000.0), (0.0, 3000.0), (0.0, 1000.0)], true));
+        let p = project(vec![wall], vec![]);
+        let solids = synthesize(&p)?.solids;
+        assert_eq!(solids.len(), 1);
+        let zs: Vec<f64> = solids[0].faces.iter().flatten().map(|q| q.z).collect();
+        let lo = zs.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = zs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!((lo, hi), (FLOOR, FLOOR + 2700.0));
+        Ok(())
+    }
+}

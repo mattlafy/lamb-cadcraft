@@ -10,7 +10,7 @@ use super::{Field, Id, IdStrings, LinkRecord};
 use crate::geometry::hatch_pattern::PatternDefinition;
 use crate::geometry::{Polyline2, Transform2D};
 
-pub const DEFAULT_CUT_HEIGHT_MM: f64 = 1000.0;
+pub const DEFAULT_CUT_HEIGHT_MM: f64 = 0.0;
 pub const DEFAULT_FLOOR_TO_FLOOR_MM: f64 = 3000.0;
 /// 2 (T58): virtual corners on `PolySegment.cornerAtTo`. 3 (T94): circles became two-arc polylines.
 pub const CURRENT_SCHEMA_VERSION: u32 = 3;

@@ -271,7 +271,13 @@ fn dispatch() -> HashMap<&'static str, Handler> {
         ("document-model/views#isPlaced", |a| Ok(Value::Bool(model::is_placed(&arg::<AnyView>(a, 0)?)))),
         // document-model/project
         ("document-model/project#defaultProjectDefaults", |_| out(model::default_project_defaults())),
-        ("document-model/project#emptyProject", |a| out(model::empty_project(arg::<Option<String>>(a, 0)?.as_deref()))),
+        // The fork's plans cut at their floor (default cut height 0, LAMB T516); the TypeScript app
+        // still defaults to 1000 mm, so its fixtures are compared at that value.
+        ("document-model/project#emptyProject", |a| {
+            let mut p = model::empty_project(arg::<Option<String>>(a, 0)?.as_deref());
+            p.defaults.default_cut_height_mm = 1000.0;
+            out(p)
+        }),
         ("document-model/project#findView", |a| out(model::find_view(&arg::<Project>(a, 0)?, arg(a, 1)?))),
         ("document-model/project#findLayer", |a| out(model::find_layer(&arg::<Project>(a, 0)?, &arg::<String>(a, 1)?))),
         ("document-model/project#findLevel", |a| out(model::find_level(&arg::<Project>(a, 0)?, arg(a, 1)?))),
