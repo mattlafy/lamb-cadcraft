@@ -1,22 +1,25 @@
 //! LINK and UNLINK at the command line (TS `linkCommand.ts` `LinkCommand`, `pickCommands.ts`
-//! `UnlinkCommand`): pick a line, then its match in another view; or click a filled marker.
+//! `UnlinkCommand`): in the edited view, click a hollow marker, then the line through it; or click a
+//! filled marker to unlink it.
 //!
 //! Both are repeatable until Enter/Esc, and each completed link or unlink is its own undo step: the
 //! machines run under the non-undoable `link` / `unlink` specs and apply through `link.apply` /
 //! `unlink.apply` with [`Session::execute`], which records one step per call (an undoable
 //! interactive spec would fold the whole run into one step when it ends).
 //!
-//! The user reaches the other view by clicking the other tile mid-command; LINK never binds itself
-//! to one view (TS T154's `atDefaultState` opt-out).
+//! A link only exists where two lines cross, which is where a marker is drawn, so LINK never leaves
+//! the edited view: the marker names the far end, the clicked line the near one. Crossings stacked
+//! at one marker position are a drawing error and are refused, never resolved by choosing one.
 
 use cadcraft_engine::cmd::curves::{pick_aperture, pick_at};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::Vec2;
 use lamb_core::derivation::linking::find_link_for_marker;
-use lamb_core::derivation::markers::{compute_markers_for_view, is_near_marker};
+use lamb_core::derivation::markers::{Marker, compute_markers_for_view, is_near_marker};
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::geometry::Point2;
 use lamb_core::geometry::polyline::{closest_point_on_segment, resolved_segments};
+use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::Id;
 use serde_json::{Value, json};
 
@@ -53,11 +56,48 @@ pub(crate) fn pick_line(s: &Session, p: Vec2) -> Option<Picked> {
 }
 
 const NO_LINE: &str = "No line found near click";
+const NO_MARKER: &str = "No marker near click";
+const STACKED: &str = "Several crossings meet here — fix the drawing first";
+const FILLED: &str = "That marker is already linked";
+const MISSES: &str = "That line does not pass through the marker";
 
-/// LINK: a line, then the matching line in another view; repeatable.
+/// The one marker of `view` under `p`, or the refusal to echo.
+fn marker_under(s: &Session, view: Id, p: Vec2) -> Result<std::result::Result<Marker, &'static str>> {
+    let dp = DrawingProject::new(s.doc()?).map_err(other)?;
+    let markers = compute_markers_for_view(&dp, view).map_err(other)?;
+    let q = Point2 { x: p.x, y: p.y };
+    let near: Vec<&Marker> = markers.iter().filter(|m| is_near_marker(m, q, pick_aperture(s))).collect();
+    let Some(first) = near.first() else { return Ok(Err(NO_MARKER)) };
+    if near.iter().any(|m| m.source_entity_id != first.source_entity_id) {
+        return Ok(Err(STACKED));
+    }
+    if first.filled {
+        return Ok(Err(FILLED));
+    }
+    Ok(Ok((*first).clone()))
+}
+
+/// The line under `p`, anchored at its point nearest `m` — or the refusal to echo when there is no
+/// line or it misses the marker by more than the auto-link slack.
+fn line_through(s: &Session, p: Vec2, m: &Marker) -> std::result::Result<Picked, &'static str> {
+    let h = pick_line(s, p).ok_or(NO_LINE)?;
+    let proj = DrawingProject::new(s.doc().map_err(|_| NO_LINE)?).map_err(|_| NO_LINE)?;
+    let poly = proj.entity(h.entity).and_then(|e| e.polyline.map(std::borrow::Cow::into_owned)).ok_or(NO_LINE)?;
+    let (segment_index, c) = resolved_segments(&poly)
+        .iter()
+        .map(|seg| (seg.index, closest_point_on_segment(seg, m.position)))
+        .min_by(|a, b| a.1.distance.total_cmp(&b.1.distance))
+        .ok_or(NO_LINE)?;
+    if c.distance > TOLERANCE.coincidence_mm + 2.0 {
+        return Err(MISSES);
+    }
+    Ok(Picked { entity: h.entity, segment_index, param: c.t })
+}
+
+/// LINK: a hollow marker, then the line through it, in the edited view; repeatable.
 #[derive(Default)]
 struct Link {
-    a: Option<Picked>,
+    marker: Option<Marker>,
 }
 
 impl Interactive for Link {
@@ -65,9 +105,15 @@ impl Interactive for Link {
         "link"
     }
     fn prompt(&self, _s: &Session) -> Prompt {
-        let msg =
-            if self.a.is_some() { "Pick the matching line in another view (Esc/Enter to end)" } else { "Select a line to link (Esc/Enter to end)" };
+        let msg = if self.marker.is_some() { "Select the line through it" } else { "Select a marker to link (Esc/Enter to end)" };
         Prompt::new(msg, Accept::POINT)
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        if edited_view(s).is_none() {
+            s.echo("Edit a view first");
+            return Ok(Step::Done);
+        }
+        Ok(Step::Continue)
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         let p = match i {
@@ -75,18 +121,27 @@ impl Interactive for Link {
             Input::Point(p) => p,
             _ => return Ok(Step::Continue),
         };
-        let Some(picked) = pick_line(s, p) else {
-            s.echo(NO_LINE);
-            return Ok(Step::Continue);
+        let Some(view) = edited_view(s) else {
+            s.echo("Edit a view first");
+            return Ok(Step::Done);
         };
-        let Some(a) = self.a.take() else {
-            self.a = Some(picked);
+        let Some(m) = self.marker.take() else {
+            match marker_under(s, view, p)? {
+                Ok(m) => self.marker = Some(m),
+                Err(msg) => s.echo(msg),
+            }
             return Ok(Step::Continue);
         };
         // Repeatable: back to the first prompt whatever the outcome.
-        match s.execute("link.apply", &json!({ "a": a.json(), "b": picked.json() })) {
-            Ok(_) => s.echo("Linked"),
-            Err(e) => s.echo(format!("Error: {e}")),
+        match line_through(s, p, &m) {
+            Err(msg) => s.echo(msg),
+            Ok(near) => {
+                let far = Picked { entity: m.source_entity_id, segment_index: m.source_segment_index, param: m.source_segment_param };
+                match s.execute("link.apply", &json!({ "a": near.json(), "b": far.json() })) {
+                    Ok(_) => s.echo("Linked"),
+                    Err(e) => s.echo(format!("Error: {e}")),
+                }
+            }
         }
         Ok(Step::Continue)
     }
@@ -215,64 +270,99 @@ mod tests {
         Ok(Vec2::new(m.position.x, m.position.y))
     }
 
-    const FIRST: &str = "Select a line to link (Esc/Enter to end)";
-    const SECOND: &str = "Pick the matching line in another view (Esc/Enter to end)";
+    const FIRST: &str = "Select a marker to link (Esc/Enter to end)";
+    const SECOND: &str = "Select the line through it";
+
+    fn filled(s: &Session, view: Id, source: Id) -> E<bool> {
+        let markers = compute_markers_for_view(&DrawingProject::new(s.doc()?)?, view)?;
+        Ok(markers.iter().find(|m| m.source_entity_id == source).ok_or("no marker")?.filled)
+    }
 
     #[test]
-    fn link_picks_a_line_then_its_match_in_another_view_and_repeats() -> R {
+    fn link_clicks_a_marker_then_the_line_through_it_in_one_view_and_repeats() -> R {
         let mut f = fixture()?;
         let s = &mut f.s;
         let base = links(s)?.len();
+        enter_space(s, Space::Block(view_block_name(f.section)))?;
+        let crossing = marker_at(s, f.section, f.plan_line)?;
+        assert!(!filled(s, f.section, f.plan_line)? && !filled(s, f.plan, f.section_line)?, "hollow before");
         s.start("link")?;
         assert_eq!(prompt(s).as_deref(), Some(FIRST));
-        s.input(Input::Point(Vec2::new(3000.0, 0.0)))?;
-        assert_eq!(prompt(s).as_deref(), Some(SECOND));
-        // Mid-command, the user clicks the section's tile, then the crossing.
-        let crossing = marker_at(s, f.section, f.plan_line)?;
-        enter_space(s, Space::Block(view_block_name(f.section)))?;
         s.input(Input::Point(crossing))?;
+        assert_eq!(prompt(s).as_deref(), Some(SECOND));
+        // The line, clicked away from the crossing: anchored at the marker, not the click.
+        s.input(Input::Point(Vec2::new(5000.0, 4000.0)))?;
         assert!(s.log.iter().any(|l| l == "Linked"), "{:?}", s.log);
         let now = links(s)?;
         assert_eq!(now.len(), base + 1);
         let l = now.last().ok_or("no link")?;
         assert_eq!(l.origin, LinkOrigin::Explicit);
-        assert_eq!((l.a.entity_id, l.a.segment_index), (f.plan_line, 0));
-        assert!((l.a.segment_param - 0.3).abs() < 1e-9, "{}", l.a.segment_param);
-        assert_eq!((l.b.entity_id, l.b.segment_index), (f.section_line, 0));
+        assert_eq!((l.a.entity_id, l.a.segment_index), (f.section_line, 0));
         let want = (crossing.y + 5000.0) / 10000.0;
-        assert!((l.b.segment_param - want).abs() < 1e-9, "{} vs {want}", l.b.segment_param);
+        assert!((l.a.segment_param - want).abs() < 1e-9, "{} vs {want}", l.a.segment_param);
+        assert_eq!((l.b.entity_id, l.b.segment_index), (f.plan_line, 0));
+        assert!((l.b.segment_param - 0.3).abs() < 1e-9, "{}", l.b.segment_param);
+        assert!(filled(s, f.section, f.plan_line)? && filled(s, f.plan, f.section_line)?, "filled in both views");
         assert_eq!(prompt(s).as_deref(), Some(FIRST), "repeatable");
         assert!(s.running.is_some());
-        // A second pair in the same run, back from the section to a plan line it does not cross:
-        // refused (LAMB T514), and the run goes on.
-        s.input(Input::Point(Vec2::new(5000.0, 4000.0)))?;
-        enter_space(s, Space::Block(view_block_name(f.plan)))?;
-        s.input(Input::Point(Vec2::new(8000.0, 2000.0)))?;
-        assert!(s.log.iter().any(|l| l.contains("Those lines do not cross at a marker")), "{:?}", s.log);
-        assert_eq!(links(s)?.len(), base + 1);
-        assert_eq!(prompt(s).as_deref(), Some(FIRST), "still repeatable");
         s.input(Input::Enter)?;
         assert!(s.running.is_none(), "Enter ends it");
         s.undo()?;
-        assert_eq!(links(s)?.len(), base, "one undo step for the link, none for the refusal");
+        assert_eq!(links(s)?.len(), base, "one undo step");
         Ok(())
     }
 
     #[test]
-    fn link_misses_and_same_view_pairs_echo_and_keep_prompting() -> R {
+    fn link_refusals_echo_and_keep_prompting() -> R {
         let mut f = fixture()?;
         let s = &mut f.s;
+        // A third plan line through (3000, 0): its crossing stacks on the plan line's in the section.
+        let stacked = new_entity(s, f.plan, json!([[0, -3000], [6000, 3000]]))?;
+        enter_space(s, Space::Block(view_block_name(f.section)))?;
         let base = links(s)?.len();
+        let (crossing, other) = (marker_at(s, f.section, f.plan_line)?, marker_at(s, f.section, f.other_line)?);
+        assert!((marker_at(s, f.section, stacked)? - crossing).len() < 1e-6, "stacked");
         s.start("lk")?;
         let n = s.log.len();
         s.input(Input::Point(Vec2::new(-50000.0, -50000.0)))?;
-        assert_eq!(&s.log[n..], [NO_LINE.to_owned()]);
-        assert_eq!(prompt(s).as_deref(), Some(FIRST), "same prompt");
-        s.input(Input::Point(Vec2::new(3000.0, 0.0)))?;
-        s.input(Input::Point(Vec2::new(6000.0, 2000.0)))?;
-        assert!(s.log[n..].iter().any(|l| l.contains("Link ends must be in different views")), "{:?}", &s.log[n..]);
-        assert_eq!(links(s)?.len(), base);
+        assert_eq!(prompt(s).as_deref(), Some(FIRST), "empty spot keeps the first prompt");
+        s.input(Input::Point(crossing))?;
+        assert_eq!(prompt(s).as_deref(), Some(FIRST), "stacked crossings refused");
+        // The other line's marker is hollow, but the section line misses it.
+        s.input(Input::Point(other))?;
+        assert_eq!(prompt(s).as_deref(), Some(SECOND));
+        s.input(Input::Point(Vec2::new(5000.0, 4000.0)))?;
         assert_eq!(prompt(s).as_deref(), Some(FIRST));
+        // Second prompt, nothing there.
+        s.input(Input::Point(other))?;
+        s.input(Input::Point(Vec2::new(-50000.0, 50000.0)))?;
+        assert_eq!(&s.log[n..], [NO_MARKER, STACKED, MISSES, NO_LINE].map(str::to_owned));
+        assert_eq!(links(s)?.len(), base);
+        s.input(Input::Enter)?;
+
+        // Filled: erase the stacked line, link the crossing, then click it again.
+        enter_space(s, Space::Block(view_block_name(f.plan)))?;
+        s.execute("erase", &json!({ "handles": [cadcraft_doc::Handle(stacked.0).hex()] }))?;
+        enter_space(s, Space::Block(view_block_name(f.section)))?;
+        s.start("link")?;
+        s.input(Input::Point(crossing))?;
+        s.input(Input::Point(Vec2::new(5000.0, 4000.0)))?;
+        assert_eq!(links(s)?.len(), base + 1);
+        let n = s.log.len();
+        s.input(Input::Point(crossing))?;
+        assert_eq!(&s.log[n..], [FILLED.to_owned()]);
+        assert_eq!(links(s)?.len(), base + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn link_outside_a_view_refuses() -> R {
+        let mut f = fixture()?;
+        let s = &mut f.s;
+        enter_space(s, Space::Model)?;
+        s.start("link")?;
+        assert!(s.running.is_none());
+        assert!(s.log.iter().any(|l| l == "Edit a view first"), "{:?}", s.log);
         Ok(())
     }
 
@@ -281,10 +371,10 @@ mod tests {
         let mut f = fixture()?;
         let s = &mut f.s;
         let crossing = marker_at(s, f.section, f.plan_line)?;
-        s.start("link")?;
-        s.input(Input::Point(Vec2::new(3000.0, 0.0)))?;
         enter_space(s, Space::Block(view_block_name(f.section)))?;
+        s.start("link")?;
         s.input(Input::Point(crossing))?;
+        s.input(Input::Point(Vec2::new(5000.0, 4000.0)))?;
         s.input(Input::Enter)?;
         let linked = links(s)?;
         let link = linked.last().ok_or("no link")?.clone();
