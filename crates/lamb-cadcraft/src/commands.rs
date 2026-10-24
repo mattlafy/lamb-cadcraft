@@ -1,9 +1,11 @@
 //! LAMB's view commands as engine `CommandSpec`s, registered once per process with
 //! `cadcraft_engine::register_command_provider(lamb_cadcraft::commands)` (FORK.md patch 4).
 //!
-//! - `newplan {name}` (`npl`): a floating plan view.
+//! - `newplan {name}` (`npl`): a floating plan view. Interactively NEWPLAN is the TS app's New
+//!   Plan and places by default (`New plan [Offset/Height/Floating]`) — see [`crate::newviews`].
 //! - `newsectionline` / `newelevationline {name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}` (`nsl`,
-//!   `nel`): a vertical view placed on a straight cut line in the host view.
+//!   `nel`): a vertical view placed on a straight cut line in the host view; a floating host plan
+//!   is placed first, in the same undo step ([`crate::viewlife::place_floating_plan`]).
 //! - `editview {viewId?}`: edit inside the view's block; no `viewId` returns to Model.
 //! - `newsheet {name, viewIds?, assemblyIds?}` (`nsh`): a paper layout with one viewport per view
 //!   (default every view, when neither list is given), then one per plan in `assemblyIds` showing
@@ -118,7 +120,7 @@ use lamb_core::geometry::polyline::resolved_segments;
 use lamb_core::geometry::{IDENTITY_TRANSFORM, Point2};
 use lamb_core::model::{
     Actor, AnyView, CutDirection, DetailView, Id, Level, LinkAnchor, LinkOrigin, LinkRecord, Placement, PlanView, VerticalIntent, VerticalView,
-    authored_field, is_plan_view,
+    authored_field,
 };
 use serde_json::{Value, json};
 
@@ -160,7 +162,7 @@ pub(crate) fn create(s: &mut Session, view: AnyView) -> Result<Value> {
     Ok(json!({ "viewId": id.0 }))
 }
 
-fn newplan(s: &mut Session, p: &Value) -> Result<Value> {
+pub(crate) fn newplan(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_param("newplan", p, "name")?.to_owned();
     create(s, AnyView::Plan(PlanView { id: Id(0), name, entities: Vec::new(), placement: None }))
 }
@@ -195,10 +197,13 @@ fn new_vertical(s: &mut Session, p: &Value, cmd: &str, intent: VerticalIntent) -
     let to = point_param(cmd, p, "cutTo")?;
     let doc = read_document(s.doc()?).map_err(other)?;
     let host_view = doc.views.iter().find(|v| v.id() == host).ok_or_else(|| other("No such host view"))?;
-    if let AnyView::Vertical(v) = host_view
-        && v.placement.is_none()
-    {
-        return Err(other("Host vertical view must be placed"));
+    match host_view {
+        AnyView::Vertical(v) if v.placement.is_none() => return Err(other("Host vertical view must be placed")),
+        // A floating plan host is placed first, in this command's undo step (LAMB T507).
+        AnyView::Plan(PlanView { placement: None, .. }) => {
+            crate::viewlife::place_floating_plan(s, host)?;
+        }
+        _ => {}
     }
     let placement = Placement::Vertical { cut_line: line2(from, to), host_view_id: host, transform: IDENTITY_TRANSFORM, flipped: None };
     create(s, AnyView::Vertical(VerticalView { id: Id(0), name, intent, entities: Vec::new(), placement: Some(placement) }))
@@ -363,7 +368,7 @@ fn unlink(s: &mut Session, p: &Value) -> Result<Value> {
 // ---------------- interactive machines ----------------
 
 /// The `Plan N` default: one more than the views already of that kind.
-fn next_name(s: &Session, prefix: &str, kind: impl Fn(&AnyView) -> bool) -> String {
+pub(crate) fn next_name(s: &Session, prefix: &str, kind: impl Fn(&AnyView) -> bool) -> String {
     let n = s.doc().ok().and_then(|d| read_document(d).ok()).map_or(0, |doc| doc.views.iter().filter(|v| kind(v)).count());
     format!("{prefix} {}", n + 1)
 }
@@ -430,24 +435,18 @@ pub(crate) fn enter_space(s: &mut Session, space: Space) -> Result<()> {
     crate::refpane::refresh(s)
 }
 
-/// NEWPLAN: `Enter plan name <Plan N>:`, then edit inside the new plan. NEWDETAIL the same with
-/// `Enter detail name or [Plan/Section] <Detail N>:`, where `P` / `S` set the detail's cut direction
-/// and ask the name again.
-struct NewPlan {
+/// NEWDETAIL: `Enter detail name or [Plan/Section] <Detail N>:`, where `P` / `S` set the detail's
+/// cut direction and ask the name again; then edit inside the new detail.
+struct NewDetail {
     default: String,
-    detail: bool,
-    /// NEWDETAIL's cut direction.
     direction: CutDirection,
 }
 
-impl Interactive for NewPlan {
+impl Interactive for NewDetail {
     fn name(&self) -> &'static str {
-        if self.detail { "newdetail" } else { "newplan" }
+        "newdetail"
     }
     fn prompt(&self, _s: &Session) -> Prompt {
-        if !self.detail {
-            return Prompt::new("Enter plan name", Accept::TEXT).default(self.default.clone());
-        }
         Prompt::new("Enter detail name", Accept::TEXT).kw(&["Plan", "Section"]).default(self.default.clone())
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
@@ -455,23 +454,20 @@ impl Interactive for NewPlan {
             return Ok(Step::Cancel);
         }
         let Some(name) = name_input(i, &self.default) else { return Ok(Step::Continue) };
-        if self.detail {
-            let dir = match name.to_ascii_lowercase().as_str() {
-                "p" | "plan" => Some((CutDirection::Plan, "<Plan detail>")),
-                "s" | "section" => Some((CutDirection::Vertical, "<Section detail>")),
-                _ => None,
-            };
-            if let Some((d, echo)) = dir {
-                self.direction = d;
-                s.echo(echo);
-                return Ok(Step::Continue);
-            }
+        let dir = match name.to_ascii_lowercase().as_str() {
+            "p" | "plan" => Some((CutDirection::Plan, "<Plan detail>")),
+            "s" | "section" => Some((CutDirection::Vertical, "<Section detail>")),
+            _ => None,
+        };
+        if let Some((d, echo)) = dir {
+            self.direction = d;
+            s.echo(echo);
+            return Ok(Step::Continue);
         }
         let dir = if self.direction == CutDirection::Vertical { "vertical" } else { "plan" };
-        let (run, word): (fn(&mut Session, &Value) -> Result<Value>, &str) = if self.detail { (newdetail, "Detail") } else { (newplan, "Plan") };
-        match run(s, &json!({ "name": name, "cutDirection": dir })) {
+        match newdetail(s, &json!({ "name": name, "cutDirection": dir })) {
             Ok(r) => {
-                if let Some(id) = echo_created(s, word, &name, &r) {
+                if let Some(id) = echo_created(s, "Detail", &name, &r) {
                     enter_space(s, Space::Block(view_block_name(id)))?;
                 }
             }
@@ -481,12 +477,8 @@ impl Interactive for NewPlan {
     }
 }
 
-fn newplan_machine(s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(NewPlan { default: next_name(s, "Plan", is_plan_view), detail: false, direction: CutDirection::Plan }))
-}
-
 fn newdetail_machine(s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(NewPlan { default: next_name(s, "Detail", |v| matches!(v, AnyView::Detail(_))), detail: true, direction: CutDirection::Plan }))
+    Ok(Box::new(NewDetail { default: next_name(s, "Detail", |v| matches!(v, AnyView::Detail(_))), direction: CutDirection::Plan }))
 }
 
 /// NEWSECTIONLINE / NEWELEVATIONLINE: two points of the cut line in the edited view, then a name.
@@ -762,7 +754,7 @@ const MENU: &[&str] = &["View", "LAMB", ""];
 /// The LAMB commands, for `register_command_provider`.
 pub fn commands() -> Vec<CommandSpec> {
     vec![
-        CommandSpec::new("newplan", "New Plan", newplan).alias(&["npl"]).params("{name}").menu(MENU).interactive(newplan_machine),
+        CommandSpec::new("newplan", "New Plan", newplan).alias(&["npl"]).params("{name}").menu(MENU).interactive(newviews::newplan_machine),
         CommandSpec::new("newsectionline", "New Section Line", newsectionline)
             .alias(&["nsl"])
             .params("{name, hostViewId, cutFrom:{x,y}, cutTo:{x,y}}")
@@ -995,6 +987,13 @@ mod tests {
         s.input(Input::Text(t.into()))
     }
 
+    /// NEWPLAN's `Floating` option: a floating plan named `name`, edited.
+    fn floating_plan(s: &mut Session, name: &str) -> Result<()> {
+        s.start("newplan")?;
+        s.input(Input::Keyword("Floating".into()))?;
+        text(s, name)
+    }
+
     #[test]
     fn every_spec_has_a_menu_path_and_a_factory() -> R {
         install_app()?;
@@ -1038,20 +1037,76 @@ mod tests {
     }
 
     #[test]
-    fn newplan_enter_takes_the_default_enters_it_and_undoes() -> R {
+    fn newplan_floating_takes_the_default_name_enters_it_and_undoes() -> R {
         let mut s = session()?;
         s.start("newplan")?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("New plan or [Height/Floating] <Height>:"));
+        s.input(Input::Text("f".into()))?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter plan name <Plan 1>:"));
         s.input(Input::Enter)?;
         let v = views(&s)?;
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].name(), "Plan 1");
+        assert!(v[0].placement().is_none(), "floating on request");
         assert_eq!(space(&s)?, Space::Block(view_block_name(v[0].id())));
         assert!(s.log.iter().any(|l| l == &format!("Plan \"Plan 1\" created (view {}).", v[0].id().0)), "{:?}", s.log);
 
         s.undo()?;
         assert!(views(&s)?.is_empty(), "undo removes the plan");
         assert_eq!(space(&s)?, Space::Model, "undo leaves the removed view's block");
+        Ok(())
+    }
+
+    /// LAMB T507: NEWPLAN in an empty drawing places the plan, so a section drawn in it derives.
+    #[test]
+    fn newplan_places_by_default_and_a_section_in_it_derives() -> R {
+        use lamb_core::derivation::markers::{compute_cut_lines_for_view, compute_markers_for_view};
+        use lamb_core::derivation::reference::find_eligible_reference_views;
+        let mut s = session()?;
+        s.start("newplan")?;
+        s.input(Input::Enter)?; // Height
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify absolute floor elevation"));
+        s.input(Input::Enter)?; // 0
+        assert!(s.running.is_none());
+        let doc = read_document(s.doc()?)?;
+        let level = doc.levels.first().ok_or("no level")?;
+        assert_eq!((doc.levels.len(), level.name.as_str(), level.floor_elevation.value, level.order), (1, "Level 1", 0.0, 0.0));
+        let plan = doc.views.first().ok_or("no plan")?.id();
+        assert_eq!(
+            doc.views[0].placement(),
+            Some(&Placement::Plan { level_id: level.id, cut_elevation: doc.defaults.default_cut_height_mm, transform: IDENTITY_TRANSFORM })
+        );
+        assert_eq!(space(&s)?, Space::Block(view_block_name(plan)), "edits the new plan");
+
+        s.execute("line", &json!({ "points": [[0, -1000], [0, 1000]] }))?;
+        let r = s.execute(
+            "newsectionline",
+            &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": -2000, "y": 0}, "cutTo": {"x": 2000, "y": 0} }),
+        )?;
+        let section = Id(r["viewId"].as_u64().ok_or("no id")?);
+        let proj = DrawingProject::new(s.doc()?)?;
+        assert!(!compute_cut_lines_for_view(&proj, plan)?.is_empty(), "the cut line shows in the plan");
+        assert_eq!(compute_markers_for_view(&proj, section)?.len(), 1, "the crossed line is a marker in the section");
+        assert!(find_eligible_reference_views(&proj, plan).contains(&section), "the plan can reference the section");
+        Ok(())
+    }
+
+    /// LAMB T507: a section drawn in a floating plan places the plan in the same undo step.
+    #[test]
+    fn a_section_in_a_floating_plan_places_it_in_one_undo_step() -> R {
+        let mut s = session()?;
+        let plan = Id(s.execute("newplan", &json!({ "name": "Loose" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("newsectionline", &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 0}, "cutTo": {"x": 5000, "y": 0} }))?;
+        let doc = read_document(s.doc()?)?;
+        let level = doc.levels.first().ok_or("no level created")?;
+        assert_eq!(level.name, "Level 1");
+        assert!(matches!(doc.views[0].placement(), Some(Placement::Plan { level_id, .. }) if *level_id == level.id));
+        assert!(s.log.iter().any(|l| l == "Loose placed on Level 1"), "{:?}", s.log);
+        s.undo()?;
+        let doc = read_document(s.doc()?)?;
+        assert_eq!(doc.views.len(), 1, "the section is gone");
+        assert!(doc.views[0].placement().is_none(), "the plan floats again");
+        assert!(doc.levels.is_empty(), "and its level is gone");
         Ok(())
     }
 
@@ -1063,8 +1118,7 @@ mod tests {
         assert!(s.log.iter().any(|l| l == "Edit a plan or section first (EDITVIEW)."), "{:?}", s.log);
         assert!(views(&s)?.is_empty());
 
-        s.start("newplan")?;
-        text(&mut s, "Ground")?;
+        floating_plan(&mut s, "Ground")?;
         let plan = views(&s)?[0].id();
         s.start("nsl")?;
         assert_eq!(s.current_prompt().map(|p| p.message), Some("Specify first point of cut line".into()));
@@ -1087,8 +1141,7 @@ mod tests {
     #[test]
     fn newelevationline_preview_is_the_rubber_band() -> R {
         let mut s = session()?;
-        s.start("newplan")?;
-        s.input(Input::Enter)?;
+        floating_plan(&mut s, "Plan 1")?;
         s.start("newelevationline")?;
         s.input(Input::Point(Vec2::new(1.0, 2.0)))?;
         let pv = s.running.as_ref().ok_or("not running")?.machine.preview(&s, Vec2::new(3.0, -4.0));
@@ -1102,10 +1155,8 @@ mod tests {
     #[test]
     fn editview_by_name_id_model_and_unknown() -> R {
         let mut s = session()?;
-        s.start("newplan")?;
-        text(&mut s, "Ground")?;
-        s.start("newplan")?;
-        text(&mut s, "First")?;
+        floating_plan(&mut s, "Ground")?;
+        floating_plan(&mut s, "First")?;
         let v = views(&s)?;
         let (ground, first) = (v[0].id(), v[1].id());
 
@@ -1138,8 +1189,7 @@ mod tests {
     #[test]
     fn newsheet_lays_out_every_view() -> R {
         let mut s = session()?;
-        s.start("newplan")?;
-        s.input(Input::Enter)?;
+        floating_plan(&mut s, "Plan 1")?;
         s.start("newsheet")?;
         assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("Sheet 1"));
         s.input(Input::Enter)?;

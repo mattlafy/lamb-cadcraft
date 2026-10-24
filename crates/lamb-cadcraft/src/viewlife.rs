@@ -14,7 +14,12 @@
 //!   view's entities. Returns `{droppedLinks}`.
 //! - `level {mode:"create", name, floorElevationMm, order?}` | `{mode:"rename", levelId, name}` |
 //!   `{mode:"elevation", levelId, floorElevationMm}`: moving a level moves every placed plan on it,
-//!   each keeping its own cut height above the floor.
+//!   each keeping its own cut height above the floor. LEVEL begun in a floating plan places it
+//!   first ([`place_floating_plan`]).
+//! - [`place_floating_plan`] (LAMB T507): a floating plan placed on the first level by `order`
+//!   (`Level 1` at 0 created when there is none) at that floor plus the default cut height, identity
+//!   transform, inside the caller's undo step — NEWSECTIONLINE, NEWPLANLINE and LEVEL repair a
+//!   floating host with it instead of refusing.
 //!
 //! Each is one undo step (the drawing snapshot is the inverse); every refusal is decided on a read
 //! before `doc_mut`, so it records no step.
@@ -149,6 +154,27 @@ pub(crate) fn placeview(s: &mut Session, p: &Value) -> Result<Value> {
     doc.views[idx] = new_view;
     write_document(s.doc_mut()?, &doc).map_err(other)?;
     Ok(Value::Null)
+}
+
+/// Place the floating plan `plan` on the first level by `order` (creating `Level 1` at floor 0 when
+/// there is none) at that floor plus the default cut height, identity transform. No step of its
+/// own: it lands in the caller's. Echoes `<plan> placed on <level>`; returns the level id.
+pub(crate) fn place_floating_plan(s: &mut Session, plan: Id) -> Result<Id> {
+    let doc = doc_of(s)?;
+    let name = doc.views.iter().find(|v| v.id() == plan).map(|v| v.name().to_owned()).ok_or_else(|| other("No such view"))?;
+    let first = doc.levels.iter().min_by(|a, b| a.order.total_cmp(&b.order)).map(|l| (l.id, l.name.clone(), l.floor_elevation.value));
+    let (level_id, level_name, floor) = match first {
+        Some(l) => l,
+        None => {
+            let r = level(s, &json!({ "mode": "create", "name": "Level 1", "floorElevationMm": 0.0 }))?;
+            (r.get("levelId").and_then(id_value).ok_or_else(|| other("level create returned no id"))?, "Level 1".to_owned(), 0.0)
+        }
+    };
+    let cut = floor + doc.defaults.default_cut_height_mm;
+    let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
+    placeview(s, &json!({ "viewId": plan.0, "kind": "plan", "levelId": level_id.0, "cutElevation": cut, "transform": t }))?;
+    s.echo(format!("{name} placed on {level_name}"));
+    Ok(level_id)
 }
 
 // ---------------- UNPLACEVIEW ----------------
@@ -333,7 +359,8 @@ enum LevelStep {
     NewElevation,
 }
 
-/// LEVEL on the edited placed plan's level: `Level option [Name/Elevation/New] <Elevation>:`.
+/// LEVEL on the edited plan's level (a floating plan placed first): `Level option
+/// [Name/Elevation/New] <Elevation>:`.
 struct LevelMachine {
     level: Option<Level>,
     step: LevelStep,
@@ -369,6 +396,12 @@ impl Interactive for LevelMachine {
         }
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        // A floating plan is placed first, in this command's undo step (LAMB T507).
+        if let Some(id) = edited_view(s)
+            && doc_of(s)?.views.iter().any(|v| v.id() == id && matches!(v, AnyView::Plan(PlanView { placement: None, .. })))
+        {
+            place_floating_plan(s, id)?;
+        }
         let doc = doc_of(s)?;
         let level_id = edited_view(s).and_then(|id| match doc.views.iter().find(|v| v.id() == id) {
             Some(AnyView::Plan(PlanView { placement: Some(Placement::Plan { level_id, .. }), .. })) => Some(*level_id),
@@ -732,8 +765,21 @@ mod tests {
         assert!(s.running.is_none());
         assert!(view_by_id(&s, gf)?.placement().is_none());
         assert!(s.log.iter().any(|l| l == "Ground Floor is now floating; 0 links dropped."), "{:?}", s.log);
+        // LEVEL in a floating plan places it on the first level by order, then prompts (T507).
+        let steps = undo_len(&s)?;
         s.start("level")?;
-        assert!(s.log.iter().any(|l| l == "Switch to a placed plan first"), "a floating plan has no level");
+        let cut = read_document(s.doc()?)?.defaults.default_cut_height_mm;
+        assert_eq!(
+            view_by_id(&s, gf)?.placement(),
+            Some(&Placement::Plan { level_id: level, cut_elevation: 300.0 + cut, transform: lamb_core::geometry::IDENTITY_TRANSFORM })
+        );
+        assert!(s.log.iter().any(|l| l == "Ground Floor placed on Ground"), "{:?}", s.log);
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Level option"));
+        s.input(Input::Text("n".into()))?;
+        s.input(Input::Text("Ground".into()))?;
+        assert_eq!(undo_len(&s)?, steps + 1, "placing and the command are one step");
+        s.undo()?;
+        assert!(view_by_id(&s, gf)?.placement().is_none(), "one undo floats it again");
 
         s.execute("editview", &json!({}))?;
         s.start("duplicateview")?;

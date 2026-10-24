@@ -821,9 +821,8 @@ mod tests {
             _ => None,
         });
         let plan = plan.ok_or("no plan")?;
-        let level = Id(s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].as_u64().ok_or("no id")?);
-        let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
-        s.execute("placeview", &json!({ "viewId": plan.0, "kind": "plan", "levelId": level.0, "cutElevation": 1200, "transform": t }))?;
+        // The section drawn in the plan placed it already (LAMB T507).
+        assert!(doc.views.iter().any(|v| v.id() == plan && v.placement().is_some()));
         let inner = {
             let d = s.doc()?;
             let b = d.block(&crate::schema::view_block_name(sec)).ok_or("no section block")?;

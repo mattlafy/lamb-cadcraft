@@ -861,8 +861,12 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Places `plan` on a new level L1 at the origin.
+    /// Places `plan` on a new level L1 at the origin, unless a section drawn in it already placed it
+    /// (LAMB T507).
     fn place(s: &mut Session, plan: Id) -> R {
+        if crate::schema::read_document(s.doc()?)?.views.iter().any(|v| v.id() == plan && v.placement().is_some()) {
+            return Ok(());
+        }
         let level = Id(s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].as_u64().ok_or("no id")?);
         let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
         s.execute("placeview", &json!({ "viewId": plan.0, "kind": "plan", "levelId": level.0, "cutElevation": 1200, "transform": t }))?;

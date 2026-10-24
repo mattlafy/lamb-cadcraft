@@ -5,10 +5,17 @@
 //! - `newoffsetplan {mode:"offset"|"height", fromViewId, floorToFloorMm | floorElevationMm, name?,
 //!   cutHeightMm?}` (`np`, View ▸ LAMB ▸ New Offset Plan): a new level and a placed plan on it, a
 //!   floor-to-floor distance above the from-plan's level or at an absolute floor elevation, with
-//!   the from-plan's transform; then edit the new plan.
+//!   the from-plan's transform; then edit the new plan. In `height` mode `fromViewId` may be
+//!   omitted: identity transform, level order one past the highest.
+//! - Interactive NEWPLAN (LAMB T507, the TS app's New Plan) is the same machine:
+//!   `New plan [Offset/Height/Floating] <Offset>` from the edited placed plan, else the first placed
+//!   plan; `[Height/Floating] <Height>` with none. Plans are placed by default; `Floating` asks a
+//!   name and makes the old floating plan. Neither machine refuses for want of a placed plan.
 //! - `newplanline {fromVerticalViewId, localPoint:{x,y}, name?, cutHeightMm?}` (`npln`, Plan Here):
-//!   one point in a placed section or elevation gives a new level and plan at that point's
-//!   absolute height, with the host plan's transform. The edit space stays where it is.
+//!   one point in a section or elevation gives a new level and plan at that point's absolute
+//!   height, with the host plan's transform; the edit space stays where it is. A floating host plan
+//!   is placed first; a floating section is built backwards — the new plan at the point's `y`,
+//!   identity transform, then the section placed on it along local x (one undo step).
 //! - NEWSECTIONLINE's one-click form in a placed section ([`perpendicular_cut`],
 //!   [`vertical_preview`]): the branch itself lives in `commands.rs`'s machine.
 //!
@@ -22,14 +29,15 @@ use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step,
 use cadcraft_geom::{Bounds2, Vec2};
 use lamb_core::derivation::projection::{PerpendicularCutLine, perpendicular_cut_line_through, plan_placement_through};
 use lamb_core::derivation::read::{ProjectRead, ViewKind};
-use lamb_core::geometry::{Point2, Transform2D};
-use lamb_core::model::{Actor, AnyView, Id, Level, Placement, PlanView, authored_field};
+use lamb_core::geometry::{IDENTITY_TRANSFORM, Point2, Transform2D};
+use lamb_core::model::{Actor, AnyView, Id, Level, Placement, PlanView, VerticalIntent, authored_field, is_plan_view};
 use serde_json::{Value, json};
 
-use crate::commands::{bad, echo_created, edited_view, enter_space, id_value, other, point_param};
+use crate::commands::{bad, echo_created, edited_view, enter_space, id_value, name_input, newplan, next_name, other, point_param};
 use crate::maintain::now;
 use crate::project::DrawingProject;
-use crate::schema::{read_document, view_block_name, write_document};
+use crate::schema::{LambDocument, read_document, view_block_name, write_document};
+use crate::viewlife::{place_floating_plan, placeview};
 use crate::views::create_view;
 
 /// How far a one-click preview line runs past the view's drawn extents (TS `PREVIEW_MARGIN_MM`).
@@ -65,6 +73,11 @@ fn create_level_and_plan(s: &mut Session, spec: PlanSpec) -> Result<Value> {
     Ok(json!({ "viewId": view_id.0, "levelId": level_id.0 }))
 }
 
+/// One past the highest level `order`, 0 with no levels.
+fn next_order(doc: &LambDocument) -> f64 {
+    doc.levels.iter().map(|l| l.order).reduce(f64::max).map_or(0.0, |m| m + 1.0)
+}
+
 fn default_level_name(levels: usize) -> String {
     format!("Level {}", levels + 1)
 }
@@ -87,8 +100,15 @@ fn num(cmd: &str, p: &Value, key: &str) -> Result<f64> {
 /// NEWOFFSETPLAN (TS `applyNewOffsetPlan`), then edit the new plan.
 pub(crate) fn newoffsetplan(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "newoffsetplan";
-    let from = p.get("fromViewId").and_then(id_value).ok_or_else(|| bad(CMD, "`fromViewId` is required"))?;
-    let (from_floor, order, transform) = {
+    let mode = p.get("mode").and_then(Value::as_str);
+    if !matches!(mode, Some("offset" | "height")) {
+        return Err(bad(CMD, "`mode` must be \"offset\" or \"height\""));
+    }
+    let from = p.get("fromViewId").filter(|v| !v.is_null());
+    let (from_floor, order, transform) = if from.is_none() && mode == Some("height") {
+        (0.0, next_order(&read_document(s.doc()?).map_err(other)?), IDENTITY_TRANSFORM)
+    } else {
+        let from = from.and_then(id_value).ok_or_else(|| bad(CMD, "`fromViewId` is required"))?;
         let doc = read_document(s.doc()?).map_err(other)?;
         let Some(AnyView::Plan(PlanView { placement: Some(Placement::Plan { level_id, transform, .. }), .. })) =
             doc.views.iter().find(|v| v.id() == from)
@@ -98,11 +118,7 @@ pub(crate) fn newoffsetplan(s: &mut Session, p: &Value) -> Result<Value> {
         let level = doc.levels.iter().find(|l| l.id == *level_id);
         (level.map_or(0.0, |l| l.floor_elevation.value), level.map_or(0.0, |l| l.order) + 1.0, *transform)
     };
-    let floor = match p.get("mode").and_then(Value::as_str) {
-        Some("offset") => from_floor + num(CMD, p, "floorToFloorMm")?,
-        Some("height") => num(CMD, p, "floorElevationMm")?,
-        _ => return Err(bad(CMD, "`mode` must be \"offset\" or \"height\"")),
-    };
+    let floor = if mode == Some("offset") { from_floor + num(CMD, p, "floorToFloorMm")? } else { num(CMD, p, "floorElevationMm")? };
     let cut_height = opt_num(CMD, p, "cutHeightMm")?;
     let r = create_level_and_plan(s, PlanSpec { name: opt_name(p), floor, cut_height, order, transform })?;
     if let Some(id) = r.get("viewId").and_then(Value::as_u64) {
@@ -117,12 +133,33 @@ pub(crate) fn newplanline(s: &mut Session, p: &Value) -> Result<Value> {
     let from = p.get("fromVerticalViewId").and_then(id_value).ok_or_else(|| bad(CMD, "`fromVerticalViewId` is required"))?;
     let local = point_param(CMD, p, "localPoint")?;
     let cut_height = opt_num(CMD, p, "cutHeightMm")?;
+    let doc = read_document(s.doc()?).map_err(other)?;
+    let Some(AnyView::Vertical(vertical)) = doc.views.iter().find(|v| v.id() == from) else {
+        return Err(other("fromVerticalViewId must be a section or elevation"));
+    };
+    match &vertical.placement {
+        // A floating section, built backwards: a plan at the point's height, then the section on it.
+        None => {
+            let spec = PlanSpec { name: opt_name(p), floor: local.y, cut_height, order: next_order(&doc), transform: IDENTITY_TRANSFORM };
+            let r = create_level_and_plan(s, spec)?;
+            let plan = r.get("viewId").and_then(id_value).ok_or_else(|| other("no plan created"))?;
+            let intent = if vertical.intent == VerticalIntent::Elevation { "elevation" } else { "section" };
+            let cut = json!({ "start": {"x": 0.0, "y": 0.0}, "segments": [{ "to": {"x": CUT_LINE_LENGTH_MM, "y": 0.0} }] });
+            let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
+            placeview(s, &json!({ "viewId": from.0, "kind": "vertical", "hostViewId": plan.0, "cutLine": cut, "transform": t, "intent": intent }))?;
+            return Ok(r);
+        }
+        Some(Placement::Vertical { host_view_id, .. })
+            if doc.views.iter().any(|v| v.id() == *host_view_id && matches!(v, AnyView::Plan(PlanView { placement: None, .. }))) =>
+        {
+            place_floating_plan(s, *host_view_id)?;
+        }
+        Some(_) => {}
+    }
     let (through, order) = {
         let proj = DrawingProject::new(s.doc()?).map_err(other)?;
-        let view = proj
-            .view(from)
-            .filter(|v| v.kind == ViewKind::Vertical && v.placement.is_some())
-            .ok_or_else(|| other("fromVerticalViewId must be a placed vertical view"))?;
+        let view =
+            proj.view(from).filter(|v| v.kind == ViewKind::Vertical).ok_or_else(|| other("fromVerticalViewId must be a section or elevation"))?;
         let host = view.host_view_id().and_then(|h| proj.view(h)).ok_or_else(|| other(format!("Vertical view {} has no host view", from.0)))?;
         let through = plan_placement_through(&view, &host, local).map_err(other)?;
         let host_order = match host.placement {
@@ -139,6 +176,16 @@ pub(crate) fn newplanline(s: &mut Session, p: &Value) -> Result<Value> {
 /// The view, when it is a placed plan.
 fn is_placed_plan(s: &Session, id: Id) -> bool {
     read_document_of(s).is_some_and(|doc| doc.views.iter().any(|v| v.id() == id && matches!(v, AnyView::Plan(PlanView { placement: Some(_), .. }))))
+}
+
+/// The first placed plan in document order.
+fn first_placed_plan(s: &Session) -> Option<Id> {
+    read_document_of(s)?.views.iter().find(|v| matches!(v, AnyView::Plan(PlanView { placement: Some(_), .. }))).map(AnyView::id)
+}
+
+/// The view, when it is a section or elevation, placed or not.
+fn is_vertical(s: &Session, id: Id) -> bool {
+    read_document_of(s).is_some_and(|doc| doc.views.iter().any(|v| v.id() == id && matches!(v, AnyView::Vertical(_))))
 }
 
 /// The view, when it is a placed section or elevation.
@@ -203,10 +250,14 @@ fn remember(m: &Mutex<f64>, v: f64) {
 enum Mode {
     Offset,
     Height,
+    /// NEWPLAN only: `Enter plan name`, then a floating plan.
+    Floating,
 }
 
-/// NEWOFFSETPLAN: `New plan or [Offset/Height] <Offset>:`, then the distance or elevation.
+/// NEWOFFSETPLAN / NEWPLAN: `New plan or [Offset/Height(/Floating)] <Offset>:` from a placed plan
+/// (`[Height(/Floating)] <Height>` with none), then the distance, elevation or name.
 struct NewOffsetPlan {
+    name: &'static str,
     from: Option<Id>,
     mode: Option<Mode>,
 }
@@ -215,25 +266,30 @@ impl NewOffsetPlan {
     fn store(&self) -> &'static Mutex<f64> {
         if self.mode == Some(Mode::Height) { &LAST_HEIGHT } else { &LAST_OFFSET }
     }
+    fn keywords(&self) -> Vec<&'static str> {
+        let mut k = if self.from.is_some() { vec!["Offset", "Height"] } else { vec!["Height"] };
+        if self.name == "newplan" {
+            k.push("Floating");
+        }
+        k
+    }
 }
 
 impl Interactive for NewOffsetPlan {
     fn name(&self) -> &'static str {
-        "newoffsetplan"
+        self.name
     }
-    fn prompt(&self, _s: &Session) -> Prompt {
+    fn prompt(&self, s: &Session) -> Prompt {
         match self.mode {
-            None => Prompt::new("New plan", Accept::TEXT).kw(&["Offset", "Height"]).default("Offset"),
+            None => Prompt::new("New plan", Accept::TEXT).kw(&self.keywords()).default(self.keywords()[0]),
             Some(Mode::Offset) => Prompt::new("Specify floor-to-floor distance", Accept::NUMBER).default(remembered(&LAST_OFFSET).to_string()),
             Some(Mode::Height) => Prompt::new("Specify absolute floor elevation", Accept::NUMBER).default(remembered(&LAST_HEIGHT).to_string()),
+            Some(Mode::Floating) => Prompt::new("Enter plan name", Accept::TEXT).default(next_name(s, "Plan", is_plan_view)),
         }
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        self.from = edited_view(s).filter(|&id| is_placed_plan(s, id));
-        if self.from.is_none() {
-            s.echo("Switch to a placed plan first");
-            return Ok(Step::Done);
-        }
+        // The edited placed plan, else the first one (LAMB T507: plans are placed by default).
+        self.from = edited_view(s).filter(|&id| is_placed_plan(s, id)).or_else(|| first_placed_plan(s));
         Ok(Step::Continue)
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
@@ -242,29 +298,45 @@ impl Interactive for NewOffsetPlan {
         }
         let Some(mode) = self.mode else {
             let picked = match i {
-                Input::Enter => Some("Offset".to_owned()),
+                Input::Enter => Some(self.keywords()[0].to_owned()),
                 Input::Text(t) | Input::Keyword(t) => self.prompt(s).match_keyword(&t),
                 _ => return Ok(Step::Continue),
             };
             self.mode = match picked.as_deref() {
                 Some("Offset") => Some(Mode::Offset),
                 Some("Height") => Some(Mode::Height),
+                Some("Floating") => Some(Mode::Floating),
                 _ => return Err(other("Unrecognized mode (try O for offset or H for height)")),
             };
             return Ok(Step::Continue);
         };
+        if mode == Mode::Floating {
+            let default = next_name(s, "Plan", is_plan_view);
+            let Some(name) = name_input(i, &default) else { return Ok(Step::Continue) };
+            match newplan(s, &json!({ "name": name })) {
+                Ok(r) => {
+                    if let Some(id) = echo_created(s, "Plan", &name, &r) {
+                        enter_space(s, Space::Block(view_block_name(id)))?;
+                    }
+                }
+                Err(e) => s.echo(e.to_string()),
+            }
+            return Ok(Step::Done);
+        }
         let value = match i {
             Input::Enter => remembered(self.store()),
             Input::Text(t) | Input::Keyword(t) => parse_distance(&t).filter(|v| v.is_finite()).ok_or_else(|| other("Requires a number."))?,
             _ => return Ok(Step::Continue),
         };
-        let Some(from) = self.from else { return Ok(Step::Done) };
         remember(self.store(), value);
         let name = default_level_name(read_document(s.doc()?).map_err(other)?.levels.len());
-        let params = match mode {
-            Mode::Offset => json!({ "mode": "offset", "fromViewId": from.0, "floorToFloorMm": value, "name": name }),
-            Mode::Height => json!({ "mode": "height", "fromViewId": from.0, "floorElevationMm": value, "name": name }),
+        let mut params = match mode {
+            Mode::Offset => json!({ "mode": "offset", "floorToFloorMm": value, "name": name }),
+            _ => json!({ "mode": "height", "floorElevationMm": value, "name": name }),
         };
+        if let Some(from) = self.from {
+            params["fromViewId"] = json!(from.0);
+        }
         match newoffsetplan(s, &params) {
             Ok(r) => {
                 echo_created(s, "Plan", &name, &r);
@@ -276,10 +348,15 @@ impl Interactive for NewOffsetPlan {
 }
 
 pub(crate) fn newoffsetplan_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(NewOffsetPlan { from: None, mode: None }))
+    Ok(Box::new(NewOffsetPlan { name: "newoffsetplan", from: None, mode: None }))
 }
 
-/// NEWPLANLINE: one point in a placed section or elevation.
+/// Interactive NEWPLAN (LAMB T507): the TS app's New Plan, placed by default.
+pub(crate) fn newplan_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(NewOffsetPlan { name: "newplan", from: None, mode: None }))
+}
+
+/// NEWPLANLINE: one point in a section or elevation, placed or floating.
 struct NewPlanLine {
     view: Option<Id>,
 }
@@ -292,9 +369,9 @@ impl Interactive for NewPlanLine {
         Prompt::new("Click a point to place a plan at that elevation", Accept::POINT)
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        self.view = edited_view(s).filter(|&id| is_placed_vertical(s, id));
+        self.view = edited_view(s).filter(|&id| is_vertical(s, id));
         if self.view.is_none() {
-            s.echo("Switch to a placed section or elevation first");
+            s.echo("Switch to a section or elevation first");
             return Ok(Step::Done);
         }
         Ok(Step::Continue)
@@ -444,10 +521,75 @@ mod tests {
         let doc = read_document(s.doc()?)?;
         assert!(doc.levels.iter().any(|l| l.name == "Level 3" && l.floor_elevation.value == 6000.0 && l.order == 2.0));
 
+        // LAMB T507: in Model, or editing a floating plan, NEWPLAN offsets from the first placed plan.
         s.execute("editview", &json!({}))?;
         s.start("newoffsetplan")?;
-        assert!(s.running.is_none(), "refused in Model");
-        assert!(s.log.iter().any(|l| l == "Switch to a placed plan first"), "{:?}", s.log);
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("New plan or [Offset/Height] <Offset>:"));
+        s.input(Input::Cancel)?;
+        let loose = s.execute("newplan", &json!({ "name": "Loose" }))?["viewId"].as_u64().ok_or("no id")?;
+        s.execute("editview", &json!({ "viewId": loose }))?;
+        s.start("newplan")?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("New plan or [Offset/Height/Floating] <Offset>:"));
+        s.input(Input::Enter)?;
+        s.input(Input::Text("3000".into()))?;
+        let doc = read_document(s.doc()?)?;
+        let view = doc.views.iter().find(|v| v.name() == "Level 4").ok_or("no plan")?.id();
+        let (level, placement) = level_of(&s, view)?;
+        assert_eq!(level.floor_elevation.value, 3000.0, "3000 above the ground plan's level");
+        assert!(matches!(placement, Placement::Plan { transform, .. } if transform == MOVED), "the ground plan's transform");
+        assert!(read_document(s.doc()?)?.views.iter().any(|v| v.id().0 == loose && v.placement().is_none()), "the floating plan is untouched");
+        Ok(())
+    }
+
+    #[test]
+    fn newoffsetplan_height_without_a_from_plan_uses_the_identity() -> R {
+        let (mut s, _) = project()?;
+        let r = s.execute("newoffsetplan", &json!({ "mode": "height", "floorElevationMm": 6000 }))?;
+        let (level, placement) = level_of(&s, Id(r["viewId"].as_u64().ok_or("no id")?))?;
+        assert_eq!((level.order, level.floor_elevation.value), (1.0, 6000.0));
+        assert!(matches!(placement, Placement::Plan { transform, .. } if transform == IDENTITY_TRANSFORM));
+        let e = s.execute("newoffsetplan", &json!({ "mode": "offset", "floorToFloorMm": 3000 }));
+        assert!(e.is_err_and(|e| e.to_string().contains("`fromViewId` is required")));
+        Ok(())
+    }
+
+    /// LAMB T507: NEWPLANLINE in a floating section builds it backwards — a plan at the clicked
+    /// height, and the section placed on it — in one undo step.
+    #[test]
+    fn newplanline_in_a_floating_section_places_both_in_one_undo_step() -> R {
+        install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        // A floating section: placed on a plan, then unplaced.
+        let plan = Id(s.execute("newplan", &json!({ "name": "Seed" }))?["viewId"].as_u64().ok_or("no id")?);
+        let sec = Id(s
+            .execute("newsectionline", &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 0}, "cutTo": {"x": 5000, "y": 0} }))?
+            ["viewId"]
+            .as_u64()
+            .ok_or("no id")?);
+        s.execute("unplaceview", &json!({ "viewId": sec.0 }))?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        let (views, levels) = {
+            let d = read_document(s.doc()?)?;
+            (d.views.len(), d.levels.len())
+        };
+        s.start("newplanline")?;
+        s.input(Input::Point(Vec2::new(500.0, 2700.0)))?;
+        assert!(s.running.is_none());
+        let doc = read_document(s.doc()?)?;
+        let new_plan = doc.views.iter().find(|v| v.id() != plan && matches!(v, AnyView::Plan(_))).ok_or("no new plan")?.id();
+        let (level, placement) = level_of(&s, new_plan)?;
+        assert_eq!(level.floor_elevation.value, 2700.0);
+        assert!(matches!(placement, Placement::Plan { transform, .. } if transform == IDENTITY_TRANSFORM));
+        let a = sections(&s)?.into_iter().find(|v| v.id == sec).ok_or("no section")?;
+        let Some(Placement::Vertical { host_view_id, cut_line, .. }) = &a.placement else { return Err("section not placed".into()) };
+        assert_eq!(*host_view_id, new_plan, "hosted by the new plan");
+        assert_eq!(cut_line, &line2(Point2 { x: 0.0, y: 0.0 }, Point2 { x: CUT_LINE_LENGTH_MM, y: 0.0 }));
+        assert_eq!(space(&s)?, Space::Block(view_block_name(sec)), "the edit space is unchanged");
+        s.undo()?;
+        let doc = read_document(s.doc()?)?;
+        assert_eq!((doc.views.len(), doc.levels.len()), (views, levels), "one undo removes the plan and its level");
+        assert!(sections(&s)?.into_iter().any(|v| v.id == sec && v.placement.is_none()), "and floats the section again");
         Ok(())
     }
 
@@ -463,7 +605,7 @@ mod tests {
         assert_eq!(space(&s)?, Space::Block(view_block_name(section)), "the edit space is unchanged");
 
         let e = s.execute("newplanline", &json!({ "fromVerticalViewId": plan.0, "localPoint": {"x": 0, "y": 0} }));
-        assert!(e.is_err_and(|e| e.to_string().contains("fromVerticalViewId must be a placed vertical view")));
+        assert!(e.is_err_and(|e| e.to_string().contains("fromVerticalViewId must be a section or elevation")));
         Ok(())
     }
 
@@ -472,7 +614,7 @@ mod tests {
         let (mut s, plan) = project()?;
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
         s.start("newplanline")?;
-        assert!(s.running.is_none() && s.log.iter().any(|l| l == "Switch to a placed section or elevation first"), "{:?}", s.log);
+        assert!(s.running.is_none() && s.log.iter().any(|l| l == "Switch to a section or elevation first"), "{:?}", s.log);
 
         let section = with_section(&mut s, plan)?;
         s.start("newplanline")?;

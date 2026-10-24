@@ -731,7 +731,7 @@ mod tests {
                 .is_err_and(|e| e.to_string().contains("`cutDirection` must be plan or vertical"))
         );
         s.start("newplan")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter plan name <Plan 1>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("New plan or [Height/Floating] <Height>:"));
         Ok(())
     }
 }
