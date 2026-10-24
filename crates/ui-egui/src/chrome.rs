@@ -404,7 +404,10 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         let active_tab = tabs.iter().position(|n| cur.as_deref().is_ok_and(|c| c == n));
         // Model and "+" stay; the layouts share what is left.
         let layouts = widths.get(1..).unwrap_or_default();
-        let room = limit - x - widths.first().copied().unwrap_or(0.0) - 22.0;
+        // Fork (LAMB T525): the registered views, behind an icon right of the Model tab.
+        let views = view_choices(crate::viewlist::rows(app));
+        let views_w = if views.is_empty() { 0.0 } else { 22.0 };
+        let room = limit - x - widths.first().copied().unwrap_or(0.0) - 22.0 - views_w;
         let active_layout = active_tab.and_then(|a| a.checked_sub(1));
         let mut shown = visible_tabs(layouts, active_layout, room);
         let hidden = shown.len() < layouts.len();
@@ -414,6 +417,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         let clip = Rect::from_min_max(r.min, pos2(limit.max(r.left()), r.bottom()));
         let tp = p.with_clip_rect(clip);
         let mut switch = None;
+        let mut views_button = None;
         for (i, (name, (g, cut))) in tabs.iter().zip(labels).enumerate() {
             if i > 0 && !shown.contains(&(i - 1)) {
                 continue;
@@ -435,6 +439,17 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             }
             crate::shortcut_menus::attach(app, &resp, |app| crate::shortcut_menus::layout_tab_entries(app, name));
             x += w + 2.0;
+            if i == 0 && !views.is_empty() {
+                let vr = Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(16.0, 16.0));
+                let vresp = ui.interact(vr, ui.id().with("lamb_views"), Sense::click());
+                if vresp.hovered() {
+                    p.rect_filled(vr, 3.0, t.control_hover.gamma_multiply(0.5));
+                }
+                icons::paint(&p, vr.shrink(2.0), Icon::List, false);
+                icons::describe_control(ui, &vresp, "Views", None, false);
+                views_button = Some(vresp.on_hover_text(crate::tl!("Views")));
+                x += 22.0;
+            }
             if i == 0 {
                 let pr = Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(16.0, 16.0));
                 let presp = ui.interact(pr, ui.id().with("layout_plus"), Sense::click());
@@ -472,6 +487,16 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
                     }
                 });
             });
+        }
+        if let Some(resp) = &views_button {
+            let chosen = egui::Popup::from_toggle_button_response(resp)
+                .width(200.0)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| view_list_popup(ui, &views))
+                .and_then(|r| r.inner);
+            if let Some((id, params)) = chosen {
+                let _ = app.run(&id, params);
+            }
         }
         if let Some(n) = switch {
             let _ = app.run("layout.set", json!({ "name": n }));
@@ -607,9 +632,63 @@ pub fn start_page(app: &mut CadApp, ui: &mut egui::Ui) {
     }
 }
 
+/// Fork (LAMB T525): the rows the views popup lists — every clickable row but Model and headings.
+fn view_choices(rows: Vec<crate::viewlist::Row>) -> Vec<crate::viewlist::Row> {
+    rows.into_iter().filter(|r| !r.heading && r.label != "Model" && r.command.is_some()).collect()
+}
+
+/// Fork (LAMB T525): the views popup body; returns the clicked row's command and closes the popup.
+fn view_list_popup(ui: &mut egui::Ui, rows: &[crate::viewlist::Row]) -> Option<(String, serde_json::Value)> {
+    let mut chosen = None;
+    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+        for row in rows {
+            if ui.add(egui::Button::selectable(row.active, row.label.as_str()).truncate()).clicked() {
+                chosen = row.command.clone();
+                ui.close();
+            }
+        }
+    });
+    chosen
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(label: &str, heading: bool, active: bool) -> crate::viewlist::Row {
+        crate::viewlist::Row {
+            label: label.into(),
+            active,
+            heading,
+            command: (!heading).then(|| ("editview".to_string(), json!({ "view": label }))),
+            cells: vec![],
+        }
+    }
+
+    #[test]
+    fn the_views_popup_lists_views_and_returns_the_clicked_command() {
+        let rows = vec![row("Plans", true, false), row("Model", false, true), row("Level 1", false, false), row("Section A", false, true)];
+        let views = view_choices(rows);
+        assert_eq!(views.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["Level 1", "Section A"]);
+        // No source (no rows) or only Model and headings: no button.
+        assert!(view_choices(vec![]).is_empty());
+        assert!(view_choices(vec![row("Model", false, true), row("Views", true, false)]).is_empty());
+        type State = (Vec<crate::viewlist::Row>, Option<(String, serde_json::Value)>);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(240.0, 200.0)).build_ui_state(
+            |ui, st: &mut State| {
+                if let Some(c) = view_list_popup(ui, &st.0) {
+                    st.1 = Some(c);
+                }
+            },
+            (views, None),
+        );
+        h.run();
+        use egui_kittest::kittest::Queryable;
+        assert!(h.query_by_label("Model").is_none());
+        h.get_by_label("Section A").click();
+        h.run();
+        assert_eq!(h.state().1, Some(("editview".to_string(), json!({ "view": "Section A" }))));
+    }
 
     #[test]
     fn mac_title_row_centres_and_clears_the_traffic_lights() {
