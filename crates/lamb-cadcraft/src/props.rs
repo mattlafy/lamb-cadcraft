@@ -1,10 +1,11 @@
 //! The LAMB group of the Properties palette (TS `PropertiesPanel.tsx`'s Role select, `CutSummary`,
 //! `SeenSummary`): a Role row whose choices run SETROLE, and for one plan polyline in a placed plan
 //! view whose resolved role is cut or seen, where its height comes from at the stepped segment.
+//! One selected layout viewport gets a View row instead, whose choices run VPVIEW.
 //! The desktop app maps [`LambGroup`] onto the UI's generic property-group slot.
 
 use cadcraft_doc::Space;
-use cadcraft_doc::{Drawing, Handle};
+use cadcraft_doc::{Drawing, EntityKind, Handle};
 use lamb_core::derivation::read::{EntityRef, ProjectRead, ViewKind};
 use lamb_core::derivation::resolve::{ProvenanceKind, resolve_cut_segment, resolve_seen_z};
 use lamb_core::model::{AnyView, Id, LineRole, Placement, VerticalIntent};
@@ -14,7 +15,7 @@ use crate::commands::kind_word;
 use crate::entitycmds::ROLE_WORDS;
 use crate::overlays::view_id;
 use crate::project::DrawingProject;
-use crate::schema::read_document;
+use crate::schema::{read_document, read_entity_data};
 
 /// One row: a label, its shown value, hover text, and (label, command, params) choices — none for
 /// a read-only row.
@@ -85,11 +86,34 @@ fn role_row(dp: &DrawingProject<'_>, sel: &[Handle], ents: &[EntityRef<'_>]) -> 
     LambRow { label: "Role".into(), value, tip: None, choices, edit: None }
 }
 
-/// The LAMB group for `sel` at `segment` (clamped to the polyline's last segment); `None` unless
-/// every handle is a LAMB entity.
+/// The View row of one selected layout viewport (not a layout's overall one): its bound view's name
+/// or `(none)`, with VPVIEW choices `(none)` then every view in document order. `None` for anything
+/// else.
+fn viewport_group(d: &Drawing, sel: &[Handle]) -> Option<LambGroup> {
+    let [h] = sel else { return None };
+    let e = d.entity(*h)?;
+    let EntityKind::Viewport(vp) = &e.kind else { return None };
+    if vp.id <= 1 || !matches!(d.space_of(*h), Some(Space::Paper(_))) {
+        return None;
+    }
+    let doc = read_document(d).ok()?;
+    let bound = read_entity_data(&e.common).ok().and_then(|x| x.view_id);
+    let value = bound.and_then(|id| doc.views.iter().find(|v| v.id() == id)).map_or("(none)".to_owned(), |v| v.name().to_owned());
+    let hex = h.hex();
+    let choices = std::iter::once(("(none)".to_owned(), "vpview".to_owned(), json!({ "handle": hex, "viewId": null })))
+        .chain(doc.views.iter().map(|v| (v.name().to_owned(), "vpview".to_owned(), json!({ "handle": hex, "viewId": v.id().0 }))))
+        .collect();
+    Some(LambGroup { title: "LAMB".into(), segments: 0, rows: vec![LambRow { label: "View".into(), value, tip: None, choices, edit: None }] })
+}
+
+/// The LAMB group for `sel` at `segment` (clamped to the polyline's last segment): the View row for
+/// one layout viewport, else `None` unless every handle is a LAMB entity.
 pub fn property_group(d: &Drawing, sel: &[Handle], segment: usize) -> Option<LambGroup> {
     if sel.is_empty() {
         return None;
+    }
+    if let Some(g) = viewport_group(d, sel) {
+        return Some(g);
     }
     let dp = DrawingProject::new(d).ok()?;
     let ents: Vec<EntityRef<'_>> = sel.iter().map(|h| dp.entity(Id(h.0))).collect::<Option<_>>()?;

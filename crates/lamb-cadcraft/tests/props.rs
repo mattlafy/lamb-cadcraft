@@ -176,3 +176,31 @@ fn the_picked_views_form_rows_run_viewprops_with_one_undo_each() -> R {
     assert!(!flipped(s.doc()?, sec)?, "one UNDO restores the flip");
     Ok(())
 }
+
+#[test]
+fn a_selected_layout_viewport_shows_a_view_row_running_vpview() -> R {
+    let mut s = session()?;
+    let views: Vec<(Id, String)> = read_document(s.doc()?)?.views.iter().map(|v| (v.id(), v.name().to_owned())).collect();
+    let (plan, _) = plan_and_section(s.doc()?)?;
+    s.execute("layout.new", &serde_json::json!({ "name": "L1", "viewport": false }))?;
+    let out = s.execute("mview", &serde_json::json!({ "layout": "L1" }))?;
+    let h = Handle::parse_hex(out["viewports"][0].as_str().ok_or("no viewport")?).ok_or("bad handle")?;
+
+    let g = property_group(s.doc()?, &[h], 0).ok_or("no group for a viewport")?;
+    assert_eq!((g.title.as_str(), g.rows.len()), ("LAMB", 1));
+    let row = &g.rows[0];
+    assert_eq!((row.label.as_str(), row.value.as_str()), ("View", "(none)"));
+    let labels: Vec<&str> = row.choices.iter().map(|c| c.0.as_str()).collect();
+    let want: Vec<&str> = std::iter::once("(none)").chain(views.iter().map(|v| v.1.as_str())).collect();
+    assert_eq!(labels, want);
+    assert!(row.choices.iter().all(|c| c.1 == "vpview"));
+    assert_eq!(row.choices[0].2, serde_json::json!({ "handle": h.hex(), "viewId": null }));
+
+    let (_, cmd, params) = row.choices.iter().find(|c| c.2["viewId"] == serde_json::json!(plan.0)).ok_or("no plan choice")?;
+    s.execute(cmd, params)?;
+    let g = property_group(s.doc()?, &[h], 0).ok_or("no group")?;
+    assert_eq!(g.rows[0].value, view_name(s.doc()?, plan)?);
+    s.undo()?;
+    assert_eq!(property_group(s.doc()?, &[h], 0).ok_or("no group")?.rows[0].value, "(none)");
+    Ok(())
+}

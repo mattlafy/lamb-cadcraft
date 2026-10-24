@@ -10,7 +10,11 @@
 //! - `newsheet {name, viewIds?, assemblyIds?}` (`nsh`): a paper layout with one viewport per view
 //!   (default every view, when neither list is given), then one per plan in `assemblyIds` showing
 //!   its assembly plan; each freezes every other view's layer and every other assembly layer;
-//!   returns `{layout, viewports: [hex handles]}`.
+//!   returns `{layout, viewports: [hex handles]}`. Typed only: a sheet is an ordinary layout (`+`,
+//!   MVIEW) whose viewports each pick their view with VPVIEW.
+//! - `vpview {handle, viewId | null}`: binds a layout viewport to a view — its `view_id`, every other
+//!   view's layer frozen in it, zoomed to the view; `null` unbinds it. One undo step; the
+//!   Properties palette's View row runs it ([`crate::props`]).
 //!
 //! - `link {a:{entityId, segmentIndex, segmentParam}, b:{…}}` (`lk`): an explicit link between two
 //!   segments in different views (the escape hatch from the same-layer auto-link rule); `entityId`
@@ -131,7 +135,7 @@ use crate::maintain::now;
 use crate::newviews;
 use crate::project::DrawingProject;
 use crate::schema::{read_document, view_block_name, write_document};
-use crate::sheets::create_sheet;
+use crate::sheets::{create_sheet, set_viewport_view};
 use crate::views::create_view;
 
 pub(crate) fn other(e: impl std::fmt::Display) -> EngineError {
@@ -275,6 +279,20 @@ fn newsheet(s: &mut Session, p: &Value) -> Result<Value> {
     *s.doc_mut()? = d;
     let hex: Vec<String> = handles.iter().map(|h| format!("{:X}", h.0)).collect();
     Ok(json!({ "layout": name, "viewports": hex }))
+}
+
+fn vpview(s: &mut Session, p: &Value) -> Result<Value> {
+    let handle =
+        p.get("handle").and_then(Value::as_str).and_then(Handle::parse_hex).ok_or_else(|| bad("vpview", "`handle` must be a hex viewport handle"))?;
+    let view = match p.get("viewId") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(id_value(v).ok_or_else(|| other("No such view"))?),
+    };
+    // Build on a copy: touching the drawing on a refusal would still record an undo step.
+    let mut d = s.doc()?.clone();
+    set_viewport_view(&mut d, handle, view).map_err(other)?;
+    *s.doc_mut()? = d;
+    Ok(json!({ "handle": handle.hex(), "viewId": view.map(|v| v.0) }))
 }
 
 /// One end of a `link` call, as given: the entity id (hex handle string or JSON number), the
@@ -817,7 +835,8 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{viewId?, name?}")
             .menu(MENU_NEW_VIEW)
             .interactive(crate::viewlife::duplicateview_machine),
-        CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?, assemblyIds?}").menu(MENU_NEW_VIEW).interactive(newsheet_machine),
+        CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?, assemblyIds?}").interactive(newsheet_machine),
+        CommandSpec::new("vpview", "Viewport View", vpview).params("{handle, viewId | null} → {handle, viewId}"),
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU_VIEW_SETUP).interactive(editview_machine),
         CommandSpec::new("viewprops", "View Properties", crate::viewprops::viewprops)
             .params("{mode: rename|cutElevation|intent|flip|cutOffset, viewId, name | cutElevation | intent: section|elevation | flipped | offsetMm}")
@@ -1025,7 +1044,6 @@ mod tests {
                     "newoffsetelevation",
                     "newdetail",
                     "duplicateview",
-                    "newsheet",
                 ],
             ),
             ("View Setup", &["editview", "viewprops", "unplaceview"]),
@@ -1048,7 +1066,7 @@ mod tests {
         let menued = specs.iter().filter(|c| !c.menu.is_empty()).count();
         assert_eq!(menued, groups.iter().map(|(_, ids)| ids.len()).sum::<usize>(), "every menu item is in a listed submenu");
         assert!(specs.iter().all(|c| c.menu.first() != Some(&"View")), "View ▸ LAMB is gone");
-        for id in ["showlinks", "lambopen", "lambsave"] {
+        for id in ["showlinks", "lambopen", "lambsave", "newsheet"] {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
             assert!(c.menu.is_empty(), "{id} is typed only");
             assert!(c.interactive.is_some(), "{id}");

@@ -20,7 +20,7 @@ use lamb_core::model::Id;
 
 use lamb_core::model::AnyView;
 
-use crate::schema::{EntityData, SchemaError, assembly_block_name, read_document, set_entity_data, view_block_name};
+use crate::schema::{EntityData, SchemaError, assembly_block_name, read_document, read_entity_data, set_entity_data, view_block_name};
 
 /// Why a sheet could not be created.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +35,8 @@ pub enum SheetError {
     NoViews,
     /// A requested plan has no assembly block yet.
     NoAssembly(Id),
+    /// The handle is not a paper-space viewport other than a layout's overall one.
+    NotAViewport,
 }
 
 impl fmt::Display for SheetError {
@@ -45,6 +47,7 @@ impl fmt::Display for SheetError {
             SheetError::NoSuchView(id) => write!(f, "No such view {}", id.0),
             SheetError::NoViews => f.write_str("No views to place on a sheet"),
             SheetError::NoAssembly(id) => write!(f, "Plan {} has no assembly plan — run ASSEMBLYPLAN", id.0),
+            SheetError::NotAViewport => f.write_str("Not a layout viewport"),
         }
     }
 }
@@ -70,6 +73,63 @@ fn zoom(d: &Drawing, block: &str, vp_width: f64, vp_height: f64) -> (Vec2, f64) 
     }
     let h = ext.height().max(ext.width() * vp_height / vp_width) * 1.1;
     (ext.center(), if h.is_finite() && h > 0.0 { h } else { EMPTY_VIEW_HEIGHT })
+}
+
+/// The frozen-layer list of a viewport showing block `shown`: every LAMB view layer and every
+/// assembly layer except `shown`, sorted.
+fn frozen_except(view_layers: &[String], assembly_layers: &[String], shown: &str) -> Vec<String> {
+    let mut out: Vec<String> = view_layers.iter().chain(assembly_layers).filter(|l| *l != shown).cloned().collect();
+    out.sort();
+    out
+}
+
+/// Every assembly layer in `d`.
+fn assembly_layers(d: &Drawing) -> Vec<String> {
+    d.layers.iter().map(|l| l.name.clone()).filter(|n| n.starts_with(ASSEMBLY_PREFIX)).collect()
+}
+
+/// Binds viewport `vp` to `view` (VPVIEW): writes its `EntityData.view_id`, freezes every other LAMB
+/// view layer and every assembly layer in it (the rule [`create_sheet`] applies; non-LAMB frozen
+/// layers are kept) and zooms it to the view block's extents. `None` clears `view_id` and thaws
+/// every LAMB view layer. Refuses a handle that is not a paper-space viewport, a layout's overall
+/// viewport (id 1), or an unknown view; nothing is changed on error.
+pub fn set_viewport_view(d: &mut Drawing, vp: Handle, view: Option<Id>) -> Result<(), SheetError> {
+    let doc = read_document(d)?;
+    let e = d.entity(vp).ok_or(SheetError::NotAViewport)?;
+    let EntityKind::Viewport(port) = &e.kind else { return Err(SheetError::NotAViewport) };
+    if port.id <= 1 || !matches!(d.space_of(vp), Some(Space::Paper(_))) {
+        return Err(SheetError::NotAViewport);
+    }
+    if let Some(v) = view
+        && !doc.views.iter().any(|x| x.id() == v)
+    {
+        return Err(SheetError::NoSuchView(v));
+    }
+    let view_layers: Vec<String> = doc.views.iter().map(|v| view_block_name(v.id())).collect();
+    let assemblies = assembly_layers(d);
+    let is_view_layer = |l: &String| view_layers.iter().any(|x| x.eq_ignore_ascii_case(l));
+    let mut port = port.clone();
+    let mut common = e.common.clone();
+    let mut data = read_entity_data(&common)?;
+    data.view_id = view;
+    set_entity_data(&mut common, &data)?;
+    match view {
+        Some(v) => {
+            let block = view_block_name(v);
+            let mut frozen: Vec<String> =
+                port.frozen_layers.iter().filter(|l| !is_view_layer(l) && !assemblies.iter().any(|a| a.eq_ignore_ascii_case(l))).cloned().collect();
+            frozen.extend(frozen_except(&view_layers, &assemblies, &block));
+            frozen.sort();
+            port.frozen_layers = frozen;
+            (port.view_center, port.view_height) = zoom(d, &block, port.width, port.height);
+        }
+        None => port.frozen_layers.retain(|l| !is_view_layer(l)),
+    }
+    d.modify_entity(vp, |e| {
+        e.common = common;
+        e.kind = EntityKind::Viewport(port);
+    })
+    .map_err(|e| SheetError::Schema(SchemaError::Malformed { what: "viewport".into(), message: e.to_string() }))
 }
 
 /// Creates layout `name` with one viewport per view in `views`, then one per plan in `assemblies`
@@ -98,7 +158,7 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
         }
     }
     let view_layers: Vec<String> = all.iter().map(|v| view_block_name(*v)).collect();
-    let assembly_layers: Vec<String> = d.layers.iter().map(|l| l.name.clone()).filter(|n| n.starts_with(ASSEMBLY_PREFIX)).collect();
+    let assembly_layers = assembly_layers(d);
     // (block shown, EntityData) per viewport, built before anything changes.
     let slots: Vec<(String, EntityData)> = chosen
         .iter()
@@ -143,8 +203,7 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
         let (r, c) = (i / cols, i % cols);
         let center = Vec3::new(area.min.x + cell.x * (c as f64 + 0.5), area.max.y - cell.y * (r as f64 + 0.5), 0.0);
         let (view_center, view_height) = zoom(d, block, w, h);
-        let mut frozen_layers: Vec<String> = view_layers.iter().chain(&assembly_layers).filter(|l| *l != block).cloned().collect();
-        frozen_layers.sort();
+        let frozen_layers = frozen_except(&view_layers, &assembly_layers, block);
         let vp = Viewport { center, width: w, height: h, view_center, view_height, id: next_id + i as u32, frozen_layers, ..Viewport::default() };
         match d.add(&space, common, EntityKind::Viewport(vp)) {
             Ok(hd) => handles.push(hd),
@@ -202,7 +261,6 @@ pub fn view_sheet_ref(d: &Drawing, view: Id) -> Option<(usize, String)> {
 mod tests {
     use super::*;
     use crate::assembly::tests::{room_with, undo_len};
-    use crate::schema::read_entity_data;
     use cadcraft_engine::Session;
     use serde_json::json;
 

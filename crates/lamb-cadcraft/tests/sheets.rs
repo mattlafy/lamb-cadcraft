@@ -143,5 +143,43 @@ fn newsheet_one_viewport_per_view() -> R {
     let dxf = write_dxf(s.doc()?);
     let after = read_dxf(dxf.as_bytes())?;
     check_sheet(&after, "S1", plan, section)?;
+
+    // VPVIEW: an ordinary layout's MVIEW viewport picks its view.
+    s.execute("layout.new", &json!({"name": "L1", "viewport": false}))?;
+    let out = s.execute("mview", &json!({"layout": "L1"}))?;
+    let hex = out["viewports"][0].as_str().ok_or("no viewport")?.to_owned();
+    let only = |d: &Drawing| -> Result<(Viewport, Option<Id>), String> {
+        let v = viewports(d, "L1")?;
+        v.into_iter().next().ok_or_else(|| "no viewport".to_owned())
+    };
+    let (vp0, v0) = only(s.doc()?)?;
+    assert_eq!((v0, vp0.frozen_layers.is_empty()), (None, true));
+    let bound_to = |d: &Drawing, view: Id, other: Id| -> R {
+        let (vp, v) = only(d)?;
+        assert_eq!(v, Some(view));
+        assert_eq!(vp.frozen_layers, vec![view_block_name(other)]);
+        let c = d.extents(&Space::Block(view_block_name(view))).center();
+        assert!(vp.view_center.near(c, 1e-6), "zoomed to the view: {:?} vs {c:?}", vp.view_center);
+        Ok(())
+    };
+    s.execute("vpview", &json!({"handle": hex, "viewId": plan.0}))?;
+    bound_to(s.doc()?, plan, section)?;
+    s.execute("vpview", &json!({"handle": hex, "viewId": section.0}))?;
+    bound_to(s.doc()?, section, plan)?;
+    s.execute("vpview", &json!({"handle": hex, "viewId": null}))?;
+    let (vp, v) = only(s.doc()?)?;
+    assert_eq!((v, vp.frozen_layers.is_empty()), (None, true), "unbound and thawed");
+    s.undo()?;
+    bound_to(s.doc()?, section, plan)?;
+    s.undo()?;
+    bound_to(s.doc()?, plan, section)?;
+    // Refusals change nothing.
+    let before = s.doc()?.clone();
+    let e = s.execute("vpview", &json!({"handle": hex, "viewId": 999_999})).err().ok_or("unknown view accepted")?;
+    assert!(e.to_string().contains("No such view"), "{e}");
+    let line = s.doc()?.block(&view_block_name(plan)).and_then(|b| b.entities.iter().next().map(|e| e.handle.hex())).ok_or("no line")?;
+    let e = s.execute("vpview", &json!({"handle": line, "viewId": plan.0})).err().ok_or("a line accepted")?;
+    assert!(e.to_string().contains("Not a layout viewport"), "{e}");
+    assert_eq!(s.doc()?, &before);
     Ok(())
 }
