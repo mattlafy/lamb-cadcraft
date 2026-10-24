@@ -7,14 +7,14 @@ use std::collections::{HashMap, HashSet};
 
 use super::markers::{SOLID_CUT_PROPOSAL_PREFIX, compute_solid_cuts_for_view};
 use super::proposals::{CreatedEntity, ReconcileResult, UpdatedEntity};
-use super::read::ViewKind;
+use super::read::{ProjectRead, ViewKind};
 use super::resolve::ProvenanceKind;
 use super::synthesis::synthesize;
 use super::write::ProjectWrite;
 use crate::geometry::Point2;
 use crate::geometry::polyline::{PolySegment, Polyline2};
 use crate::geometry::tolerance::TOLERANCE;
-use crate::model::{AiOrigin, DrawingEntity, EntityGeometry, Id, LineRole};
+use crate::model::{AiOrigin, AiProducer, DrawingEntity, EntityGeometry, Id, LineRole};
 
 /// `ids` sorted by their `Display` strings (TS `[...ids].sort()`), never by the `u64`.
 fn sorted_by_display(ids: &[Id]) -> Vec<Id> {
@@ -60,6 +60,23 @@ fn is_pending_solid_cut(origin: &AiOrigin) -> bool {
     !origin.accepted && origin.proposal_id.starts_with(SOLID_CUT_PROPOSAL_PREFIX)
 }
 
+/// Every slot key that must not be (re-)proposed: the document's suppressed keys, plus every
+/// `proposal_id` held by an accepted or assistant-produced entity in any view (T513). Shared by
+/// both reconcile sweeps.
+pub fn filled_slots(doc: &impl ProjectRead) -> HashSet<String> {
+    let mut out: HashSet<String> = doc.suppressed_proposals().iter().cloned().collect();
+    for v in doc.views() {
+        for e in doc.entities(v.id) {
+            if let Some(o) = e.ai_origin
+                && (o.accepted || o.producer == Some(AiProducer::Assistant))
+            {
+                out.insert(o.proposal_id.clone());
+            }
+        }
+    }
+    out
+}
+
 struct DesiredSolidCut {
     view_id: Id,
     layer_id: String,
@@ -73,7 +90,22 @@ struct DesiredSolidCut {
 /// delete the no-longer-implied. Never touches accepted ones or user geometry, and never auto-links
 /// what it creates (a loop's edges coincide with its source solid's boundary, which would feed a
 /// spurious link back into synthesis — T99).
+///
+/// TS-faithful (the golden cases replay it): a slot whose line was accepted or erased is
+/// re-proposed. The fork's after-command sweep runs [`reconcile_solid_cut_lines_once`] instead.
 pub fn reconcile_solid_cut_lines(doc: &mut impl ProjectWrite, mint: &mut impl FnMut() -> Id) -> Result<ReconcileResult, String> {
+    reconcile(doc, mint, false)
+}
+
+/// [`reconcile_solid_cut_lines`] where a slot filled once stays filled (T513): a key in
+/// [`filled_slots`] — suppressed by an erase, or held by an accepted / assistant-produced line —
+/// is never (re-)proposed, and a pending line on it is removed. Diverges from TS on purpose (user
+/// feedback 2026-10-24).
+pub fn reconcile_solid_cut_lines_once(doc: &mut impl ProjectWrite, mint: &mut impl FnMut() -> Id) -> Result<ReconcileResult, String> {
+    reconcile(doc, mint, true)
+}
+
+fn reconcile(doc: &mut impl ProjectWrite, mint: &mut impl FnMut() -> Id, keep_filled: bool) -> Result<ReconcileResult, String> {
     let mut result = ReconcileResult::default();
     let views: Vec<(Id, ViewKind, bool)> = doc.views().map(|v| (v.id, v.kind, v.placement.is_some())).collect();
 
@@ -105,6 +137,10 @@ pub fn reconcile_solid_cut_lines(doc: &mut impl ProjectWrite, mint: &mut impl Fn
         }
     }
 
+    // T513 (`keep_filled` only): a key the user erased (suppressed) or that an accepted or
+    // assistant-produced entity already holds is never re-proposed.
+    let filled = if keep_filled { filled_slots(&*doc) } else { HashSet::new() };
+
     // Desired, in first-insertion order with the last value winning (a JS Map).
     let mut desired: Vec<(String, DesiredSolidCut)> = Vec::new();
     let mut desired_index: HashMap<String, usize> = HashMap::new();
@@ -117,6 +153,9 @@ pub fn reconcile_solid_cut_lines(doc: &mut impl ProjectWrite, mint: &mut impl Fn
             }
             for cut in compute_solid_cuts_for_view(rd, view_id, Some(&solids))? {
                 let key = solid_cut_slot_key(&cut.source_entity_ids, view_id);
+                if filled.contains(&key) {
+                    continue;
+                }
                 // The first (sorted) source entity's own layer, the one `sourceEntityId` points at.
                 let layer_id = sorted_by_display(&cut.source_entity_ids)
                     .first()
@@ -198,4 +237,98 @@ pub fn reconcile_solid_cut_lines(doc: &mut impl ProjectWrite, mint: &mut impl Fn
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod filled_slot_tests {
+    //! T513: a slot filled once stays filled — a suppressed key, or one an accepted line holds,
+    //! is never (re-)proposed by this sweep.
+    use super::*;
+    use crate::derivation::write::ProjectWrite;
+    use crate::model::Project;
+
+    /// The golden "materialises a view's derived solid cut" project: one box solid, one placed
+    /// section across it.
+    fn fixture() -> Project {
+        fn decode(v: &serde_json::Value) -> serde_json::Value {
+            use serde_json::Value;
+            match v {
+                Value::Array(a) => Value::Array(a.iter().map(decode).collect()),
+                Value::Object(o) => {
+                    if o.get("$undefined") == Some(&Value::Bool(true)) {
+                        return Value::Null;
+                    }
+                    if let Some(Value::Array(items)) = o.get("$map").or_else(|| o.get("$set")) {
+                        return Value::Array(items.iter().map(decode).collect());
+                    }
+                    Value::Object(o.iter().map(|(k, v)| (k.clone(), decode(v))).collect())
+                }
+                _ => v.clone(),
+            }
+        }
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/derivation-engine/solidCutLines.json");
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("json");
+        let case = doc["cases"]
+            .as_array()
+            .and_then(|c| {
+                c.iter().find(|c| c["export"] == "reconcileSolidCutLines" && c["test"].as_str().is_some_and(|t| t.contains("materialises")))
+            })
+            .expect("case")
+            .clone();
+        crate::model::with_string_ids(|| serde_json::from_value(decode(&case["args"][0])).expect("project"))
+    }
+
+    fn sweep(p: &mut Project) -> ReconcileResult {
+        let mut n = 1u64 << 40;
+        let mut mint = || {
+            n += 1;
+            Id(n)
+        };
+        reconcile_solid_cut_lines_once(p, &mut mint).expect("sweep")
+    }
+
+    /// The fixture swept to rest, and one pending line this sweep owns: (id, view, origin).
+    fn settled() -> (Project, DrawingEntity) {
+        let mut p = fixture();
+        sweep(&mut p);
+        let e = p
+            .views
+            .iter()
+            .flat_map(|v| v.entities().iter())
+            .find(|e| e.ai_origin.as_ref().is_some_and(|o| !o.accepted && o.proposal_id.starts_with(SOLID_CUT_PROPOSAL_PREFIX)))
+            .cloned()
+            .expect("a pending line of this sweep");
+        (p, e)
+    }
+
+    fn holders(p: &Project, key: &str) -> Vec<(Id, bool)> {
+        p.views
+            .iter()
+            .flat_map(|v| v.entities().iter())
+            .filter_map(|e| e.ai_origin.as_ref().filter(|o| o.proposal_id == key).map(|o| (e.id, o.accepted)))
+            .collect()
+    }
+
+    #[test]
+    fn a_suppressed_key_is_removed_and_not_reproposed() {
+        let (mut p, e) = settled();
+        let key = e.ai_origin.as_ref().map(|o| o.proposal_id.clone()).unwrap_or_default();
+        p.set_suppressed_proposals(vec![key.clone()]);
+        let r = sweep(&mut p);
+        assert!(r.created_entities.is_empty(), "{r:?}");
+        assert!(holders(&p, &key).is_empty());
+    }
+
+    #[test]
+    fn a_key_an_accepted_line_holds_is_not_reproposed() {
+        let (mut p, e) = settled();
+        let key = e.ai_origin.as_ref().map(|o| o.proposal_id.clone()).unwrap_or_default();
+        let accepted = DrawingEntity { id: Id(1 << 50), ai_origin: e.ai_origin.clone().map(|o| AiOrigin { accepted: true, ..o }), ..e.clone() };
+        p.push_entity(accepted).expect("push");
+        let r = sweep(&mut p);
+        assert!(r.created_entities.is_empty(), "{r:?}");
+        assert_eq!(holders(&p, &key), vec![(Id(1 << 50), true)], "only the accepted holder is left on the slot");
+        let r = sweep(&mut p);
+        assert!(r.created_entities.is_empty() && r.removed_entities.is_empty(), "and it stays settled: {r:?}");
+    }
 }

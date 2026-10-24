@@ -94,6 +94,12 @@ pub fn property_group(d: &Drawing, sel: &[Handle], segment: usize) -> Option<Lam
     let dp = DrawingProject::new(d).ok()?;
     let ents: Vec<EntityRef<'_>> = sel.iter().map(|h| dp.entity(Id(h.0))).collect::<Option<_>>()?;
     let mut rows = vec![role_row(&dp, sel, &ents)];
+    if let [e] = ents.as_slice()
+        && let Some(o) = e.ai_origin
+    {
+        let value = if o.accepted { "Accepted" } else { "Proposed — ACCEPT to keep" };
+        rows.push(LambRow { label: "AI line".into(), value: value.into(), tip: None, choices: vec![], edit: None });
+    }
     let mut segments = 0;
     if let [e] = ents.as_slice()
         && let Some(poly) = &e.polyline

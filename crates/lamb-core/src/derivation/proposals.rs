@@ -234,13 +234,18 @@ pub fn reconcile_ai_lines(doc: &mut impl ProjectWrite, now: &str, mint: &mut imp
     let mut existing: OrderedMap<(Id, Id)> = OrderedMap::new();
     for &(view, ..) in &view_ids {
         for e in doc.entities(view) {
-            if let Some(o) = e.ai_origin.filter(|o| !o.accepted && o.producer != Some(AiProducer::Assistant)) {
+            // Solid-cut lines belong to the sibling sweep (`reconcile_solid_cut_lines`); counting
+            // them here removed every one each command and had it re-minted (T513).
+            if let Some(o) = e.ai_origin.filter(|o| {
+                !o.accepted && o.producer != Some(AiProducer::Assistant) && !o.proposal_id.starts_with(super::markers::SOLID_CUT_PROPOSAL_PREFIX)
+            }) {
                 existing.set(o.proposal_id.clone(), (view, e.id));
             }
         }
     }
 
-    let suppressed: HashSet<String> = doc.suppressed_proposals().iter().cloned().collect();
+    // Suppressed keys plus keys an accepted / assistant-produced line already holds (T513).
+    let suppressed: HashSet<String> = super::solid_cut_lines::filled_slots(&*doc);
     let mut desired: OrderedMap<DesiredProposal> = OrderedMap::new();
     let placed_plans: Vec<Id> = view_ids.iter().filter(|v| v.1 == ViewKind::Plan && v.2).map(|v| v.0).collect();
     let placed_verticals: Vec<Id> = view_ids.iter().filter(|v| v.1 == ViewKind::Vertical && v.2).map(|v| v.0).collect();
@@ -458,5 +463,78 @@ mod remap_slot_key_tests {
         assert_eq!(remap_slot_key("ghost:0:sec-1", table), "ghost:0:12");
         assert_eq!(remap_slot_key("not a key", table), "not a key");
         assert_eq!(remap_slot_key("a:b:c:d", table), "a:b:c:d");
+    }
+}
+
+#[cfg(test)]
+mod filled_slot_tests {
+    //! T513: a slot filled once stays filled — a suppressed key, or one an accepted line holds,
+    //! is never (re-)proposed by this sweep.
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::derivation::write::ProjectWrite;
+    use crate::model::Project;
+
+    fn fixture() -> Project {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/lamb/u-wall-two-sections.lamb.json");
+        let files: BTreeMap<String, String> = serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("json");
+        crate::persistence::files_to_project(&files).expect("project")
+    }
+
+    fn sweep(p: &mut Project) -> ReconcileResult {
+        let mut n = 1u64 << 40;
+        let mut mint = || {
+            n += 1;
+            Id(n)
+        };
+        reconcile_ai_lines(p, "2026-01-01T00:00:00.000Z", &mut mint).expect("sweep")
+    }
+
+    /// The fixture swept to rest, and one pending line this sweep owns: (id, view, origin).
+    fn settled() -> (Project, DrawingEntity) {
+        let mut p = fixture();
+        sweep(&mut p);
+        let e = p
+            .views
+            .iter()
+            .flat_map(|v| v.entities().iter())
+            .find(|e| {
+                e.ai_origin.as_ref().is_some_and(|o| !o.accepted && !o.proposal_id.starts_with(crate::derivation::markers::SOLID_CUT_PROPOSAL_PREFIX))
+            })
+            .cloned()
+            .expect("a pending line of this sweep");
+        (p, e)
+    }
+
+    fn holders(p: &Project, key: &str) -> Vec<(Id, bool)> {
+        p.views
+            .iter()
+            .flat_map(|v| v.entities().iter())
+            .filter_map(|e| e.ai_origin.as_ref().filter(|o| o.proposal_id == key).map(|o| (e.id, o.accepted)))
+            .collect()
+    }
+
+    #[test]
+    fn a_suppressed_key_is_removed_and_not_reproposed() {
+        let (mut p, e) = settled();
+        let key = e.ai_origin.as_ref().map(|o| o.proposal_id.clone()).unwrap_or_default();
+        p.set_suppressed_proposals(vec![key.clone()]);
+        let r = sweep(&mut p);
+        assert!(r.created_entities.is_empty(), "{r:?}");
+        assert!(holders(&p, &key).is_empty());
+    }
+
+    #[test]
+    fn a_key_an_accepted_line_holds_is_not_reproposed() {
+        let (mut p, e) = settled();
+        let key = e.ai_origin.as_ref().map(|o| o.proposal_id.clone()).unwrap_or_default();
+        let accepted = DrawingEntity { id: Id(1 << 50), ai_origin: e.ai_origin.clone().map(|o| AiOrigin { accepted: true, ..o }), ..e.clone() };
+        p.push_entity(accepted).expect("push");
+        let r = sweep(&mut p);
+        assert!(r.created_entities.is_empty(), "{r:?}");
+        assert_eq!(holders(&p, &key), vec![(Id(1 << 50), true)], "only the accepted holder is left on the slot");
+        let r = sweep(&mut p);
+        assert!(r.created_entities.is_empty() && r.removed_entities.is_empty(), "and it stays settled: {r:?}");
     }
 }

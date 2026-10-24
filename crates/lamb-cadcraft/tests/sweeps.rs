@@ -402,3 +402,137 @@ fn accepted_ai_line_no_longer_follows_the_sweep() -> R {
     assert!(!raise_face_line(&mut s, ai, ai_view)?, "an accepted AI line is the user's: the sweep leaves it alone");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// T513: a slot filled once stays filled; a copy is the user's line; pending reads in Properties
+// ---------------------------------------------------------------------------------------------
+
+/// A fresh LAMBPROJECT: a 2000x8000 WALL-EXT outline in a plan placed at 1200, sections across
+/// y=4000 and along x=1000 — the solid-cut sweep materialises pending lines in every placed view.
+fn solid_cut_session() -> Result<Session, Box<dyn std::error::Error>> {
+    commands::install_app().map_err(|e| e.to_string())?;
+    let mut s = Session::new();
+    install(&mut s);
+    s.new_drawing(true);
+    s.execute("lambproject", &json!({}))?;
+    let level = s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].clone();
+    let plan = s.execute("newplan", &json!({ "name": "P" }))?["viewId"].clone();
+    s.execute(
+        "placeview",
+        &json!({ "viewId": plan, "kind": "plan", "levelId": level, "cutElevation": 1200, "transform": { "originX": 0, "originY": 0, "rotation": 0 } }),
+    )?;
+    s.execute("editview", &json!({ "viewId": plan }))?;
+    s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+    s.execute("pline", &json!({ "vertices": [[0, 0], [2000, 0], [2000, 8000], [0, 8000]], "closed": true }))?;
+    s.execute(
+        "newsectionline",
+        &json!({ "name": "A", "hostViewId": plan, "cutFrom": { "x": -1000, "y": 4000 }, "cutTo": { "x": 3000, "y": 4000 } }),
+    )?;
+    s.execute(
+        "newsectionline",
+        &json!({ "name": "B", "hostViewId": plan, "cutFrom": { "x": 1000, "y": -1000 }, "cutTo": { "x": 1000, "y": 9000 } }),
+    )?;
+    s.execute(
+        "newsectionline",
+        &json!({ "name": "C", "hostViewId": plan, "cutFrom": { "x": -1000, "y": 2000 }, "cutTo": { "x": 3000, "y": 2000 } }),
+    )?;
+    Ok(s)
+}
+
+fn solid_cuts(d: &Drawing) -> Result<Vec<(Id, Id, AiOrigin, Polyline2)>, Box<dyn std::error::Error>> {
+    Ok(ai_lines(d)?.into_iter().filter(|l| l.2.proposal_id.starts_with("solidcut:")).collect())
+}
+
+/// How many entities hold `key`, and how many of those are pending.
+fn holders(d: &Drawing, key: &str) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    let l: Vec<_> = solid_cuts(d)?.into_iter().filter(|l| l.2.proposal_id == key).collect();
+    Ok((l.len(), l.iter().filter(|l| !l.2.accepted).count()))
+}
+
+/// A document-changing command far from everything, in `view`.
+fn poke(s: &mut Session, view: Id, n: i64) -> R {
+    s.execute("editview", &json!({ "viewId": view.0 }))?;
+    s.execute("line", &json!({ "points": [[-90000 - n * 1000, -90000], [-89500 - n * 1000, -90000]] }))?;
+    Ok(())
+}
+
+#[test]
+fn accepted_moved_and_erased_solid_cut_lines_are_never_respawned() -> R {
+    let mut s = solid_cut_session()?;
+    let pending = solid_cuts(s.doc()?)?;
+    assert!(pending.len() >= 3 && pending.iter().all(|l| !l.2.accepted), "pending solid-cut lines in every placed view: {}", pending.len());
+    let (a, b, c) = (pending[0].clone(), pending[1].clone(), pending[2].clone());
+
+    // ERASE first: ACCEPT takes every AI line of the same source, so `c` is still pending here.
+    s.execute("editview", &json!({ "viewId": c.1.0 }))?;
+    s.execute("erase", &json!({ "handles": [Handle(c.0.0).hex()] }))?;
+    poke(&mut s, c.1, 0)?;
+    poke(&mut s, c.1, 1)?;
+    assert_eq!(holders(s.doc()?, &c.2.proposal_id)?, (0, 0), "ERASE: stays gone after two more commands");
+
+    s.execute("editview", &json!({ "viewId": b.1.0 }))?;
+    s.execute("move", &json!({ "handles": [Handle(b.0.0).hex()], "delta": [150, 0] }))?;
+    poke(&mut s, b.1, 2)?;
+    assert_eq!(holders(s.doc()?, &b.2.proposal_id)?, (1, 0), "MOVE: the moved line is accepted and no replacement appears");
+    assert!(s.doc()?.entity(Handle(b.0.0)).is_some(), "the moved line itself survives");
+
+    s.execute("editview", &json!({ "viewId": a.1.0 }))?;
+    s.execute("accept", &json!({ "handles": [Handle(a.0.0).hex()] }))?;
+    poke(&mut s, a.1, 3)?;
+    assert_eq!(holders(s.doc()?, &a.2.proposal_id)?, (1, 0), "ACCEPT: exactly the accepted line on its slot, no new pending one");
+
+    // An accepted line erased stays gone too.
+    s.execute("editview", &json!({ "viewId": a.1.0 }))?;
+    s.execute("erase", &json!({ "handles": [Handle(a.0.0).hex()] }))?;
+    poke(&mut s, a.1, 4)?;
+    poke(&mut s, a.1, 5)?;
+    assert_eq!(holders(s.doc()?, &a.2.proposal_id)?, (0, 0), "ERASE of an accepted line: not re-proposed");
+    Ok(())
+}
+
+#[test]
+fn a_copied_ai_line_is_plain_geometry_and_the_original_stays() -> R {
+    let mut s = solid_cut_session()?;
+    let (orig, view, origin, poly) = solid_cuts(s.doc()?)?.into_iter().next().ok_or("no pending solid-cut line")?;
+    s.execute("editview", &json!({ "viewId": view.0 }))?;
+    let before: Vec<Id> = DrawingProject::new(s.doc()?)?.entities(view).map(|e| e.id).collect();
+    s.execute("copy", &json!({ "handles": [Handle(orig.0).hex()], "delta": [100000, 100000] }))?;
+
+    let after = solid_cuts(s.doc()?)?;
+    let kept = after.iter().find(|l| l.0 == orig).ok_or("the original vanished")?;
+    assert!(!kept.2.accepted && kept.2.proposal_id == origin.proposal_id && kept.3 == poly, "the original is still pending on its slot");
+    assert_eq!(holders(s.doc()?, &origin.proposal_id)?, (1, 1), "only the original holds the slot");
+    let copy = {
+        let p = DrawingProject::new(s.doc()?)?;
+        let new: Vec<_> = p.entities(view).filter(|e| !before.contains(&e.id)).map(|e| (e.id, e.ai_origin.is_none())).collect();
+        assert_eq!(new.len(), 1, "one copy: {new:?}");
+        assert!(new[0].1, "the copy has no ai_origin");
+        new[0].0
+    };
+    assert!(lamb_cadcraft::props::property_group(s.doc()?, &[Handle(copy.0)], 0).ok_or("no group")?.rows.iter().all(|r| r.label != "AI line"));
+
+    s.execute("erase", &json!({ "handles": [Handle(copy.0).hex()] }))?;
+    assert!(s.doc()?.entity(Handle(orig.0)).is_some(), "erasing the copy leaves the original");
+    assert_eq!(holders(s.doc()?, &origin.proposal_id)?, (1, 1));
+    Ok(())
+}
+
+#[test]
+fn properties_say_whether_an_ai_line_is_pending() -> R {
+    let mut s = solid_cut_session()?;
+    let (ai, view, ..) = solid_cuts(s.doc()?)?.into_iter().next().ok_or("no pending solid-cut line")?;
+    let row = |s: &Session| -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let g = lamb_cadcraft::props::property_group(s.doc()?, &[Handle(ai.0)], 0).ok_or("no group")?;
+        Ok(g.rows.into_iter().find(|r| r.label == "AI line").map(|r| r.value))
+    };
+    assert_eq!(row(&s)?.as_deref(), Some("Proposed — ACCEPT to keep"));
+    s.execute("editview", &json!({ "viewId": view.0 }))?;
+    s.execute("accept", &json!({ "handles": [Handle(ai.0).hex()] }))?;
+    assert_eq!(row(&s)?.as_deref(), Some("Accepted"));
+    let plain = DrawingProject::new(s.doc()?)?.entities(view).find(|e| e.ai_origin.is_none()).map(|e| e.id);
+    if let Some(plain) = plain {
+        let g = lamb_cadcraft::props::property_group(s.doc()?, &[Handle(plain.0)], 0).ok_or("no group")?;
+        assert!(g.rows.iter().all(|r| r.label != "AI line"), "absent for a plain line");
+    }
+    Ok(())
+}
