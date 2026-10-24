@@ -523,7 +523,7 @@ mod tests {
         assert_eq!((d.name.as_str(), d.placement.is_none()), ("Eaves", true));
         assert_eq!(s.state()?.space, Space::Block(view_block_name(d.id)));
         let rows = crate::views::browser_rows(s.doc()?, &s.state()?.space);
-        assert!(rows.iter().any(|r| r.label == "Eaves — Detail (floating)" && r.active), "{rows:?}");
+        assert!(rows.iter().any(|r| r.label == "Eaves — Detail" && r.active), "{rows:?}");
         Ok(())
     }
 

@@ -25,7 +25,7 @@ pub enum Panel {
 }
 
 impl Panel {
-    pub const ALL: &[Self] = &[Self::Canvas, Self::Views, Self::ToolSets, Self::Layers, Self::Properties, Self::ExternalRefs];
+    pub const ALL: &[Self] = &[Self::Canvas, Self::Views, Self::ToolSets, Self::Layers, Self::Properties, Self::ExternalRefs, Self::Scene3d];
     pub fn id(self) -> &'static str {
         match self {
             Self::Canvas => "canvas",
@@ -55,7 +55,7 @@ impl Panel {
     fn default_side(self) -> Zone {
         match self {
             Self::Canvas => Zone::Right,
-            Self::Views => Zone::Left,
+            Self::Views => Zone::Right,
             Self::ToolSets => Zone::Left,
             Self::QuickCalc => Zone::Right,
             Self::Layers => Zone::Right,
@@ -66,7 +66,7 @@ impl Panel {
         }
     }
     /// Palettes outside the default arrangement, opened on request (QUICKCALC).
-    pub const ON_DEMAND: &[Self] = &[Self::QuickCalc, Self::Scene3d, Self::Assistant];
+    pub const ON_DEMAND: &[Self] = &[Self::QuickCalc, Self::Assistant];
     fn parse(id: &str) -> Result<Self, String> {
         Self::ALL.iter().chain(Self::ON_DEMAND).copied().find(|panel| panel.id() == id).ok_or_else(|| format!("Unknown panel: {id}"))
     }
@@ -99,22 +99,24 @@ impl Default for Workspace {
                 root: Some(split(
                     SplitAxis::Horizontal,
                     SplitSize::FixedFirst(220.0),
-                    Node::Stack {
-                        entries: vec![
-                            craft_ui::docking::StackEntry { panel: Panel::Views, open: true, height: Some(200.0) },
-                            craft_ui::docking::StackEntry { panel: Panel::ToolSets, open: true, height: None },
-                        ],
-                    },
+                    Node::Stack { entries: vec![craft_ui::docking::StackEntry { panel: Panel::ToolSets, open: true, height: None }] },
                     split(
                         SplitAxis::Horizontal,
                         SplitSize::FixedSecond(300.0),
                         tabs(Panel::Canvas),
-                        Node::Stack {
-                            entries: vec![
-                                craft_ui::docking::StackEntry { panel: Panel::Layers, open: true, height: Some(280.0) },
-                                craft_ui::docking::StackEntry { panel: Panel::Properties, open: true, height: None },
-                            ],
-                        },
+                        // Right column: Layers/Properties above, the Views palette with a 3D View
+                        // tab beside it below (LAMB T510).
+                        split(
+                            SplitAxis::Vertical,
+                            SplitSize::FixedSecond(260.0),
+                            Node::Stack {
+                                entries: vec![
+                                    craft_ui::docking::StackEntry { panel: Panel::Layers, open: true, height: Some(280.0) },
+                                    craft_ui::docking::StackEntry { panel: Panel::Properties, open: true, height: None },
+                                ],
+                            },
+                            Node::Tabs { panels: vec![Panel::Views, Panel::Scene3d], active: 0 },
+                        ),
                     ),
                 )),
                 floating: Vec::new(),

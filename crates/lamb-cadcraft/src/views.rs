@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use cadcraft_doc::{Block, Common, Drawing, Entity, EntityKind, Handle, Insert, Space};
 use cadcraft_geom::Vec3;
-use lamb_core::model::{AnyView, Id};
+use lamb_core::model::{AnyView, Id, Placement};
 
+use crate::LambDocument;
 use crate::schema::{SchemaError, read_document, view_block_name, write_document};
 
 /// Why a view could not be created.
@@ -93,7 +94,7 @@ fn row(label: String, active: bool, command: &str, params: serde_json::Value) ->
 }
 
 /// The Views palette for `d` while editing `edit`: `Model`, then each view in document order as
-/// `"<name> — <kind>"` (`" (floating)"` without a placement), the edited one active, each running
+/// [`view_label`] (its level and floor, its host plan, or `(unplaced)`), the edited one active, each running
 /// `editview`; a drawing with no views offers `Start LAMB project` (LAMBPROJECT). When the edited
 /// view has eligible reference views: a `Reference pane` heading, `Show reference pane` (active
 /// while shown, toggling REFPANE) and one row per eligible view, active when the pane shows it,
@@ -106,7 +107,7 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     let Ok(doc) = read_document(d) else { return rows };
     for v in &doc.views {
         let active = matches!(edit, Space::Block(name) if *name == view_block_name(v.id()));
-        rows.push(row(view_label(v), active, "editview", serde_json::json!({ "viewId": v.id().0 })));
+        rows.push(row(view_label(&doc, v), active, "editview", serde_json::json!({ "viewId": v.id().0 })));
     }
     if doc.views.is_empty() {
         rows.push(row("Start LAMB project".into(), false, "lambproject", serde_json::json!({})));
@@ -117,7 +118,7 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
         rows.push(BrowserRow { label: "Reference pane".into(), active: false, heading: true, command: None });
         rows.push(row("Show reference pane".into(), shown, "refpane", serde_json::json!({ "on": !shown })));
         for v in eligible.iter().filter_map(|id| doc.views.iter().find(|v| v.id() == *id)) {
-            rows.push(row(view_label(v), shown && v.id() == pick, "refpane", serde_json::json!({ "viewId": v.id().0 })));
+            rows.push(row(view_label(&doc, v), shown && v.id() == pick, "refpane", serde_json::json!({ "viewId": v.id().0 })));
         }
     }
     // The underlay (LAMB T350).
@@ -128,7 +129,7 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
             rows.push(BrowserRow { label: "Underlay".into(), active: false, heading: true, command: None });
             for c in &candidates {
                 let Some(v) = doc.views.iter().find(|v| v.id() == c.view_id) else { continue };
-                let label = if c.mirrored { format!("{} (mirrored)", view_label(v)) } else { view_label(v) };
+                let label = if c.mirrored { format!("{} (mirrored)", view_label(&doc, v)) } else { view_label(&doc, v) };
                 rows.push(row(label, current == Some(c.view_id), "underlay", serde_json::json!({ "viewId": c.view_id.0 })));
             }
         }
@@ -136,10 +137,25 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     rows
 }
 
-/// `"<name> — <kind>"`, `" (floating)"` without a placement.
-fn view_label(v: &AnyView) -> String {
-    let floating = if v.placement().is_none() { " (floating)" } else { "" };
-    format!("{} — {}{floating}", v.name(), crate::commands::kind_word(v))
+/// A placed plan `"<name> — Plan · <level> <floor>"` (floor in signed mm, `+0`, `+3000`, `-450`);
+/// a placed section or elevation `"<name> — Section · on <host plan>"`; an unplaced plan, section or
+/// elevation `"<name> — <kind> (unplaced)"`; a detail `"<name> — Detail"`. A level or host that
+/// cannot be found leaves just `"<name> — <kind>"`.
+fn view_label(doc: &LambDocument, v: &AnyView) -> String {
+    let kind = crate::commands::kind_word(v);
+    let base = format!("{} — {kind}", v.name());
+    match v.placement() {
+        Some(Placement::Plan { level_id, .. }) => match doc.levels.iter().find(|l| l.id == *level_id) {
+            Some(l) => format!("{base} · {} {:+}", l.name, l.floor_elevation.value.round() as i64),
+            None => base,
+        },
+        Some(Placement::Vertical { host_view_id, .. }) => match doc.views.iter().find(|h| h.id() == *host_view_id) {
+            Some(h) => format!("{base} · on {}", h.name()),
+            None => base,
+        },
+        None if matches!(v, AnyView::Plan(_) | AnyView::Vertical(_)) => format!("{base} (unplaced)"),
+        None => base,
+    }
 }
 
 #[cfg(test)]
@@ -179,14 +195,17 @@ mod tests {
         let mut s = session()?;
         s.execute("lambproject", &json!({}))?;
         let r = rows(&s)?;
-        assert_eq!(r.iter().map(|r| (r.label.as_str(), r.active)).collect::<Vec<_>>(), [("Model", false), ("Ground Floor — Plan", true)]);
+        assert_eq!(
+            r.iter().map(|r| (r.label.as_str(), r.active)).collect::<Vec<_>>(),
+            [("Model", false), ("Ground Floor — Plan · Level 1 +0", true)]
+        );
         let ground = read_document(s.doc()?)?.views[0].id();
         assert_eq!(r[1].command, Some(("editview".into(), json!({ "viewId": ground.0 }))));
 
         let id = s.execute("newplan", &json!({ "name": "Sketch" }))?["viewId"].as_u64().ok_or("no id")?;
         let r = rows(&s)?;
         assert_eq!(r.len(), 3, "no Start row once views exist");
-        assert_eq!(r[2].label, "Sketch — Plan (floating)");
+        assert_eq!(r[2].label, "Sketch — Plan (unplaced)");
         assert_eq!(r[2].command, Some(("editview".into(), json!({ "viewId": id }))));
 
         // A row's command is what a click runs: it makes that view the edit space.
@@ -211,8 +230,8 @@ mod tests {
             [
                 ("Reference pane", false, true),
                 ("Show reference pane", false, false),
-                ("A-A — Section", false, false),
-                ("B-B — Section", false, false)
+                ("A-A — Section · on Ground Floor", false, false),
+                ("B-B — Section · on Ground Floor", false, false)
             ]
         );
         assert_eq!(r[4].command, None);
@@ -233,10 +252,10 @@ mod tests {
             [
                 ("Reference pane", false),
                 ("Show reference pane", true),
-                ("Ground Floor — Plan", true),
-                ("B-B — Section", false),
+                ("Ground Floor — Plan · Level 1 +0", true),
+                ("B-B — Section · on Ground Floor", false),
                 ("Underlay", false),
-                ("B-B — Section", false)
+                ("B-B — Section · on Ground Floor", false)
             ],
             "a section's parallel sibling is also an underlay candidate"
         );
@@ -261,7 +280,7 @@ mod tests {
         let r = rows(&s)?;
         let at = r.iter().position(|r| r.label == "Underlay" && r.heading).ok_or("no Underlay heading")?;
         let under: Vec<_> = r[at + 1..].iter().map(|r| (r.label.as_str(), r.active)).collect();
-        assert_eq!(under, [("B-B — Section", false), ("C-C — Section (mirrored)", false)]);
+        assert_eq!(under, [("B-B — Section · on Ground Floor", false), ("C-C — Section · on Ground Floor (mirrored)", false)]);
         assert_eq!(r[at + 2].command, Some(("underlay".into(), json!({ "viewId": c }))));
 
         let (cmd, params) = r[at + 1].command.clone().ok_or("no command")?;

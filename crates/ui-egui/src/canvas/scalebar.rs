@@ -1,5 +1,5 @@
 //! A scale bar HUD in the bottom-left corner of each model/block-space tile (fork-only, LAMB T363):
-//! a bar spanning a round real length, ticked at both ends and the midpoint, labelled in mm or m.
+//! a bar spanning a round real length, ticked at both ends and the midpoint, labelled in mm, m or km.
 //! Ported 1:1 from the TypeScript app's `screenMarks.ts` (`chooseScaleBarLengthMm`,
 //! `scaleBarLabel`, `drawScaleBar`). Drawn only when a registered predicate says the drawing wants
 //! it (LAMB: the drawing has views), so plain CADCraft drawings are unchanged. Drawing units are mm.
@@ -11,10 +11,7 @@ use egui::{Color32, Rect, Stroke, pos2};
 
 use crate::CadApp;
 
-/// Round lengths the bar may span, in drawing units (mm).
-const STEPS: [f64; 10] = [100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10_000.0, 20_000.0, 50_000.0, 100_000.0];
 const MAX_PX: f64 = 180.0;
-const MIN_PX: f64 = 40.0;
 const INSET_PX: f32 = 16.0;
 const TICK_PX: f32 = 8.0;
 
@@ -33,24 +30,42 @@ pub(super) fn wanted(app: &CadApp) -> bool {
     WANTED.get().is_some_and(|f| app.session.doc().is_ok_and(*f))
 }
 
-/// The largest step whose on-screen width is at most `MAX_PX` at `scale` px per mm; none fits →
-/// the smallest; the chosen width under `MIN_PX` → the largest; a degenerate scale → the smallest.
+/// The largest value of the unbounded 1-2-5 series (… 0.1, 0.2, 0.5, 1, 2, 5, 10 … mm) whose
+/// on-screen width is at most `MAX_PX` at `scale` px per mm. Consecutive steps differ by at most
+/// 2.5x and `MAX_PX` / 40 px is 4.5, so the width never drops under 40 px. A degenerate scale
+/// gives 100 mm.
 pub fn length_mm(scale: f64) -> f64 {
-    let (smallest, largest) = (STEPS[0], STEPS[STEPS.len() - 1]);
     if !scale.is_finite() || scale <= 0.0 {
-        return smallest;
+        return 100.0;
     }
-    let Some(chosen) = STEPS.iter().copied().rfind(|mm| mm * scale <= MAX_PX) else { return smallest };
-    if chosen * scale < MIN_PX { largest } else { chosen }
+    let limit = MAX_PX / scale;
+    if !limit.is_finite() || limit <= 0.0 {
+        return 100.0;
+    }
+    let mut exp = limit.log10().floor() as i32;
+    // `log10` can land a hair off at exact powers of ten; nudge so 10^exp <= limit < 10^(exp+1).
+    if decade(exp + 1, 1.0) <= limit {
+        exp += 1;
+    } else if decade(exp, 1.0) > limit {
+        exp -= 1;
+    }
+    [5.0, 2.0, 1.0].into_iter().map(|m| decade(exp, m)).find(|mm| *mm <= limit).unwrap_or(decade(exp, 1.0))
 }
 
-/// Millimetres below a metre, metres (one decimal, a trailing `.0` trimmed) at or above.
+/// `m * 10^exp`, computed so negative exponents stay correctly rounded (`5 / 100`, not `5 * 0.01`).
+fn decade(exp: i32, m: f64) -> f64 {
+    if exp >= 0 { m * 10f64.powi(exp) } else { m / 10f64.powi(-exp) }
+}
+
+/// Millimetres below a metre, metres below a kilometre, kilometres at or above; no trailing `.0`.
 pub fn label(mm: f64) -> String {
     if mm < 1000.0 {
-        return format!("{mm}mm");
+        format!("{mm}mm")
+    } else if mm < 1_000_000.0 {
+        format!("{}m", mm / 1000.0)
+    } else {
+        format!("{}km", mm / 1_000_000.0)
     }
-    let m = format!("{:.1}", mm / 1000.0);
-    format!("{}m", m.strip_suffix(".0").unwrap_or(&m))
 }
 
 /// The bar in `rect`'s bottom-left corner at `scale` px per mm.
@@ -71,6 +86,9 @@ pub(super) fn draw(p: &egui::Painter, rect: Rect, scale: f64, color: Color32) {
 mod tests {
     use super::*;
 
+    /// The narrowest the bar ever gets: guaranteed by the series, not clamped.
+    const MIN_PX: f64 = 40.0;
+
     #[test]
     fn picks_the_largest_step_that_fits() {
         assert_eq!(length_mm(0.3), 500.0); // 150 px fits, 300 px does not
@@ -81,30 +99,41 @@ mod tests {
 
     #[test]
     fn stays_inside_the_band_across_a_wide_zoom_range() {
-        let mut scale = 0.002;
-        while scale < 1.5 {
+        let mut scale = 1e-7;
+        while scale < 1e4 {
             let px = length_mm(scale) * scale;
             assert!((MIN_PX..=MAX_PX).contains(&px), "{px} px at scale {scale}");
             scale *= 1.15;
         }
+        for scale in [10.0, 1.0, 0.1, 0.001, 1e-6] {
+            let px = length_mm(scale) * scale;
+            assert!((MIN_PX..=MAX_PX).contains(&px), "{px} px at scale {scale}");
+        }
     }
 
     #[test]
-    fn clamps_at_both_ends_and_survives_a_degenerate_scale() {
-        assert_eq!(length_mm(5.0), 100.0);
-        assert_eq!(length_mm(0.0001), 100_000.0);
+    fn has_no_minimum_or_maximum_and_survives_a_degenerate_scale() {
+        assert_eq!(length_mm(10.0), 10.0);
+        assert_eq!(length_mm(5.0), 20.0);
+        assert_eq!(length_mm(1e-5), 10_000_000.0);
+        assert_eq!(length_mm(1.8), 100.0); // exactly MAX_PX
+        assert_eq!(length_mm(500.0), 0.2);
         assert_eq!(length_mm(0.0), 100.0);
+        assert_eq!(length_mm(-1.0), 100.0);
         assert_eq!(length_mm(f64::NAN), 100.0);
         assert_eq!(length_mm(f64::INFINITY), 100.0);
     }
 
     #[test]
-    fn labels_in_mm_below_a_metre_and_m_above() {
+    fn labels_in_mm_m_and_km() {
+        assert_eq!(label(0.5), "0.5mm");
         assert_eq!(label(100.0), "100mm");
         assert_eq!(label(500.0), "500mm");
         assert_eq!(label(1000.0), "1m");
         assert_eq!(label(2000.0), "2m");
-        assert_eq!(label(2500.0), "2.5m");
-        assert_eq!(label(100_000.0), "100m");
+        assert_eq!(label(500_000.0), "500m");
+        assert_eq!(label(1_000_000.0), "1km");
+        assert_eq!(label(5_000_000.0), "5km");
+        assert_eq!(label(20_000_000.0), "20km");
     }
 }
