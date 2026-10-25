@@ -741,7 +741,7 @@ fn hatch(tags: &[Tag], t: &T) -> Option<EntityKind> {
                         while let Some(x) = get(i).filter(|x| matches!(x.code, 94 | 73 | 74 | 95 | 96)) {
                             let n = x.i64().clamp(0, 100_000) as usize;
                             match x.code {
-                                94 => degree = n,
+                                94 => degree = n.clamp(1, 10), // same cap as the SPLINE reader
                                 95 => nk = n,
                                 96 => nc = n,
                                 _ => {}
@@ -1595,7 +1595,12 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 // Every variable with a DIMSTYLE group code; values the style can't take are
                 // left at their defaults.
                 let mut fields = serde_json::Map::new();
-                for tag in tg.iter().take_while(|x| x.code < 1000) {
+                // The first 70 is the record's flags; a later one is DIMTFILLCLR.
+                let flags = tg.iter().position(|x| x.code == 70);
+                for (i, tag) in tg.iter().enumerate().take_while(|(_, x)| x.code < 1000) {
+                    if Some(i) == flags {
+                        continue;
+                    }
                     let Some((field, kind)) = crate::dxf_ext::dim_field(tag.code) else { continue };
                     if let Some(v) = crate::dxf_ext::decode(kind, tag, &rx.styles, &rx.brs, &rx.ltypes) {
                         fields.insert(field.to_string(), v);
@@ -1995,6 +2000,8 @@ struct Objects {
     layout_views: Vec<(String, (Vec2, f64))>,
     /// SORTENTSTABLE objects: (owning block record handle, entity handle → sort handle).
     sortents: Vec<(String, HashMap<Handle, u64>)>,
+    /// WIPEOUTVARIABLES: the drawing's WIPEOUTFRAME (0 = frames hidden, 1 = shown).
+    wipeout_frame: Option<i64>,
 }
 
 const MAX_OBJECTS: usize = 1_000_000;
@@ -2033,6 +2040,7 @@ impl Objects {
             "DIMASSOC" if self.dimassocs.len() < MAX_OBJECTS => self.dimassocs.push(tags.to_vec()),
             "MLEADERSTYLE" if self.mleader_styles.len() < MAX_OBJECTS => self.mleader_styles.push((h, tags.to_vec())),
             "GROUP" if self.groups.len() < MAX_OBJECTS => self.groups.push((h, tags.to_vec())),
+            "WIPEOUTVARIABLES" => self.wipeout_frame = T(tags).i(70).filter(|v| (0..=2).contains(v)),
             "SORTENTSTABLE" if self.sortents.len() < MAX_OBJECTS => {
                 if let Some(t) = sortents_table(tags) {
                     self.sortents.push(t);
@@ -2063,6 +2071,9 @@ impl Objects {
     }
 
     fn apply(self, d: &mut Drawing, rx: &Rx) {
+        if let Some(v) = self.wipeout_frame {
+            d.header.set_i64("WIPEOUTFRAME", v);
+        }
         if let Some(style) = self.xrecord_text(crate::dxf_ext::MLEADER_STYLE_KEY).filter(|s| !s.trim().is_empty()) {
             d.header.set_str("CMLEADERSTYLE", &style);
         }

@@ -82,7 +82,7 @@ pub fn status(app: &mut CadApp, ui: &mut egui::Ui, right: f32, cy: f32) -> f32 {
         let g = p.layout_no_wrap(tg.label.clone(), crate::theme::small(), t.text);
         let w = g.size().x + 12.0;
         let r = Rect::from_min_size(pos2(x - w, cy - 9.0), vec2(w, 18.0));
-        let resp = ui.interact(r, ui.id().with(("status_ext", i)), Sense::click());
+        let resp = ui.interact(r, ui.scope_id().with(("status_ext", i)), Sense::click());
         let fill = if resp.hovered() {
             t.control_hover
         } else if tg.on {

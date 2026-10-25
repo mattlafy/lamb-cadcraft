@@ -79,7 +79,7 @@ pub fn show_picked(app: &mut CadApp, ui: &mut egui::Ui) -> bool {
     let Some(g) = picked_rows(app) else { return false };
     let key = app.session.picked().unwrap_or_default();
     group(ui, &g.title);
-    let run = rows(ui, &g.rows, egui::Id::new(("lamb-props-picked", key)));
+    let run = rows(ui, &g.rows, egui::Id::unique(("lamb-props-picked", key)));
     finish(app, run);
     true
 }
@@ -154,7 +154,7 @@ pub fn rows_for(app: &CadApp, segment: usize) -> Option<(PropGroup, usize)> {
 fn segment_key(app: &CadApp) -> Option<egui::Id> {
     let st = app.session.state().ok()?;
     let first = *st.selection.first()?;
-    Some(egui::Id::new(("lamb-props-segment", first, st.uid)))
+    Some(egui::Id::unique(("lamb-props-segment", first, st.uid)))
 }
 
 pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {

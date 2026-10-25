@@ -272,7 +272,7 @@ const BASE_KEY: &str = "cadcraft-chat-base-url";
 const MODEL_KEY: &str = "cadcraft-chat-model";
 
 fn persist(ctx: &egui::Context, key: &str, value: &str) {
-    ctx.data_mut(|d| d.insert_persisted(egui::Id::new(key), value.to_string()));
+    ctx.data_mut(|d| d.insert_persisted(egui::Id::unique(key), value.to_string()));
 }
 
 pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
@@ -289,7 +289,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     if !app.chat.loaded {
         app.chat.loaded = true;
         let (base, model) =
-            ctx.data_mut(|d| (d.get_persisted::<String>(egui::Id::new(BASE_KEY)), d.get_persisted::<String>(egui::Id::new(MODEL_KEY))));
+            ctx.data_mut(|d| (d.get_persisted::<String>(egui::Id::unique(BASE_KEY)), d.get_persisted::<String>(egui::Id::unique(MODEL_KEY))));
         app.chat.base_url = base.filter(|s| !s.is_empty()).unwrap_or_else(|| b.default_base_url.to_string());
         if app.chat.model.is_empty() {
             app.chat.model = model.unwrap_or_default();
@@ -551,8 +551,8 @@ mod tests {
 
     #[test]
     fn window_assistant_palette_opens_the_panel_on_demand() {
-        use crate::docking::{Panel, Workspace};
-        assert!(!Workspace::default().layout.contains(&Panel::Assistant), "opened on request");
+        use crate::docking::Panel;
+        assert!(!crate::docking::default_workspace().layout.contains(&Panel::Assistant), "opened on request");
         let mut app = app();
         app.run("ui.panel.assistant", json!({})).unwrap();
         assert!(app.ui.docking.layout.contains(&Panel::Assistant));

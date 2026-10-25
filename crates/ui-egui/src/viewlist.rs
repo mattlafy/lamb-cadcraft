@@ -132,7 +132,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
                     continue;
                 };
                 let (r, resp) = ui.allocate_exact_size(vec2(COL_W, 20.0), Sense::click());
-                resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, cell.on, &cell.tip));
+                resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, cell.on, &cell.tip));
                 if resp.hovered() {
                     ui.painter().rect_filled(egui::Rect::from_center_size(r.center(), vec2(20.0, 20.0)), 3.0, t.hover);
                 }
