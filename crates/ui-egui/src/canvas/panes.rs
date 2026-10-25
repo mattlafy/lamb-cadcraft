@@ -143,20 +143,33 @@ pub(super) struct Hover {
     pub tile: usize,
     /// The (snapped) point, in that tile's space.
     pub point: Vec2,
-    /// The snap found in an inactive tile (the current tile draws its own).
+    /// The snap found for the hover: in an inactive tile, or in the current tile at idle (no
+    /// point prompt) when tiled; `None` while a point prompt snaps the cursor itself.
     pub snap: Option<SnapHit>,
     /// The pointer, on screen.
     pub at: Pos2,
 }
 
-/// The hover source for pointer position `hover`: in the current tile, the canvas's cursor
-/// (already snapped by `effective_point`); in an inactive tile, the pointer in that tile's view
-/// snapped against that tile's own space. `None` off the tiles, or untiled.
+/// The hover source for pointer position `hover`: in the current tile, the canvas's cursor —
+/// already snapped by `effective_point` while a point prompt is active, and otherwise (idle,
+/// two or more tiles) object-snapped here in the edit space, as the TS app snaps every pointer
+/// move; in an inactive tile, the pointer in that tile's view snapped against that tile's own
+/// space. The idle snap feeds only the hover: it never changes the canvas cursor or a click.
+/// `None` off the tiles, or untiled.
 pub(super) fn hover_source(app: &CadApp, tiles: &[(Rect, ModelTile)], rots: &[f64], hover: Option<Pos2>) -> Option<Hover> {
     let hp = hover?;
     let (h, (r, tile)) = tiles.iter().enumerate().find(|(_, (r, _))| r.width() >= 1.0 && r.height() >= 1.0 && r.contains(hp))?;
     if tile.active {
-        return Some(Hover { tile: h, point: app.canvas.cursor?, snap: None, at: hp });
+        let cursor = app.canvas.cursor?;
+        let prompting = app.session.current_prompt().as_ref().is_some_and(cadcraft_engine::pointmod::accepts);
+        let hit = match (prompting, tiles.len() >= 2, app.canvas.xf, app.session.state()) {
+            (false, true, Some(xf), Ok(st)) => {
+                let s = &app.session.settings;
+                snap::osnap(&st.doc, &st.space, cursor, s.aperture / xf.scale, s.osmode, None, false)
+            }
+            _ => None,
+        };
+        return Some(Hover { tile: h, point: hit.map_or(cursor, |hit| hit.point), snap: hit, at: hp });
     }
     let xf = tile_xf(*r, tile, rotation(rots, h));
     let w = xf.to_world(hp);
@@ -198,9 +211,10 @@ pub(super) fn hover_lines(app: &CadApp, tiles: &[(Rect, ModelTile)], rots: &[f64
     out
 }
 
-/// Draw the cross-tile hover (after `draw_tiles`): the mapped lines in every related tile and,
-/// over an inactive tile, its own crosshair and snap marker, with the OS cursor hidden as over
-/// the current one. `hover` is the pointer, `None` when the canvas isn't hovered.
+/// Draw the cross-tile hover (after `draw_tiles`): the mapped lines in every related tile; over
+/// the current tile, the idle snap's marker (the canvas draws its own crosshair); over an
+/// inactive tile, its own crosshair and snap marker, with the OS cursor hidden as over the
+/// current one. `hover` is the pointer, `None` when the canvas isn't hovered.
 pub(super) fn draw_hover(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, ModelTile)], rots: &[f64], hover: Option<Pos2>) {
     let Some(src) = hover_source(app, tiles, rots, hover) else { return };
     let stroke = Stroke::new(1.0, Tokens::get().crosshair);
@@ -209,6 +223,9 @@ pub(super) fn draw_hover(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, ModelTile)
     }
     let (r, tile) = &tiles[src.tile];
     if tile.active {
+        if let (Some(hit), Some(xf)) = (src.snap, app.canvas.xf) {
+            draw_snap_marker(&ui.painter_at(*r), xf.to_screen(hit.point), &hit);
+        }
         return;
     }
     ui.ctx().set_cursor_icon(if app.ui.system_cursor { egui::CursorIcon::Crosshair } else { egui::CursorIcon::None });
@@ -342,6 +359,40 @@ mod tests {
 
         // Not hovering: nothing.
         assert!(hover_source(&app, &tiles, &rots, None).is_none());
+    }
+
+    #[test]
+    fn the_current_tile_snaps_its_hover_at_idle() {
+        register();
+        let (mut app, tiles) = app();
+        let rots = rotations(&app);
+        let xf0 = tile_xf(tiles[0].0, &tiles[0].1, rotation(&rots, 0));
+        app.canvas.xf = Some(tile_xf(tiles[1].0, &tiles[1].1, rotation(&rots, 1)));
+        app.session.settings.osmode = snap::mode::END;
+        app.session.settings.aperture = 10.0;
+        // Near model space's line end (100,100), well inside the aperture.
+        let raw = Vec2::new(100.0, 100.0) + Vec2::new(2.0, 1.0) / app.canvas.xf.unwrap().scale;
+        app.canvas.cursor = Some(raw);
+
+        // No command: the hover snaps to the end, and the other tile's lines go through the
+        // mapped end (0,0), not the mapped raw cursor.
+        let src = hover_source(&app, &tiles, &rots, Some(tiles[1].0.center())).unwrap();
+        assert_eq!(src.tile, 1);
+        assert!(src.snap.is_some());
+        assert!((src.point - Vec2::new(100.0, 100.0)).len() < 1e-9, "{:?}", src.point);
+        let s = xf0.to_screen(Vec2::new(0.0, 0.0));
+        let r0 = tiles[0].0;
+        assert_eq!(
+            hover_lines(&app, &tiles, &rots, &src),
+            vec![(0, [pos2(r0.left(), s.y), pos2(r0.right(), s.y)]), (0, [pos2(s.x, r0.top()), pos2(s.x, r0.bottom())])]
+        );
+        assert_eq!(app.canvas.cursor, Some(raw), "the idle snap never moves the canvas cursor");
+
+        // A point prompt snaps the cursor itself: the hover takes the cursor as it is.
+        app.session.start("line").unwrap();
+        let src = hover_source(&app, &tiles, &rots, Some(tiles[1].0.center())).unwrap();
+        assert!(src.snap.is_none());
+        assert_eq!(src.point, raw);
     }
 
     #[test]
