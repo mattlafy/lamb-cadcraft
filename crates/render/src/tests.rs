@@ -1208,6 +1208,27 @@ fn window_plot_builds_only_the_block_contents_that_reach_the_window() {
     assert_eq!(windowed, reaching);
 }
 
+#[test]
+fn byblock_child_on_an_unlocked_layer_does_not_inherit_the_fade() {
+    use cadcraft_doc::Transparency::{ByBlock, ByLayer, Percent};
+    // A ByBlock line on unlocked layer "Open" in a block inserted on locked layer "Locked".
+    let drawing = |insert_transparency| {
+        let mut d = Drawing::new_imperial();
+        d.layers.push(cadcraft_doc::Layer { name: "Locked".into(), locked: true, ..Default::default() });
+        d.layers.push(cadcraft_doc::Layer { name: "Open".into(), ..Default::default() });
+        let mut blk = cadcraft_doc::Block::new("B");
+        let (c, k) = line_common(Common { layer: "Open".into(), transparency: ByBlock, ..Default::default() });
+        blk.entities.push(block_entity(1, c, k));
+        d.blocks.insert("B".into(), std::sync::Arc::new(blk));
+        let common = Common { layer: "Locked".into(), transparency: insert_transparency, ..Default::default() };
+        d.add(&Space::Model, common, insert_of("B")).unwrap();
+        d
+    };
+    // The child takes the reference's own transparency, not its display fade.
+    assert_eq!(faded(&build(&drawing(ByLayer), &Space::Model, &on_screen(with_transparency()))), vec![0]);
+    assert_eq!(faded(&build(&drawing(Percent(20)), &Space::Model, &on_screen(with_transparency()))), vec![20]);
+}
+
 /// #1434: a closed polyline with a global width narrower than a pixel loses whole sides at
 /// some zooms, while the same polyline with width 0 always shows every side.
 #[test]
