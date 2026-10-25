@@ -1082,6 +1082,88 @@ fn kinded_prims(l: &DisplayList, h: cadcraft_doc::Handle) -> Vec<(Kind, Vec<Vec2
 }
 
 #[test]
+fn window_plot_measures_a_block_again_when_a_block_nested_in_it_changes() {
+    let line = |a: (f64, f64), b: (f64, f64)| {
+        block_entity(1, Common::default(), EntityKind::Line(cadcraft_doc::Line { a: Vec3::new(a.0, a.1, 0.0), b: Vec3::new(b.0, b.1, 0.0) }))
+    };
+    let inner = |a: (f64, f64), b: (f64, f64)| {
+        let mut blk = cadcraft_doc::Block::new("INNER");
+        blk.entities.push(line(a, b));
+        std::sync::Arc::new(blk)
+    };
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("INNER".into(), inner((500.0, 500.0), (510.0, 500.0)));
+    let mut outer = cadcraft_doc::Block::new("OUTER");
+    outer.entities.push(line((3.0, 3.0), (4.0, 4.0)));
+    outer.entities.push(block_entity(2, Common::default(), insert_of("INNER")));
+    d.blocks.insert("OUTER".into(), std::sync::Arc::new(outer));
+    let h = d.add(&Space::Model, Common::default(), insert_of("OUTER")).unwrap();
+    let opts = Options { view: Some(Bounds2::new(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0))), ..Default::default() };
+    assert_eq!(kinded_prims(&build_plot(&d, &Space::Model, &opts), h).len(), 1, "INNER out of the window");
+    // INNER is redefined into the window; OUTER's definition is unchanged.
+    d.blocks.insert("INNER".into(), inner((1.0, 1.0), (2.0, 2.0)));
+    assert_eq!(kinded_prims(&build_plot(&d, &Space::Model, &opts), h).len(), 2, "INNER now reaches the window");
+}
+
+#[test]
+fn window_plot_tells_apart_nested_blocks_whose_names_differ_only_in_case() {
+    let line = |a: (f64, f64), b: (f64, f64)| {
+        block_entity(1, Common::default(), EntityKind::Line(cadcraft_doc::Line { a: Vec3::new(a.0, a.1, 0.0), b: Vec3::new(b.0, b.1, 0.0) }))
+    };
+    let block = |name: &str, a: (f64, f64), b: (f64, f64)| {
+        let mut blk = cadcraft_doc::Block::new(name);
+        blk.entities.push(line(a, b));
+        std::sync::Arc::new(blk)
+    };
+    let mut d = Drawing::new_imperial();
+    d.blocks.insert("PART".into(), block("PART", (500.0, 500.0), (510.0, 500.0)));
+    d.blocks.insert("part".into(), block("part", (600.0, 600.0), (610.0, 600.0)));
+    let mut outer = cadcraft_doc::Block::new("CASES");
+    outer.entities.push(line((3.0, 3.0), (4.0, 4.0)));
+    outer.entities.push(block_entity(2, Common::default(), insert_of("PART")));
+    outer.entities.push(block_entity(3, Common::default(), insert_of("part")));
+    d.blocks.insert("CASES".into(), std::sync::Arc::new(outer));
+    let h = d.add(&Space::Model, Common::default(), insert_of("CASES")).unwrap();
+    let opts = Options { view: Some(Bounds2::new(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0))), ..Default::default() };
+    assert_eq!(kinded_prims(&build_plot(&d, &Space::Model, &opts), h).len(), 1, "both nested blocks out of the window");
+    // `part` is redefined into the window; `PART` and CASES are unchanged.
+    d.blocks.insert("part".into(), block("part", (1.0, 1.0), (2.0, 2.0)));
+    assert_eq!(kinded_prims(&build_plot(&d, &Space::Model, &opts), h).len(), 2, "`part` now reaches the window");
+}
+
+#[test]
+fn window_plot_measures_block_dimensions_with_the_drawing_dimension_styles() {
+    let mut d = Drawing::new_imperial();
+    let mut blk = cadcraft_doc::Block::new("DIMS");
+    blk.entities.push(block_entity(1, Common::default(), EntityKind::Dimension(lin_dim())));
+    // A line that reaches the window, so the reference is built and its contents culled.
+    blk.entities.push(block_entity(
+        2,
+        Common::default(),
+        EntityKind::Line(cadcraft_doc::Line { a: Vec3::new(3.0, -17.0, 0.0), b: Vec3::new(4.0, -16.0, 0.0) }),
+    ));
+    d.blocks.insert("DIMS".into(), std::sync::Arc::new(blk));
+    let h = d
+        .add(
+            &Space::Model,
+            Common::default(),
+            match insert_of("DIMS") {
+                EntityKind::Insert(ins) => EntityKind::Insert(cadcraft_doc::Insert { insert: Vec3::new(0.0, 20.0, 0.0), ..ins }),
+                k => k,
+            },
+        )
+        .unwrap();
+    let opts = Options { view: Some(Bounds2::new(Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0))), ..Default::default() };
+    assert_eq!(kinded_prims(&build_plot(&d, &Space::Model, &opts), h).len(), 1, "small dimension text stays out of the window");
+    // A copy of the drawing shares the block definition but sizes dimension text far larger.
+    let mut big = d.clone();
+    if let Some(st) = big.dim_styles.first_mut() {
+        st.text_height = 6.0;
+    }
+    assert!(kinded_prims(&build_plot(&big, &Space::Model, &opts), h).len() > 1, "large dimension text reaches the window");
+}
+
+#[test]
 fn window_plot_builds_only_the_block_contents_that_reach_the_window() {
     let line = |h: u64, a: (f64, f64), b: (f64, f64)| {
         block_entity(h, Common::default(), EntityKind::Line(cadcraft_doc::Line { a: Vec3::new(a.0, a.1, 0.0), b: Vec3::new(b.0, b.1, 0.0) }))
