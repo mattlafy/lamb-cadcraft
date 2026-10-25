@@ -646,8 +646,10 @@ mod tests {
         let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
         let sd = Id(s.execute("newdetail", &json!({ "name": "SD", "cutDirection": "vertical" }))?["viewId"].as_u64().ok_or("no id")?);
-        let r =
-            s.execute("newsectionline", &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": -2000}, "cutTo": {"x": 5000, "y": -2000} }))?;
+        let r = s.execute(
+            "newsectionline",
+            &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": -2000}, "cutTo": {"x": 5000, "y": -2000} }),
+        )?;
         let sec = Id(r["viewId"].as_u64().ok_or("no id")?);
         s.execute("editview", &json!({ "viewId": sec.0 }))?;
         s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
