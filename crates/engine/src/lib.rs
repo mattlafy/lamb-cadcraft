@@ -1425,7 +1425,10 @@ impl Session {
         let base = if matches!(input, Some(Input::Point(_))) { self.current_prompt().and_then(|p| p.base) } else { None };
         let Some(mut run) = self.running.take() else { return Ok(()) };
         let step = match input {
-            Some(Input::Cancel) => Ok(Step::Cancel),
+            Some(Input::Cancel) => {
+                run.machine.cancelled(self);
+                Ok(Step::Cancel)
+            }
             Some(i) => {
                 if let Input::Point(p) = &i {
                     self.last_point = *p;
@@ -1567,7 +1570,8 @@ impl Session {
         }
         if self.running.is_some() {
             if self.suspended.is_some() {
-                if let Some(nested) = self.running.take() {
+                if let Some(mut nested) = self.running.take() {
+                    nested.machine.cancelled(self);
                     self.finish(nested, true);
                 }
                 self.running = self.suspended.take();
