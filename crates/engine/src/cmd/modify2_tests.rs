@@ -868,6 +868,24 @@ fn offset_echoes_the_gap_type() {
 }
 
 #[test]
+fn interactive_offset_previews_and_makes_the_gap_type_fill() {
+    for (gap, bulged) in [(1, 4), (2, 0)] {
+        let mut s = Session::new();
+        s.execute("setvar", &json!({"name": "OFFSETGAPTYPE", "value": gap})).unwrap();
+        pline(&mut s, square(), true);
+        s.cmdline("offset 1").unwrap();
+        s.input(crate::Input::Point(Vec2::new(10.0, 5.0))).unwrap();
+        let shown: Vec<_> = s.preview(Vec2::new(12.0, 5.0)).into_iter().map(|e| poly(&e.kind)).collect();
+        assert_eq!(shown.len(), 1, "gap {gap}");
+        s.input(crate::Input::Point(Vec2::new(12.0, 5.0))).unwrap();
+        let made = poly(&last(&s));
+        assert_eq!(made.vertices.len(), 8, "gap {gap}: {:?}", made.vertices);
+        assert_eq!(made.vertices.iter().filter(|v| v.bulge != 0.0).count(), bulged, "gap {gap}: {:?}", made.vertices);
+        assert_eq!(shown.first().map(|p| &p.vertices), Some(&made.vertices), "gap {gap}: preview matches the copy");
+    }
+}
+
+#[test]
 fn offset_elliptical_arc_follows_picked_side() {
     let max_x = |side: Value| {
         let mut s = Session::new();
