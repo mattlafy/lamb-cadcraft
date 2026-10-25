@@ -7,12 +7,13 @@
 //!
 //! A tag leader and its bubble are the two members of one unnamed, selectable group
 //! ([`GROUP_DESCRIPTION`], LAMB T509), so picking either selects both and MOVE/COPY/ERASE act on
-//! the pair. The group is the bubble's identity: [`bubble_observer`] reconciles every plan view's
-//! bubbles with its tag leaders after every command, updating a leader's bubble in place (same
-//! handle), and writes the drawing back only when something changed, so the bubble change lands in
-//! the command's own undo step. A bubble moved on its own (its grip) drags the leader's last vertex
-//! with it; otherwise the bubble goes to the leader's last vertex. The bubble's attributes have
-//! Lock position set, so they have no grips: the text can't be dragged off the bubble.
+//! the pair. The group is the bubble's identity: [`bubble_observer`] reconciles every plan and
+//! section view's bubbles with its tag leaders after every command, updating a leader's bubble in
+//! place (same handle), and writes the drawing back only when something changed, so the bubble
+//! change lands in the command's own undo step. A bubble moved on its own (its grip) drags the
+//! leader's last vertex with it; otherwise the bubble goes to the leader's last vertex. The
+//! bubble's attributes have Lock position set, so they have no grips: the text can't be dragged
+//! off the bubble.
 
 use std::sync::Arc;
 
@@ -188,9 +189,10 @@ fn is_bubble(e: &Entity) -> bool {
     matches!(&e.kind, EntityKind::Insert(i) if i.block.eq_ignore_ascii_case(BUBBLE_BLOCK))
 }
 
-/// The changes that make every plan view's bubbles and tag groups equal what its tag leaders want.
-/// `before` (the drawing before the command) decides who drives: a bubble that moved while its
-/// leader's last vertex did not drags that vertex; otherwise the bubble follows the leader.
+/// The changes that make every plan and section view's bubbles and tag groups equal what its tag
+/// leaders want. `before` (the drawing before the command) decides who drives: a bubble that moved
+/// while its leader's last vertex did not drags that vertex; otherwise the bubble follows the
+/// leader.
 fn plan(d: &Drawing, before: Option<&Drawing>) -> Result<Plan, String> {
     let doc = read_document(d).map_err(|e| e.to_string())?;
     let name_of = |id| doc.views.iter().find(|v| matches!(v, AnyView::Detail(_)) && v.id() == id).map(|v| v.name().to_owned());
@@ -199,8 +201,8 @@ fn plan(d: &Drawing, before: Option<&Drawing>) -> Result<Plan, String> {
     let sheet_of = |id: Id| refs.iter().find(|(v, _, _)| *v == id).map_or_else(String::new, |(_, n, l)| format!("{n}/{l}"));
     let grouped = |h: Handle| d.groups.iter().any(|g| is_tag_group(g) && g.members.contains(&h));
     let mut out = Plan::default();
-    // Each view block is reconciled on its own; section views extend the filter.
-    for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_))) {
+    // Each plan and section view block is reconciled on its own.
+    for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_) | AnyView::Vertical(_))) {
         let block_name = view_block_name(v.id());
         let Some(block) = d.block(&block_name) else { continue };
         let bi = out.blocks.len();
@@ -333,9 +335,9 @@ fn apply(d: &mut Drawing, plan: &Plan) -> Result<(), String> {
     Ok(())
 }
 
-/// The after-command observer: every plan view's `LAMB_DTAG` inserts and tag groups made to equal
-/// its tag leaders' wanted bubbles — grouped ones updated in place, the rest erased, missing ones
-/// added. The drawing is written back only when something changed.
+/// The after-command observer: every plan and section view's `LAMB_DTAG` inserts and tag groups
+/// made to equal its tag leaders' wanted bubbles — grouped ones updated in place, the rest erased,
+/// missing ones added. The drawing is written back only when something changed.
 pub fn bubble_observer(s: &mut Session, before: &Arc<Drawing>) {
     let todo = match s.doc().map_err(|e| e.to_string()).and_then(|d| plan(d, Some(before))) {
         Ok(p) if p.is_empty() => return,
@@ -631,6 +633,59 @@ mod tests {
         s.execute("line", &json!({ "points": [[9000, 9000], [9500, 9000]] }))?;
         assert_eq!(tag_groups(&s)?.iter().map(|g| g.members.clone()).collect::<Vec<_>>(), [vec![leader, hb]]);
         assert_eq!(s.grips_of(hb)?.len(), 1);
+        Ok(())
+    }
+
+    /// detailtags.rs's section room: plan `Ground`, section `A-A` (cut walls and floors) edited on
+    /// layer `TAGS`, vertical detail `SD`. Returns (session, section, SD).
+    fn section_room() -> T<(Session, Id, Id)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        crate::maintain::install(&mut s);
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let sd = Id(s.execute("newdetail", &json!({ "name": "SD", "cutDirection": "vertical" }))?["viewId"].as_u64().ok_or("no id")?);
+        let r =
+            s.execute("newsectionline", &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": -2000}, "cutTo": {"x": 5000, "y": -2000} }))?;
+        let sec = Id(r["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [0, 3000]] }))?;
+        s.execute("pline", &json!({ "vertices": [[300, 0], [300, 3000]] }))?;
+        let block = s.doc()?.block(&view_block_name(sec)).ok_or("no block")?;
+        let hs: Vec<String> = block.entities.iter().filter(|e| e.common.layer == "WALL-EXT").map(|e| format!("{:X}", e.handle.0)).collect();
+        s.execute("setrole", &json!({ "handles": hs, "role": "cut" }))?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        Ok((s, sec, sd))
+    }
+
+    #[test]
+    fn a_section_tag_gets_its_bubble_and_sheet_reference() -> R {
+        let (mut s, sec, sd) = section_room()?;
+        let n = undo_len(&s)?;
+        let r = s.execute(
+            "detailtag",
+            &json!({ "detailViewId": sd.0, "corner": false, "tip": {"x": 150, "y": 2000}, "bubble": {"x": -800, "y": 2500} }),
+        )?;
+        let leader = hx(r["handle"].as_str().ok_or("no handle")?)?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let b = bubbles(&s, sec)?;
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert_eq!((b[0].1, b[0].2.as_str(), b[0].3.as_str(), b[0].4.as_str()), ((-800.0, 2500.0), "TAGS", "SD", ""));
+        assert_eq!(tag_groups(&s)?.iter().map(|g| g.members.clone()).collect::<Vec<_>>(), [vec![leader, b[0].0]]);
+
+        let out = s.execute("newsheet", &json!({ "name": "A300", "viewIds": [sd.0] }))?;
+        let refs = crate::sheets::sheet_refs(s.doc()?, &[(sd, view_block_name(sd))]);
+        let want = refs.iter().find(|(v, _, _)| *v == sd).map(|(_, k, l)| format!("{k}/{l}")).ok_or("no sheet ref")?;
+        assert_eq!(bubbles(&s, sec)?.into_iter().map(|b| b.4).collect::<Vec<_>>(), [want], "{out}");
+        s.undo()?;
+        assert_eq!(bubbles(&s, sec)?.into_iter().map(|b| b.4).collect::<Vec<_>>(), [""]);
+
+        s.undo()?;
+        assert!(bubbles(&s, sec)?.is_empty());
+        assert!(s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.iter().all(|e| !matches!(e.kind, EntityKind::Leader(_))));
+        assert!(tag_groups(&s)?.is_empty());
         Ok(())
     }
 
