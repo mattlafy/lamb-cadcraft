@@ -332,8 +332,16 @@ fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, result: 
         let Some(j) = graph.junctions.get(c.junction) else { continue };
         groups.push((&c.lines, j.arms.iter().map(|a| a.run).collect()));
     }
-    for o in openings.iter().filter(|o| o.skipped.is_none() && o.lines.len() % 2 == 0) {
+    for o in openings.iter().filter(|o| o.skipped.is_none()) {
         let Some(b) = graph.bridges.get(o.bridge) else { continue };
+        if let Some(at_b) = o.end {
+            // A section's head or sill (LAMB T505): one end, all its lines.
+            groups.push((&o.lines, vec![if at_b { b.b.0 } else { b.a.0 }]));
+            continue;
+        }
+        if o.lines.len() % 2 != 0 {
+            continue;
+        }
         let (first, second) = o.lines.split_at(o.lines.len() / 2);
         groups.push((first, vec![b.a.0]));
         groups.push((second, vec![b.b.0]));

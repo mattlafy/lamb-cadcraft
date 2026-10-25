@@ -35,7 +35,8 @@
 //! `datum` line within the wall ([`run_grid_offset`]).
 //! At each opening bridge an opening tag resolves to (LAMB T486), [`opening_assembly`] places the
 //! jamb detail at both jambs (lamb-core's [`place_opening`], mirrored at the second); each jamb's run
-//! is trimmed back to the detail's reach there ([`jamb_reach`]) as at a corner. The block holds the
+//! is trimmed back to the detail's reach there ([`jamb_reach`]) as at a corner. In a section each
+//! end — head, sill — resolves and places on its own (LAMB T505, lamb-core's [`place_opening_end`]). The block holds the
 //! run lines, then the corners', then the openings'.
 //! Not the AI-line sweep in [`crate::sweeps`].
 
@@ -46,9 +47,9 @@ use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult
 use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
     AssemblyLine, FaceRef, WidthConflict, arm_direction, corner_reach, detail_bands, detail_frame, jamb_reach, junction_bisector, lay_bands,
-    lay_repeat, mitre_end, place_corner, place_opening, tee_butt, trim_to_reach, width_conflict,
+    lay_repeat, mitre_end, place_corner, place_opening, place_opening_end, tee_butt, trim_to_reach, width_conflict,
 };
-use lamb_core::derivation::detail_tags::RunDetail;
+use lamb_core::derivation::detail_tags::{EndLevel, RunDetail};
 use lamb_core::derivation::issues::{Issue, IssueKind};
 use lamb_core::derivation::wall_junctions::RunEnd;
 use lamb_core::derivation::wall_openings::OpeningBridge;
@@ -62,7 +63,10 @@ use serde_json::{Value, json};
 use crate::commands::{id_value, other};
 use crate::convert::to_polyline;
 use crate::detailref::{DetailRefKind, detail_reference};
-use crate::detailtags::{edited_wall_view, graph_and_sides, resolve_view_details, resolve_view_openings, view_detail_tags};
+use crate::detailtags::{
+    bridge_upper, edited_wall_view, graph_and_sides, resolve_view_details, resolve_view_opening_ends, resolve_view_openings, view_detail_tags,
+    view_direction,
+};
 use crate::project::DrawingProject;
 use crate::repeats::{detail_repeats, repeat_members};
 use crate::schema::{assembly_block_name, read_document, view_block_name, write_document};
@@ -373,7 +377,12 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
     for o in opening_assembly(d, plan)?.iter().filter(|o| o.skipped.is_none()) {
         let Some(b) = graph.bridges.get(o.bridge) else { continue };
         let half = o.lines.len() / 2;
-        for ((i, end), point, lines) in [(b.a, b.from, &o.lines[..half]), (b.b, b.to, &o.lines[half..])] {
+        let ends: Vec<((usize, RunEnd), Point2, &[AssemblyLine])> = match o.end {
+            None => vec![(b.a, b.from, &o.lines[..half]), (b.b, b.to, &o.lines[half..])],
+            Some(false) => vec![(b.a, b.from, &o.lines[..])],
+            Some(true) => vec![(b.b, b.to, &o.lines[..])],
+        };
+        for ((i, end), point, lines) in ends {
             let Some(RunCurve::Line { from, to }) = graph.runs.get(i).map(|r| r.centreline) else { continue };
             let len = (to.x - from.x).hypot(to.y - from.y);
             if len <= 0.0 {
@@ -514,17 +523,21 @@ pub struct OpeningAssembly {
     /// Index into the view's wall-graph bridges.
     pub bridge: usize,
     pub detail: Option<Id>,
-    /// Jamb `a`'s lines, then jamb `b`'s (the same count each).
+    /// `None`: both jambs (a plan) — jamb `a`'s lines, then jamb `b`'s, the same count each.
+    /// `Some(at_b)`: that end only — a section's head or sill (LAMB T505).
+    pub end: Option<bool>,
     pub lines: Vec<AssemblyLine>,
     pub skipped: Option<String>,
 }
 
-/// One opening detail's lines placed at both jambs of `bridge`, a's then b's, or why not.
+/// One opening detail's lines placed at both jambs of `bridge`, a's then b's — or with `end:
+/// Some(at_b)` at that end only — or why not.
 fn opening_lines(
     d: &Drawing,
     view: Id,
     detail: Id,
     bridge: &OpeningBridge,
+    end: Option<bool>,
     runs: &[WallRun],
     sides: &[lamb_core::derivation::wall_spaces::RunSides],
 ) -> Result<Vec<AssemblyLine>, String> {
@@ -533,30 +546,44 @@ fn opening_lines(
     let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| *h != r.handle).collect();
     let lines = member_segments(d, detail, &others);
     let (face, insets, outward) = junction_placement(d, view, &r, &lines, &[Some(bridge.a.0), Some(bridge.b.0)], runs, sides)?;
-    let [a, b] = place_opening(bridge, runs, sides, face, (r.from, r.to), &lines, &insets, outward)?;
-    Ok(a.into_iter().chain(b).collect())
+    match end {
+        None => {
+            let [a, b] = place_opening(bridge, runs, sides, face, (r.from, r.to), &lines, &insets, outward)?;
+            Ok(a.into_iter().chain(b).collect())
+        }
+        Some(at_b) => {
+            let inset = insets.get(usize::from(at_b)).copied().unwrap_or(0.0);
+            place_opening_end(bridge, at_b, runs, sides, face, (r.from, r.to), &lines, inset, outward)
+        }
+    }
 }
 
 /// Every opening bridge of `view`'s wall graph whose opening detail resolves (`Tagged`, `Spread` or
 /// `Gap`), in bridge order, with that detail placed at both jambs ([`place_opening`]); a failure is
-/// the entry's `skipped` reason, never an error of the view.
+/// the entry's `skipped` reason, never an error of the view. In a vertical view each bridge end
+/// resolves on its own ([`resolve_view_opening_ends`]) and has its own entry, a's before b's.
 pub fn opening_assembly(d: &Drawing, view: Id) -> Result<Vec<OpeningAssembly>, String> {
-    let openings = resolve_view_openings(d, view)?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let (graph, sides) = graph_and_sides(&p, view);
+    let resolved: Vec<(usize, Option<bool>, RunDetail)> = if view_direction(d, view) == lamb_core::model::CutDirection::Vertical {
+        resolve_view_opening_ends(d, view)?.into_iter().enumerate().flat_map(|(i, [a, b])| [(i, Some(false), a), (i, Some(true), b)]).collect()
+    } else {
+        resolve_view_openings(d, view)?.into_iter().enumerate().map(|(i, o)| (i, None, o)).collect()
+    };
     let mut out = Vec::new();
-    for (i, (b, opening)) in graph.bridges.iter().zip(&openings).enumerate() {
-        let id = match opening {
+    for (i, end, opening) in resolved {
+        let Some(b) = graph.bridges.get(i) else { continue };
+        let id = match &opening {
             RunDetail::Tagged(id) | RunDetail::Spread(id) | RunDetail::Gap(id) => id,
             RunDetail::Conflict | RunDetail::Untyped => continue,
         };
-        let skip = |why: String, detail: Option<Id>| OpeningAssembly { bridge: i, detail, lines: Vec::new(), skipped: Some(why) };
+        let skip = |why: String, detail: Option<Id>| OpeningAssembly { bridge: i, detail, end, lines: Vec::new(), skipped: Some(why) };
         let Ok(detail) = id.parse::<u64>().map(Id) else {
             out.push(skip("detail id is not a number".into(), None));
             continue;
         };
-        out.push(match opening_lines(d, view, detail, b, &graph.runs, &sides.runs) {
-            Ok(lines) => OpeningAssembly { bridge: i, detail: Some(detail), lines, skipped: None },
+        out.push(match opening_lines(d, view, detail, b, end, &graph.runs, &sides.runs) {
+            Ok(lines) => OpeningAssembly { bridge: i, detail: Some(detail), end, lines, skipped: None },
             Err(e) => skip(e, Some(detail)),
         });
     }
@@ -647,7 +674,40 @@ pub(crate) fn wall_issues(d: &Drawing) -> Result<Vec<Issue>, String> {
                 format!("Corner at ({:.0}, {:.0}) has no corner detail{suffix}", junction.point.x, junction.point.y),
             ));
         }
-        if !view_detail_tags(d, plan)?.openings.is_empty() {
+        let tags = view_detail_tags(d, plan)?;
+        if !tags.opening_ends.is_empty() {
+            // A section's heads and sills (LAMB T505), each end on its own.
+            let upper = bridge_upper(&graph);
+            for (i, (b, ends)) in graph.bridges.iter().zip(resolve_view_opening_ends(d, plan)?).enumerate() {
+                for (at_b, opening) in [false, true].into_iter().zip(ends) {
+                    if !matches!(opening, RunDetail::Untyped | RunDetail::Conflict) {
+                        continue;
+                    }
+                    let (run, point) = if at_b { (b.b.0, b.to) } else { (b.a.0, b.from) };
+                    if !runs.get(run).is_some_and(|r| r.skipped.is_none()) {
+                        continue;
+                    }
+                    let level = match upper.get(i).copied().flatten() {
+                        Some(a_up) if a_up != at_b => EndLevel::Upper,
+                        Some(_) => EndLevel::Lower,
+                        None => EndLevel::Level,
+                    };
+                    let word = match level {
+                        EndLevel::Upper => "head",
+                        EndLevel::Lower => "sill",
+                        EndLevel::Level => "end",
+                    };
+                    out.push(issue(
+                        IssueKind::UndetailedOpening,
+                        format!("undetailed_opening:{plan}:{i}:{}", if at_b { "b" } else { "a" }),
+                        point,
+                        b.opening_entity_ids.clone(),
+                        format!("Opening {word} at ({:.0}, {:.0}) has no opening detail", point.x, point.y),
+                    ));
+                }
+            }
+        }
+        if !tags.openings.is_empty() {
             for (i, (b, opening)) in graph.bridges.iter().zip(resolve_view_openings(d, plan)?).enumerate() {
                 if !matches!(opening, RunDetail::Untyped | RunDetail::Conflict) {
                     continue;
@@ -2969,6 +3029,103 @@ pub(crate) mod tests {
         let (mut s, plan) = window_room(true, false)?;
         s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
         assert!(wall_issues(s.doc()?)?.iter().all(|i| i.kind != IssueKind::UndetailedOpening), "no opening tag, no opening issues");
+        Ok(())
+    }
+
+    /// A section through a window (LAMB T505): a 300 mm `WALL-EXT` wall cut below the sill (z
+    /// 0..900) and above the head (z 2100..3000), u 0 the exterior face (an outside point beside each run), a `WINDOW` line across the
+    /// gap, `SD` edge-tagged on the lower run, and two vertical opening details drawn like `JD` —
+    /// `H` on layer `HEAD`, `S` on layer `SILL` — corner-tagged near the head and near the sill (S
+    /// only when `sill`). Returns (session, section, S's tag handle).
+    fn window_section(sill: bool) -> T<(Session, Id, Option<String>)> {
+        let (mut s, sec) = section_fixture(150.0, Some((-1000.0, 450.0)), |s| {
+            s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+            for (u, z0, z1) in [(0, 0, 900), (300, 0, 900), (0, 2100, 3000), (300, 2100, 3000)] {
+                s.execute("pline", &json!({ "vertices": [[u, z0], [u, z1]] }))?;
+            }
+            s.execute("layer.new", &json!({ "name": "WINDOW", "current": true }))?;
+            s.execute("pline", &json!({ "vertices": [[150, 900], [150, 2100]] }))?;
+            Ok(())
+        })?;
+        let detail = |s: &mut Session, name: &str, layer: &str| -> T<Id> {
+            let id = Id(s.execute("newdetail", &json!({ "name": name, "cutDirection": "vertical" }))?["viewId"].as_u64().ok_or("no id")?);
+            s.execute("editview", &json!({ "viewId": id.0 }))?;
+            s.execute("layer.current", &json!({ "name": "0" }))?;
+            let r = line(s, [-1000.0, 0.0], [0.0, 0.0])?;
+            s.execute("detailref", &json!({ "handle": r.hex(), "kind": "exterior_face" }))?;
+            s.execute("layer.new", &json!({ "name": layer, "current": true }))?;
+            line(s, [-50.0, 0.0], [-50.0, 200.0])?;
+            s.execute("layer.current", &json!({ "name": "GYP" }))?;
+            line(s, [-50.0, 200.0], [0.0, 200.0])?;
+            Ok(id)
+        };
+        s.execute("outsidepoint", &json!({ "point": {"x": -1000, "y": 2550} }))?;
+        let h = detail(&mut s, "H", "HEAD")?;
+        let sd = detail(&mut s, "S", "SILL")?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("layer.current", &json!({ "name": "TAGS" }))?;
+        let tag = |s: &mut Session, id: Id, z: f64| -> T<String> {
+            let r =
+                s.execute("detailtag", &json!({ "detailViewId": id.0, "corner": true, "tip": {"x": 150, "y": z}, "bubble": {"x": 1500, "y": z} }))?;
+            Ok(r["handle"].as_str().ok_or("no handle")?.to_owned())
+        };
+        tag(&mut s, h, 2050.0)?;
+        let st = if sill { Some(tag(&mut s, sd, 950.0)?) } else { None };
+        Ok((s, sec, st))
+    }
+
+    #[test]
+    fn a_section_s_head_and_sill_take_their_own_details() -> R {
+        let (mut s, sec, _) = window_section(true)?;
+        let tags = view_detail_tags(s.doc()?, sec)?;
+        assert_eq!((tags.openings.len(), tags.opening_ends.len(), tags.unattached.len()), (0, 2, 0), "{tags:?}");
+        let r = s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        assert_eq!(r["skipped"], json!([]), "{r}");
+        let block = block_xy(&s, &assembly_block_name(sec))?;
+        let of = |layer: &str| block.iter().filter(|l| l.4 == layer).map(|l| (l.0, l.1, l.2, l.3)).collect::<Vec<_>>();
+        assert_eq!(of("HEAD"), [(0.0, 2150.0, 200.0, 2150.0)], "H at the head only: {block:?}");
+        assert_eq!(of("SILL"), [(0.0, 850.0, 200.0, 850.0)], "S at the sill only: {block:?}");
+        assert!(resolve_view_openings(s.doc()?, sec)?.iter().all(|o| *o == RunDetail::Untyped), "nothing lays twice");
+
+        // Each run's bands stop 50 short of its end of the opening.
+        let d = s.doc()?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, sec);
+        let runs = assembly_lines(d, sec)?;
+        let z_span = |r: &RunAssembly| {
+            let zs = r.lines[..r.bands].iter().flat_map(|l| [l.from.y, l.to.y]);
+            (r6(zs.clone().fold(f64::INFINITY, f64::min)), r6(zs.fold(f64::NEG_INFINITY, f64::max)))
+        };
+        let lower = runs.iter().find(|r| run_midpoint(&graph.runs[r.run]).y < 1500.0).ok_or("no lower run")?;
+        let upper = runs.iter().find(|r| run_midpoint(&graph.runs[r.run]).y > 1500.0).ok_or("no upper run")?;
+        assert_eq!((z_span(lower).1, z_span(upper).0), (850.0, 2150.0), "{runs:?}");
+        assert!(block_matches(d.block(&assembly_block_name(sec)).ok_or("no block")?, &runs, &corner_assembly(d, sec)?, &opening_assembly(d, sec)?));
+
+        let r = s.execute("detailtags", &json!({ "viewId": sec.0 }))?;
+        assert_eq!(
+            r["openingEnds"],
+            json!([{ "kind": "tagged", "detail": r["openingEnds"][0]["detail"] }, { "kind": "tagged", "detail": r["openingEnds"][1]["detail"] }]),
+            "{r}"
+        );
+        assert!(r["message"].as_str().is_some_and(|m| m.contains("2 opening ends: 2 tagged")), "{r}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_untagged_sill_is_the_only_undetailed_opening_end() -> R {
+        let (mut s, sec, st) = window_section(true)?;
+        s.execute("erase", &json!({ "handles": [st.ok_or("no sill tag")?] }))?;
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let block = block_xy(&s, &assembly_block_name(sec))?;
+        assert!(block.iter().all(|l| l.4 != "SILL") && block.iter().any(|l| l.4 == "HEAD"), "{block:?}");
+        let list = wall_issues(s.doc()?)?;
+        let opens: Vec<_> = list.iter().filter(|i| i.kind == IssueKind::UndetailedOpening).collect();
+        assert_eq!(opens.len(), 1, "{list:?}");
+        let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, sec);
+        let b = &graph.bridges[0];
+        let (end, point) = if b.from.y < b.to.y { ("a", b.from) } else { ("b", b.to) };
+        assert_eq!(opens[0].id, format!("undetailed_opening:{sec}:0:{end}"));
+        assert_eq!(opens[0].location, point);
+        assert_eq!(opens[0].note, format!("Opening sill at ({:.0}, {:.0}) has no opening detail", point.x, point.y));
         Ok(())
     }
 }

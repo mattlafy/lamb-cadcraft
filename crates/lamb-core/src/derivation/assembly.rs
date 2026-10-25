@@ -425,25 +425,44 @@ pub fn place_opening(
     insets: &[f64],
     outward: bool,
 ) -> Result<[Vec<AssemblyLine>; 2], String> {
+    let inset = |k: usize| insets.get(k).copied().unwrap_or(0.0);
+    Ok([
+        place_opening_end(bridge, false, runs, sides, face, reference, lines, inset(0), outward)?,
+        place_opening_end(bridge, true, runs, sides, face, reference, lines, inset(1), outward)?,
+    ])
+}
+
+/// An opening detail placed at one end of `bridge` — `b` when `at_b`, else `a` — exactly as
+/// [`place_opening`] places it there, `inset` being that end's inset. In a section the two ends are
+/// a head and a sill, each with its own detail (LAMB T505).
+#[allow(clippy::too_many_arguments)]
+pub fn place_opening_end(
+    bridge: &OpeningBridge,
+    at_b: bool,
+    runs: &[WallRun],
+    sides: &[RunSides],
+    face: FaceRef,
+    reference: (Point2, Point2),
+    lines: &[(Point2, Point2, String)],
+    inset: f64,
+    outward: bool,
+) -> Result<Vec<AssemblyLine>, String> {
     let frame = detail_frame(reference, lines)?;
     let r = reference.1;
     let sgn = if outward { -1.0 } else { 1.0 };
-    let jamb = |(i, end): (usize, RunEnd), inset: f64| -> Result<Vec<AssemblyLine>, String> {
-        let run = runs.get(i).ok_or("the opening bridge names no run")?;
-        let side = sides.get(i).ok_or("the opening bridge's run has no sides")?;
-        let f = face_frame(run, side, face)?;
-        let (c, t) = jamb_point(run, side, face, end)?;
-        let c = Point2 { x: c.x - f.normal.x * inset, y: c.y - f.normal.y * inset };
-        let ni = Point2 { x: -f.normal.x * sgn, y: -f.normal.y * sgn };
-        let map = |p: Point2| {
-            let (dx, dy) = (p.x - r.x, p.y - r.y);
-            let (u, v) = (dx * frame.along.x + dy * frame.along.y, dx * frame.into.x + dy * frame.into.y);
-            Point2 { x: c.x + t.x * u + ni.x * v, y: c.y + t.y * u + ni.y * v }
-        };
-        Ok(lines.iter().map(|(p, q, layer)| AssemblyLine { from: map(*p), to: map(*q), layer: layer.clone(), arc: None }).collect())
+    let (i, end) = if at_b { bridge.b } else { bridge.a };
+    let run = runs.get(i).ok_or("the opening bridge names no run")?;
+    let side = sides.get(i).ok_or("the opening bridge's run has no sides")?;
+    let f = face_frame(run, side, face)?;
+    let (c, t) = jamb_point(run, side, face, end)?;
+    let c = Point2 { x: c.x - f.normal.x * inset, y: c.y - f.normal.y * inset };
+    let ni = Point2 { x: -f.normal.x * sgn, y: -f.normal.y * sgn };
+    let map = |p: Point2| {
+        let (dx, dy) = (p.x - r.x, p.y - r.y);
+        let (u, v) = (dx * frame.along.x + dy * frame.along.y, dx * frame.into.x + dy * frame.into.y);
+        Point2 { x: c.x + t.x * u + ni.x * v, y: c.y + t.y * u + ni.y * v }
     };
-    let inset = |k: usize| insets.get(k).copied().unwrap_or(0.0);
-    Ok([jamb(bridge.a, inset(0))?, jamb(bridge.b, inset(1))?])
+    Ok(lines.iter().map(|(p, q, layer)| AssemblyLine { from: map(*p), to: map(*q), layer: layer.clone(), arc: None }).collect())
 }
 
 /// How far a placed jamb detail reaches back into its run from the jamb point `c`, `t` being the

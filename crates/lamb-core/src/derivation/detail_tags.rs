@@ -34,6 +34,11 @@
 //! runs' [`RunClass`]es, sorted, so a jamb detail for a 200 mm exterior wall never lands in a 90 mm
 //! partition's door. The detail is drawn for one jamb and placed at both
 //! (`assembly::place_opening`).
+//!
+//! **Opening ends** (LAMB T505): in a section an opening bridge's two ends are different
+//! conditions — a head and a sill — so [`resolve_opening_end_details`] resolves each end as its own
+//! item, classed by the bridge's class plus its [`EndLevel`]. A head tag spreads to heads, never to
+//! a sill; a level bridge's two ends share one class.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -226,17 +231,62 @@ pub struct OpeningTag {
 /// class — its two runs' [`RunClass`]es, sorted — with no neighbours, so gaps never decide it.
 /// Tags naming a bridge that is not in the graph are ignored.
 pub fn resolve_opening_details(graph: &WallGraph, sides: &WallSides, tags: &[OpeningTag]) -> Vec<RunDetail> {
+    let classes = bridge_classes(graph, sides);
+    let tags: Vec<(usize, &str)> = tags.iter().map(|t| (t.bridge, t.detail.as_str())).collect();
+    resolve_greedy(&classes, &vec![BTreeSet::new(); classes.len()], &tags)
+}
+
+/// Each bridge's class: its two runs' [`RunClass`]es, sorted.
+fn bridge_classes(graph: &WallGraph, sides: &WallSides) -> Vec<(Option<RunClass>, Option<RunClass>)> {
     let rc = run_classes(graph, sides);
-    let classes: Vec<(Option<RunClass>, Option<RunClass>)> = graph
+    graph
         .bridges
         .iter()
         .map(|b| {
             let (x, y) = (rc.get(b.a.0).copied(), rc.get(b.b.0).copied());
             if x <= y { (x, y) } else { (y, x) }
         })
-        .collect();
-    let tags: Vec<(usize, &str)> = tags.iter().map(|t| (t.bridge, t.detail.as_str())).collect();
-    resolve_greedy(&classes, &vec![BTreeSet::new(); classes.len()], &tags)
+        .collect()
+}
+
+/// An opening-detail tag on one end of an opening bridge: `bridge` indexes [`WallGraph::bridges`],
+/// `at_b` picks the `b` end (`bridge.to`) over the `a` end (`bridge.from`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpeningEndTag {
+    pub detail: String,
+    pub bridge: usize,
+    pub at_b: bool,
+}
+
+/// Where an opening end sits against the bridge's other end: `Upper` (a head), `Lower` (a sill or
+/// threshold) or `Level` (both ends at one height, e.g. a gap in a floor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EndLevel {
+    Upper,
+    Lower,
+    Level,
+}
+
+/// `[a-end, b-end]` per bridge of `graph`: rules 1 and 2 of the module docs over items `2*i` (a) and
+/// `2*i+1` (b), each classed by its bridge's class and [`EndLevel`] from `upper[i]` (`Some(true)` =
+/// a is higher, `Some(false)` = b is higher, `None` or missing = level). No neighbours. Tags naming
+/// a bridge that is not in the graph are ignored.
+pub fn resolve_opening_end_details(graph: &WallGraph, sides: &WallSides, tags: &[OpeningEndTag], upper: &[Option<bool>]) -> Vec<[RunDetail; 2]> {
+    let bc = bridge_classes(graph, sides);
+    let mut classes = Vec::with_capacity(bc.len() * 2);
+    for (i, c) in bc.iter().enumerate() {
+        let (a, b) = match upper.get(i).copied().flatten() {
+            Some(true) => (EndLevel::Upper, EndLevel::Lower),
+            Some(false) => (EndLevel::Lower, EndLevel::Upper),
+            None => (EndLevel::Level, EndLevel::Level),
+        };
+        classes.push((*c, a));
+        classes.push((*c, b));
+    }
+    let tags: Vec<(usize, &str)> =
+        tags.iter().filter(|t| t.bridge < bc.len()).map(|t| (2 * t.bridge + usize::from(t.at_b), t.detail.as_str())).collect();
+    let flat = resolve_greedy(&classes, &vec![BTreeSet::new(); classes.len()], &tags);
+    flat.chunks(2).map(|c| [c[0].clone(), c[1].clone()]).collect()
 }
 
 /// The greedy algorithm shared by edges, corners and openings: `classes[i]` and `neighbours[i]` describe item
@@ -364,6 +414,38 @@ mod tests {
         assert_eq!(resolve_opening_details(&g, &s, &[tag("J1", 0), tag("J2", 0)]), [RunDetail::Conflict, RunDetail::Untyped]);
         // A tag on a bridge not in the graph is ignored.
         assert_eq!(resolve_opening_details(&g, &s, &[tag("J1", 7)]), [RunDetail::Untyped, RunDetail::Untyped]);
+    }
+
+    fn end(detail: &str, bridge: usize, at_b: bool) -> OpeningEndTag {
+        OpeningEndTag { detail: detail.into(), bridge, at_b }
+    }
+
+    #[test]
+    fn a_head_tag_spreads_to_heads_and_never_to_sills() {
+        let (g, s) = bridged(&[200.0; 4]);
+        // Bridge 0: a is the head; bridge 1: b is the head.
+        let r = resolve_opening_end_details(&g, &s, &[end("H", 0, false)], &[Some(true), Some(false)]);
+        assert_eq!(r, [[RunDetail::Tagged("H".into()), RunDetail::Untyped], [RunDetail::Untyped, RunDetail::Spread("H".into())]]);
+        let r = resolve_opening_end_details(&g, &s, &[end("H", 0, false), end("S", 1, false)], &[Some(true), Some(false)]);
+        assert_eq!(
+            r,
+            [[RunDetail::Tagged("H".into()), RunDetail::Spread("S".into())], [RunDetail::Tagged("S".into()), RunDetail::Spread("H".into())]]
+        );
+    }
+
+    #[test]
+    fn a_level_bridge_shares_one_tag_between_its_ends() {
+        let (g, s) = bridged(&[200.0; 2]);
+        let r = resolve_opening_end_details(&g, &s, &[end("F", 0, true)], &[None]);
+        assert_eq!(r, [[RunDetail::Spread("F".into()), RunDetail::Tagged("F".into())]]);
+    }
+
+    #[test]
+    fn two_tags_on_one_end_conflict() {
+        let (g, s) = bridged(&[200.0; 2]);
+        let r = resolve_opening_end_details(&g, &s, &[end("H", 0, false), end("X", 0, false)], &[Some(true)]);
+        assert_eq!(r, [[RunDetail::Conflict, RunDetail::Untyped]]);
+        assert_eq!(resolve_opening_end_details(&g, &s, &[end("H", 3, false)], &[Some(true)]), [[RunDetail::Untyped, RunDetail::Untyped]]);
     }
 
     #[test]

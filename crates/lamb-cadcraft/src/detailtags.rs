@@ -21,7 +21,8 @@ use cadcraft_doc::{Drawing, EntityKind, Handle, Leader, Line};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::Vec2;
 use lamb_core::derivation::detail_tags::{
-    CornerTag, EdgeTag, OpeningTag, RunDetail, resolve_corner_details, resolve_edge_details, resolve_opening_details,
+    CornerTag, EdgeTag, OpeningEndTag, OpeningTag, RunDetail, resolve_corner_details, resolve_edge_details, resolve_opening_details,
+    resolve_opening_end_details,
 };
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::derivation::wall_junctions::{WallGraph, wall_graph};
@@ -46,6 +47,9 @@ pub struct ViewTags {
     pub corners: Vec<CornerTag>,
     /// Corner-shaped tags whose tip attaches to no junction but to an opening bridge (LAMB T486).
     pub openings: Vec<OpeningTag>,
+    /// In a vertical view, opening tags instead attach to the bridge end their tip is nearer — a
+    /// head or a sill (LAMB T505); `openings` stays empty there.
+    pub opening_ends: Vec<OpeningEndTag>,
     /// Tags whose tip attaches to nothing, or whose detail view no longer exists.
     pub unattached: Vec<Handle>,
 }
@@ -135,7 +139,7 @@ pub(crate) fn wall_params(p: &DrawingProject<'_>, view: Id) -> WallRunParams {
 }
 
 /// The cut direction details tagging `view` must have: `Vertical` in a vertical view, else `Plan`.
-fn view_direction(d: &Drawing, view: Id) -> CutDirection {
+pub(crate) fn view_direction(d: &Drawing, view: Id) -> CutDirection {
     let vertical = read_document(d).is_ok_and(|doc| doc.views.iter().any(|v| matches!(v, AnyView::Vertical(_)) && v.id() == view));
     if vertical { CutDirection::Vertical } else { CutDirection::Plan }
 }
@@ -167,7 +171,19 @@ fn graph_tags(d: &Drawing, view: Id, graph: &WallGraph) -> std::result::Result<V
                 out.corners.push(CornerTag { detail, junction });
                 true
             } else {
-                attach_bridge(graph, tip).map(|bridge| out.openings.push(OpeningTag { detail, bridge })).is_some()
+                match attach_bridge(graph, tip) {
+                    Some(bridge) if want == CutDirection::Vertical => {
+                        let b = &graph.bridges[bridge];
+                        let at_b = dist(tip, b.to) < dist(tip, b.from);
+                        out.opening_ends.push(OpeningEndTag { detail, bridge, at_b });
+                        true
+                    }
+                    Some(bridge) => {
+                        out.openings.push(OpeningTag { detail, bridge });
+                        true
+                    }
+                    None => false,
+                }
             }
         } else {
             attach_run(graph, tip).map(|run| out.edges.push(EdgeTag { detail, run })).is_some()
@@ -214,7 +230,8 @@ pub fn resolve_view_details(d: &Drawing, view: Id) -> std::result::Result<(Vec<R
 }
 
 /// Every opening bridge's opening detail in `view` (parallel to its wall graph's `bridges`, LAMB
-/// T486).
+/// T486). In a vertical view every bridge is `Untyped` — its ends resolve separately
+/// ([`resolve_view_opening_ends`]).
 pub fn resolve_view_openings(d: &Drawing, view: Id) -> std::result::Result<Vec<RunDetail>, String> {
     wall_view(d, view)?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
@@ -223,14 +240,48 @@ pub fn resolve_view_openings(d: &Drawing, view: Id) -> std::result::Result<Vec<R
     Ok(resolve_opening_details(&graph, &sides, &tags.openings))
 }
 
+/// Which end of each bridge is higher: `Some(true)` when `from` (the a end) is, `Some(false)` when
+/// `to` is, `None` within `TOLERANCE.coincidence_mm` — a vertical view's local y is z.
+pub fn bridge_upper(graph: &WallGraph) -> Vec<Option<bool>> {
+    graph
+        .bridges
+        .iter()
+        .map(|b| {
+            let dz = b.from.y - b.to.y;
+            (dz.abs() > TOLERANCE.coincidence_mm).then_some(dz > 0.0)
+        })
+        .collect()
+}
+
+/// `[a-end, b-end]` opening details per bridge of a vertical `view` (LAMB T505): head and sill
+/// resolve separately. In a plan view, every end is `Untyped`.
+pub fn resolve_view_opening_ends(d: &Drawing, view: Id) -> std::result::Result<Vec<[RunDetail; 2]>, String> {
+    wall_view(d, view)?;
+    let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
+    let (graph, sides) = graph_and_sides(&p, view);
+    let tags = graph_tags(d, view, &graph)?;
+    Ok(resolve_opening_end_details(&graph, &sides, &tags.opening_ends, &bridge_upper(&graph)))
+}
+
 fn resolve_with_tags(d: &Drawing, view: Id) -> std::result::Result<(Vec<RunDetail>, Vec<RunDetail>, ViewTags), String> {
+    resolve_all(d, view).map(|(runs, junctions, _, tags)| (runs, junctions, tags))
+}
+
+/// Runs, junctions, and — in a vertical view only, flattened a-then-b per bridge — opening ends.
+#[allow(clippy::type_complexity)]
+fn resolve_all(d: &Drawing, view: Id) -> std::result::Result<(Vec<RunDetail>, Vec<RunDetail>, Vec<RunDetail>, ViewTags), String> {
     wall_view(d, view)?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let (graph, sides) = graph_and_sides(&p, view);
     let tags = graph_tags(d, view, &graph)?;
     let runs = resolve_edge_details(&graph, &sides, &tags.edges);
     let junctions = resolve_corner_details(&graph, &sides, &tags.corners);
-    Ok((runs, junctions, tags))
+    let ends = if view_direction(d, view) == CutDirection::Vertical {
+        resolve_opening_end_details(&graph, &sides, &tags.opening_ends, &bridge_upper(&graph)).into_iter().flatten().collect()
+    } else {
+        Vec::new()
+    };
+    Ok((runs, junctions, ends, tags))
 }
 
 /// `3 tagged, 7 spread, 2 untyped` — the non-zero kinds, in a fixed order.
@@ -279,13 +330,21 @@ pub(crate) fn detailtags(s: &mut Session, p: &Value) -> Result<Value> {
         Some(v) => id_value(v).ok_or_else(|| other("No such view"))?,
         None => edited_view(s).ok_or_else(|| other("Edit a plan or section view first (EDITVIEW)"))?,
     };
-    let (runs, junctions, tags) = resolve_with_tags(s.doc()?, view).map_err(other)?;
-    let message = report(&runs, &junctions, tags.unattached.len());
+    let (runs, junctions, ends, tags) = resolve_all(s.doc()?, view).map_err(other)?;
+    let mut message = report(&runs, &junctions, tags.unattached.len());
+    if !ends.is_empty() {
+        // A section's opening ends (LAMB T505), before the unattached count.
+        let c = counts(&ends);
+        let part = format!("; {} opening ends: {c}", ends.len());
+        let at = message.find("; ").and_then(|i| message[i + 2..].find("; ").map(|j| i + 2 + j)).unwrap_or(message.len() - 1);
+        message.insert_str(at, &part);
+    }
     s.echo(message.clone());
     Ok(json!({
         "message": message,
         "runs": runs.iter().map(kind_json).collect::<Vec<_>>(),
         "junctions": junctions.iter().map(kind_json).collect::<Vec<_>>(),
+        "openingEnds": ends.iter().map(kind_json).collect::<Vec<_>>(),
         "unattached": tags.unattached.iter().map(|h| format!("{:X}", h.0)).collect::<Vec<_>>(),
     }))
 }
