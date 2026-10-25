@@ -96,7 +96,7 @@
 //!   [`crate::entitycmds`].
 //! - `showlinks {handle?}` (`sl`, typed only, off the menu) and `query {…}` (parameter-only):
 //!   read-only — an edit's link blast radius, and the filter lookup; see [`crate::querycmds`].
-//! - `duplicateview {viewId?, name?}`, `placeview {viewId, kind, …}` (parameter-only),
+//! - `duplicateview {viewId?, name?}`, `placeview {viewId, kind, …}` (interactive: PLACEVIEW / `pv`),
 //!   `unplaceview {viewId?}` and `level {mode, …}` (LAMB ▸ View Setup, LAMB ▸ Levels & Cuts): a view's lifecycle and the level
 //!   cascade — see [`crate::viewlife`].
 //! - `cutline {planViewId, elevation}` (`cl`, LAMB ▸ Levels & Cuts ▸ Cut Line): move a placed plan's cut
@@ -986,9 +986,11 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("query", "Query", crate::querycmds::query)
             .params("{viewId?, layerName?, role?, kind?, closed?, near?: {entityIds?, layerName?, minMm?, maxMm?}, include?: \"geometry\", limit?}")
             .noundo(),
-        CommandSpec::new("placeview", "Place View", crate::viewlife::placeview).params(
-            "{viewId, kind: \"plan\", levelId, cutElevation, transform} | {viewId, kind: \"vertical\", cutLine, hostViewId, transform, intent?}",
-        ),
+        CommandSpec::new("placeview", "Place View", crate::viewlife::placeview)
+            .alias(&["pv"])
+            .params("{viewId, kind: \"plan\", levelId, cutElevation, transform} | {viewId, kind: \"vertical\", cutLine, hostViewId, transform, intent?}")
+            .menu(MENU_VIEW_SETUP)
+            .interactive(crate::viewlife::placeview_machine),
     ]
 }
 
@@ -1046,7 +1048,7 @@ mod tests {
                     "duplicateview",
                 ],
             ),
-            ("View Setup", &["editview", "viewprops", "unplaceview"]),
+            ("View Setup", &["editview", "viewprops", "unplaceview", "placeview"]),
             ("Levels & Cuts", &["level", "levelline", "cutline", "viewhole"]),
             ("Display", &["refpane", "underlay", "panelock", "ucsalign", "ghosthide", "ghostshow"]),
             ("Links", &["link", "unlink"]),

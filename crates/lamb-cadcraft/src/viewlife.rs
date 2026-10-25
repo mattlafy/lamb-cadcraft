@@ -8,8 +8,10 @@
 //!   along) into a new **unplaced** view of the same kind; no links copied. Returns
 //!   `{viewId, entities}`.
 //! - `placeview {viewId, kind:"plan", levelId, cutElevation, transform}` |
-//!   `{viewId, kind:"vertical", cutLine, hostViewId, transform, intent?}` (parameter-only, as the
-//!   TS app has no button for it): placing a floating view as the other kind converts it.
+//!   `{viewId, kind:"vertical", cutLine, hostViewId, transform, intent?}`: placing a floating view
+//!   as the other kind converts it. Interactively (LAMB T506, alias `pv`): name, `Place as
+//!   [Plan/Section/Elevation]`, then a level, cut height and base/target point pairs (translation
+//!   and rotation, no scale), or a cut line clicked in a placed plan plus a base point's elevation.
 //! - `unplaceview {viewId?}`: back to floating, dropping every link with an end on one of the
 //!   view's entities. Returns `{droppedLinks}`.
 //! - `level {mode:"create", name, floorElevationMm, order?}` | `{mode:"rename", levelId, name}` |
@@ -25,9 +27,12 @@
 //! before `doc_mut`, so it records no step.
 
 use cadcraft_doc::{Common, EntityKind, Space};
+use cadcraft_engine::geom::Vec2;
+use cadcraft_engine::prompt::parse_point;
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step, units::parse_distance};
-use lamb_core::geometry::Transform2D;
 use lamb_core::geometry::polyline::Polyline2;
+use lamb_core::geometry::transform2d::local_to_world2;
+use lamb_core::geometry::{Point2, Transform2D};
 use lamb_core::model::{Actor, AnyView, Id, Level, Placement, PlanView, VerticalIntent, VerticalView, authored_field};
 use serde_json::{Value, json};
 
@@ -482,12 +487,337 @@ pub(crate) fn level_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::new(LevelMachine { level: None, step: LevelStep::Option, new_name: String::new() }))
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PvStep {
+    Name,
+    Kind,
+    Level,
+    Height,
+    Base1,
+    Base2,
+    Target1,
+    Target2,
+    Cut1,
+    Cut2,
+    VBase,
+    VElev,
+}
+
+/// PLACEVIEW interactively (LAMB T506, `view-creation-and-placement.md` §4): a floating view's
+/// name, `Place as [Plan/Section/Elevation]`, then for a plan a level, a cut height and one or two
+/// base/target point pairs (targets clicked in a placed plan's tile, or typed global XY after
+/// `Global`), for a section/elevation a cut line clicked in a placed plan plus a base point and its
+/// elevation. The machine computes only [`placeview`]'s parameters.
+struct PlaceViewMachine {
+    step: PvStep,
+    default_name: Option<String>,
+    view: Option<(Id, String)>,
+    kind: &'static str,
+    level: Option<(Id, f64)>,
+    cut: f64,
+    base: Vec<Point2>,
+    target: Vec<Point2>,
+    global: bool,
+    host: Option<Id>,
+    cut_pts: Vec<Point2>,
+    vbase: Point2,
+}
+
+fn p2(v: Vec2) -> Point2 {
+    Point2 { x: v.x, y: v.y }
+}
+
+/// A point input: a click, or typed `x,y`.
+fn point_of(i: &Input) -> Option<Point2> {
+    match i {
+        Input::Point(p) => Some(p2(*p)),
+        Input::Text(t) => parse_point(t, Vec2::new(0.0, 0.0)).map(p2),
+        _ => None,
+    }
+}
+
+/// The edited view when it is a placed plan, with its transform.
+fn edited_placed_plan(s: &Session) -> Option<(Id, Transform2D)> {
+    let id = edited_view(s)?;
+    match doc_of(s).ok()?.views.into_iter().find(|v| v.id() == id)? {
+        AnyView::Plan(PlanView { placement: Some(Placement::Plan { transform, .. }), .. }) => Some((id, transform)),
+        _ => None,
+    }
+}
+
+impl PlaceViewMachine {
+    fn first_level(s: &Session) -> Option<Level> {
+        doc_of(s).ok()?.levels.into_iter().min_by(|a, b| a.order.total_cmp(&b.order))
+    }
+
+    fn apply(&self, s: &mut Session, p: Value) -> Result<Step> {
+        let name = self.view.as_ref().map(|v| v.1.clone()).unwrap_or_default();
+        match placeview(s, &p) {
+            Ok(_) => s.echo(format!("{name} placed")),
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+
+    fn place_plan(&self, s: &mut Session) -> Result<Step> {
+        let (Some((view, _)), Some((level, _)), Some(&b1), Some(&t1)) = (&self.view, self.level, self.base.first(), self.target.first()) else {
+            return Ok(Step::Done);
+        };
+        let rotation = match (self.base.get(1), self.target.get(1)) {
+            (Some(b2), Some(t2)) => (t2.y - t1.y).atan2(t2.x - t1.x) - (b2.y - b1.y).atan2(b2.x - b1.x),
+            _ => 0.0,
+        };
+        let r = local_to_world2(&Transform2D { origin_x: 0.0, origin_y: 0.0, rotation }, b1);
+        let t = json!({ "originX": t1.x - r.x, "originY": t1.y - r.y, "rotation": rotation });
+        self.apply(s, json!({ "viewId": view.0, "kind": "plan", "levelId": level.0, "cutElevation": self.cut, "transform": t }))
+    }
+
+    /// A target point: a click in a placed plan's tile mapped to global XY, or (after `Global`)
+    /// the point as typed. None re-prompts.
+    fn target_of(&mut self, s: &mut Session, i: &Input) -> Option<Point2> {
+        let p = point_of(i)?;
+        if self.global {
+            self.global = false;
+            return Some(p);
+        }
+        match edited_placed_plan(s) {
+            Some((_, t)) => Some(local_to_world2(&t, p)),
+            None => {
+                s.echo("Pick the target in a placed plan");
+                None
+            }
+        }
+    }
+}
+
+impl Interactive for PlaceViewMachine {
+    fn name(&self) -> &'static str {
+        "placeview"
+    }
+    fn prompt(&self, s: &Session) -> Prompt {
+        let with = |p: Prompt, d: Option<String>| match d {
+            Some(d) => p.default(d),
+            None => p,
+        };
+        match self.step {
+            PvStep::Name => with(Prompt::new("Enter floating view name", Accept::TEXT), self.default_name.clone()),
+            PvStep::Kind => Prompt::new("Place as", Accept::TEXT).kw(&["Plan", "Section", "Elevation"]).options_only().default(self.kind),
+            PvStep::Level => with(Prompt::new("Enter level name", Accept::TEXT).kw(&["?"]), Self::first_level(s).map(|l| l.name)),
+            PvStep::Height => {
+                let h = doc_of(s).map_or(0.0, |d| d.defaults.default_cut_height_mm);
+                Prompt::new("Specify cut height above the level", Accept::NUMBER).default(h.to_string())
+            }
+            PvStep::Base1 => Prompt::new("Specify base point", Accept::POINT),
+            PvStep::Base2 => Prompt::new("Specify second base point", Accept::POINT).default("none"),
+            PvStep::Target1 | PvStep::Target2 => {
+                let second = if self.step == PvStep::Target2 { "second " } else { "" };
+                if self.global {
+                    Prompt::new(format!("Specify {second}global target point"), Accept::POINT)
+                } else {
+                    Prompt::new(format!("Specify {second}target point"), Accept::POINT).kw(&["Global"])
+                }
+            }
+            PvStep::Cut1 => Prompt::new("Specify first point of cut line", Accept::POINT),
+            PvStep::Cut2 => Prompt::new("Specify second point of cut line", Accept::POINT),
+            PvStep::VBase => Prompt::new("Specify base point in the view", Accept::POINT).default("0,0"),
+            PvStep::VElev => Prompt::new("Specify its elevation", Accept::NUMBER).default("0"),
+        }
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        let id = edited_view(s);
+        self.default_name = id.and_then(|id| {
+            doc_of(s)
+                .ok()?
+                .views
+                .into_iter()
+                .find(|v| v.id() == id && v.placement().is_none() && !matches!(v, AnyView::Detail(_)))
+                .map(|v| v.name().to_owned())
+        });
+        Ok(Step::Continue)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        match self.step {
+            PvStep::Name => {
+                let name = match (&i, &self.default_name) {
+                    (Input::Enter, None) => None,
+                    (Input::Text(t), None) if t.trim().is_empty() => None,
+                    _ => name_input(i, self.default_name.as_deref().unwrap_or_default()),
+                };
+                let Some(name) = name else {
+                    s.echo("Name a floating view");
+                    return Ok(Step::Continue);
+                };
+                let doc = doc_of(s)?;
+                let refusal = match doc.views.iter().find(|v| v.name() == name) {
+                    None => Some(format!("No such view: {name}")),
+                    Some(AnyView::Detail(_)) => Some("PLACEVIEW does not support detail views".to_owned()),
+                    Some(v) if v.placement().is_some() => Some("View is already placed; use UNPLACEVIEW first".to_owned()),
+                    Some(v) => {
+                        self.kind = kind_word(v);
+                        self.view = Some((v.id(), name.clone()));
+                        None
+                    }
+                };
+                match refusal {
+                    Some(r) => s.echo(r),
+                    None => self.step = PvStep::Kind,
+                }
+                Ok(Step::Continue)
+            }
+            PvStep::Kind => {
+                let picked = match i {
+                    Input::Enter => Some(self.kind.to_owned()),
+                    Input::Text(t) | Input::Keyword(t) => self.prompt(s).match_keyword(&t),
+                    _ => return Ok(Step::Continue),
+                };
+                match picked.as_deref() {
+                    Some("Plan") => {
+                        self.kind = "Plan";
+                        if Self::first_level(s).is_none() {
+                            s.echo("Create a level first (LEVEL)");
+                            return Ok(Step::Done);
+                        }
+                        self.step = PvStep::Level;
+                    }
+                    Some("Section") => {
+                        self.kind = "Section";
+                        self.step = PvStep::Cut1;
+                    }
+                    Some("Elevation") => {
+                        self.kind = "Elevation";
+                        self.step = PvStep::Cut1;
+                    }
+                    _ => return Err(other("Invalid option keyword.")),
+                }
+                Ok(Step::Continue)
+            }
+            PvStep::Level => {
+                let default = Self::first_level(s).map(|l| l.name).unwrap_or_default();
+                let Some(name) = name_input(i, &default) else { return Ok(Step::Continue) };
+                let levels = doc_of(s)?.levels;
+                if name == "?" {
+                    s.echo(levels.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", "));
+                    return Ok(Step::Continue);
+                }
+                match levels.iter().find(|l| l.name == name) {
+                    Some(l) => {
+                        self.level = Some((l.id, l.floor_elevation.value));
+                        self.step = PvStep::Height;
+                    }
+                    None => s.echo(format!("No such level: {name}")),
+                }
+                Ok(Step::Continue)
+            }
+            PvStep::Height => {
+                let h = match i {
+                    Input::Enter => doc_of(s)?.defaults.default_cut_height_mm,
+                    Input::Text(t) | Input::Keyword(t) => parse_distance(&t).filter(|v| v.is_finite()).ok_or_else(|| other("Requires a number."))?,
+                    _ => return Ok(Step::Continue),
+                };
+                self.cut = self.level.map_or(0.0, |l| l.1) + h;
+                self.step = PvStep::Base1;
+                Ok(Step::Continue)
+            }
+            PvStep::Base1 | PvStep::Base2 => {
+                if self.step == PvStep::Base2 && i == Input::Enter {
+                    self.step = PvStep::Target1;
+                    return Ok(Step::Continue);
+                }
+                let Some(p) = point_of(&i) else { return Ok(Step::Continue) };
+                let floating = self.view.as_ref().map(|v| v.0);
+                if matches!(i, Input::Point(_)) && edited_view(s) != floating {
+                    s.echo(format!("Pick the base point in {}", self.view.as_ref().map_or("", |v| v.1.as_str())));
+                    return Ok(Step::Continue);
+                }
+                self.base.push(p);
+                self.step = if self.step == PvStep::Base1 { PvStep::Base2 } else { PvStep::Target1 };
+                Ok(Step::Continue)
+            }
+            PvStep::Target1 | PvStep::Target2 => {
+                if let Input::Text(t) | Input::Keyword(t) = &i
+                    && !self.global
+                    && self.prompt(s).match_keyword(t).as_deref() == Some("Global")
+                {
+                    self.global = true;
+                    return Ok(Step::Continue);
+                }
+                let Some(p) = self.target_of(s, &i) else { return Ok(Step::Continue) };
+                self.target.push(p);
+                if self.step == PvStep::Target1 && self.base.len() == 2 {
+                    self.step = PvStep::Target2;
+                    return Ok(Step::Continue);
+                }
+                self.place_plan(s)
+            }
+            PvStep::Cut1 | PvStep::Cut2 => {
+                let Some(p) = point_of(&i) else { return Ok(Step::Continue) };
+                let host = edited_placed_plan(s).map(|(id, _)| id);
+                if host.is_none() || (self.step == PvStep::Cut2 && host != self.host) {
+                    s.echo("Pick the cut line in a placed plan");
+                    return Ok(Step::Continue);
+                }
+                if self.step == PvStep::Cut2 && self.cut_pts.first().is_some_and(|a| (a.x - p.x).hypot(a.y - p.y) <= 1e-9) {
+                    s.echo("The cut line needs two different points");
+                    return Ok(Step::Continue);
+                }
+                self.host = host;
+                self.cut_pts.push(p);
+                self.step = if self.step == PvStep::Cut1 { PvStep::Cut2 } else { PvStep::VBase };
+                Ok(Step::Continue)
+            }
+            PvStep::VBase => {
+                self.vbase = match i {
+                    Input::Enter => Point2 { x: 0.0, y: 0.0 },
+                    ref i => match point_of(i) {
+                        Some(p) => p,
+                        None => return Ok(Step::Continue),
+                    },
+                };
+                self.step = PvStep::VElev;
+                Ok(Step::Continue)
+            }
+            PvStep::VElev => {
+                let elev = match i {
+                    Input::Enter => 0.0,
+                    Input::Text(t) | Input::Keyword(t) => parse_distance(&t).filter(|v| v.is_finite()).ok_or_else(|| other("Requires a number."))?,
+                    _ => return Ok(Step::Continue),
+                };
+                let (Some((view, _)), Some(host), [a, b]) = (&self.view, self.host, self.cut_pts.as_slice()) else { return Ok(Step::Done) };
+                let cut = json!({ "start": { "x": a.x, "y": a.y }, "segments": [{ "to": { "x": b.x, "y": b.y } }] });
+                let t = json!({ "originX": -self.vbase.x, "originY": elev - self.vbase.y, "rotation": 0.0 });
+                let intent = if self.kind == "Elevation" { "elevation" } else { "section" };
+                self.apply(s, json!({ "viewId": view.0, "kind": "vertical", "cutLine": cut, "hostViewId": host.0, "transform": t, "intent": intent }))
+            }
+        }
+    }
+}
+
+pub(crate) fn placeview_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(PlaceViewMachine {
+        step: PvStep::Name,
+        default_name: None,
+        view: None,
+        kind: "Plan",
+        level: None,
+        cut: 0.0,
+        base: Vec::new(),
+        target: Vec::new(),
+        global: false,
+        host: None,
+        cut_pts: Vec::new(),
+        vbase: Point2 { x: 0.0, y: 0.0 },
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     //! Headless, as the other command modules': the registry is process-global, so every test
     //! installs first.
     use super::*;
-    use crate::commands::install_app;
+    use crate::commands::{enter_space, install_app};
     use crate::import::project_to_drawing;
     use crate::project::DrawingProject;
     use crate::schema::{EntityData, read_entity_data, set_entity_data};
@@ -784,6 +1114,163 @@ mod tests {
         s.execute("editview", &json!({}))?;
         s.start("duplicateview")?;
         assert!(s.running.is_none() && s.log.iter().any(|l| l == "Edit a view first (EDITVIEW)."));
+        Ok(())
+    }
+
+    /// LAMBPROJECT, a placed plan `P` at transform (5000, 2000, 0) on Level 1, and a floating plan
+    /// `F` holding a polyline (0,0)→(1000,300), edited.
+    fn floating_and_placed() -> E<(Session, Id, Id)> {
+        install_app().map_err(|e| e.to_string())?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        s.execute("lambproject", &json!({}))?;
+        let level = read_document(s.doc()?)?.levels.first().ok_or("no level")?.id;
+        let p = Id(s.execute("newplan", &json!({ "name": "P" }))?["viewId"].as_u64().ok_or("no id")?);
+        let t = json!({ "originX": 5000, "originY": 2000, "rotation": 0 });
+        s.execute("placeview", &json!({ "viewId": p.0, "kind": "plan", "levelId": level.0, "cutElevation": 1200, "transform": t }))?;
+        let f = Id(s.execute("newplan", &json!({ "name": "F" }))?["viewId"].as_u64().ok_or("no id")?);
+        let vertices = [(0.0, 0.0), (1000.0, 300.0)]
+            .iter()
+            .map(|&(x, y)| PolyVertex { p: Vec2::new(x, y), bulge: 0.0, start_width: 0.0, end_width: 0.0 })
+            .collect();
+        let kind = EntityKind::LwPolyline(LwPolyline { vertices, closed: false, const_width: 0.0, elevation: 0.0, plinegen: false });
+        s.doc_mut()?.add(&Space::Block(view_block_name(f)), Common { layer: "0".into(), ..Common::default() }, kind)?;
+        s.execute("editview", &json!({ "viewId": f.0 }))?;
+        Ok((s, p, f))
+    }
+
+    fn shown(s: &Session) -> Option<String> {
+        s.current_prompt().map(|p| p.display())
+    }
+
+    fn pt(x: f64, y: f64) -> Input {
+        Input::Point(Vec2::new(x, y))
+    }
+
+    fn plan_transform(s: &Session, id: Id) -> E<Transform2D> {
+        match view_by_id(s, id)? {
+            AnyView::Plan(PlanView { placement: Some(Placement::Plan { transform, .. }), .. }) => Ok(transform),
+            _ => Err("not a placed plan".into()),
+        }
+    }
+
+    #[test]
+    fn placeview_machine_aligns_two_point_pairs_with_the_target_clicked_in_a_placed_plan() -> E<()> {
+        let (mut s, p, f) = floating_and_placed()?;
+        let steps = undo_len(&s)?;
+        s.start("pv")?;
+        assert_eq!(shown(&s).as_deref(), Some("Enter floating view name <F>:"));
+        s.input(Input::Enter)?;
+        assert_eq!(shown(&s).as_deref(), Some("Place as [Plan/Section/Elevation] <Plan>:"));
+        s.input(Input::Enter)?;
+        assert_eq!(shown(&s).as_deref(), Some("Enter level name or [?] <Level 1>:"));
+        s.input(Input::Text("?".into()))?;
+        assert!(s.log.iter().any(|l| l == "Level 1"), "{:?}", s.log);
+        s.input(Input::Enter)?;
+        let height = read_document(s.doc()?)?.defaults.default_cut_height_mm;
+        assert_eq!(shown(&s), Some(format!("Specify cut height above the level <{height}>:")));
+        s.input(Input::Enter)?;
+        s.input(pt(0.0, 0.0))?;
+        assert_eq!(shown(&s).as_deref(), Some("Specify second base point <none>:"));
+        s.input(pt(1000.0, 0.0))?;
+        assert_eq!(shown(&s).as_deref(), Some("Specify target point or [Global]:"));
+        enter_space(&mut s, Space::Block(view_block_name(p)))?;
+        s.input(pt(100.0, 200.0))?;
+        assert_eq!(shown(&s).as_deref(), Some("Specify second target point or [Global]:"));
+        s.input(pt(100.0, 1200.0))?;
+        assert!(s.running.is_none());
+        assert!(s.log.iter().any(|l| l == "F placed"), "{:?}", s.log);
+
+        let t = plan_transform(&s, f)?;
+        assert!((t.rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9, "{t:?}");
+        let (_, _, kind) = block_entities(&s, f)?.into_iter().next().ok_or("no entity")?;
+        let EntityKind::LwPolyline(pl) = kind else { return Err("not a polyline".into()) };
+        let (a, b) = (pl.vertices[0].p, pl.vertices[1].p);
+        let ga = local_to_world2(&t, Point2 { x: a.x, y: a.y });
+        let gb = local_to_world2(&t, Point2 { x: b.x, y: b.y });
+        assert!((ga.x - 5100.0).abs() < 1e-6 && (ga.y - 2200.0).abs() < 1e-6, "{ga:?}");
+        assert!((gb.x - 4800.0).abs() < 1e-6 && (gb.y - 3200.0).abs() < 1e-6, "{gb:?}");
+        let level = read_document(s.doc()?)?.levels[0].clone();
+        assert!(matches!(view_by_id(&s, f)?, AnyView::Plan(PlanView { placement: Some(Placement::Plan { level_id, cut_elevation, .. }), .. })
+            if level_id == level.id && cut_elevation == level.floor_elevation.value + height));
+        assert_eq!(undo_len(&s)?, steps + 1, "one undo step");
+        s.undo()?;
+        assert!(view_by_id(&s, f)?.placement().is_none(), "undo floats it again");
+        Ok(())
+    }
+
+    #[test]
+    fn placeview_machine_global_keyword_translates_only() -> E<()> {
+        let (mut s, _, f) = floating_and_placed()?;
+        s.start("placeview")?;
+        for i in [Input::Enter, Input::Enter, Input::Enter, Input::Text("1000".into())] {
+            s.input(i)?;
+        }
+        s.input(pt(50.0, -20.0))?;
+        s.input(Input::Enter)?;
+        s.input(Input::Text("g".into()))?;
+        assert_eq!(shown(&s).as_deref(), Some("Specify global target point:"));
+        s.input(pt(7000.0, 3000.0))?;
+        assert!(s.running.is_none());
+        assert_eq!(plan_transform(&s, f)?, Transform2D { origin_x: 6950.0, origin_y: 3020.0, rotation: 0.0 });
+        assert!(
+            matches!(view_by_id(&s, f)?, AnyView::Plan(PlanView { placement: Some(Placement::Plan { cut_elevation, .. }), .. }) if cut_elevation == 1000.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn placeview_machine_places_a_floating_plan_as_an_elevation_on_a_cut_line() -> E<()> {
+        let (mut s, p, f) = floating_and_placed()?;
+        s.start("placeview")?;
+        s.input(Input::Enter)?;
+        s.input(Input::Text("e".into()))?;
+        assert_eq!(shown(&s).as_deref(), Some("Specify first point of cut line:"));
+        s.input(pt(0.0, 0.0))?;
+        assert!(s.log.iter().any(|l| l == "Pick the cut line in a placed plan"), "a click in F re-prompts");
+        enter_space(&mut s, Space::Block(view_block_name(p)))?;
+        s.input(pt(0.0, 0.0))?;
+        s.input(pt(4000.0, 0.0))?;
+        assert_eq!(shown(&s).as_deref(), Some("Specify base point in the view <0,0>:"));
+        s.input(Input::Text("0,0".into()))?;
+        assert_eq!(shown(&s).as_deref(), Some("Specify its elevation <0>:"));
+        s.input(Input::Text("3000".into()))?;
+        assert!(s.running.is_none() && s.log.iter().any(|l| l == "F placed"), "{:?}", s.log);
+        let AnyView::Vertical(v) = view_by_id(&s, f)? else { return Err("not vertical".into()) };
+        assert_eq!(v.intent, VerticalIntent::Elevation);
+        let Some(Placement::Vertical { host_view_id, cut_line, .. }) = &v.placement else { return Err("not placed".into()) };
+        assert_eq!((*host_view_id, cut_line.start.x, cut_line.segments[0].to.x), (p, 0.0, 4000.0));
+        let proj = DrawingProject::new(s.doc()?)?;
+        let uz = lamb_core::derivation::projection::vertical_local_to_uz(&proj.view(f).ok_or("no view")?, Point2 { x: 0.0, y: 0.0 });
+        assert_eq!((uz.u, uz.z), (0.0, 3000.0));
+        Ok(())
+    }
+
+    #[test]
+    fn placeview_machine_reprompts_a_target_outside_a_placed_plan_and_esc_records_nothing() -> E<()> {
+        let (mut s, _, f) = floating_and_placed()?;
+        let steps = undo_len(&s)?;
+        s.execute("editview", &json!({}))?;
+        s.start("placeview")?;
+        assert_eq!(shown(&s).as_deref(), Some("Enter floating view name:"));
+        s.input(Input::Enter)?;
+        assert!(s.log.iter().any(|l| l == "Name a floating view"));
+        s.input(Input::Text("P".into()))?;
+        assert!(s.log.iter().any(|l| l == "View is already placed; use UNPLACEVIEW first"), "{:?}", s.log);
+        s.input(Input::Text("F".into()))?;
+        s.execute("editview", &json!({ "viewId": f.0 }))?;
+        for i in [Input::Enter, Input::Enter, Input::Enter] {
+            s.input(i)?;
+        }
+        s.input(pt(0.0, 0.0))?;
+        s.input(Input::Enter)?;
+        s.input(pt(10.0, 10.0))?;
+        assert!(s.log.iter().any(|l| l == "Pick the target in a placed plan"), "{:?}", s.log);
+        assert_eq!(shown(&s).as_deref(), Some("Specify target point or [Global]:"));
+        s.input(Input::Cancel)?;
+        assert!(s.running.is_none());
+        assert!(view_by_id(&s, f)?.placement().is_none());
+        assert_eq!(undo_len(&s)?, steps, "Esc records nothing");
         Ok(())
     }
 }
