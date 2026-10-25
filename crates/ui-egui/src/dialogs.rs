@@ -445,28 +445,30 @@ fn blocks(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
         if names.is_empty() {
             ui.label(crate::tl!("No blocks defined in this drawing."));
         }
-        // At most one preview is built per frame, so a large library opens at once.
-        let mut build = true;
-        for n in &names {
-            let list = if block_preview_ready(app, n) || std::mem::take(&mut build) {
-                block_preview(app, n)
-            } else {
-                ui.ctx().request_repaint();
-                None
-            };
-            let note = if list.is_some() { crate::tl!("Empty") } else { "" };
-            let row = ui
-                .horizontal(|ui| {
-                    crate::bedit::draw_preview(ui, list.as_deref(), note, THUMB);
-                    ui.label(n);
-                })
-                .response
-                .interact(egui::Sense::click())
-                .on_hover_text(crate::tl!("Insert this block"));
-            if row.clicked() {
-                pick = Some(n.clone());
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // At most one preview is built per frame, so a large library opens at once.
+            let mut build = true;
+            for n in &names {
+                let list = if block_preview_ready(app, n) || std::mem::take(&mut build) {
+                    block_preview(app, n)
+                } else {
+                    ui.ctx().request_repaint();
+                    None
+                };
+                let note = if list.is_some() { crate::tl!("Empty") } else { "" };
+                let row = ui
+                    .horizontal(|ui| {
+                        crate::bedit::draw_preview(ui, list.as_deref(), note, THUMB);
+                        ui.label(n);
+                    })
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_text(crate::tl!("Insert this block"));
+                if row.clicked() {
+                    pick = Some(n.clone());
+                }
             }
-        }
+        });
     });
     if let Some(n) = pick {
         insert_block(app, &n);
