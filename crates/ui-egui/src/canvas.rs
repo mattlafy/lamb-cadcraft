@@ -782,6 +782,7 @@ fn draw_grid(app: &CadApp, p: &egui::Painter, xf: &Xf) {
         let major = minor * major_n;
         let mut lines = Vec::new();
         if let Some(((x0, x1), (y0, y1))) = grid_index_ranges(&wb, minor) {
+            // World-aligned lines across the visible box (the painter clips them to the rect).
             for i in x0..=x1 {
                 let x = i as f64 * minor;
                 let is_major = (x / major).round() * major - x == 0.0 || ((x / major) - (x / major).round()).abs() < 1e-6;
