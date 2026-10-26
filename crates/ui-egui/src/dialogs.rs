@@ -437,6 +437,22 @@ fn block_preview_ready(app: &CadApp, name: &str) -> bool {
     app.block_previews.key == Some((st.uid, st.revision)) && app.block_previews.lists.contains_key(&name.to_ascii_uppercase())
 }
 
+/// One row of the Blocks window: block `name`'s thumbnail (`list`; `None` while not built yet)
+/// and its name. The whole row, to the window's edge, is a button named after the block.
+fn block_row(ui: &mut egui::Ui, list: Option<&DisplayList>, name: &str) -> egui::Response {
+    let note = if list.is_some() { crate::tl!("Empty") } else { "" };
+    let row = ui
+        .horizontal(|ui| {
+            crate::bedit::draw_preview(ui, list, note, THUMB);
+            ui.label(name);
+            ui.allocate_space(vec2(ui.available_width(), 0.0));
+        })
+        .response
+        .interact(egui::Sense::click());
+    row.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, row.enabled(), name));
+    row.on_hover_text(crate::tl!("Insert this block"))
+}
+
 /// Blocks window listing named (non-anonymous) blocks; clicking one starts INSERT with that block name already supplied.
 fn blocks(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
     let mut pick = None;
@@ -445,26 +461,18 @@ fn blocks(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
         if names.is_empty() {
             ui.label(crate::tl!("No blocks defined in this drawing."));
         }
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            // At most one preview is built per frame, so a large library opens at once.
+        // Only the rows in view are laid out, and at most one preview is built per frame, so a
+        // large library opens at once.
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, THUMB.y, names.len(), |ui, rows| {
             let mut build = true;
-            for n in &names {
+            for n in rows.filter_map(|k| names.get(k)) {
                 let list = if block_preview_ready(app, n) || std::mem::take(&mut build) {
                     block_preview(app, n)
                 } else {
                     ui.ctx().request_repaint();
                     None
                 };
-                let note = if list.is_some() { crate::tl!("Empty") } else { "" };
-                let row = ui
-                    .horizontal(|ui| {
-                        crate::bedit::draw_preview(ui, list.as_deref(), note, THUMB);
-                        ui.label(n);
-                    })
-                    .response
-                    .interact(egui::Sense::click())
-                    .on_hover_text(crate::tl!("Insert this block"));
-                if row.clicked() {
+                if block_row(ui, list.as_deref(), n).clicked() {
                     pick = Some(n.clone());
                 }
             }
@@ -581,5 +589,21 @@ mod tests {
         assert!(!std::sync::Arc::ptr_eq(&first, &after));
 
         assert!(super::block_preview(&mut app, "Nope").is_none());
+    }
+
+    #[test]
+    fn a_block_row_spans_the_window_width() {
+        let ctx = egui::Context::default();
+        let mut widths = None;
+        let mut out = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))), ..Default::default() },
+            |ui| {
+                let row = super::block_row(ui, None, "Door");
+                widths = Some((row.rect.width(), ui.max_rect().width()));
+            },
+        );
+        out.textures_delta.clear();
+        let (row, available) = widths.expect("the frame ran");
+        assert!((row - available).abs() < 1.0, "row {row} of {available}");
     }
 }
