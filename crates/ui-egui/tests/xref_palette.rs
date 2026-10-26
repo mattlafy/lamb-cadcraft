@@ -42,6 +42,9 @@ fn xref_opens_the_palette_and_its_buttons_manage_the_xref() {
     // Typed (by its alias) it opens the palette instead of listing.
     assert!(app.cmdline("XR").is_none());
     assert!(app.ui.docking.layout.contains(&Panel::ExternalRefs));
+    // Fork (LAMB T510): close the Views / 3D View group so the palette's buttons stay on screen.
+    app.run("ui.dock", json!({"operation":"close","panel":"views"})).unwrap();
+    app.run("ui.dock", json!({"operation":"close","panel":"scene3d"})).unwrap();
     app.ui.in_window_menu = false;
     let mut h = Harness::builder().with_size(vec2(1400.0, 900.0)).build_ui_state(
         |ui, app: &mut CadApp| {
