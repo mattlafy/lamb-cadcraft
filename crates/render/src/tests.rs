@@ -1229,6 +1229,24 @@ fn byblock_child_on_an_unlocked_layer_does_not_inherit_the_fade() {
     assert_eq!(faded(&build(&drawing(Percent(20)), &Space::Model, &on_screen(with_transparency()))), vec![20]);
 }
 
+#[test]
+fn byblock_attribute_on_an_unlocked_layer_does_not_inherit_the_fade() {
+    use cadcraft_doc::Transparency::{ByBlock, Percent};
+    // A ByBlock attribute definition on unlocked layer "Open", in a reference on locked "Locked".
+    for (reference, want) in [(cadcraft_doc::Transparency::ByLayer, 0), (Percent(20), 20)] {
+        let mut d = attributed(
+            Common { layer: "Open".into(), transparency: ByBlock, ..Default::default() },
+            Common { layer: "Locked".into(), transparency: reference, ..Default::default() },
+        );
+        d.layers.push(cadcraft_doc::Layer { name: "Open".into(), ..Default::default() });
+        d.layer_mut("Locked").unwrap().locked = true;
+        let l = build(&d, &Space::Model, &on_screen(with_transparency()));
+        let (line, text) = l.prims.split_first().unwrap();
+        assert_eq!(line.transparency, 50, "the layer-0 line takes the locked reference layer's fade");
+        assert!(!text.is_empty() && text.iter().all(|p| p.transparency == want), "{:?}", faded(&l));
+    }
+}
+
 /// #1434: a closed polyline with a global width narrower than a pixel loses whole sides at
 /// some zooms, while the same polyline with width 0 always shows every side.
 #[test]
