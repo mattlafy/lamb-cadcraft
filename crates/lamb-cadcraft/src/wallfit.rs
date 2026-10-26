@@ -1,8 +1,9 @@
 //! WALLFIT: close a plan's or section's width conflicts by moving a conflicted straight run's faces so the drawn
 //! wall is as thick as its detail. A [`Hold`] chooses which face stays put: the detail's reference
-//! face (the default), the exterior face, the interior face, or the centre (both faces move by half
-//! the delta). A moving face moves along the run's normal toward its own side by
-//! [`WidthConflict::delta`]. A LINE face moves both ends; an LWPOLYLINE face moves its segment's two vertices, so the
+//! face (the default), the exterior face, the interior face, the centre (both faces move by half
+//! the delta), or the grid (T533: a grid-referenced run's grid line stays put and each face moves
+//! onto the laid detail's outermost band on its own side). A moving face moves along the run's
+//! normal toward its own side by [`WidthConflict::delta`] (or, holding the grid, onto its band). A LINE face moves both ends; an LWPOLYLINE face moves its segment's two vertices, so the
 //! neighbouring segments stretch with it (a rectangle stays a rectangle, and two faces sharing a
 //! corner vertex compose). Arc runs carry no conflict yet and are never fitted. Two runs sharing
 //! one face segment (either side of a T) move it once. Every other wall-run face line whose free
@@ -27,8 +28,9 @@ use lamb_core::geometry::{Point2, Polyline2};
 use lamb_core::model::Id;
 use serde_json::{Value, json};
 
-use crate::assembly::{assembly_lines, check_wall_view};
+use crate::assembly::{RunAssembly, assembly_lines, check_wall_view};
 use crate::commands::{id_value, other};
+use crate::detailref::{DetailRefKind, detail_reference};
 use crate::detailtags::{edited_wall_view, graph_and_sides};
 use crate::maintain::write_travelled;
 use crate::project::DrawingProject;
@@ -44,18 +46,22 @@ pub enum Hold {
     Interior,
     /// Both faces move by half the delta.
     Centre,
+    /// The run's grid line holds: each face moves onto the grid-laid detail's outermost band on
+    /// its own side. Every conflicted run in scope needs a grid-referenced detail.
+    Grid,
 }
 
-const HOLD_VALUES: &str = "hold must be reference, exterior, interior or centre";
+const HOLD_VALUES: &str = "hold must be reference, exterior, interior, centre or grid";
 
 impl Hold {
-    /// `reference` / `exterior` / `interior` / `centre`.
+    /// `reference` / `exterior` / `interior` / `centre` / `grid`.
     pub fn name(self) -> &'static str {
         match self {
             Hold::Reference => "reference",
             Hold::Exterior => "exterior",
             Hold::Interior => "interior",
             Hold::Centre => "centre",
+            Hold::Grid => "grid",
         }
     }
 
@@ -65,14 +71,16 @@ impl Hold {
             "exterior" => Ok(Hold::Exterior),
             "interior" => Ok(Hold::Interior),
             "centre" => Ok(Hold::Centre),
-            "grid" => Err("Grid hold is not available yet".to_string()),
+            "grid" => Ok(Hold::Grid),
             _ => Err(HOLD_VALUES.to_string()),
         }
     }
 
     /// The faces that move for conflict `c`, each with the amount it moves toward its own side.
+    /// The grid hold's amounts come from the laid bands instead ([`grid_targets`]); here both faces.
     fn moves(self, c: &WidthConflict) -> Vec<(FaceRef, f64)> {
         let held = match self {
+            Hold::Grid => return vec![(FaceRef::Exterior, 0.0), (FaceRef::Interior, 0.0)],
             Hold::Reference => opposite(c.toward),
             Hold::Exterior => FaceRef::Exterior,
             Hold::Interior => FaceRef::Interior,
@@ -80,6 +88,22 @@ impl Hold {
         };
         vec![(opposite(held), c.delta)]
     }
+}
+
+/// The signed distances from straight centreline `from`-`to`, toward the exterior side
+/// (`outside_left`), of run assembly `r`'s outermost laid bands: (exterior-most, interior-most).
+fn grid_targets(r: &RunAssembly, from: Point2, to: Point2, outside_left: bool) -> Option<(f64, f64)> {
+    let len = (to.x - from.x).hypot(to.y - from.y);
+    let u = Point2 { x: (to.x - from.x) / len, y: (to.y - from.y) / len };
+    let out = if outside_left { Point2 { x: -u.y, y: u.x } } else { Point2 { x: u.y, y: -u.x } };
+    let hs: Vec<f64> = r.lines[..r.bands]
+        .iter()
+        .filter(|l| l.arc.is_none())
+        .map(|l| ((l.from.x + l.to.x) / 2.0 - from.x) * out.x + ((l.from.y + l.to.y) / 2.0 - from.y) * out.y)
+        .collect();
+    let max = hs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min = hs.iter().copied().fold(f64::INFINITY, f64::min);
+    (!hs.is_empty()).then_some((max, min))
 }
 
 fn opposite(f: FaceRef) -> FaceRef {
@@ -278,28 +302,51 @@ fn plan_moves(d: &Drawing, view: Id, only: Option<&[usize]>, hold: Hold) -> Resu
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let (graph, sides) = graph_and_sides(&p, view);
     let mut moves = Vec::new();
+    let grid_refused = |run: usize| format!("run {run}: grid hold needs a grid-referenced detail");
     for r in &runs {
-        let Some(c) = r.conflict else { continue };
         if only.is_some_and(|o| !o.contains(&r.run)) {
             continue;
+        }
+        if hold == Hold::Grid && matches!(r.skipped.as_deref(), Some("no grid line on the run" | "ambiguous grid line")) {
+            return Err(grid_refused(r.run));
+        }
+        let Some(c) = r.conflict else { continue };
+        if hold == Hold::Grid {
+            let kind = match r.detail {
+                Some(detail) => detail_reference(d, detail)?.map(|x| x.kind),
+                None => None,
+            };
+            if kind != Some(DetailRefKind::Grid) {
+                return Err(grid_refused(r.run));
+            }
         }
         let (run, side) = (&graph.runs[r.run], &sides.runs[r.run]);
         let RunCurve::Line { from, to } = run.centreline else { continue };
         let Some(outside_left) = outside_on_left(side) else { continue };
         let (dx, dy) = (to.x - from.x, to.y - from.y);
         let len = dx.hypot(dy);
+        let targets = if hold == Hold::Grid { Some(grid_targets(r, from, to, outside_left).ok_or_else(|| grid_refused(r.run))?) } else { None };
         for (face, amount) in hold.moves(&c) {
             let target_left = outside_left == (face == FaceRef::Exterior);
             let mut found = None;
             for f in &run.faces {
                 let h = Handle(f.from.entity_id.0);
                 let (mx, my) = segment_mid(d, h, f.from.segment_index)?;
-                let left = dx * (my - from.y) - dy * (mx - from.x) > 0.0;
-                if left == target_left {
-                    found = Some((h, f.from.segment_index));
+                let cross = dx * (my - from.y) - dy * (mx - from.x);
+                if (cross > 0.0) == target_left {
+                    found = Some((h, f.from.segment_index, cross.abs() / len));
                 }
             }
-            let Some((handle, segment)) = found else { return Err(format!("run {}: no face on the {} side", r.run, face.name())) };
+            let Some((handle, segment, dist)) = found else { return Err(format!("run {}: no face on the {} side", r.run, face.name())) };
+            // Holding the grid, the face moves from its distance off the centreline onto its band's.
+            let amount = match (targets, face) {
+                (Some((ext, _)), FaceRef::Exterior) => ext - dist,
+                (Some((_, int)), FaceRef::Interior) => -int - dist,
+                (None, _) => amount,
+            };
+            if targets.is_some() && amount.abs() <= TOLERANCE.coincidence_mm {
+                continue;
+            }
             let s = if target_left { 1.0 } else { -1.0 };
             let (nx, ny) = (-dy / len * s, dx / len * s);
             moves.push((r.run, Move { handle, segment, dx: nx * amount, dy: ny * amount }));
@@ -352,7 +399,7 @@ fn plan_moves(d: &Drawing, view: Id, only: Option<&[usize]>, hold: Hold) -> Resu
 }
 
 /// WALLFIT `{viewId, runs?: [index], hold?}`: [`wall_fit_holding`] in one undo step, `hold` one of
-/// `reference` (the default), `exterior`, `interior` or `centre`. Returns `{fitted: [index], hold}`;
+/// `reference` (the default), `exterior`, `interior`, `centre` or `grid`. Returns `{fitted: [index], hold}`;
 /// nothing to fit records no undo step.
 pub fn wallfit(s: &mut Session, p: &Value) -> EngineResult<Value> {
     let plan = p.get("viewId").and_then(id_value).ok_or_else(|| other("No such view"))?;
@@ -385,7 +432,7 @@ pub fn wallfit(s: &mut Session, p: &Value) -> EngineResult<Value> {
 /// conflicted run is fitted. The Hold prompt previews the reference hold's moved face segments.
 struct WallFitM;
 
-const HOLD_WORDS: [&str; 4] = ["Reference", "Exterior", "Interior", "Centre"];
+const HOLD_WORDS: [&str; 5] = ["Reference", "Exterior", "Interior", "Centre", "Grid"];
 
 fn parse_hold_word(t: &str) -> Option<&'static str> {
     let t = t.trim();
@@ -393,6 +440,7 @@ fn parse_hold_word(t: &str) -> Option<&'static str> {
         "Reference" => "reference",
         "Exterior" => "exterior",
         "Interior" => "interior",
+        "Grid" => "grid",
         _ => "centre",
     })
 }
@@ -418,7 +466,7 @@ impl Interactive for WallFitM {
             Input::Text(t) | Input::Keyword(t) => match parse_hold_word(&t) {
                 Some(h) => h,
                 None => {
-                    s.echo("Reference, Exterior, Interior or Centre");
+                    s.echo("Reference, Exterior, Interior, Centre or Grid");
                     return Ok(Step::Continue);
                 }
             },
@@ -581,16 +629,98 @@ mod tests {
     }
 
     #[test]
-    fn wallfit_refuses_grid_and_unknown_holds_without_touching_the_drawing() -> R {
+    fn wallfit_refuses_grid_on_a_face_detail_and_unknown_holds_without_touching_the_drawing() -> R {
         let (mut s, plan) = room_with("exterior_face", true, 210.0)?;
         let before = plines(&s, plan)?;
         let n = undo_len(&s)?;
         let e = s.execute("wallfit", &json!({ "viewId": plan.0, "hold": "grid" })).err().ok_or("grid accepted")?;
-        assert!(e.to_string().contains("Grid hold is not available yet"), "{e}");
+        assert!(e.to_string().contains("grid hold needs a grid-referenced detail"), "{e}");
         let e = s.execute("wallfit", &json!({ "viewId": plan.0, "hold": "sideways" })).err().ok_or("sideways accepted")?;
-        assert!(e.to_string().contains("hold must be reference, exterior, interior or centre"), "{e}");
+        assert!(e.to_string().contains("hold must be reference, exterior, interior, centre or grid"), "{e}");
         assert_eq!(undo_len(&s)?, n);
         assert_eq!(plines(&s, plan)?, before);
+        Ok(())
+    }
+
+    /// `room_with("grid", true, inner)` (detail 220) plus a `datum` LINE 25 mm inside the outer
+    /// face along each of the four walls, or along the bottom wall only.
+    fn grid_room(inner: f64, bottom_only: bool) -> T<(Session, Id)> {
+        use crate::assembly::tests::line;
+        let (mut s, plan) = room_with("grid", true, inner)?;
+        let all =
+            [[[0.0, 25.0], [5000.0, 25.0]], [[0.0, 3975.0], [5000.0, 3975.0]], [[25.0, 0.0], [25.0, 4000.0]], [[4975.0, 0.0], [4975.0, 4000.0]]];
+        for [a, b] in &all[..if bottom_only { 1 } else { 4 }] {
+            let h = line(&mut s, *a, *b)?;
+            s.execute("setrole", &json!({ "handles": [format!("{:X}", h.0)], "role": "datum" }))?;
+        }
+        Ok((s, plan))
+    }
+
+    #[test]
+    fn wallfit_grid_hold_keeps_the_grid_line_and_moves_both_faces_onto_the_outermost_bands() -> R {
+        // Grid 25 mm in: the detail's reference lands on it, so its bands lie 5, 75 and 225 mm in.
+        let (mut s, plan) = grid_room(210.0, false)?;
+        let datum = lines(&s, plan)?;
+        let n = undo_len(&s)?;
+        let r = s.execute("wallfit", &json!({ "viewId": plan.0, "hold": "grid" }))?;
+        assert_eq!(r["fitted"], json!([0, 1, 2, 3]));
+        assert_eq!(r["hold"], json!("grid"));
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert!(conflict_runs(&mut s, plan)?.is_empty());
+        assert_eq!(lines(&s, plan)?, datum, "grid lines unchanged");
+        let pl = plines(&s, plan)?;
+        assert_eq!(pl[0], [(5.0, 5.0), (4995.0, 5.0), (4995.0, 3995.0), (5.0, 3995.0)]);
+        assert_eq!(pl[1], [(225.0, 225.0), (4775.0, 225.0), (4775.0, 3775.0), (225.0, 3775.0)]);
+        // Each fitted run's faces lie on its laid outermost bands.
+        let d = s.doc()?;
+        let p = crate::project::DrawingProject::new(d)?;
+        let (graph, _) = crate::detailtags::graph_and_sides(&p, plan);
+        let tol = lamb_core::geometry::tolerance::TOLERANCE.coincidence_mm;
+        for a in crate::assembly::assembly_lines(d, plan)? {
+            assert!(a.skipped.is_none() && a.conflict.is_none(), "{a:?}");
+            let lamb_core::derivation::walls::RunCurve::Line { from, to } = graph.runs[a.run].centreline else { return Err("arc run".into()) };
+            let horizontal = (from.y - to.y).abs() < 1e-9;
+            let mut offs: Vec<f64> = a.lines[..a.bands].iter().map(|l| if horizontal { l.from.y } else { l.from.x }).collect();
+            offs.sort_by(f64::total_cmp);
+            let (lo, hi) = (offs[0], offs[offs.len() - 1]);
+            let c = if horizontal { from.y } else { from.x };
+            let (want_lo, want_hi) = if c < 2000.0 {
+                (5.0, 225.0)
+            } else if horizontal {
+                (3775.0, 3995.0)
+            } else {
+                (4775.0, 4995.0)
+            };
+            assert!((lo - want_lo).abs() <= tol && (hi - want_hi).abs() <= tol, "run {}: bands {offs:?}", a.run);
+        }
+        s.undo()?;
+        assert_eq!(plines(&s, plan)?[0], [(0.0, 0.0), (5000.0, 0.0), (5000.0, 4000.0), (0.0, 4000.0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn wallfit_grid_hold_refuses_a_grid_detail_run_without_a_grid_line() -> R {
+        let (mut s, plan) = grid_room(210.0, true)?;
+        let before = plines(&s, plan)?;
+        let n = undo_len(&s)?;
+        let e = s.execute("wallfit", &json!({ "viewId": plan.0, "hold": "grid" })).err().ok_or("grid accepted")?;
+        assert!(e.to_string().contains("grid hold needs a grid-referenced detail"), "{e}");
+        assert_eq!(undo_len(&s)?, n);
+        assert_eq!(plines(&s, plan)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn typing_g_at_the_hold_prompt_holds_the_grid() -> R {
+        use cadcraft_engine::Input;
+        let (mut s, plan) = grid_room(210.0, false)?;
+        s.start("wallfit")?;
+        s.input(Input::Text("G".into()))?;
+        assert!(s.running.is_none());
+        let (mut p, plan2) = grid_room(210.0, false)?;
+        p.execute("wallfit", &json!({ "viewId": plan2.0, "hold": "grid" }))?;
+        assert_eq!(plines(&s, plan)?, plines(&p, plan2)?);
+        assert_ne!(plines(&s, plan)?[0][0], (0.0, 0.0), "fitted");
         Ok(())
     }
     #[test]
@@ -599,10 +729,10 @@ mod tests {
         let (mut s, plan) = room_with("exterior_face", true, 210.0)?;
         let n = undo_len(&s)?;
         s.start("wallfit")?;
-        assert_eq!(s.current_prompt().ok_or("no prompt")?.display(), "Hold or [Reference/Exterior/Interior/Centre] <Reference>:");
+        assert_eq!(s.current_prompt().ok_or("no prompt")?.display(), "Hold or [Reference/Exterior/Interior/Centre/Grid] <Reference>:");
         s.input(Input::Text("bogus".into()))?;
         assert!(s.running.is_some(), "re-asks");
-        assert!(s.log.iter().any(|l| l == "Reference, Exterior, Interior or Centre"), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l == "Reference, Exterior, Interior, Centre or Grid"), "{:?}", s.log);
         s.input(Input::Keyword("Exterior".into()))?;
         assert!(s.running.is_none());
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");

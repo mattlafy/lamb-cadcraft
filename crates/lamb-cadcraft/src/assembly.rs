@@ -1068,7 +1068,7 @@ pub(crate) mod tests {
         Ok(d.model.iter().map(|e| e.handle).chain(d.blocks.values().flat_map(|b| b.entities.iter().map(|e| e.handle))).collect())
     }
 
-    fn line(s: &mut Session, a: [f64; 2], b: [f64; 2]) -> T<Handle> {
+    pub(crate) fn line(s: &mut Session, a: [f64; 2], b: [f64; 2]) -> T<Handle> {
         let before = all_handles(s)?;
         s.execute("line", &json!({ "points": [a, b] }))?;
         Ok(all_handles(s)?.into_iter().find(|h| !before.contains(h)).ok_or("line not drawn")?)
