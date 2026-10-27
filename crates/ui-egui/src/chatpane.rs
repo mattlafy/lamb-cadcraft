@@ -311,11 +311,14 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         ui.label(crate::i18n::t("Model"));
         let before = app.chat.model.clone();
         let shown = if app.chat.model.is_empty() { crate::i18n::t("(none)").to_string() } else { app.chat.model.clone() };
-        egui::ComboBox::from_id_salt("cadcraft-chat-model").selected_text(shown).width((ui.available_width() - 44.0).max(60.0)).show_ui(ui, |ui| {
-            for m in app.chat.models.clone() {
-                ui.selectable_value(&mut app.chat.model, m.clone(), m);
-            }
-        });
+        craft_ui::ComboBox::from_id_salt("cadcraft-chat-model").selected_text(shown).width((ui.available_width() - 44.0).max(60.0)).show_ui(
+            ui,
+            |ui| {
+                for m in app.chat.models.clone() {
+                    ui.selectable_value(&mut app.chat.model, m.clone(), m);
+                }
+            },
+        );
         if app.chat.model != before {
             persist(&ctx, MODEL_KEY, &app.chat.model);
         }
