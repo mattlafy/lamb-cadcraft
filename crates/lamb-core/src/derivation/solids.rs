@@ -23,7 +23,8 @@ pub enum SolidForm {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SynthesizedSolid {
-    /// One entity, or a plan entity followed by its linked vertical partners.
+    /// The outline entity, then the entities of its holes (in entity order), then — for a plan
+    /// solid — its linked vertical partners.
     pub entity_ids: Vec<Id>,
     pub provenance: ProvenanceKind,
     /// Planar closed loops, project-global mm, first vertex not repeated.
@@ -55,22 +56,29 @@ pub fn most_doubtful(kinds: &[ProvenanceKind]) -> ProvenanceKind {
 /// Extrude a planar loop along `axis`, offsets measured from the given loop. Bottom cap reversed
 /// so both caps wind outward.
 pub fn prism_from_loop(base_loop: &[Point3], axis: Point3, from: f64, to: f64) -> Vec<Vec<Point3>> {
-    if base_loop.len() < 3 {
+    prism_with_holes(base_loop, &[], base_loop, axis, from, to)
+}
+
+/// [`prism_from_loop`] with holes: side walls round `outer` and round each hole (a hole winding
+/// opposite to `outer`, so its walls face into the void), and caps from `cap` — the outline with
+/// every hole bridged in (`bridge_holes`), or `outer` itself when there are none.
+pub fn prism_with_holes(outer: &[Point3], holes: &[Vec<Point3>], cap: &[Point3], axis: Point3, from: f64, to: f64) -> Vec<Vec<Point3>> {
+    if outer.len() < 3 || cap.len() < 3 {
         return Vec::new();
     }
     let a = normalize3(axis);
-    let bottom: Vec<Point3> = base_loop.iter().map(|&p| add3(p, scale3(a, from))).collect();
-    let top: Vec<Point3> = base_loop.iter().map(|&p| add3(p, scale3(a, to))).collect();
-
-    let n = base_loop.len();
-    let mut faces: Vec<Vec<Point3>> = (0..n)
-        .map(|i| {
+    let lift = |lp: &[Point3], by: f64| lp.iter().map(|&p| add3(p, scale3(a, by))).collect::<Vec<_>>();
+    let mut faces = Vec::new();
+    for lp in std::iter::once(outer).chain(holes.iter().map(Vec::as_slice)).filter(|lp| lp.len() >= 3) {
+        let (bottom, top) = (lift(lp, from), lift(lp, to));
+        let n = lp.len();
+        faces.extend((0..n).map(|i| {
             let j = (i + 1) % n;
             vec![bottom[i], bottom[j], top[j], top[i]]
-        })
-        .collect();
-    faces.push(bottom.iter().rev().copied().collect());
-    faces.push(top);
+        }));
+    }
+    faces.push(lift(cap, from).into_iter().rev().collect());
+    faces.push(lift(cap, to));
     faces
 }
 
@@ -82,13 +90,28 @@ pub struct VerticalPrism {
 }
 
 /// A closed shape drawn in a placed vertical view, extruded symmetrically about its cut plane along
-/// the (unflipped) gaze direction.
-pub fn vertical_prism(view: &ViewRef<'_>, host_view: &ViewRef<'_>, loop_local: &[Point2], depth_mm: f64) -> Result<VerticalPrism, String> {
+/// the (unflipped) gaze direction. `holes` and `cap` are as [`prism_with_holes`] takes them, in the
+/// view's local space; `cap` is ignored when there are no holes.
+pub fn vertical_prism(
+    view: &ViewRef<'_>,
+    host_view: &ViewRef<'_>,
+    loop_local: &[Point2],
+    holes: &[Vec<Point2>],
+    cap: &[Point2],
+    depth_mm: f64,
+) -> Result<VerticalPrism, String> {
     let basis = vertical_basis(view, host_view)?;
     let gaze = vertical_gaze_dir(basis.c_hat, false);
     let axis = Point3 { x: gaze.x, y: gaze.y, z: 0.0 };
-    let base_loop = loop_local.iter().map(|&p| vertical_local_to_global3(view, host_view, p)).collect::<Result<Vec<_>, _>>()?;
-    Ok(VerticalPrism { faces: prism_from_loop(&base_loop, axis, -depth_mm / 2.0, depth_mm / 2.0), base_loop, axis })
+    let to3 = |lp: &[Point2]| lp.iter().map(|&p| vertical_local_to_global3(view, host_view, p)).collect::<Result<Vec<_>, _>>();
+    let base_loop = to3(loop_local)?;
+    let faces = if holes.is_empty() {
+        prism_from_loop(&base_loop, axis, -depth_mm / 2.0, depth_mm / 2.0)
+    } else {
+        let holes3 = holes.iter().map(|h| to3(h)).collect::<Result<Vec<_>, _>>()?;
+        prism_with_holes(&base_loop, &holes3, &to3(cap)?, axis, -depth_mm / 2.0, depth_mm / 2.0)
+    };
+    Ok(VerticalPrism { faces, base_loop, axis })
 }
 
 /// Newell's method: a planar loop's normal, robust to collinear vertices.

@@ -27,7 +27,7 @@ use super::walls::RunCurve;
 use crate::geometry::Point2;
 use crate::geometry::point::{angle_of2, cross2, dist2, dot2, scale2, sub2};
 use crate::geometry::tolerance::TOLERANCE;
-use crate::geometry::triangulate::polygon_area_signed;
+use crate::geometry::triangulate::{point_in_loop, polygon_area_signed};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideKind {
@@ -133,22 +133,6 @@ fn centreline_points(c: &RunCurve) -> Vec<Point2> {
                 .collect()
         }
     }
-}
-
-/// Even–odd containment of `p` in the closed loop `poly`.
-fn contains(poly: &[Point2], p: Point2) -> bool {
-    let n = poly.len();
-    let mut inside = false;
-    for i in 0..n {
-        let (a, b) = (poly[i], poly[(i + 1) % n]);
-        if (a.y > p.y) != (b.y > p.y) {
-            let x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
-            if p.x < x {
-                inside = !inside;
-            }
-        }
-    }
-    inside
 }
 
 struct HalfEdge {
@@ -293,7 +277,7 @@ pub fn wall_sides(p: &impl ProjectRead, graph: &WallGraph, params: &SideParams) 
     // Outside pick points: the smallest remaining space containing each.
     for &pt in &params.outside_points {
         let hit = (0..faces.len())
-            .filter(|&f| !outside[f] && contains(&faces[f].poly, pt))
+            .filter(|&f| !outside[f] && point_in_loop(&faces[f].poly, pt))
             .min_by(|&a, &b| cmp_f64(faces[a].area, faces[b].area).then(a.cmp(&b)));
         if let Some(f) = hit {
             outside[f] = true;

@@ -629,7 +629,7 @@ pub(crate) mod tests {
         let (mut s, plan) = placed(true)?;
         let before = scene(s.doc()?)?;
         let solids: Vec<_> = before.meshes.iter().filter(|m| m.kind == SceneMeshKind::Solid).collect();
-        assert_eq!(solids.len(), 2, "the two room plines derive solids");
+        assert_eq!(solids.len(), 1, "the two room plines derive one wall-ring solid (even/odd nesting)");
         let zr = |ms: &[&crate::scene::SceneMesh], sc: &crate::scene::Scene| {
             let z = ms.iter().flat_map(|m| m.positions.iter()).map(|p| sc.origin[2] + f64::from(p[2]));
             (z.clone().fold(f64::INFINITY, f64::min), z.fold(f64::NEG_INFINITY, f64::max))
@@ -731,7 +731,7 @@ pub(crate) mod tests {
         assert_eq!(layers.len(), 9, "three laid runs");
         assert!(layers.iter().all(|st| *st == Some(ConstructionState::Resolved)), "{layers:?}");
         let solids = states(&sc, SceneMeshKind::Solid);
-        assert_eq!(solids, [Some(ConstructionState::Massing); 2], "both plines survive partly layered");
+        assert_eq!(solids, [Some(ConstructionState::Massing)], "the plines' wall ring survives partly layered");
         assert!(states(&sc, SceneMeshKind::Surface).iter().all(|st| *st == Some(ConstructionState::Massing)));
         Ok(())
     }
@@ -757,7 +757,7 @@ pub(crate) mod tests {
         assert_eq!(skipped, ["conflict", "untyped", "untyped", "untyped"]);
         let sc = scene(s.doc()?)?;
         assert!(states(&sc, SceneMeshKind::Layer).is_empty());
-        assert_eq!(states(&sc, SceneMeshKind::Solid), [Some(ConstructionState::DetailConflicted); 2]);
+        assert_eq!(states(&sc, SceneMeshKind::Solid), [Some(ConstructionState::DetailConflicted)]);
 
         // A 210 wall under a 200 detail: every run laid with a width conflict.
         let (mut s, plan) = crate::assembly::tests::room_with("exterior_face", true, 210.0)?;
