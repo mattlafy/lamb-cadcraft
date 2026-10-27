@@ -66,13 +66,6 @@ const CUT_LINE: IconDef = &[
 // Links.
 const LINK: IconDef = &[b(Circle(9.0, 12.0, 5.5)), a(Circle(15.0, 12.0, 5.5))];
 const UNLINK: IconDef = &[b(Circle(6.5, 12.0, 4.5)), b(Circle(17.5, 12.0, 4.5)), a(Line(&[(10.0, 21.0), (14.0, 3.0)]))];
-const SHOW_LINKS: IconDef = &[
-    b(Circle(9.0, 15.0, 5.0)),
-    b(Circle(15.0, 15.0, 5.0)),
-    a(Line(&[(12.0, 2.0), (12.0, 6.0)])),
-    a(Line(&[(4.0, 4.0), (6.5, 7.0)])),
-    a(Line(&[(20.0, 4.0), (17.5, 7.0)])),
-];
 const RESOLVE: IconDef = &[b(Circle(6.0, 9.0, 4.0)), b(Circle(12.0, 9.0, 4.0)), a(Line(&[(11.0, 17.0), (14.5, 21.0), (22.0, 12.0)]))];
 const ACCEPT: IconDef = &[
     b(Line(&[(2.0, 18.0), (5.0, 15.0)])),
@@ -171,12 +164,6 @@ const STUD_MOVE: IconDef = &[
 // Project.
 const FOLDER: &[(f32, f32)] = &[(2.0, 5.0), (9.0, 5.0), (11.0, 7.0), (22.0, 7.0), (22.0, 20.0), (2.0, 20.0)];
 const START_PROJECT: IconDef = &[b(Loop(FOLDER)), a(Line(&[(12.0, 10.0), (12.0, 17.0)])), a(Line(&[(8.5, 13.5), (15.5, 13.5)]))];
-const OPEN_PROJECT: IconDef = &[b(Loop(FOLDER)), a(Line(&[(8.0, 17.0), (16.0, 11.0)])), a(Line(&[(12.0, 11.0), (16.0, 11.0), (16.0, 15.0)]))];
-const SAVE_PROJECT: IconDef = &[
-    b(Loop(&[(3.0, 3.0), (18.0, 3.0), (21.0, 6.0), (21.0, 21.0), (3.0, 21.0)])),
-    b(Loop(&[(7.0, 3.0), (16.0, 3.0), (16.0, 9.0), (7.0, 9.0)])),
-    a(Loop(&[(7.0, 14.0), (17.0, 14.0), (17.0, 21.0), (7.0, 21.0)])),
-];
 const DXF_IMPORT: IconDef = &[
     b(Loop(&[(6.0, 2.0), (16.0, 2.0), (20.0, 6.0), (20.0, 22.0), (6.0, 22.0)])),
     a(Line(&[(1.0, 14.0), (12.0, 14.0)])),
@@ -213,12 +200,7 @@ pub const LAMB_TAB: ExtTab = ExtTab {
         },
         ExtGroup {
             name: "Links",
-            large: &[
-                tool(LINK, "link", "Link"),
-                tool(UNLINK, "unlink", "Unlink"),
-                tool(SHOW_LINKS, "showlinks", "Show Links"),
-                tool(RESOLVE, "resolve", "Review Issues"),
-            ],
+            large: &[tool(LINK, "link", "Link"), tool(UNLINK, "unlink", "Unlink"), tool(RESOLVE, "resolve", "Review Issues")],
             small: &[
                 tool(ACCEPT, "accept", "Accept AI Line"),
                 tool(SET_ROLE, "setrole", "Set Role"),
@@ -255,11 +237,7 @@ pub const LAMB_TAB: ExtTab = ExtTab {
         },
         ExtGroup {
             name: "Project",
-            large: &[
-                tool(START_PROJECT, "lambproject", "Start Project"),
-                tool(OPEN_PROJECT, "lambopen", "Import TS-app Project"),
-                tool(SAVE_PROJECT, "lambsave", "Export TS-app Project"),
-            ],
+            large: &[tool(START_PROJECT, "lambproject", "Start Project")],
             small: &[tool(DXF_IMPORT, "dxfimport", "Import DXF as View"), tool(NEW_SHEET, "newsheet", "New Sheet")],
         },
     ],
@@ -300,6 +278,13 @@ mod tests {
         }
         for g in LAMB_TAB.groups {
             assert!(g.large.len() <= 4, "{}", g.name);
+        }
+    }
+
+    #[test]
+    fn typed_only_commands_stay_off_the_lamb_tab() {
+        for t in tools() {
+            assert!(!["showlinks", "lambopen", "lambsave"].contains(&t.command), "{} is typed-only", t.command);
         }
     }
 
