@@ -63,7 +63,7 @@ use crate::project::DrawingProject;
 use crate::schema::{SchemaError, read_document, read_entity_data, set_entity_data, write_document};
 
 /// What [`maintain_links`] changed, as link ids.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MaintenanceReport {
     /// Links removed because an anchored entity was erased.
     pub dropped: Vec<Id>,
@@ -81,6 +81,10 @@ pub struct MaintenanceReport {
     pub stamped: Vec<Id>,
     /// Entities (not links) moved to the new layer of a relayered entity in their automatic-link component.
     pub relayered: Vec<Id>,
+    /// Travelled partners (not links) whose neighbours could not absorb the whole move, with the
+    /// unachieved length in mm (`selection-and-link-editing.md` §4b: reported, not approximated).
+    /// The partial slide is still applied; this alone changes nothing.
+    pub unreachable: Vec<(Id, f64)>,
 }
 
 impl MaintenanceReport {
@@ -93,6 +97,16 @@ impl MaintenanceReport {
             && self.reanchored.is_empty()
             && self.stamped.is_empty()
             && self.relayered.is_empty()
+    }
+
+    /// One echo line per [`Self::unreachable`] entry.
+    pub fn unreachable_lines(&self) -> Vec<String> {
+        self.unreachable
+            .iter()
+            .map(|(id, len)| {
+                format!("LAMB: {len:.0} mm of the move could not travel to entity {} (its neighbours cannot absorb it)", Handle(id.0).hex())
+            })
+            .collect()
     }
 }
 
@@ -145,12 +159,10 @@ fn rigid_delta(before: &Polyline2, after: &Polyline2, index: usize) -> Option<Po
 /// slides the partner by `travel_segment_move` and writes its new geometry into `after` (keeping
 /// the entity's handle, layer and `ext`). Each partner travels at most once, first link in
 /// `doc.links` order; nothing cascades — the partner's other links are left to step 2's re-check.
-/// A partial slide (`unreachable`) is still applied; step 2 drops the link if the lines no longer cross.
-///
-/// Known limitation, TS parity: an oblique segment slid along its own direction is a translation
-/// whose crossing does not move, yet travel shifts the partner by the delta's component along the
-/// cut; step 2 then drops that link.
-fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -> Result<Vec<Id>, SchemaError> {
+/// A partial slide (`unreachable`) is still applied, and returned with its unachieved length in mm;
+/// step 2 drops the link if the lines no longer cross.
+fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -> Result<(Vec<Id>, Vec<(Id, f64)>), SchemaError> {
+    let mut unreachable: Vec<(Id, f64)> = Vec::new();
     let writes: Vec<(Id, Polyline2)> = {
         let p = DrawingProject::new(after)?;
         let after_entities = entity_map(&p);
@@ -172,7 +184,16 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -
                 }
                 let Some(d) = rigid_delta(bp, ap, mine.segment_index) else { continue };
                 let Some(t) = travel_segment_move(&p, link, mine, d).map_err(derivation_error)? else { continue };
-                if t.entity_id == other.entity_id && &t.geometry != op_after {
+                if t.entity_id != other.entity_id {
+                    continue;
+                }
+                if let Some(u) = t.unreachable {
+                    let len = u.x.hypot(u.y);
+                    if len > TOLERANCE.coincidence_mm {
+                        unreachable.push((t.entity_id, len));
+                    }
+                }
+                if &t.geometry != op_after {
                     writes.push((t.entity_id, t.geometry));
                 }
             }
@@ -180,7 +201,7 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -
         writes
     };
     write_travelled(after, &writes)?;
-    Ok(writes.into_iter().map(|(id, _)| id).collect())
+    Ok((writes.into_iter().map(|(id, _)| id).collect(), unreachable))
 }
 
 /// Writes each travelled partner's new geometry into `after`, keeping the entity's handle, layer
@@ -346,7 +367,7 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
     drop(before_project);
 
     // 0: travel, before anything reads `after`.
-    report.travelled = travel(&before_entities, after, travel_set)?;
+    (report.travelled, report.unreachable) = travel(&before_entities, after, travel_set)?;
     // 0b: re-anchor ends whose entity was replaced by pieces, before step 1 would drop them.
     report.reanchored = reanchor(&before_entities, after)?;
     // 0d: vertex inserts, removals and reversals on the same handle keep anchors on their segments.
@@ -445,12 +466,16 @@ pub fn link_observer(s: &mut Session, before: &Arc<Drawing>) {
     let mut after = current.clone();
     let travel_set: Vec<Id> = s.travel().into_iter().map(Id).collect();
     match maintain_links(before, &mut after, &now(), &travel_set) {
-        Ok(report) if !report.is_empty() => {
-            if let Ok(d) = s.doc_mut() {
+        Ok(report) => {
+            for line in report.unreachable_lines() {
+                s.echo(line);
+            }
+            if !report.is_empty()
+                && let Ok(d) = s.doc_mut()
+            {
                 *d = after;
             }
         }
-        Ok(_) => {}
         Err(e) => s.echo(format!("LAMB link maintenance: {e}")),
     }
 }

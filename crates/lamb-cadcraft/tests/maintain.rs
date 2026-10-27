@@ -983,3 +983,89 @@ fn a_disagreeing_or_unlinked_layer_change_relayers_nothing() -> R {
     }
     Ok(())
 }
+
+/// LAMB T541's fixture: a one-segment plan wall `wall` linked to segment 1 of the section face
+/// `face`, the section's cut line along global +X at y = 0 with an identity transform (local x = u).
+fn wall_and_face(wall: [[f64; 2]; 2], face: &[[f64; 2]]) -> Result<Drawing, Box<dyn std::error::Error>> {
+    let poly = |pts: &[[f64; 2]]| {
+        json!({"kind": "polyline", "geometry": {"closed": false, "start": {"x": pts[0][0], "y": pts[0][1]},
+            "segments": pts[1..].iter().map(|p| json!({"bulge": 0, "to": {"x": p[0], "y": p[1]}})).collect::<Vec<_>>()}})
+    };
+    let ident = json!({"originX": 0, "originY": 0, "rotation": 0});
+    let project: Project = serde_json::from_value(json!({
+        "commandLog": [], "name": "T541", "patterns": {}, "schemaVersion": 3,
+        "levels": [],
+        "defaults": {"defaultCutHeightMm": 1000, "defaultFloorToFloorMm": 3000, "defaultSurfaceDepthMm": 2700,
+            "defaultSurfaceHeightMm": 2700, "dimTextHeightPaperMm": 3, "plotScale": 50, "units": "mm"},
+        "layers": [{"color": "#d0d0d0", "defaultRole": "cut", "id": "layer-0", "lineweight": 0.25, "locked": false, "name": "0", "visible": true}],
+        "links": [{"a": {"entityId": 11, "segmentIndex": 0, "segmentParam": 0.5}, "b": {"entityId": 21, "segmentIndex": 1, "segmentParam": 0.5},
+            "createdAt": "2026-01-01T00:00:00.000Z", "createdBy": {"kind": "user", "userId": "t"}, "id": 31, "origin": "automatic"}],
+        "views": [
+            {"id": 1, "kind": "plan", "name": "plan", "entities": [{"id": 11, "layerId": "layer-0", "role": "cut", "viewId": 1, "geometry": poly(&wall)}],
+             "placement": {"kind": "plan", "cutElevation": 1200, "levelId": 41, "transform": ident}},
+            {"id": 2, "kind": "vertical", "intent": "section", "name": "sec", "entities": [{"id": 21, "layerId": "layer-0", "role": "cut", "viewId": 2, "geometry": poly(face)}],
+             "placement": {"kind": "vertical", "hostViewId": 1, "transform": ident,
+                "cutLine": {"closed": false, "start": {"x": 0, "y": 0}, "segments": [{"bulge": 0, "to": {"x": 10000, "y": 0}}]}}}
+        ]
+    }))?;
+    Ok(project_to_drawing(&project)?.0)
+}
+
+/// The fixture's one link, its plan entity and plan view.
+fn wall_link(d: &Drawing) -> Result<(LinkRecord, Id, Id), Box<dyn std::error::Error>> {
+    let link = read_document(d)?.links.into_iter().next().ok_or("no link")?;
+    let plan_e = if is_plan(d, view_of(d, link.a.entity_id)?)? { link.a.entity_id } else { link.b.entity_id };
+    Ok((link, plan_e, view_of(d, plan_e)?))
+}
+
+/// LAMB T541: a 45° plan wall moved along its own direction keeps its section crossing, so its
+/// travelled link survives (the crossing shift is (d·n)/(c·n), not d·c).
+#[test]
+fn an_oblique_wall_slid_along_itself_keeps_its_link() -> R {
+    register();
+    // The face's crossing segment holds the wall's section marker (u = 5000, z = the 1200 cut) at
+    // its link parameter, so the link holds from the section side whatever the wall's own anchor does.
+    let d = wall_and_face([[0.0, -5000.0], [10000.0, 5000.0]], &[[4000.0, 0.0], [5000.0, 0.0], [5000.0, 2400.0], [6000.0, 2400.0]])?;
+    let (link, plan_e, plan_view) = wall_link(&d)?;
+    {
+        let p = DrawingProject::new(&d)?;
+        assert!(link_still_coincides(&p, &link)?, "the fixture's link holds");
+    }
+    let k = 100.0 / 2f64.sqrt();
+    let (after, report) = raw_report(&d, plan_view, "move", &json!({"handles": [hex(plan_e)], "delta": [k, k]}), &[link.id])?;
+    assert!(report.separated.is_empty() && report.unreachable.is_empty(), "{report:?}");
+    assert!(read_document(&after)?.links.iter().any(|l| l.id == link.id), "the link survives");
+    // Along its normal: the section line follows 100·√2 and the link still holds.
+    let (after, report) = raw_report(&d, plan_view, "move", &json!({"handles": [hex(plan_e)], "delta": [-k, k]}), &[link.id])?;
+    assert!(report.separated.is_empty() && report.travelled.len() == 1, "{report:?}");
+    let sec_e = report.travelled[0];
+    let x = resolved_segments(&poly(&after, sec_e)?)[1].from.x;
+    assert!((x - (5000.0 - 100.0 * 2f64.sqrt())).abs() < 0.1, "{x}");
+    Ok(())
+}
+
+/// LAMB T541: a section partner whose crossing segment continues straight into its neighbour
+/// cannot absorb a move across them; the partial slide is applied and the unreachable length is
+/// reported and echoed.
+#[test]
+fn an_unreachable_travel_is_reported_and_echoed() -> R {
+    register();
+    let d = wall_and_face([[5000.0, -5000.0], [5000.0, 5000.0]], &[[5000.0, 0.0], [5000.0, 1000.0], [5000.0, 3000.0], [6000.0, 3000.0]])?;
+    let (link, plan_e, plan_view) = wall_link(&d)?;
+    let mv = json!({"handles": [hex(plan_e)], "delta": [100, 0]});
+    let (_, report) = raw_report(&d, plan_view, "move", &mv, &[link.id])?;
+    assert_eq!(report.unreachable.len(), 1, "{report:?}");
+    let sec_e = if link.a.entity_id == plan_e { link.b.entity_id } else { link.a.entity_id };
+    assert_eq!(report.unreachable[0].0, sec_e);
+    assert!(close(report.unreachable[0].1, 100.0), "{report:?}");
+
+    let mut s = Session::new();
+    s.open_drawing(d, "t541", None);
+    install_link_maintenance(&mut s);
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    s.set_travel(vec![link.id.0]);
+    s.execute("move", &mv)?;
+    let line = format!("LAMB: 100 mm of the move could not travel to entity {} (its neighbours cannot absorb it)", hex(sec_e));
+    assert!(s.log.contains(&line), "{:?}", s.log);
+    Ok(())
+}
