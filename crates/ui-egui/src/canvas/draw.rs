@@ -1,5 +1,5 @@
 use super::list::preview_options;
-use super::*;
+use super::{Bounds2, CanvasState, Color32, DisplayList, Handle, Kind, ListKey, Mat3, Pos2, Rect, Rgb, Shape, SnapHit, Stroke, Vec2, Xf, vec2};
 
 fn color32(c: Rgb) -> Color32 {
     Color32::from_rgb(c.0, c.1, c.2)
@@ -442,6 +442,7 @@ pub(super) fn track_press(
 #[cfg(test)]
 mod highlight_stability_tests {
     use super::*;
+    use egui::pos2;
 
     fn frame(list: &DisplayList, look: Look, pointer: Pos2) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();

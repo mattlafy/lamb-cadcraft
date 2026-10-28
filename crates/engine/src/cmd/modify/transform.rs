@@ -1,4 +1,6 @@
-use super::*;
+use super::{
+    Entity, EntityKind, Handle, HashMap, Mat3, Result, Session, Value, Vec2, bad, bool_or, f64_req, hatch, json, point_param, point_req, targets,
+};
 
 // ---------------- core operations ----------------
 

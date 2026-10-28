@@ -304,6 +304,7 @@ pub fn param_along_edge(p0: Point2, p1: Point2, bulge: f64, point: Point2) -> f6
 /// The single point BOTH picked edges should meet at, from the apparent-intersection candidates
 /// `pts`. One candidate wins outright; with two, each edge picks whichever is nearer its own click
 /// (along `param_along_edge`), and disagreement is `None`.
+#[allow(clippy::too_many_arguments)]
 pub fn choose_shared_corner(
     pts: &[Point2],
     p0_a: Point2,

@@ -1,4 +1,4 @@
-use super::*;
+use super::{Bounds2, Deserialize, Serialize, Vec2};
 
 /// A 2D view of a space: world centre and visible height in drawing units, and the view twist
 /// (VIEWTWIST, DVIEW TWist): how far the view is turned on screen, in radians counterclockwise

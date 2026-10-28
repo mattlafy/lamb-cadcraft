@@ -291,6 +291,43 @@ fn visible_tabs(widths: &[f32], active: Option<usize>, room: f32) -> std::ops::R
     start..active + 1
 }
 
+fn draw_status_toggles(
+    app: &mut CadApp,
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    t: Tokens,
+    toggles: &[(Icon, bool, &str, &str)],
+    layout: (Rect, f32, f32),
+) {
+    let (rect, mut rx, size) = layout;
+    let mut toggle_cmd = None;
+    for &(icon, on, cmd, tip) in toggles {
+        let br = Rect::from_min_size(pos2(rx, rect.center().y - size / 2.0), vec2(size, size));
+        let resp = ui.interact(br, ui.scope_id().with(("tg", tip)), Sense::click());
+        if on {
+            painter.rect_filled(br, 3.0, t.toggle_on.gamma_multiply(0.35));
+        } else if resp.hovered() {
+            painter.rect_filled(br, 3.0, t.control_hover.gamma_multiply(0.5));
+        }
+        icons::paint(painter, br.shrink(2.5), icon, false);
+        if on {
+            // Re-tint the icon blue-ish by an underline.
+            painter.hline(br.x_range().shrink(4.0), br.bottom() - 1.0, Stroke::new(1.5, t.toggle_on));
+        }
+        icons::describe_control(ui, &resp, tip, Some(on), false);
+        if resp.on_hover_text(crate::i18n::t(tip)).clicked() {
+            toggle_cmd = Some(cmd);
+        }
+        rx += size + 4.0;
+    }
+    // The toggles don't cancel the active command (#1108); the dialog buttons start theirs.
+    match toggle_cmd {
+        Some(c) if c.starts_with("ui.") => app.start(c),
+        Some(c) => crate::menus::run_transparent(app, c),
+        None => {}
+    }
+}
+
 /// Status bar: layout tabs follow the left-hand layout actions, independent of palette docking.
 /// Coordinates and drafting toggles remain on the right.
 pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
@@ -344,7 +381,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             (Icon::Gear, false, "ui.dialog.dsettings", "Drafting Settings"),
         ];
         let size = 20.0;
-        let mut rx = r.right() - 8.0 - toggles.len() as f32 * (size + 4.0);
+        let rx = r.right() - 8.0 - toggles.len() as f32 * (size + 4.0);
         // Coordinates.
         let coord = app.canvas.cursor.map(|c| {
             let (lu, lp) = app.session.doc().map(|d| (d.header.i64("LUNITS", 2), d.header.i64("LUPREC", 4))).unwrap_or((2, 4));
@@ -400,7 +437,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         let layouts = widths.get(1..).unwrap_or_default();
         // Fork (LAMB T525): the registered views, behind an icon right of the Model tab.
         let views = view_choices(crate::viewlist::rows(app));
-        let views_w = if views.is_empty() { 0.0 } else { 22.0 };
+        let views_w = views_width(&views);
         let room = limit - x - widths.first().copied().unwrap_or(0.0) - 22.0 - views_w;
         let active_layout = active_tab.and_then(|a| a.checked_sub(1));
         let mut shown = visible_tabs(layouts, active_layout, room);
@@ -434,14 +471,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             crate::shortcut_menus::attach(app, &resp, |app| crate::shortcut_menus::layout_tab_entries(app, name));
             x += w + 2.0;
             if i == 0 && !views.is_empty() {
-                let vr = Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(16.0, 16.0));
-                let vresp = ui.interact(vr, ui.scope_id().with("lamb_views"), Sense::click());
-                if vresp.hovered() {
-                    p.rect_filled(vr, 3.0, t.control_hover.gamma_multiply(0.5));
-                }
-                icons::paint(&p, vr.shrink(2.0), Icon::List, false);
-                icons::describe_control(ui, &vresp, "Views", None, false);
-                views_button = Some(vresp.on_hover_text(crate::tl!("Views")));
+                views_button = Some(views_tab_button(ui, &p, pos2(x, r.top() + 5.0)));
                 x += 22.0;
             }
             if i == 0 {
@@ -482,16 +512,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
                 });
             });
         }
-        if let Some(resp) = &views_button {
-            let chosen = egui::Popup::from_toggle_button_response(resp)
-                .width(200.0)
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .show(|ui| view_list_popup(ui, &views))
-                .and_then(|r| r.inner);
-            if let Some((id, params)) = chosen {
-                let _ = app.run(&id, params);
-            }
-        }
+        run_view_choice(app, views_button.as_ref(), &views);
         if let Some(n) = switch {
             let _ = app.run("layout.set", json!({ "name": n }));
         }
@@ -515,32 +536,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
                 ui.interact(rect, ui.scope_id().with("status_readout"), Sense::hover()).on_hover_text(text);
             }
         }
-        let mut toggle_cmd = None;
-        for (icon, on, cmd, tip) in toggles {
-            let br = Rect::from_min_size(pos2(rx, r.center().y - size / 2.0), vec2(size, size));
-            let resp = ui.interact(br, ui.scope_id().with(("tg", tip)), Sense::click());
-            if on {
-                p.rect_filled(br, 3.0, t.toggle_on.gamma_multiply(0.35));
-            } else if resp.hovered() {
-                p.rect_filled(br, 3.0, t.control_hover.gamma_multiply(0.5));
-            }
-            icons::paint(&p, br.shrink(2.5), icon, false);
-            if on {
-                // Re-tint the icon blue-ish by an underline.
-                p.hline(br.x_range().shrink(4.0), br.bottom() - 1.0, Stroke::new(1.5, t.toggle_on));
-            }
-            icons::describe_control(ui, &resp, tip, Some(on), false);
-            if resp.on_hover_text(crate::i18n::t(tip)).clicked() {
-                toggle_cmd = Some(cmd);
-            }
-            rx += size + 4.0;
-        }
-        // The toggles don't cancel the active command (#1108); the dialog buttons start theirs.
-        match toggle_cmd {
-            Some(c) if c.starts_with("ui.") => app.start(c),
-            Some(c) => crate::menus::run_transparent(app, c),
-            None => {}
-        }
+        draw_status_toggles(app, ui, &p, t, &toggles, (r, rx, size));
     });
 }
 
@@ -592,7 +588,7 @@ pub fn start_page(app: &mut CadApp, ui: &mut egui::Ui) {
         y += 46.0;
     }
     if let Some(path) = recent {
-        app.open_path(&path);
+        app.open_path(std::path::Path::new(&path));
     } else if app.ui.recent_files.is_empty() {
         p.text(
             pos2(main.center().x, main.center().y),
@@ -629,6 +625,37 @@ pub fn start_page(app: &mut CadApp, ui: &mut egui::Ui) {
 /// Fork (LAMB T525): the rows the views popup lists — every clickable row but Model and headings.
 fn view_choices(rows: Vec<crate::viewlist::Row>) -> Vec<crate::viewlist::Row> {
     rows.into_iter().filter(|r| !r.heading && r.label != "Model" && r.command.is_some()).collect()
+}
+
+/// Fork (LAMB T525): the room the views button takes right of the Model tab.
+fn views_width(views: &[crate::viewlist::Row]) -> f32 {
+    if views.is_empty() { 0.0 } else { 22.0 }
+}
+
+/// Fork (LAMB T525): the views button at `at`, right of the Model tab.
+fn views_tab_button(ui: &mut egui::Ui, p: &egui::Painter, at: egui::Pos2) -> egui::Response {
+    let t = Tokens::get();
+    let vr = Rect::from_min_size(at, vec2(16.0, 16.0));
+    let vresp = ui.interact(vr, ui.scope_id().with("lamb_views"), Sense::click());
+    if vresp.hovered() {
+        p.rect_filled(vr, 3.0, t.control_hover.gamma_multiply(0.5));
+    }
+    icons::paint(p, vr.shrink(2.0), Icon::List, false);
+    icons::describe_control(ui, &vresp, "Views", None, false);
+    vresp.on_hover_text(crate::tl!("Views"))
+}
+
+/// Fork (LAMB T525): the views popup under `button`, running the row picked in it.
+fn run_view_choice(app: &mut CadApp, button: Option<&egui::Response>, views: &[crate::viewlist::Row]) {
+    let Some(resp) = button else { return };
+    let chosen = egui::Popup::from_toggle_button_response(resp)
+        .width(200.0)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| view_list_popup(ui, views))
+        .and_then(|r| r.inner);
+    if let Some((id, params)) = chosen {
+        let _ = app.run(&id, params);
+    }
 }
 
 /// Fork (LAMB T525): the views popup body; returns the clicked row's command and closes the popup.

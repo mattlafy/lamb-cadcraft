@@ -26,7 +26,7 @@ mod widgets;
 use cursor::{draw_crosshair, draw_snap_marker, draw_tracking, effective_point, override_cursor};
 use cycle::{CycleList, cycle_badge, cycle_click, cycle_list, over_canvas_menu, shift_space_cycle};
 pub(crate) use draw::{Look, draw_highlight, draw_list};
-use draw::{Press, PressPick, clip_infinite, track_press};
+use draw::{Press, PressPick, Release, clip_infinite, track_press};
 use draw::{draw_drag_gpu, draw_highlight_gpu, draw_list_gpu, list_mesh_key, selection_area_fill};
 use dyn_boxes::dynamic_input;
 pub(crate) use dyn_boxes::length_units;
@@ -258,508 +258,162 @@ pub struct SnapCycle {
     index: usize,
 }
 
-/// Draw the drawing area and handle its input (zoom and pan, picking, the crosshair) for this
-/// frame.
-///
-/// It also owns the cursor-visibility contract: the OS cursor is hidden only while the pointer is
-/// over the drawing area *and* the canvas is the topmost layer under it, so the drawn crosshair
-/// replaces the pointer over the drawing alone. A menu bar, an open menu (including its frame, not
-/// just its items), a tooltip or a floating palette above the canvas keeps the normal OS cursor
-/// visible (#1701), and so do the menus painted on the canvas itself (see [`over_canvas_menu`]).
-pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
-    let t = Tokens::get();
-    let full = ui.available_rect_before_wrap();
-    // Tiled model viewports (VPORTS): the current tile is the drawing area below; `draw_tiles`
-    // draws the others.
-    let tiles = tile_rects(app, full);
-    // LAMB (fork): each tile's display-only rotation (canvas/panes.rs), read once per frame.
-    let rots = panes::rotations(app);
-    let turn = tiles.iter().position(|(_, tile)| tile.active).map_or(0.0, |i| panes::rotation(&rots, i));
-    let rect = tiles.iter().find(|(_, tile)| tile.active).map_or(full, |(r, _)| *r);
-    let resp = ui.interact(full, ui.scope_id().with("canvas"), Sense::click_and_drag());
-    let painter = ui.painter_at(rect);
-    app.canvas.rect = Some(rect);
-    app.session.viewport_px = (f64::from(rect.width()).max(1.0), f64::from(rect.height()).max(1.0));
-    if app.canvas.zoom_pending {
-        app.canvas.zoom_pending = false;
-        let _ = app.session.zoom_extents();
-    }
-    let Ok(st) = app.session.state() else { return };
-    let view = st.view();
-    let scale = f64::from(rect.height()) / view.height.max(1e-12);
-    let xf = Xf { rect, center: view.center, scale, twist: view.twist + turn };
-    app.canvas.xf = Some(xf);
+#[derive(Clone, Copy)]
+struct PointerInput {
+    hover_pos: Option<Pos2>,
+    scroll: egui::Vec2,
+    mods: egui::Modifiers,
+    middle_down: bool,
+    pressed_secondary: bool,
+    dbl_middle: bool,
+    dbl_primary: bool,
+}
 
-    // ---------- input ----------
-    let (hover_pos, scroll, mods, middle_down, pressed_secondary, dbl_middle, dbl_primary) = ui.input(|i| {
-        (
-            i.pointer.hover_pos(),
-            i.smooth_scroll_delta,
-            i.modifiers,
-            i.pointer.middle_down(),
-            i.pointer.secondary_clicked(),
-            i.pointer.button_double_clicked(egui::PointerButton::Middle),
-            i.pointer.button_double_clicked(egui::PointerButton::Primary),
-        )
-    });
-    // The drawing area alone: a menu popup's frame (between its items and its border), a tooltip
-    // or a floating palette lives on a layer above the canvas, where `hovered()` alone still
-    // counts the canvas. Over those the OS cursor stays visible and the crosshair stays put, as
-    // over the menu bar (#1701).
-    let inside = hover_pos.is_some_and(|p| rect.contains(p) && ui.ctx().layer_id_at(p) == Some(ui.layer_id()) && resp.hovered());
-    // The menus the canvas paints itself (selection cycling's rows, Dynamic Input's options) are
-    // menus too, but they share the canvas's layer: `layer_id_at` reports the drawing under them,
-    // so only their rectangles tell them apart from it ([`over_canvas_menu`]). They are excluded
-    // from the cursor contract below, though not from the canvas's input: a click on a row is
-    // taken by the row.
-    let on_menu = hover_pos.is_some_and(|p| over_canvas_menu(app, p));
-    // Primary presses are followed here rather than through egui's click/drag split (which drops a
-    // click that wanders a few pixels or is held a moment): each one ends as exactly one input.
-    let slop = ui.ctx().options(|o| o.input_options.max_click_dist);
-    let hovered = resp.hovered();
-    let (became_far, releases) = ui.input(|i| track_press(&mut app.canvas.press, &i.events, i.time, slop, |p| hovered && full.contains(p)));
+struct Navigation<'a> {
+    rect: Rect,
+    tiles: &'a [(Rect, cadcraft_engine::ModelTile)],
+    response: &'a egui::Response,
+    xf: Xf,
+    pointer: PointerInput,
+    /// This frame's primary releases ([`track_press`]).
+    releases: &'a [Release],
+}
 
-    // Whether Ctrl is held right now. Written every frame (not just while a command prompts), so
-    // previews that read `Session::ctrl_down` always see the current state. The engine
-    // deliberately does not carry modifiers through `Input`, which is UI-agnostic (see PR
-    // #407's Limits note: modifiers used to be dropped on the floor at this point).
-    app.session.ctrl_down = mods.ctrl;
-    // Which device is scrolling? On macOS, trackpads (and Magic Mouse) report precise point
-    // deltas; notched mouse wheels report lines. The answer is sticky because egui spreads a wheel
-    // notch over several frames. Elsewhere (browsers, Wayland smooth-scroll mice) ordinary wheels
-    // also report points, so the wheel keeps zooming there.
+fn navigate_canvas(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>) -> Option<(bool, bool)> {
+    let p = nav.pointer;
+    let inside = p.hover_pos.is_some_and(|at| nav.rect.contains(at) && ui.ctx().layer_id_at(at) == Some(ui.layer_id()) && nav.response.hovered());
+    let on_menu = p.hover_pos.is_some_and(|at| over_canvas_menu(app, at));
+    app.session.ctrl_down = p.mods.ctrl;
     ui.input(|i| {
-        for e in &i.raw.events {
-            if let egui::Event::MouseWheel { unit, .. } = e {
+        for event in &i.raw.events {
+            if let egui::Event::MouseWheel { unit, .. } = event {
                 app.canvas.scroll_pans = cfg!(target_os = "macos") && *unit == egui::MouseWheelUnit::Point;
             }
         }
     });
-    if inside && app.canvas.scroll_pans && scroll != egui::Vec2::ZERO {
-        // Two-finger swipe pans: the drawing follows the fingers, like a middle-drag.
-        // Pinch (and Cmd+scroll) still zoom via `zoom_delta` below.
-        if let Ok(st) = app.session.state_mut() {
-            let v = st.view();
-            st.set_view_quiet(cadcraft_engine::View { center: v.center - xf.screen_delta_to_world(scroll), height: v.height, twist: v.twist });
-        }
-    }
-    let opts = ui.ctx().options(|o| o.input_options);
-    let wheel = ui.input(|i| wheel_zoom_points(&i.raw.events, &opts, rect.height()));
-    if inside
-        && !app.canvas.scroll_pans
-        && wheel != 0.0
-        && let Some(hp) = hover_pos
-    {
-        // Zoom with the mouse wheel about the cursor, each notch at once.
-        let f = app.session.wheel_zoom_factor(f64::from(wheel));
-        let about = xf.to_world(hp);
-        let _ = app.session.zoom_about(f, about);
-    }
-    let zoom_pinch = ui.input(|i| crate::animation::zoom_delta(i, &opts, app.shows_animations()));
-    if inside
-        && (zoom_pinch - 1.0).abs() > 1e-4
-        && let Some(hp) = hover_pos
-    {
-        let _ = app.session.zoom_about(f64::from(zoom_pinch), xf.to_world(hp));
-    }
-    // Pan with the middle button (or Shift+right-drag / two-finger drag on trackpads is scroll).
-    let middle_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
-    let focused = ui.input(|i| i.focused);
-    if middle_down
-        && focused
-        && (app.canvas.pan_last.is_some() || (middle_pressed && inside))
-        && let Some(hp) = hover_pos
-    {
-        if let Some(last) = app.canvas.pan_last {
-            let d = hp - last;
-            if let Ok(st) = app.session.state_mut() {
-                let v = st.view();
-                st.set_view_quiet(cadcraft_engine::View { center: v.center - xf.screen_delta_to_world(d), height: v.height, twist: v.twist });
-            }
-        }
-        app.canvas.pan_last = Some(hp);
-    } else {
-        app.canvas.pan_last = None;
-    }
-    if dbl_middle && inside {
-        let _ = app.session.zoom_extents();
-    }
-    // ZOOM Realtime: dragging up zooms in, down zooms out.
-    if resp.dragged_by(egui::PointerButton::Primary) && app.session.realtime_zoom_active() {
-        let _ = app.session.realtime_zoom(f64::from(resp.drag_delta().y));
+    handle_scroll_zoom(app, ui, nav, inside);
+    handle_button_navigation(app, nav, inside);
+    if nav.response.dragged_by(egui::PointerButton::Primary) && app.session.realtime_zoom_active() {
+        let _ = app.session.realtime_zoom(f64::from(nav.response.drag_delta().y));
     }
     // PAN (realtime): the drawing follows a left-button drag.
-    if resp.dragged_by(egui::PointerButton::Primary) && app.session.realtime_pan_active() {
-        let d = resp.drag_delta();
+    if nav.response.dragged_by(egui::PointerButton::Primary) && app.session.realtime_pan_active() {
+        let d = nav.response.drag_delta();
         let _ = app.session.realtime_pan(f64::from(d.x), f64::from(d.y));
     }
     // A click in another tile makes it current (or answers -VPORTS Join's prompts).
     if !app.canvas.drag_window
-        && let Some(r) = releases.last()
-        && !rect.contains(r.tap_at())
-        && let Some(i) = tiles.iter().position(|(t, _)| t.contains(r.tap_at()))
+        && let Some(r) = nav.releases.last()
+        && !nav.rect.contains(r.tap_at())
+        && let Some(i) = nav.tiles.iter().position(|(t, _)| t.contains(r.tap_at()))
     {
         if let Err(e) = app.session.click_tile(i) {
             app.session.echo(e.to_string());
         }
         ui.ctx().request_repaint();
-        return;
+        return None;
     }
-    // Re-read the view after navigation.
-    let view = app.session.state().map(|s| s.view()).unwrap_or(view);
-    let scale = f64::from(rect.height()) / view.height.max(1e-12);
-    let xf = Xf { rect, center: view.center, scale, twist: view.twist + turn };
-    app.canvas.xf = Some(xf);
-    // The paper (display) transform; equal to `xf` except inside an MSPACE viewport.
-    let (xf_paper, active_vp) = match app.session.state() {
-        Ok(st) => {
-            let pv = st.paper_view();
-            // Paper space is never twisted.
-            let xp = Xf { rect, center: pv.center, scale: f64::from(rect.height()) / pv.height.max(1e-12), twist: 0.0 };
-            (if st.mspace.is_some() { xp } else { xf }, st.active_viewport().map(|(_, v)| v))
-        }
-        Err(_) => (xf, None),
-    };
-    // A clipped active viewport's outline (picks and its heavy border follow it).
-    let active_clip = app.session.state().ok().and_then(|st| st.active_viewport().and_then(|(h, v)| cadcraft_render::viewport_clip(&st.doc, h, &v)));
-    // Double-click a viewport to work inside it; double-click the sheet outside it to return.
+    Some((inside, on_menu))
+}
+
+fn handle_scroll_zoom(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>, inside: bool) {
+    let p = nav.pointer;
     if inside
-        && dbl_primary
-        && !app.session.prompting()
-        && matches!(app.session.layout_space(), cadcraft_doc::Space::Paper(_))
-        && let Some(hp) = hover_pos
+        && app.canvas.scroll_pans
+        && p.scroll != egui::Vec2::ZERO
+        && let Ok(st) = app.session.state_mut()
     {
-        let pp = xf_paper.to_world(hp);
-        let in_rect = |v: &cadcraft_doc::Viewport| (pp.x - v.center.x).abs() <= v.width / 2.0 && (pp.y - v.center.y).abs() <= v.height / 2.0;
-        let in_active = active_vp.as_ref().is_some_and(|v| active_clip.as_ref().map_or(in_rect(v), |c| c.contains(pp)));
-        if !in_active {
-            app.canvas.hot_grips.clear();
-            app.session.pending_window = None;
-            app.canvas.drag_window = false;
-            if app.run("mspace", serde_json::json!({"at": [pp.x, pp.y]})).is_err() && active_vp.is_some() {
-                let _ = app.run("pspace", serde_json::json!({}));
+        let view = st.view();
+        st.set_view_quiet(cadcraft_engine::View {
+            center: view.center - nav.xf.screen_delta_to_world(p.scroll),
+            height: view.height,
+            twist: view.twist,
+        });
+    }
+    let opts = ui.ctx().options(|o| o.input_options);
+    let wheel = ui.input(|i| wheel_zoom_points(&i.raw.events, &opts, nav.rect.height()));
+    if inside
+        && !app.canvas.scroll_pans
+        && wheel != 0.0
+        && let Some(at) = p.hover_pos
+    {
+        let factor = app.session.wheel_zoom_factor(f64::from(wheel));
+        let about = nav.xf.to_world(at);
+        let _ = app.session.zoom_about(factor, about);
+    }
+    let pinch = ui.input(|i| crate::animation::zoom_delta(i, &opts, app.shows_animations()));
+    if inside
+        && (pinch - 1.0).abs() > 1e-4
+        && let Some(at) = p.hover_pos
+    {
+        let _ = app.session.zoom_about(f64::from(pinch), nav.xf.to_world(at));
+    }
+}
+
+fn handle_button_navigation(app: &mut CadApp, nav: &Navigation<'_>, inside: bool) {
+    let p = nav.pointer;
+    let middle_pressed = nav.response.ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+    let focused = nav.response.ctx.input(|i| i.focused);
+    if p.middle_down
+        && focused
+        && (app.canvas.pan_last.is_some() || (middle_pressed && inside))
+        && let Some(at) = p.hover_pos
+    {
+        if let Some(last) = app.canvas.pan_last {
+            let delta = at - last;
+            if let Ok(st) = app.session.state_mut() {
+                let view = st.view();
+                st.set_view_quiet(cadcraft_engine::View {
+                    center: view.center - nav.xf.screen_delta_to_world(delta),
+                    height: view.height,
+                    twist: view.twist,
+                });
             }
-            app.session.pending_window = None;
-            app.canvas.drag_window = false;
-            app.canvas.list = None;
-            return;
         }
-    }
-    // Double-click text to edit it, as in AutoCAD: TEXTEDIT with that object already picked.
-    if inside
-        && dbl_primary
-        && app.session.running.is_none()
-        && let Some(hp) = hover_pos
-        && edit_text_at(app, xf.to_world(hp))
-    {
-        return;
-    }
-
-    // Double-click a hatch (no command running) to edit it in the Hatch Edit dialog. The click is
-    // used up: it must not also start a grip edit on the hatch's centre grip below.
-    let mut hatch_dialog = false;
-    if inside
-        && dbl_primary
-        && app.session.running.is_none()
-        && let Some(hp) = hover_pos
-        && let Some(h) = hatch_at(app, xf.to_world(hp), scale)
-    {
-        app.session.set_selection(vec![h]);
-        crate::hatchdlg::open_edit(app);
-        hatch_dialog = true;
-    }
-
-    let raw_world = hover_pos.filter(|_| inside).map(|p| xf.to_world(p));
-    let dyn_frame = crate::cmdline::dyn_frame(app);
-    if let Some(w) = raw_world {
-        let mut eff = effective_point(app, w, &xf, ui.ctx());
-        // A locked Dynamic Input value (`40,` or `40<` typed) holds the cursor and overrides snaps.
-        if let Some(f) = dyn_frame
-            && let Some(e) = crate::dyninput::parse(&app.cmd.buffer, &f)
-            && e.first_locked().is_some()
-        {
-            eff = crate::dyninput::constrain(&e, &f, eff, app.cmd.second_locked());
-            app.canvas.snap = None;
-            app.canvas.track = None;
-        }
-        // Grip dimensional input: typed lengths and angles hold the grip and override snaps.
-        let grip_held = crate::grip_dyn::constrain(app, eff);
-        if let Some(q) = grip_held {
-            eff = q;
-            app.canvas.snap = None;
-            app.canvas.track = None;
-        }
-        app.canvas.cursor = Some(eff);
-        app.session.cursor = eff;
-        app.session.cursor_deferred = app.canvas.snap.and_then(|h| h.deferred);
-        // Typed or menu snap overrides (END, NON…) and Tab cycling; a locked Dynamic Input value wins.
-        if dyn_frame.and_then(|f| crate::dyninput::parse(&app.cmd.buffer, &f)).is_none_or(|e| e.first_locked().is_none()) {
-            override_cursor(app, w, &xf);
-        }
-        // Typed grip dimensions win over snap overrides too.
-        if let Some(q) = grip_held {
-            app.canvas.cursor = Some(q);
-            app.session.cursor = q;
-            app.canvas.snap = None;
-            app.session.cursor_deferred = None;
-        }
+        app.canvas.pan_last = Some(at);
     } else {
-        app.canvas.cursor = None;
-        app.canvas.snap = None;
-        app.session.cursor_deferred = None;
+        app.canvas.pan_last = None;
     }
+    if p.dbl_middle && inside {
+        let _ = app.session.zoom_extents();
+    }
+}
 
-    // A press picks up the cursor and snap as they stand where it went down.
-    if let Some(p) = app.canvas.press.as_mut()
-        && p.pick.is_none()
-    {
-        p.pick = Some(PressPick { cursor: app.canvas.cursor, raw: raw_world, snap: app.canvas.snap });
-    }
+struct CanvasPaint<'a> {
+    app: &'a mut CadApp,
+    ui: &'a mut egui::Ui,
+    painter: &'a egui::Painter,
+    tokens: Tokens,
+    full: Rect,
+    tiles: &'a [(Rect, cadcraft_engine::ModelTile)],
+    rect: Rect,
+    xf: Xf,
+    xf_paper: Xf,
+    view: cadcraft_engine::View,
+    active_vp: Option<cadcraft_doc::Viewport>,
+    active_clip: Option<cadcraft_render::clip::PolyClip>,
+    inside: bool,
+    on_menu: bool,
+    hover_pos: Option<Pos2>,
+    raw_world: Option<Vec2>,
+    /// LAMB (fork): each tile's display-only rotation (canvas/panes.rs), read once per frame.
+    rots: &'a [f64],
+    /// The canvas widget is hovered (LAMB's pane hover reads it).
+    hovered: bool,
+}
 
-    // A double-click with no command running (on a layout viewport, say) leaves no selection
-    // window behind; while a command asks for points, every click still counts (#815).
-    let idle_dbl = dbl_primary && app.session.running.is_none();
-    if idle_dbl {
-        app.session.pending_window = None;
-        app.canvas.drag_window = false;
-    }
-    // Selection cycling's list and Shift+Space highlight go stale with the command, prompt,
-    // drawing or view they were made for.
-    let key: CycleKey = (
-        app.session.running.as_ref().map(|r| r.id.clone()),
-        app.session.current_prompt().map(|p| p.message),
-        app.session.state().map_or(0, |st| st.uid),
-        app.session.state().map_or(0, |st| st.revision),
-        xf.center,
-        xf.scale,
-    );
-    if app.canvas.cycle_key.as_ref() != Some(&key) {
-        app.canvas.cycle = None;
-        app.canvas.hover_cycle = None;
-        app.canvas.cycle_key = Some(key);
-    }
-    if !app.session.settings.pickdrag {
-        app.canvas.drag_window = false;
-        // Two clicks only: a drag where objects are being selected (or a window is open) is no
-        // click, so a held-button movement neither starts nor closes a window.
-        if let Some(origin) = became_far
-            && !middle_down
-            && rect.contains(origin)
-            && app.cmd.options.is_none()
-            && (app.session.pending_window.is_some() || app.session.click_picks())
-            && (app.session.prompting() || (crate::dyngrips::at(app, &xf, Some(origin)).is_none() && grip_at(app, &xf, Some(origin)).is_none()))
-        {
-            app.canvas.drag_ignored = true;
-        }
-    }
-
-    // Every primary press ends as exactly one input, never none. A click (see [`Press::drags`]) counts
-    // where it went down, with the cursor and snap as they stood then, or, a fast one that moved
-    // further than `slop`, where it came up ([`Release::tap_at`]). A drag, where a drag means
-    // something, has that meaning: a selection window from where it went down to where it comes up
-    // (AutoCAD's PICKDRAG = 2; click-click still works), a grip edit's grip picked up where it went
-    // down and put down where it comes up, ZOOM Realtime's zoom, PAN's realtime pan. Any other drag is a click where it
-    // comes up (a second window corner, a point, a pick, a Shift-toggled grip, a list grip, a tile).
-    if let Some(origin) = became_far
-        && !middle_down
-        && rect.contains(origin)
-        && app.cmd.options.is_none()
-        && app.session.pending_window.is_none()
-        && !app.session.realtime_zoom_active()
-        && !app.session.realtime_pan_active()
-        && app.canvas.cycle.is_none()
-    {
-        let on_grip = crate::dyngrips::at(app, &xf, Some(origin)).is_some() || grip_at(app, &xf, Some(origin)).is_some();
-        if app.session.prompting() || !on_grip {
-            // PICKDRAG off (two clicks only): the drag is a click where it comes up.
-            app.canvas.drag_window = app.session.settings.pickdrag && app.session.begin_window(xf.to_world(origin));
-        } else if !mods.shift
-            && let Some(g) = crate::dyngrips::at(app, &xf, Some(origin)).filter(|g| g.1.shape != cadcraft_engine::doc::dynblock::GripShape::List)
-        {
-            crate::dyngrips::click(app, g);
-        } else if !mods.shift
-            && crate::dyngrips::at(app, &xf, Some(origin)).is_none()
-            && let Some(g) = grip_at(app, &xf, Some(origin))
-        {
-            click_grip(app, g, false);
-        }
-    }
-    let last = releases.len().saturating_sub(1);
-    for (k, r) in releases.iter().copied().enumerate() {
-        let ignored = std::mem::take(&mut app.canvas.drag_ignored);
-        if middle_down || (r.far && ignored) {
-            continue;
-        }
-        if app.canvas.drag_window {
-            app.canvas.drag_window = false;
-            if app.session.pending_window.is_some() {
-                let end = xf.to_world(r.at);
-                let done = if app.session.prompting() { app.session.input(Input::Point(end)) } else { app.session.idle_click(end, mods.shift) };
-                if let Err(e) = done {
-                    app.session.echo(e.to_string());
-                }
-            }
-            continue;
-        }
-        if r.far && (app.session.realtime_zoom_active() || app.session.realtime_pan_active()) {
-            continue;
-        }
-        let at = r.tap_at();
-        // A click on the Dynamic Input options menu picks the keyword; elsewhere it closes the menu.
-        if app.cmd.options.is_some() {
-            match app.cmd.option_at(at) {
-                Some(o) => {
-                    crate::cmdline::pick_option(app, o);
-                    continue;
-                }
-                None => app.cmd.options = None,
-            }
-        }
-        if hatch_dialog || idle_dbl || !rect.contains(at) {
-            continue;
-        }
-        // Where it went down, as the cursor stood then; else where it counts now: the cursor for
-        // the frame's last release, the point under it (unsnapped) for an earlier one (#815).
-        let pick = match r.pick.filter(|_| r.at_origin()) {
-            Some(pk) => pk,
-            None if k == last => PressPick { cursor: app.canvas.cursor, raw: raw_world, snap: app.canvas.snap },
-            None => {
-                let raw = xf.to_world(at);
-                PressPick { cursor: Some(effective_point(app, raw, &xf, ui.ctx())), raw: Some(raw), snap: None }
-            }
-        };
-        // Selection cycling: a click on its list, or over overlapping objects, is used up there.
-        if cycle_click(app, &xf, Some(at), pick.raw, mods.shift) {
-            continue;
-        }
-        let Some(p) = pick.cursor else { continue };
-        if app.session.prompting() {
-            // Ctrl held while picking the point of a grip edit makes copies (the Copy option).
-            if mods.ctrl && app.session.running.as_ref().is_some_and(|r| r.id == "grip") {
-                let _ = app.session.input(Input::Keyword("Copy".into()));
-            }
-            // Clicking places the point; a value typed into the Dynamic Input boxes is used up.
-            if let Some(f) = dyn_frame
-                && crate::dyninput::parse(&app.cmd.buffer, &f).is_some()
-            {
-                app.cmd.buffer.clear();
-            }
-            // Preserve a snap's viewport origin for DIST, and its deferred curve where needed.
-            let result = match pick.snap {
-                Some(hit) => app.session.input_snapped(hit),
-                None => app.session.input(Input::Point(p)),
-            };
-            if let Err(e) = result {
-                app.session.echo(e.to_string());
-            }
-        } else if let Some(g) = crate::dyngrips::at(app, &xf, Some(at)) {
-            crate::dyngrips::click(app, g);
-        } else if let Some(g) = grip_at(app, &xf, Some(at)) {
-            click_grip(app, g, mods.shift);
-        } else if let Err(e) = app.session.idle_click(pick.raw.unwrap_or(p), mods.shift) {
-            app.session.echo(e.to_string());
-        }
-    }
-    // Right-click acts as Enter while a command runs (the classic CAD default; held, it opens the
-    // command menu); otherwise it opens the shortcut menu (Repeat, Clipboard, …).
-    // Shift/Ctrl+right-click opens the object snap menu.
-    let idle = !app.session.prompting();
-    if inside && pressed_secondary {
-        app.canvas.snap_menu = mods.shift || mods.ctrl;
-    }
-    if crate::context_menu::in_command(app, ui, inside, pressed_secondary) {
-        let _ = app.session.input(Input::Enter);
-    }
-    // Right-click on a grip with options (polyline vertex, line end…) opens the grip menu.
-    if inside && pressed_secondary && idle && !app.canvas.snap_menu {
-        app.canvas.grip_menu = grip_at(app, &xf, hover_pos).filter(|g| !grip_options(app, *g).is_empty());
-    }
-    crate::dyngrips::menu(app, ui.ctx(), &xf);
-    if idle && !app.canvas.snap_menu && app.canvas.grip_menu.is_some() {
-        grip_menu(app, &resp);
-    } else if idle || app.canvas.snap_menu {
-        crate::context_menu::show(app, &resp);
-    }
-
-    // Hover highlight (throttled to cursor movement).
-    // The cursor picks objects (pick box, rollover highlight): "Select objects" and single-object
-    // prompts, or no command with PICKFIRST on; SELECTIONPREVIEW says in which of those it shows.
-    let selecting = app.session.previews_selection();
-    if inside && selecting && app.session.pending_window.is_none() {
-        if hover_pos != app.canvas.hover_at
-            && let (Some(w), Ok(st)) = (raw_world, app.session.state())
-        {
-            let filter = app.session.settings.previewfilter;
-            app.canvas.hover = cadcraft_engine::select::pick(&st.doc, &st.edit_space(), w, app.session.settings.pickbox.max(1.0) * 1.5 / scale)
-                .filter(|h| st.doc.entity(*h).is_none_or(|e| !cadcraft_engine::select::preview_filtered(&st.doc, e, filter)));
-            app.canvas.hover_at = hover_pos;
-        }
-    } else {
-        app.canvas.hover = None;
-        app.canvas.hover_at = None;
-    }
-    // The open selection cycling list highlights the object of the row under the pointer.
-    if app.canvas.cycle.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        app.canvas.cycle = None;
-    }
-    if let Some(c) = &app.canvas.cycle {
-        app.canvas.hover = hover_pos.and_then(|hp| c.row_at(hp));
-        app.canvas.hover_at = None;
-    }
-    shift_space_cycle(app, ui, hover_pos.filter(|_| inside), raw_world);
-    if inside && hover_pos != app.canvas.cycle_badge_at {
-        app.canvas.cycle_badge = raw_world.is_some_and(|w| app.session.cycling_badge(w));
-        app.canvas.cycle_badge_at = hover_pos;
-    } else if !inside {
-        app.canvas.cycle_badge = false;
-        app.canvas.cycle_badge_at = None;
-    }
-
-    // ---------- paint ----------
-    painter.rect_filled(rect, 0.0, t.canvas);
-    let t0 = crate::now_ms();
-    let mut views = vec![(xf_paper.world_bounds(), 1.0 / xf_paper.scale)];
-    views.extend(tiles.iter().enumerate().filter(|(_, (r, tile))| !tile.active && r.width() >= 1.0 && r.height() >= 1.0).map(|(i, (r, tile))| {
-        let xf = tile_xf(*r, tile, panes::rotation(&rots, i));
-        (xf.world_bounds(), 1.0 / xf.scale)
-    }));
-    ensure_list(app, &xf_paper, &views, ui.ctx());
-    let sheet = app.canvas.list.as_ref().and_then(|l| l.sheet);
-    let surround = Color32::from_rgb(0x50, 0x57, 0x63);
-    let (bg, paper_rect) = match sheet {
-        Some(sh) => {
-            // Paper space: grey surround, the sheet with a shadow, the printable area dashed.
-            painter.rect_filled(rect, 0.0, surround);
-            let a = xf_paper.to_screen(Vec2::new(0.0, sh.size.y));
-            let b = xf_paper.to_screen(Vec2::new(sh.size.x, 0.0));
-            let paper = Rect::from_two_pos(a, b);
-            painter.rect_filled(paper.translate(vec2(5.0, 5.0)), 0.0, Color32::from_black_alpha(110));
-            painter.rect_filled(paper, 0.0, t.paper);
-            let pa = Rect::from_two_pos(
-                xf_paper.to_screen(Vec2::new(sh.printable.min.x, sh.printable.max.y)),
-                xf_paper.to_screen(Vec2::new(sh.printable.max.x, sh.printable.min.y)),
-            );
-            let pts = [pa.left_top(), pa.right_top(), pa.right_bottom(), pa.left_bottom(), pa.left_top()];
-            painter.extend(Shape::dashed_line(&pts, Stroke::new(1.0, Color32::from_gray(150)), 4.0, 4.0));
-            (Rgb(t.paper.r(), t.paper.g(), t.paper.b()), Some(paper))
-        }
-        None => {
-            blockedit::wash(app, &painter, rect);
-            draw_grid(app, &painter, &xf);
-            (Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b()), None)
-        }
-    };
-    let sel = app.session.selection();
-    // How the object under the cursor and the selected ones are highlighted (PREVIEWEFFECT,
-    // HIGHLIGHT, SELECTIONEFFECT); with HIGHLIGHT off only their grips show.
-    let (preview_look, selection_look) = (Look::preview(&app.session.settings), Look::selection(&app.session.settings));
-    // The active viewport's contents, drawn apart from the layout's list, under its own objects.
-    // `masked`: its outline is in the stencil buffer this frame.
+/// The drawing itself: what a running command shows in its place, else the active viewport's
+/// contents and the layout's list; then LAMB's overlays. Returns whether the active viewport's
+/// outline is in the stencil buffer this frame.
+fn paint_drawing(frame: &mut CanvasPaint<'_>, bg: Rgb) -> bool {
+    let app = &mut *frame.app;
+    let painter = frame.painter;
+    let (rect, xf, xf_paper) = (frame.rect, frame.xf, frame.xf_paper);
     let mut masked = false;
     if let Some(only) = app.session.display_only() {
         // A command that shows only some objects while it runs (DVIEW's preview set): those,
         // in the view being changed (inside the active viewport, clipped to it).
-        let clip = active_vp.as_ref().map_or(rect, |vp| {
+        let clip = frame.active_vp.as_ref().map_or(rect, |vp| {
             Rect::from_two_pos(
                 xf_paper.to_screen(Vec2::new(vp.center.x - vp.width / 2.0, vp.center.y + vp.height / 2.0)),
                 xf_paper.to_screen(Vec2::new(vp.center.x + vp.width / 2.0, vp.center.y - vp.height / 2.0)),
@@ -768,25 +422,44 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         });
         if let Ok(st) = app.session.state() {
             // A clipped viewport's outline, in the model units the preview is built in.
-            let outline =
-                active_vp.as_ref().zip(active_clip.as_ref()).map(|(vp, c)| c.polygon().iter().map(|q| vp.paper_to_model(*q)).collect::<Vec<_>>());
-            app.canvas.only.update(st, &only, scale, outline.as_deref());
+            let outline = frame
+                .active_vp
+                .as_ref()
+                .zip(frame.active_clip.as_ref())
+                .map(|(vp, c)| c.polygon().iter().map(|q| vp.paper_to_model(*q)).collect::<Vec<_>>());
+            app.canvas.only.update(st, &only, xf.scale, outline.as_deref());
         }
         draw_list(&painter.with_clip_rect(clip), &xf, &app.canvas.only.list, bg, app.session.settings.lwdisplay);
     } else {
-        if let Some(f) = ensure_vp_content(app, &xf_paper, ui.ctx()) {
+        if let Some(f) = ensure_vp_content(app, &xf_paper, frame.ui.ctx()) {
             let gpu = app.canvas.gpu.is_some();
             let clipped = painter.with_clip_rect(f.on_screen.intersect(rect));
             draw_vp_content(&mut app.canvas.vp, gpu, &clipped, &f, &xf_paper, bg, app.session.settings.lwdisplay);
             masked = gpu && f.outline.is_some();
         }
         if app.canvas.gpu.is_some() {
-            draw_list_gpu(&mut app.canvas, &painter, &xf_paper, bg, app.session.settings.lwdisplay);
+            draw_list_gpu(&mut app.canvas, painter, &xf_paper, bg, app.session.settings.lwdisplay);
         } else if let Some(list) = &app.canvas.list {
-            draw_list(&painter, &xf_paper, list, bg, app.session.settings.lwdisplay);
+            draw_list(painter, &xf_paper, list, bg, app.session.settings.lwdisplay);
         }
     }
-    lamb_overlays::draw(app, &painter, &xf, bg);
+    lamb_overlays::draw(app, painter, &xf, bg);
+    masked
+}
+
+fn paint_content_highlights(frame: &mut CanvasPaint<'_>, bg: Rgb, sel: &[Handle], preview_look: Look, selection_look: Option<Look>) {
+    // The active viewport's contents, drawn apart from the layout's list, under its own objects.
+    // `masked`: its outline is in the stencil buffer this frame.
+    let masked = paint_drawing(frame, bg);
+    let app = &mut *frame.app;
+    let painter = frame.painter;
+    let xf_paper = frame.xf_paper;
+    let rect = frame.rect;
+    let xf = frame.xf;
+    let t = frame.tokens;
+    let active_vp = &frame.active_vp;
+    let active_clip = &frame.active_clip;
+    let scale = frame.xf.scale;
     if let Some(vp) = &active_vp {
         // The active viewport: a heavy border, highlights in model units clipped to it.
         let r = Rect::from_two_pos(
@@ -822,7 +495,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             if let Some(look) = selection_look
                 && !sel.is_empty()
             {
-                c.vp_sel.update(st, &sel, scale);
+                c.vp_sel.update(st, sel, scale);
                 let list = &c.vp_sel.list;
                 let all = || (0..list.prims.len()).collect::<Vec<_>>();
                 if c.gpu.is_some() {
@@ -831,7 +504,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
                     let list_id = c.vp_sel.list_gen | 1 << 63;
                     let stencil = if masked { crate::gpu::Stencil::Inside } else { crate::gpu::Stencil::Off };
                     let hl = (&mut c.hl_key, &c.hl_slot, &mut c.hl_origin, &mut c.hl_infinite);
-                    draw_highlight_gpu(&clipped, &xf, list, list_id, all, &sel, t.selection, look, hl, stencil);
+                    draw_highlight_gpu(&clipped, &xf, list, list_id, all, sel, t.selection, look, hl, stencil);
                     draw_highlight(&clipped, &xf, list, &c.hl_infinite, t.selection, look);
                 } else {
                     draw_highlight(&clipped, &xf, list, &all(), t.selection, look);
@@ -842,33 +515,667 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         if let Some(h) = *hover
             && !sel.contains(&h)
         {
-            draw_highlight(&painter, &xf, list, &prim_index.prims(*list_gen, list, &[h]), t.hover, preview_look);
+            draw_highlight(painter, &xf, list, &prim_index.prims(*list_gen, list, &[h]), t.hover, preview_look);
         }
         if let Some(look) = selection_look {
             if gpu.is_some() && !sel.is_empty() {
                 let list_id = *list_gen;
                 let hl = (hl_key, &*hl_slot, hl_origin, &mut *hl_infinite);
                 draw_highlight_gpu(
-                    &painter,
+                    painter,
                     &xf,
                     list,
                     list_id,
-                    || prim_index.prims(list_id, list, &sel),
-                    &sel,
+                    || prim_index.prims(list_id, list, sel),
+                    sel,
                     t.selection,
                     look,
                     hl,
                     crate::gpu::Stencil::Off,
                 );
-                draw_highlight(&painter, &xf, list, hl_infinite, t.selection, look);
+                draw_highlight(painter, &xf, list, hl_infinite, t.selection, look);
             } else {
-                draw_highlight(&painter, &xf, list, &prim_index.prims(*list_gen, list, &sel), t.selection, look);
+                draw_highlight(painter, &xf, list, &prim_index.prims(*list_gen, list, sel), t.selection, look);
             }
         }
     }
+}
+
+fn paint_pointer_overlay(
+    frame: &mut CanvasPaint<'_>,
+    paper_rect: Option<Rect>,
+    surround: Color32,
+    selecting: bool,
+    sheet: Option<cadcraft_render::Sheet>,
+) {
+    let app = &mut *frame.app;
+    let ui = &mut *frame.ui;
+    let painter = frame.painter;
+    let t = frame.tokens;
+    let rect = frame.rect;
+    let full = frame.full;
+    let tiles = frame.tiles;
+    let xf = frame.xf;
+    let inside = frame.inside;
+    let on_menu = frame.on_menu;
+    let hover_pos = frame.hover_pos;
+    let view = frame.view;
+    // Acquired tracking points and the polar / tracking paths under the cursor.
+    if app.canvas.cursor.is_some() {
+        draw_tracking(painter, &xf, &app.session.tracking.acquired, app.canvas.track.as_ref(), view.height * 4.0);
+    }
+    if let (Some(hit), Some(_)) = (app.canvas.snap, app.canvas.cursor) {
+        draw_snap_marker(painter, xf.to_screen(hit.point), &hit);
+    }
+    let rots = frame.rots;
+    panes::prepare(app, tiles, rots);
+    // LAMB (fork, T363): the scale bar in model/block space only, decided once per frame.
+    let scale_bar = sheet.is_none() && frame.active_vp.is_none() && scalebar::wanted(app);
+    draw_tiles(app, ui, tiles, rots, scale_bar);
+    panes::draw_hover(app, ui, tiles, rots, hover_pos.filter(|_| frame.hovered)); // LAMB (fork): T321
+    if scale_bar {
+        scalebar::draw(painter, rect, xf.scale, Tokens::get().crosshair); // LAMB (fork): T363
+    }
+    // UCS icon, ViewCube and viewport label.
+    if app.ui.show_ucs_icon {
+        draw_ucs_icon(painter, rect);
+        crate::viewcube::ucs_icon(app, ui, rect);
+    }
+    if app.ui.show_viewcube && sheet.is_none() {
+        draw_viewcube(app, ui, rect);
+    }
+    viewport_label(painter, rect);
+    // Typing and Escape reach the command line even when its overlay is hidden.
+    crate::cmdline::keyboard(app, ui.ctx());
+    // Command line overlay.
+    if app.ui.show_command_line {
+        crate::cmdline::show(app, ui, full);
+    }
+    // Crosshair cursor.
+    if inside && !on_menu {
+        // Hide the OS cursor under the drawn crosshair, unless assistive tech needs it (#39).
+        ui.ctx().set_cursor_icon(if app.ui.system_cursor { egui::CursorIcon::Crosshair } else { egui::CursorIcon::None });
+        if let Some(hp) = hover_pos {
+            // Use the painted sheet even in MSPACE, where the editing transform follows a
+            // model viewport. The whole cursor takes one colour from its centre.
+            let ink = paper_rect.map_or(t.crosshair, |paper| crate::theme::crosshair_color(if paper.contains(hp) { t.paper } else { surround }));
+            draw_crosshair(app, painter, rect, hp, selecting, ink);
+            if app.canvas.cycle_badge && app.canvas.cycle.is_none() {
+                cycle_badge(painter, hp);
+            }
+        }
+    }
+    if inside
+        && app.session.settings.dynmode
+        && let Some(hp) = hover_pos
+    {
+        // A stretched grip shows its dimensions instead of the pointer boxes; a prompt asking for
+        // a distance shows its one field and keeps the prompt and its options.
+        let fields = crate::grip_dyn::draw(app, painter);
+        if !fields || app.session.current_prompt().is_some_and(|p| p.distance) {
+            dynamic_input(app, painter, hp, fields);
+        }
+    }
+    // Over the crosshair, so the row under the pointer reads clearly.
+    cycle_list(app, painter);
+    // No continuous repaint while hovering: input events repaint by themselves. Repainting every
+    // frame kept a vsync swapchain's queue full (every frame waited behind queued ones) and would
+    // spin the CPU with the low-latency present mode (`gpu::surface_config`).
+}
+struct DoubleClickContext<'a> {
+    inside: bool,
+    double: bool,
+    hover: Option<Pos2>,
+    xf: Xf,
+    xf_paper: Xf,
+    scale: f64,
+    active_viewport: &'a Option<cadcraft_doc::Viewport>,
+    active_clip: &'a Option<cadcraft_render::clip::PolyClip>,
+}
+
+fn handle_double_click(app: &mut CadApp, ctx: DoubleClickContext<'_>) -> Option<bool> {
+    let DoubleClickContext { inside, double, hover, xf, xf_paper, scale, active_viewport, active_clip } = ctx;
+    if inside
+        && double
+        && !app.session.prompting()
+        && matches!(app.session.layout_space(), cadcraft_doc::Space::Paper(_))
+        && let Some(hp) = hover
+    {
+        let pp = xf_paper.to_world(hp);
+        let in_rect = |v: &cadcraft_doc::Viewport| (pp.x - v.center.x).abs() <= v.width / 2.0 && (pp.y - v.center.y).abs() <= v.height / 2.0;
+        let in_active = active_viewport.as_ref().is_some_and(|v| active_clip.as_ref().map_or(in_rect(v), |c| c.contains(pp)));
+        if !in_active {
+            app.canvas.hot_grips.clear();
+            app.session.pending_window = None;
+            app.canvas.drag_window = false;
+            if app.run("mspace", serde_json::json!({"at": [pp.x, pp.y]})).is_err() && active_viewport.is_some() {
+                let _ = app.run("pspace", serde_json::json!({}));
+            }
+            app.session.pending_window = None;
+            app.canvas.drag_window = false;
+            app.canvas.list = None;
+            return None;
+        }
+    }
+    // Double-click text to edit it, as in AutoCAD: TEXTEDIT with that object already picked.
+    if inside
+        && double
+        && app.session.running.is_none()
+        && let Some(hp) = hover
+        && edit_text_at(app, xf.to_world(hp))
+    {
+        return None;
+    }
+
+    let mut hatch_dialog = false;
+    // Double-click a hatch (no command running) to edit it in the Hatch Edit dialog. The click is
+    // used up: it must not also start a grip edit on the hatch's centre grip below.
+    if inside
+        && double
+        && app.session.running.is_none()
+        && let Some(hp) = hover
+        && let Some(h) = hatch_at(app, xf.to_world(hp), scale)
+    {
+        app.session.set_selection(vec![h]);
+        crate::hatchdlg::open_edit(app);
+        hatch_dialog = true;
+    }
+
+    Some(hatch_dialog)
+}
+
+fn update_canvas_cursor(
+    app: &mut CadApp,
+    ui: &egui::Ui,
+    xf: &Xf,
+    inside: bool,
+    hover: Option<Pos2>,
+) -> (Option<Vec2>, Option<crate::dyninput::Frame>) {
+    let raw_world = hover.filter(|_| inside).map(|p| xf.to_world(p));
+    let dyn_frame = crate::cmdline::dyn_frame(app);
+    if let Some(w) = raw_world {
+        let mut eff = effective_point(app, w, xf, ui.ctx());
+        // A locked Dynamic Input value (`40,` or `40<` typed) holds the cursor and overrides snaps.
+        if let Some(f) = dyn_frame
+            && let Some(e) = crate::dyninput::parse(&app.cmd.buffer, &f)
+            && e.first_locked().is_some()
+        {
+            eff = crate::dyninput::constrain(&e, &f, eff, app.cmd.second_locked());
+            app.canvas.snap = None;
+            app.canvas.track = None;
+        }
+        // Grip dimensional input: typed lengths and angles hold the grip and override snaps.
+        let grip_held = crate::grip_dyn::constrain(app, eff);
+        if let Some(q) = grip_held {
+            eff = q;
+            app.canvas.snap = None;
+            app.canvas.track = None;
+        }
+        app.canvas.cursor = Some(eff);
+        app.session.cursor = eff;
+        app.session.cursor_deferred = app.canvas.snap.and_then(|h| h.deferred);
+        // Typed or menu snap overrides (END, NON…) and Tab cycling; a locked Dynamic Input value wins.
+        if dyn_frame.and_then(|f| crate::dyninput::parse(&app.cmd.buffer, &f)).is_none_or(|e| e.first_locked().is_none()) {
+            override_cursor(app, w, xf);
+        }
+        // Typed grip dimensions win over snap overrides too.
+        if let Some(q) = grip_held {
+            app.canvas.cursor = Some(q);
+            app.session.cursor = q;
+            app.canvas.snap = None;
+            app.session.cursor_deferred = None;
+        }
+    } else {
+        app.canvas.cursor = None;
+        app.canvas.snap = None;
+        app.session.cursor_deferred = None;
+    }
+
+    (raw_world, dyn_frame)
+}
+
+fn update_hover(app: &mut CadApp, ui: &egui::Ui, inside: bool, hover_pos: Option<Pos2>, raw_world: Option<Vec2>, scale: f64) {
+    // The cursor picks objects (pick box, rollover highlight): "Select objects" and single-object
+    // prompts, or no command with PICKFIRST on; SELECTIONPREVIEW says in which of those it shows.
+    let selecting = app.session.previews_selection();
+    if inside && selecting && app.session.pending_window.is_none() {
+        if hover_pos != app.canvas.hover_at
+            && let (Some(w), Ok(st)) = (raw_world, app.session.state())
+        {
+            let filter = app.session.settings.previewfilter;
+            app.canvas.hover = cadcraft_engine::select::pick(&st.doc, &st.edit_space(), w, app.session.settings.pickbox.max(1.0) * 1.5 / scale)
+                .filter(|h| st.doc.entity(*h).is_none_or(|e| !cadcraft_engine::select::preview_filtered(&st.doc, e, filter)));
+            app.canvas.hover_at = hover_pos;
+        }
+    } else {
+        app.canvas.hover = None;
+        app.canvas.hover_at = None;
+    }
+    // The open selection cycling list highlights the object of the row under the pointer.
+    if app.canvas.cycle.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.canvas.cycle = None;
+    }
+    if let Some(c) = &app.canvas.cycle {
+        app.canvas.hover = hover_pos.and_then(|hp| c.row_at(hp));
+        app.canvas.hover_at = None;
+    }
+    shift_space_cycle(app, ui, hover_pos.filter(|_| inside), raw_world);
+    if inside && hover_pos != app.canvas.cycle_badge_at {
+        app.canvas.cycle_badge = raw_world.is_some_and(|w| app.session.cycling_badge(w));
+        app.canvas.cycle_badge_at = hover_pos;
+    } else if !inside {
+        app.canvas.cycle_badge = false;
+        app.canvas.cycle_badge_at = None;
+    }
+}
+
+struct ReleaseContext<'a> {
+    rect: Rect,
+    xf: Xf,
+    mods: egui::Modifiers,
+    middle_down: bool,
+    became_far: Option<Pos2>,
+    releases: &'a [Release],
+    raw_world: Option<Vec2>,
+    dyn_frame: Option<crate::dyninput::Frame>,
+    /// The press is used up already (a hatch edit dialog opened, an idle double-click).
+    used: bool,
+}
+
+/// A press that became a drag this frame: with PICKDRAG 0 (two clicks only) over objects being
+/// selected it is no input; otherwise a selection window, a grip pickup, or (left alone) a click
+/// where it comes up.
+fn start_drag(app: &mut CadApp, c: &ReleaseContext<'_>) {
+    if !app.session.settings.pickdrag {
+        app.canvas.drag_window = false;
+        // Two clicks only: a drag where objects are being selected (or a window is open) is no
+        // click, so a held-button movement neither starts nor closes a window.
+        if let Some(origin) = c.became_far
+            && !c.middle_down
+            && c.rect.contains(origin)
+            && app.cmd.options.is_none()
+            && (app.session.pending_window.is_some() || app.session.click_picks())
+            && (app.session.prompting() || (crate::dyngrips::at(app, &c.xf, Some(origin)).is_none() && grip_at(app, &c.xf, Some(origin)).is_none()))
+        {
+            app.canvas.drag_ignored = true;
+        }
+    }
+    // A drag, where a drag means something, has that meaning: a selection window from where it
+    // went down to where it comes up (AutoCAD's PICKDRAG = 2; click-click still works), a grip
+    // edit's grip picked up where it went down and put down where it comes up, ZOOM Realtime's
+    // zoom, PAN's realtime pan. Any other drag is a click where it comes up (a second window
+    // corner, a point, a pick, a Shift-toggled grip, a list grip, a tile).
+    if let Some(origin) = c.became_far
+        && !c.middle_down
+        && c.rect.contains(origin)
+        && app.cmd.options.is_none()
+        && app.session.pending_window.is_none()
+        && !app.session.realtime_zoom_active()
+        && !app.session.realtime_pan_active()
+        && app.canvas.cycle.is_none()
+    {
+        let xf = &c.xf;
+        let on_grip = crate::dyngrips::at(app, xf, Some(origin)).is_some() || grip_at(app, xf, Some(origin)).is_some();
+        if app.session.prompting() || !on_grip {
+            // PICKDRAG off (two clicks only): the drag is a click where it comes up.
+            app.canvas.drag_window = app.session.settings.pickdrag && app.session.begin_window(xf.to_world(origin));
+        } else if !c.mods.shift
+            && let Some(g) = crate::dyngrips::at(app, xf, Some(origin)).filter(|g| g.1.shape != cadcraft_engine::doc::dynblock::GripShape::List)
+        {
+            crate::dyngrips::click(app, g);
+        } else if !c.mods.shift
+            && crate::dyngrips::at(app, xf, Some(origin)).is_none()
+            && let Some(g) = grip_at(app, xf, Some(origin))
+        {
+            click_grip(app, g, false);
+        }
+    }
+}
+
+/// The point (or pick) a click puts in: while prompting, a point; otherwise a dynamic grip, a
+/// grip or an idle pick.
+fn click_at(app: &mut CadApp, c: &ReleaseContext<'_>, at: Pos2, pick: PressPick, p: Vec2) {
+    let mods = c.mods;
+    if app.session.prompting() {
+        // Ctrl held while picking the point of a grip edit makes copies (the Copy option).
+        if mods.ctrl && app.session.running.as_ref().is_some_and(|r| r.id == "grip") {
+            let _ = app.session.input(Input::Keyword("Copy".into()));
+        }
+        // Clicking places the point; a value typed into the Dynamic Input boxes is used up.
+        if let Some(f) = c.dyn_frame
+            && crate::dyninput::parse(&app.cmd.buffer, &f).is_some()
+        {
+            app.cmd.buffer.clear();
+        }
+        // Preserve a snap's viewport origin for DIST, and its deferred curve where needed.
+        let result = match pick.snap {
+            Some(hit) => app.session.input_snapped(hit),
+            None => app.session.input(Input::Point(p)),
+        };
+        if let Err(e) = result {
+            app.session.echo(e.to_string());
+        }
+    } else if let Some(g) = crate::dyngrips::at(app, &c.xf, Some(at)) {
+        crate::dyngrips::click(app, g);
+    } else if let Some(g) = grip_at(app, &c.xf, Some(at)) {
+        click_grip(app, g, mods.shift);
+    } else if let Err(e) = app.session.idle_click(pick.raw.unwrap_or(p), mods.shift) {
+        app.session.echo(e.to_string());
+    }
+}
+
+/// Every primary press ends as exactly one input, never none. A click (see [`Press::drags`])
+/// counts where it went down, with the cursor and snap as they stood then, or, a fast one that
+/// moved further than `slop`, where it came up ([`Release::tap_at`]).
+fn handle_releases(app: &mut CadApp, ui: &egui::Ui, c: &ReleaseContext<'_>) {
+    start_drag(app, c);
+    let xf = &c.xf;
+    let last = c.releases.len().saturating_sub(1);
+    for (k, r) in c.releases.iter().copied().enumerate() {
+        let ignored = std::mem::take(&mut app.canvas.drag_ignored);
+        if c.middle_down || (r.far && ignored) {
+            continue;
+        }
+        if app.canvas.drag_window {
+            app.canvas.drag_window = false;
+            if app.session.pending_window.is_some() {
+                let end = xf.to_world(r.at);
+                let done = if app.session.prompting() { app.session.input(Input::Point(end)) } else { app.session.idle_click(end, c.mods.shift) };
+                if let Err(e) = done {
+                    app.session.echo(e.to_string());
+                }
+            }
+            continue;
+        }
+        if r.far && (app.session.realtime_zoom_active() || app.session.realtime_pan_active()) {
+            continue;
+        }
+        let at = r.tap_at();
+        // A click on the Dynamic Input options menu picks the keyword; elsewhere it closes the menu.
+        if app.cmd.options.is_some() {
+            match app.cmd.option_at(at) {
+                Some(o) => {
+                    crate::cmdline::pick_option(app, o);
+                    continue;
+                }
+                None => app.cmd.options = None,
+            }
+        }
+        if c.used || !c.rect.contains(at) {
+            continue;
+        }
+        // Where it went down, as the cursor stood then; else where it counts now: the cursor for
+        // the frame's last release, the point under it (unsnapped) for an earlier one (#815).
+        let pick = match r.pick.filter(|_| r.at_origin()) {
+            Some(pk) => pk,
+            None if k == last => PressPick { cursor: app.canvas.cursor, raw: c.raw_world, snap: app.canvas.snap },
+            None => {
+                let raw = xf.to_world(at);
+                PressPick { cursor: Some(effective_point(app, raw, xf, ui.ctx())), raw: Some(raw), snap: None }
+            }
+        };
+        // Selection cycling: a click on its list, or over overlapping objects, is used up there.
+        if cycle_click(app, xf, Some(at), pick.raw, c.mods.shift) {
+            continue;
+        }
+        let Some(p) = pick.cursor else { continue };
+        click_at(app, c, at, pick, p);
+    }
+}
+
+/// Draw the drawing area and handle its input (zoom and pan, picking, the crosshair) for this
+/// frame.
+///
+/// It also owns the cursor-visibility contract: the OS cursor is hidden only while the pointer is
+/// over the drawing area *and* the canvas is the topmost layer under it, so the drawn crosshair
+/// replaces the pointer over the drawing alone. A menu bar, an open menu (including its frame, not
+/// just its items), a tooltip or a floating palette above the canvas keeps the normal OS cursor
+/// visible (#1701), and so do the menus painted on the canvas itself (see [`over_canvas_menu`]).
+pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    let full = ui.available_rect_before_wrap();
+    // Tiled model viewports (VPORTS): the current tile is the drawing area below; `draw_tiles`
+    // draws the others.
+    let tiles = tile_rects(app, full);
+    // LAMB (fork): each tile's display-only rotation (canvas/panes.rs), read once per frame.
+    let rots = panes::rotations(app);
+    let turn = tiles.iter().position(|(_, tile)| tile.active).map_or(0.0, |i| panes::rotation(&rots, i));
+    let rect = tiles.iter().find(|(_, tile)| tile.active).map_or(full, |(r, _)| *r);
+    let resp = ui.interact(full, ui.scope_id().with("canvas"), Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    app.canvas.rect = Some(rect);
+    app.session.viewport_px = (f64::from(rect.width()).max(1.0), f64::from(rect.height()).max(1.0));
+    if app.canvas.zoom_pending {
+        app.canvas.zoom_pending = false;
+        let _ = app.session.zoom_extents();
+    }
+    let Ok(st) = app.session.state() else { return };
+    let view = st.view();
+    let scale = f64::from(rect.height()) / view.height.max(1e-12);
+    let xf = Xf { rect, center: view.center, scale, twist: view.twist + turn };
+    app.canvas.xf = Some(xf);
+
+    // ---------- input ----------
+    let pointer = ui.input(|i| PointerInput {
+        hover_pos: i.pointer.hover_pos(),
+        scroll: i.smooth_scroll_delta,
+        mods: i.modifiers,
+        middle_down: i.pointer.middle_down(),
+        pressed_secondary: i.pointer.secondary_clicked(),
+        dbl_middle: i.pointer.button_double_clicked(egui::PointerButton::Middle),
+        dbl_primary: i.pointer.button_double_clicked(egui::PointerButton::Primary),
+    });
+    // Primary presses are followed here rather than through egui's click/drag split (which drops a
+    // click that wanders a few pixels or is held a moment): each one ends as exactly one input.
+    let slop = ui.ctx().options(|o| o.input_options.max_click_dist);
+    let hovered = resp.hovered();
+    let (became_far, releases) = ui.input(|i| track_press(&mut app.canvas.press, &i.events, i.time, slop, |p| hovered && full.contains(p)));
+    let navigation = Navigation { rect, tiles: &tiles, response: &resp, xf, pointer, releases: &releases };
+    let Some((inside, on_menu)) = navigate_canvas(app, ui, &navigation) else { return };
+    let PointerInput { hover_pos, mods, middle_down, pressed_secondary, dbl_primary, .. } = pointer;
+    // Re-read the view after navigation.
+    let view = app.session.state().map(|s| s.view()).unwrap_or(view);
+    let scale = f64::from(rect.height()) / view.height.max(1e-12);
+    let xf = Xf { rect, center: view.center, scale, twist: view.twist + turn };
+    app.canvas.xf = Some(xf);
+    // The paper (display) transform; equal to `xf` except inside an MSPACE viewport.
+    let (xf_paper, active_vp) = match app.session.state() {
+        Ok(st) => {
+            let pv = st.paper_view();
+            // Paper space is never twisted.
+            let xp = Xf { rect, center: pv.center, scale: f64::from(rect.height()) / pv.height.max(1e-12), twist: 0.0 };
+            (if st.mspace.is_some() { xp } else { xf }, st.active_viewport().map(|(_, v)| v))
+        }
+        Err(_) => (xf, None),
+    };
+    // A clipped active viewport's outline (picks and its heavy border follow it).
+    let active_clip = app.session.state().ok().and_then(|st| st.active_viewport().and_then(|(h, v)| cadcraft_render::viewport_clip(&st.doc, h, &v)));
+    let Some(hatch_dialog) = handle_double_click(
+        app,
+        DoubleClickContext {
+            inside,
+            double: dbl_primary,
+            hover: hover_pos,
+            xf,
+            xf_paper,
+            scale,
+            active_viewport: &active_vp,
+            active_clip: &active_clip,
+        },
+    ) else {
+        return;
+    };
+
+    let (raw_world, dyn_frame) = update_canvas_cursor(app, ui, &xf, inside, hover_pos);
+
+    // A press picks up the cursor and snap as they stand where it went down.
+    if let Some(p) = app.canvas.press.as_mut()
+        && p.pick.is_none()
+    {
+        p.pick = Some(PressPick { cursor: app.canvas.cursor, raw: raw_world, snap: app.canvas.snap });
+    }
+
+    // A double-click with no command running (on a layout viewport, say) leaves no selection
+    // window behind; while a command asks for points, every click still counts (#815).
+    let idle_dbl = dbl_primary && app.session.running.is_none();
+    if idle_dbl {
+        app.session.pending_window = None;
+        app.canvas.drag_window = false;
+    }
+    // Selection cycling's list and Shift+Space highlight go stale with the command, prompt,
+    // drawing or view they were made for.
+    let key: CycleKey = (
+        app.session.running.as_ref().map(|r| r.id.clone()),
+        app.session.current_prompt().map(|p| p.message),
+        app.session.state().map_or(0, |st| st.uid),
+        app.session.state().map_or(0, |st| st.revision),
+        xf.center,
+        xf.scale,
+    );
+    if app.canvas.cycle_key.as_ref() != Some(&key) {
+        app.canvas.cycle = None;
+        app.canvas.hover_cycle = None;
+        app.canvas.cycle_key = Some(key);
+    }
+    handle_releases(
+        app,
+        ui,
+        &ReleaseContext { rect, xf, mods, middle_down, became_far, releases: &releases, raw_world, dyn_frame, used: hatch_dialog || idle_dbl },
+    );
+    // Right-click acts as Enter while a command runs (the classic CAD default; held, it opens the
+    // command menu); otherwise it opens the shortcut menu (Repeat, Clipboard, …).
+    // Shift/Ctrl+right-click opens the object snap menu.
+    let idle = !app.session.prompting();
+    if inside && pressed_secondary {
+        app.canvas.snap_menu = mods.shift || mods.ctrl;
+    }
+    if crate::context_menu::in_command(app, ui, inside, pressed_secondary) {
+        let _ = app.session.input(Input::Enter);
+    }
+    // Right-click on a grip with options (polyline vertex, line end…) opens the grip menu.
+    if inside && pressed_secondary && idle && !app.canvas.snap_menu {
+        app.canvas.grip_menu = grip_at(app, &xf, hover_pos).filter(|g| !grip_options(app, *g).is_empty());
+    }
+    crate::dyngrips::menu(app, ui.ctx(), &xf);
+    if idle && !app.canvas.snap_menu && app.canvas.grip_menu.is_some() {
+        grip_menu(app, &resp);
+    } else if idle || app.canvas.snap_menu {
+        crate::context_menu::show(app, &resp);
+    }
+
+    update_hover(app, ui, inside, hover_pos, raw_world, scale);
+
+    paint_canvas(CanvasPaint {
+        app,
+        ui,
+        painter: &painter,
+        tokens: t,
+        full,
+        tiles: &tiles,
+        rect,
+        xf,
+        xf_paper,
+        view,
+        active_vp,
+        active_clip,
+        inside,
+        on_menu,
+        hover_pos,
+        raw_world,
+        rots: &rots,
+        hovered,
+    });
+}
+
+fn paint_canvas(frame: CanvasPaint<'_>) {
+    let CanvasPaint {
+        app,
+        ui,
+        painter,
+        tokens: t,
+        full,
+        tiles,
+        rect,
+        xf,
+        xf_paper,
+        view,
+        active_vp,
+        active_clip,
+        inside,
+        on_menu,
+        hover_pos,
+        raw_world,
+        rots,
+        hovered,
+    } = frame;
+    let scale = xf.scale;
+    let selecting = app.session.previews_selection();
+    painter.rect_filled(rect, 0.0, t.canvas);
+    let t0 = crate::now_ms();
+    let mut views = vec![(xf_paper.world_bounds(), 1.0 / xf_paper.scale)];
+    views.extend(tiles.iter().enumerate().filter(|(_, (r, tile))| !tile.active && r.width() >= 1.0 && r.height() >= 1.0).map(|(i, (r, tile))| {
+        let xf = tile_xf(*r, tile, panes::rotation(rots, i));
+        (xf.world_bounds(), 1.0 / xf.scale)
+    }));
+    ensure_list(app, &xf_paper, &views, ui.ctx());
+    let sheet = app.canvas.list.as_ref().and_then(|l| l.sheet);
+    let surround = Color32::from_rgb(0x50, 0x57, 0x63);
+    let (bg, paper_rect) = match sheet {
+        Some(sh) => {
+            // Paper space: grey surround, the sheet with a shadow, the printable area dashed.
+            painter.rect_filled(rect, 0.0, surround);
+            let a = xf_paper.to_screen(Vec2::new(0.0, sh.size.y));
+            let b = xf_paper.to_screen(Vec2::new(sh.size.x, 0.0));
+            let paper = Rect::from_two_pos(a, b);
+            painter.rect_filled(paper.translate(vec2(5.0, 5.0)), 0.0, Color32::from_black_alpha(110));
+            painter.rect_filled(paper, 0.0, t.paper);
+            let pa = Rect::from_two_pos(
+                xf_paper.to_screen(Vec2::new(sh.printable.min.x, sh.printable.max.y)),
+                xf_paper.to_screen(Vec2::new(sh.printable.max.x, sh.printable.min.y)),
+            );
+            let pts = [pa.left_top(), pa.right_top(), pa.right_bottom(), pa.left_bottom(), pa.left_top()];
+            painter.extend(Shape::dashed_line(&pts, Stroke::new(1.0, Color32::from_gray(150)), 4.0, 4.0));
+            (Rgb(t.paper.r(), t.paper.g(), t.paper.b()), Some(paper))
+        }
+        None => {
+            blockedit::wash(app, painter, rect);
+            draw_grid(app, painter, &xf);
+            (Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b()), None)
+        }
+    };
+    let sel = app.session.selection();
+    // How the object under the cursor and the selected ones are highlighted (PREVIEWEFFECT,
+    // HIGHLIGHT, SELECTIONEFFECT); with HIGHLIGHT off only their grips show.
+    let (preview_look, selection_look) = (Look::preview(&app.session.settings), Look::selection(&app.session.settings));
+    paint_content_highlights(
+        &mut CanvasPaint {
+            app,
+            ui,
+            painter,
+            tokens: t,
+            full,
+            tiles,
+            rect,
+            xf,
+            xf_paper,
+            view,
+            active_vp: active_vp.clone(),
+            active_clip: active_clip.clone(),
+            inside,
+            on_menu,
+            hover_pos,
+            raw_world,
+            rots,
+            hovered,
+        },
+        bg,
+        &sel,
+        preview_look,
+        selection_look,
+    );
     app.canvas.draw_ms = crate::now_ms() - t0;
-    compare::paint(app, ui.ctx(), &painter, &xf_paper, rect);
-    blockedit::paint(app, ui.ctx(), &painter, &xf_paper, rect);
+    compare::paint(app, ui.ctx(), painter, &xf_paper, rect);
+    blockedit::paint(app, ui.ctx(), painter, &xf_paper, rect);
     // Constraint bars and dynamic dimensional constraints (model space, or inside a viewport).
     if sheet.is_none() || active_vp.is_some() {
         let clip = match &active_vp {
@@ -922,7 +1229,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
                 }
             }
         }
-        crate::dyngrips::draw(app, &painter, &xf, rect, hover_pos);
+        crate::dyngrips::draw(app, painter, &xf, rect, hover_pos);
     }
     // Rubber band preview of the active command.
     // `xf` is the space being edited: paper space, or model space inside the active viewport.
@@ -934,9 +1241,9 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         if let Ok(st) = app.session.state() {
             let serial = app.session.clipboard_source.as_ref().map_or(0, |c| c.serial);
             let transparency = app.session.settings.transparency_display;
-            draw_drag_gpu(&mut app.canvas, &painter, &xf, &st.doc, &drag, (&app.session.clipboard, serial), bg, transparency);
+            draw_drag_gpu(&mut app.canvas, painter, &xf, &st.doc, &drag, (&app.session.clipboard, serial), bg, transparency);
             let list = rebuilt_preview(&st.doc, extra.iter(), scale);
-            draw_list(&painter, &xf, &list, bg, false);
+            draw_list(painter, &xf, &list, bg, false);
         }
     } else if let (Some(c), true) = (app.canvas.cursor, app.session.prompting()) {
         let ents = app.session.preview(c);
@@ -944,7 +1251,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             && let Ok(st) = app.session.state()
         {
             let list = rebuilt_preview(&st.doc, ents.iter(), scale);
-            draw_list(&painter, &xf, &list, bg, false);
+            draw_list(painter, &xf, &list, bg, false);
         }
     }
     // Pending selection window.
@@ -964,66 +1271,32 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             painter.add(Shape::line(pts, st));
         }
     }
-    // Acquired tracking points and the polar / tracking paths under the cursor.
-    if app.canvas.cursor.is_some() {
-        draw_tracking(&painter, &xf, &app.session.tracking.acquired, app.canvas.track.as_ref(), view.height * 4.0);
-    }
-    if let (Some(hit), Some(_)) = (app.canvas.snap, app.canvas.cursor) {
-        draw_snap_marker(&painter, xf.to_screen(hit.point), &hit);
-    }
-    panes::prepare(app, &tiles, &rots);
-    // LAMB (fork, T363): the scale bar in model/block space only, decided once per frame.
-    let scale_bar = sheet.is_none() && active_vp.is_none() && scalebar::wanted(app);
-    draw_tiles(app, ui, &tiles, &rots, scale_bar);
-    panes::draw_hover(app, ui, &tiles, &rots, hover_pos.filter(|_| resp.hovered())); // LAMB (fork): T321
-    if scale_bar {
-        scalebar::draw(&painter, rect, xf.scale, Tokens::get().crosshair); // LAMB (fork): T363
-    }
-    // UCS icon, ViewCube and viewport label.
-    if app.ui.show_ucs_icon {
-        draw_ucs_icon(&painter, rect);
-        crate::viewcube::ucs_icon(app, ui, rect);
-    }
-    if app.ui.show_viewcube && sheet.is_none() {
-        draw_viewcube(app, ui, rect);
-    }
-    viewport_label(&painter, rect);
-    // Typing and Escape reach the command line even when its overlay is hidden.
-    crate::cmdline::keyboard(app, ui.ctx());
-    // Command line overlay.
-    if app.ui.show_command_line {
-        crate::cmdline::show(app, ui, full);
-    }
-    // Crosshair cursor.
-    if inside && !on_menu {
-        // Hide the OS cursor under the drawn crosshair, unless assistive tech needs it (#39).
-        ui.ctx().set_cursor_icon(if app.ui.system_cursor { egui::CursorIcon::Crosshair } else { egui::CursorIcon::None });
-        if let Some(hp) = hover_pos {
-            // Use the painted sheet even in MSPACE, where the editing transform follows a
-            // model viewport. The whole cursor takes one colour from its centre.
-            let ink = paper_rect.map_or(t.crosshair, |paper| crate::theme::crosshair_color(if paper.contains(hp) { t.paper } else { surround }));
-            draw_crosshair(app, &painter, rect, hp, selecting, ink);
-            if app.canvas.cycle_badge && app.canvas.cycle.is_none() {
-                cycle_badge(&painter, hp);
-            }
-        }
-    }
-    if inside
-        && app.session.settings.dynmode
-        && let Some(hp) = hover_pos
-    {
-        // A stretched grip shows its dimensions instead of the pointer boxes; a prompt asking for
-        // a distance shows its one field and keeps the prompt and its options.
-        let fields = crate::grip_dyn::draw(app, &painter);
-        if !fields || app.session.current_prompt().is_some_and(|p| p.distance) {
-            dynamic_input(app, &painter, hp, fields);
-        }
-    }
-    // Over the crosshair, so the row under the pointer reads clearly.
-    cycle_list(app, &painter);
-    // No continuous repaint while hovering: input events repaint by themselves. Repainting every
-    // frame kept a vsync swapchain's queue full (every frame waited behind queued ones) and would
-    // spin the CPU with the low-latency present mode (`gpu::surface_config`).
+    paint_pointer_overlay(
+        &mut CanvasPaint {
+            app,
+            ui,
+            painter,
+            tokens: t,
+            full,
+            tiles,
+            rect,
+            xf,
+            xf_paper,
+            view,
+            active_vp: active_vp.clone(),
+            active_clip: active_clip.clone(),
+            inside,
+            on_menu,
+            hover_pos,
+            raw_world,
+            rots,
+            hovered,
+        },
+        paper_rect,
+        surround,
+        selecting,
+        sheet,
+    );
 }
 
 #[cfg(test)]

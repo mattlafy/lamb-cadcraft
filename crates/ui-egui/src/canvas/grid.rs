@@ -1,4 +1,4 @@
-use super::*;
+use super::{Bounds2, CadApp, Shape, Stroke, Tokens, Vec2, Xf};
 
 /// Grid spacing adapted to the zoom: multiply the unit until lines are at least `min_px` apart.
 fn adaptive(unit: f64, scale: f64, min_px: f64) -> f64 {
@@ -107,7 +107,7 @@ mod grid_range_tests {
         let h = cadcraft_doc::Handle::parse_hex(r["handles"][0].as_str().unwrap()).unwrap();
         let only = cadcraft_engine::DisplayOnly { handles: vec![h], extra: Vec::new() };
         let st = s.state().unwrap();
-        let mut o = super::OnlyList::default();
+        let mut o = super::super::OnlyList::default();
         o.update(st, &only, 1.0, None);
         assert!(o.list.bounds.max.x > 99.0, "{:?}", o.list.bounds);
         // A triangle outline reaching x = 10 along the line.

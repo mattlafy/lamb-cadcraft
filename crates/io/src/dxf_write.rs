@@ -7,7 +7,11 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use cadcraft_color::Color;
-use cadcraft_doc::*;
+use cadcraft_doc::{
+    AssocSnap, Attrib, Block, Common, DimAssoc, DimKind, DimStyle, Dimension, Drawing, Entity, EntityKind, EntityStore, Gradient, Group, HAlign,
+    HVal, Handle, Hatch, Insert, Layout, Leader, Line, Lineweight, LwPolyline, MLeader, MLeaderStyle, MText, PageSetup, Point, Solid, Space, Table,
+    TableStyle, Text, Transparency, VAlign, VportConfig, VportTile,
+};
 use cadcraft_dxf::{Tag, Version};
 use cadcraft_geom::{Bounds2, Vec2, Vec3};
 

@@ -41,6 +41,7 @@ fn logged(s: &Session, m: &str) -> bool {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn every_prompt_step_on_the_model_tab() {
     let mut s = session();
     let undo = s.state().unwrap().undo.len();

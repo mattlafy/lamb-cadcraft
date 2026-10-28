@@ -71,6 +71,7 @@ fn poly(d: &Drawing, e: Id) -> Result<Polyline2, Box<dyn std::error::Error>> {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn link_observer_maintains_links() -> R {
     register();
     let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
