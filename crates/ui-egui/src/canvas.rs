@@ -742,7 +742,14 @@ fn collect_prompt_clicks(app: &mut CadApp, ui: &egui::Ui, context: PromptClickCo
         && app.session.pending_window.is_none()
         && !app.session.realtime_zoom_active();
     let pressed_primary = context.primary_clicked || (point_prompt && context.response.drag_stopped_by(egui::PointerButton::Primary));
-    if !context.mobile_pan && point_prompt && context.inside && pressed_primary && !context.middle_down && app.cmd.options.is_none() && app.cmd.buffer.is_empty() {
+    if !context.mobile_pan
+        && point_prompt
+        && context.inside
+        && pressed_primary
+        && !context.middle_down
+        && app.cmd.options.is_none()
+        && app.cmd.buffer.is_empty()
+    {
         let releases: Vec<egui::Pos2> = ui.input(|i| {
             i.events
                 .iter()
@@ -846,8 +853,11 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         return;
     };
 
-    let pressed_primary =
-        collect_prompt_clicks(app, ui, PromptClickContext { rect, xf, inside, middle_down, primary_clicked: pressed_primary, mobile_pan, response: &resp });
+    let pressed_primary = collect_prompt_clicks(
+        app,
+        ui,
+        PromptClickContext { rect, xf, inside, middle_down, primary_clicked: pressed_primary, mobile_pan, response: &resp },
+    );
 
     let (raw_world, dyn_frame) = update_canvas_cursor(app, ui, &xf, inside, hover_pos);
 
