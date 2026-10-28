@@ -7,15 +7,27 @@ mod template;
 
 use std::sync::OnceLock;
 
-use cadcraft_doc::Drawing;
+use cadcraft_doc::{Drawing, Format};
 pub use cadcraft_dxf::Version;
 use serde_json::{Value, json};
 
-use super::*;
+use super::{CommandSpec, EngineError, Interactive, always, bad, bool_or, find_command, ok, str_param};
+
 use crate::{Accept, Input, Prompt, Result, Session, Step};
 
+/// The rules the Command Aliases dialog checks before it sends an alias to ALIASEDIT.
+pub use pgp::{MAX_ALIASES, alias_name, command_id};
 pub(crate) use pgp::{specs as alias_specs, user_alias};
 pub use template::{qnew_template, set_qnew_template};
+
+/// Largest drawing accepted from a local path, matching the per-file xref limit. A path naming an
+/// endless device must be rejected before it exhausts memory (CWE-400), so native opens read
+/// through [`crate::capped_read`] rather than buffering to EOF.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_DRAWING_BYTES: usize = 512 << 20;
+/// Largest `.scr` script accepted from a local path.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SCRIPT_BYTES: usize = 64 << 20;
 
 /// Plot a space to PDF bytes with JSON options (`{paper?, landscape?, fit?, lineweights?, …}`).
 pub type PlotHook = fn(&Drawing, &cadcraft_doc::Space, &Value) -> std::result::Result<Vec<u8>, String>;
@@ -124,8 +136,7 @@ fn save_options(cmd: &str, p: &Value) -> Result<SaveAs> {
 
 /// Whether `path` names a DXF file (or has no extension, which saves as DXF).
 fn is_dxf(path: &str) -> bool {
-    let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    matches!(ext.as_str(), "dxf" | "")
+    Format::from_path(path) == Some(Format::Dxf)
 }
 
 /// The drawing written to `path` with `opts`: through [`IoHooks::write`] when no option is set,
@@ -152,7 +163,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .menu(&["File", "New Drawing..."])
             .key("Cmd+N")
             .alias(&["qnew"])
-            .params("{metric?: bool, template?: path to a .dwt/.dxf template (\".\" for none; default QNEWTEMPLATE)}")
+            .params("{metric?: bool (default MEASUREINIT), template?: path to a .dwt/.dxf template (\".\" for none; default QNEWTEMPLATE)}")
             .enabled(always)
             .noundo(),
         CommandSpec::new("open", "Open...", run_open)
@@ -190,7 +201,8 @@ fn run_script(s: &mut Session, p: &Value) -> Result<Value> {
         let path = _path;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let bytes = std::fs::read(path).map_err(|e| bad("script", format!("{path}: {e}")))?;
+            let bytes =
+                crate::capped_read::read_capped(std::path::Path::new(path), MAX_SCRIPT_BYTES).map_err(|e| bad("script", format!("{path}: {e}")))?;
             String::from_utf8_lossy(&bytes).into_owned()
         }
         #[cfg(target_arch = "wasm32")]
@@ -240,7 +252,8 @@ fn run_new(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(r) = template::run_new(s, p)? {
         return Ok(r);
     }
-    let i = s.new_drawing(bool_or(p, "metric", false));
+    let metric = s.settings.measureinit;
+    let i = s.new_drawing(bool_or(p, "metric", metric));
     Ok(json!({ "index": i, "title": s.docs.get(i).map(|d| d.title.clone()) }))
 }
 
@@ -259,16 +272,21 @@ pub struct ReadFile {
 }
 
 /// Read and decode `path` (the slow half of `OPEN {path}`). Needs no session; runs anywhere.
-pub fn read_file(path: &str) -> std::result::Result<ReadFile, String> {
+pub fn read_file(path: &std::path::Path) -> std::result::Result<ReadFile, String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let r = std::panic::catch_unwind(|| {
-            let bytes = std::fs::read(path).map_err(|e| bad("open", format!("{path}: {e}")))?;
-            read_bytes(&bytes, path, Some(path.to_string()))
+            let shown = path.display();
+            // The session keeps paths as text; a name that isn't Unicode could never be saved back to.
+            let Some(text_path) = path.to_str() else {
+                return Err(bad("open", format!("{shown}: the file name is not valid Unicode, so CADCraft can't save back to it")));
+            };
+            let bytes = crate::capped_read::read_capped(path, MAX_DRAWING_BYTES).map_err(|e| bad("open", format!("{shown}: {e}")))?;
+            read_bytes(&bytes, text_path, Some(text_path.to_string()))
         });
         match r {
             Ok(r) => r.map_err(|e| e.to_string()),
-            Err(_) => Err(bad("open", format!("{path}: the file could not be read")).to_string()),
+            Err(_) => Err(bad("open", format!("{}: the file could not be read", path.display())).to_string()),
         }
     }
     #[cfg(target_arch = "wasm32")]
@@ -324,13 +342,15 @@ fn opened(s: &Session, i: usize, entities: bool) -> Value {
     }
 }
 
+/// Open a drawing from bounded regular-file bytes or base64 data and resolve its external references.
 fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(_path) = str_param(p, "path") {
         #[cfg(not(target_arch = "wasm32"))]
         let path = _path;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let bytes = std::fs::read(path).map_err(|e| bad("open", format!("{path}: {e}")))?;
+            let bytes =
+                crate::capped_read::read_capped(std::path::Path::new(path), MAX_DRAWING_BYTES).map_err(|e| bad("open", format!("{path}: {e}")))?;
             let i = open_bytes(s, &bytes, path, Some(path.to_string()))?;
             super::blocks::xref::after_open(s, i);
             return Ok(opened(s, i, true));
@@ -346,6 +366,7 @@ fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(opened(s, i, false))
 }
 
+/// `close [index]`: cancel the running command, remove the drawing (default: active), keep the active index valid, and bump the document epoch; an unknown index is an error.
 fn run_close(s: &mut Session, p: &Value) -> Result<Value> {
     let i = p.get("index").and_then(Value::as_u64).map(|i| i as usize).unwrap_or(s.active);
     if i >= s.docs.len() {
@@ -360,13 +381,16 @@ fn run_close(s: &mut Session, p: &Value) -> Result<Value> {
     if s.active >= s.docs.len() {
         s.active = s.docs.len().saturating_sub(1);
     }
+    s.bump_doc_epoch();
     ok()
 }
 
+/// `closeall`: cancel the running command, remove every drawing, reset the active index to 0 and bump the document epoch.
 fn run_closeall(s: &mut Session, _p: &Value) -> Result<Value> {
     s.cancel();
     s.docs.clear();
     s.active = 0;
+    s.bump_doc_epoch();
     ok()
 }
 
@@ -401,10 +425,9 @@ fn save_as(s: &mut Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<usiz
 fn store(path: &str, bytes: &[u8]) -> Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let tmp = format!("{path}.cadcraft-tmp");
-        std::fs::write(&tmp, bytes).map_err(|e| bad("save", format!("{path}: {e}")))?;
-        std::fs::rename(&tmp, path).map_err(|e| bad("save", format!("{path}: {e}")))?;
-        Ok(())
+        // Exclusively create a fresh temporary file and rename it over `path`, so a planted
+        // `<path>.cadcraft-tmp` symlink cannot redirect the write onto another file (CWE-59).
+        crate::atomic_write::write_atomic(std::path::Path::new(path), bytes).map_err(|e| bad("save", format!("{path}: {e}")))
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -472,6 +495,7 @@ fn drawing_version(s: &Session, path: &str) -> Version {
     if is_dxf(path) { v } else { v.max(Version::R2004) }
 }
 
+/// `document.switch index`: require the index, cancel the running command, activate that drawing and bump the epoch even if it was already active (screenshot identity).
 fn run_switch(s: &mut Session, p: &Value) -> Result<Value> {
     let i = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad("document.switch", "`index` is required"))? as usize;
     if i >= s.docs.len() {
@@ -479,6 +503,11 @@ fn run_switch(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.cancel();
     s.active = i;
+    // Bump even when `i` is already active. This is intentionally conservative: the command
+    // cancels the active command, and a screenshot client can only see observed state, not
+    // whether the switch was a no-op. Rejecting an outstanding capture is safer than returning
+    // an image whose queueing identity the client cannot distinguish from a real switch.
+    s.bump_doc_epoch();
     ok()
 }
 
@@ -489,7 +518,7 @@ fn run_bytes(s: &mut Session, p: &Value) -> Result<Value> {
     let lost = not_saved_as(s.doc()?, version);
     let bytes = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts)?;
     let mut r = json!({ "data": base64_encode(&bytes), "bytes": bytes.len() });
-    if drops_unknown(&format!("drawing.{fmt}")) {
+    if drops_unknown(format!("drawing.{fmt}")) {
         report_not_saved(s, &mut r, &lost);
     }
     Ok(r)
@@ -537,15 +566,13 @@ pub fn not_saved_message(lost: &std::collections::BTreeMap<String, usize>) -> Op
 
 /// Whether saving to `path` leaves out the entities [`not_saved`] counts: DWG does (the DWG
 /// bridge drops types it doesn't know); DXF writes them back as read.
-pub fn drops_unknown(path: &str) -> bool {
-    // Templates (.dwt) are written as DWG too.
-    std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("dwg") || e.eq_ignore_ascii_case("dwt"))
+pub fn drops_unknown(path: impl AsRef<std::path::Path>) -> bool {
+    Format::from_path(path).is_some_and(Format::drops_unknown)
 }
 
 /// Whether `path` is saved as a drawing (DXF, DWG) rather than exported as an image.
-fn is_drawing_file(path: &str) -> bool {
-    let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    matches!(ext.as_str(), "dxf" | "dwg" | "dwt" | "")
+fn is_drawing_file(path: impl AsRef<std::path::Path>) -> bool {
+    Format::from_path(path).is_some_and(Format::is_drawing)
 }
 
 /// Say on the command line what the file couldn't keep, and list it in the result's `notSaved`.
@@ -706,6 +733,7 @@ mod tests {
 #[cfg(test)]
 mod pr193_tests {
     use super::*;
+    use crate::Session;
 
     #[test]
     fn failed_store_keeps_unsaved_changes_and_delivered_save_clears_them() {

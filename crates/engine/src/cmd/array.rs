@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 use super::helpers::{line, v3};
 use super::machines::{SelOutcome, SelectPhase, number};
 use super::modify::transform_entities;
-use super::*;
+use super::{CommandSpec, bad, bool_or, f64_or, find_command, point_param, point_req, str_param, targets};
+
 use crate::{Accept, EngineError, Input, Interactive, Prompt, Result, Session, Step};
 
 mod edit;
@@ -626,7 +627,7 @@ impl Interactive for RectM {
             SpaceRows => dist("Specify the distance between rows", self.rs),
             UnitCell => match self.corner {
                 None => Prompt::new("Specify first corner of the unit cell", Accept::POINT).base(self.base),
-                Some(c) => Prompt::new("Specify other corner", Accept::POINT).base(c),
+                Some(c) => Prompt::new("Specify other corner", Accept::POINT).corner(c),
             },
             ColsSpace => dist("Specify the distance between columns", self.cs).kw(&["Total"]),
             ColsTotal => dist("Specify the distance between the first and last column", self.cs * self.cols.saturating_sub(1) as f64),
