@@ -252,6 +252,9 @@ fn install_lamb() {
     if let Err(e) = cadcraft_ui_egui::canvas::scalebar::register_scale_bar(lamb_cadcraft::commands::scale_bar_wanted) {
         log::warn!("LAMB scale bar not installed: {e}");
     }
+    if let Err(e) = cadcraft_ui_egui::canvas::hoverext::register_hover_observer(lamb_cadcraft::hover_links) {
+        log::warn!("LAMB hover halo not installed: {e}");
+    }
 }
 
 fn version_string() -> String {

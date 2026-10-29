@@ -48,6 +48,34 @@ pub(crate) fn set_attention_blocks(to: Vec<(String, Vec<Handle>)>) {
     cadcraft_render::bump_overlays();
 }
 
+/// The hover halo (LAMB T550): the rollover entity's linked lines in their own view blocks, paler
+/// than the attention halo and under it.
+const HOVER_TRANSPARENCY: u8 = 70;
+
+/// Each hover-haloed block's name and the handles to halo in it.
+static HOVER: Mutex<Vec<(String, Vec<Handle>)>> = Mutex::new(Vec::new());
+
+fn hover() -> std::sync::MutexGuard<'static, Vec<(String, Vec<Handle>)>> {
+    HOVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Halo each block's handles as the hovered entity's links; empty halos nothing. Bumps the
+/// overlays only when the value changes, since the pointer moves every frame.
+pub(crate) fn set_hover_blocks(to: Vec<(String, Vec<Handle>)>) {
+    let mut h = hover();
+    if *h != to {
+        *h = to;
+        drop(h);
+        cadcraft_render::bump_overlays();
+    }
+}
+
+/// Every hover-haloed block and its handles.
+#[cfg(test)]
+pub(crate) fn current_hover_blocks() -> Vec<(String, Vec<Handle>)> {
+    hover().clone()
+}
+
 /// TS `HALO_COLOR.added` (`#4caf50`): the assistant candidate ghost.
 pub(crate) const ADDED_COLOR: Rgb = Rgb(0x4c, 0xaf, 0x50);
 const GHOST_TRANSPARENCY: u8 = 40;
@@ -104,8 +132,8 @@ fn append(out: &mut DisplayList, src: &DisplayList, color: Option<Rgb>, transpar
     }
 }
 
-/// The halos for `space` when it is a LAMB view's block: the tentative glow first, then the
-/// attention halo when RESOLVE is pointing into this block. Empty anywhere else.
+/// The halos for `space` when it is a LAMB view's block: the tentative glow first, then the pale
+/// hover halo, then the attention halo when RESOLVE is pointing into this block. Empty anywhere else.
 pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let mut out = DisplayList { bounds: Bounds2::EMPTY, ..DisplayList::default() };
     let Space::Block(name) = space else { return out };
@@ -118,6 +146,12 @@ pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let glow: Vec<&Entity> = block.entities.iter().map(|e| &**e).filter(|e| tentative(e) && !haloed.contains(&e.handle)).collect();
     if !glow.is_empty() {
         append(&mut out, &cadcraft_render::build_entities(d, glow, &opts), None, TENTATIVE_TRANSPARENCY);
+    }
+    let hovered: Vec<Handle> =
+        hover().iter().filter(|(b, _)| b == name).flat_map(|(_, hs)| hs.iter().copied()).filter(|h| !haloed.contains(h)).collect();
+    if !hovered.is_empty() {
+        let ents: Vec<&Entity> = block.entities.iter().map(|e| &**e).filter(|e| hovered.contains(&e.handle)).collect();
+        append(&mut out, &cadcraft_render::build_entities(d, ents, &opts), Some(ATTENTION_COLOR), HOVER_TRANSPARENCY);
     }
     if !haloed.is_empty() {
         let ents: Vec<&Entity> = block.entities.iter().map(|e| &**e).filter(|e| haloed.contains(&e.handle)).collect();
@@ -199,6 +233,49 @@ mod tests {
 
         mark_ai(&mut s, h, true)?;
         assert_eq!(lamb_overlay(s.doc()?, &space, &Options::default()).prims.len(), base, "accepted: no glow");
+        Ok(())
+    }
+
+    #[test]
+    fn the_hover_halo_is_paler_and_attention_wins() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        set_attention(None);
+        set_ghost(None);
+        set_hover_blocks(Vec::new());
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("lambproject", &json!({}))?["viewId"].as_u64().ok_or("no plan")?);
+        let name = view_block_name(plan);
+        let before: Vec<Handle> = handles(&s, &name)?;
+        s.execute("line", &json!({ "points": [[0, 0], [1000, 0]] }))?;
+        s.execute("line", &json!({ "points": [[0, 500], [1000, 500]] }))?;
+        let new: Vec<Handle> = handles(&s, &name)?.into_iter().filter(|h| !before.contains(h)).collect();
+        let [a, b] = new.as_slice() else { return Err("two lines".into()) };
+        let space = Space::Block(name.clone());
+
+        let g0 = cadcraft_render::overlays_generation();
+        set_hover_blocks(vec![(name.clone(), vec![*a, *b])]);
+        let g1 = cadcraft_render::overlays_generation();
+        assert!(g1 > g0, "a change bumps");
+        set_hover_blocks(vec![(name.clone(), vec![*a, *b])]);
+        assert_eq!(cadcraft_render::overlays_generation(), g1, "the same value does not");
+        let list = draw(s.doc()?, &space, &Options::default());
+        for h in [a, b] {
+            let mine: Vec<&DPrim> = list.prims.iter().filter(|p| p.handle == *h).collect();
+            assert_eq!(mine.len(), 1, "{:?}", list.prims);
+            assert_eq!((mine[0].color, mine[0].transparency), (ATTENTION_COLOR, HOVER_TRANSPARENCY));
+        }
+        assert!(draw(s.doc()?, &Space::Model, &Options::default()).prims.is_empty(), "only its own block");
+
+        set_attention(Some((name.clone(), vec![*a])));
+        let list = draw(s.doc()?, &space, &Options::default());
+        let mine: Vec<&DPrim> = list.prims.iter().filter(|p| p.handle == *a).collect();
+        assert_eq!(mine.len(), 1, "in both: drawn once");
+        assert_eq!(mine[0].transparency, ATTENTION_TRANSPARENCY, "as attention");
+        set_attention(None);
+        set_hover_blocks(Vec::new());
+        assert!(draw(s.doc()?, &space, &Options::default()).prims.is_empty(), "cleared");
         Ok(())
     }
 

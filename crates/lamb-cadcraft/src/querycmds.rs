@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use cadcraft_doc::{EntityKind, Handle, Space, entity_bounds};
+use cadcraft_doc::{Drawing, EntityKind, Handle, Space, entity_bounds};
 use cadcraft_engine::cmd::machines::{SelOutcome, SelectPhase};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step, View};
 use cadcraft_geom::Bounds2;
@@ -31,7 +31,7 @@ use lamb_core::model::{DrawingLayer, Id, LineRole, LinkAnchor, LinkOrigin, LinkR
 use serde_json::{Map, Value, json};
 
 use crate::commands::{bad, enter_space, id_value, other};
-use crate::overlays::halo::set_attention_blocks;
+use crate::overlays::halo::{set_attention_blocks, set_hover_blocks};
 use crate::project::DrawingProject;
 use crate::schema::view_block_name;
 
@@ -118,6 +118,41 @@ pub(crate) fn showlinks(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// A linked component's members grouped by view, in the drawing's view order; members in no
+/// view are left out. SHOWLINKS' halo and the hover halo both group this way.
+fn component_blocks(dp: &DrawingProject<'_>, comp: &BTreeSet<Id>) -> Vec<(Id, Vec<Handle>)> {
+    let mut out: Vec<(Id, Vec<Handle>)> = Vec::new();
+    for e in comp {
+        let Some(v) = dp.entity_view_id(*e) else { continue };
+        match out.iter_mut().find(|(id, _)| *id == v) {
+            Some((_, hs)) => hs.push(Handle(e.0)),
+            None => out.push((v, vec![Handle(e.0)])),
+        }
+    }
+    let order: Vec<Id> = dp.views().map(|v| v.id).collect();
+    out.sort_by_key(|(id, _)| order.iter().position(|o| o == id).unwrap_or(usize::MAX));
+    out
+}
+
+/// The canvas hover observer (LAMB T550, registered by the app with
+/// `canvas::hoverext::register_hover_observer`): halo every other member of `hovered`'s linked
+/// component in its own view block, paler than SHOWLINKS. Nothing hovered, an entity in no LAMB
+/// view, or one with no links → no hover halo.
+pub fn hover_links(d: &Drawing, hovered: Option<Handle>) {
+    set_hover_blocks(hovered.map_or_else(Vec::new, |h| hover_blocks(d, h)));
+}
+
+fn hover_blocks(d: &Drawing, h: Handle) -> Vec<(String, Vec<Handle>)> {
+    let Ok(dp) = DrawingProject::new(d) else { return Vec::new() };
+    let id = Id(h.0);
+    if dp.entity_view_id(id).is_none() {
+        return Vec::new();
+    }
+    let mut comp = linked_entity_component(&dp, id);
+    comp.remove(&id);
+    component_blocks(&dp, &comp).into_iter().map(|(v, hs)| (view_block_name(v), hs)).collect()
+}
+
 /// One view of a SHOWLINKS component: its id, name and the members drawn in it.
 struct LinkedView {
     id: Id,
@@ -152,16 +187,14 @@ impl ShowLinks {
             s.echo("No links");
             return Ok(Step::Done);
         }
-        let order: Vec<Id> = DrawingProject::new(s.doc()?).map_err(other)?.views().map(|v| v.id).collect();
-        let mut views: Vec<LinkedView> = Vec::new();
-        for c in &comp {
-            let (Some(v), Some(h)) = (c["viewId"].as_u64(), c["entityId"].as_str().and_then(Handle::parse_hex)) else { continue };
-            match views.iter_mut().find(|lv| lv.id.0 == v) {
-                Some(lv) => lv.members.push(h),
-                None => views.push(LinkedView { id: Id(v), name: c["viewName"].as_str().unwrap_or("").to_owned(), members: vec![h] }),
-            }
-        }
-        views.sort_by_key(|lv| order.iter().position(|o| *o == lv.id).unwrap_or(usize::MAX));
+        let views: Vec<LinkedView> = {
+            let dp = DrawingProject::new(s.doc()?).map_err(other)?;
+            let members: BTreeSet<Id> = comp.iter().filter_map(|c| entity_id(&c["entityId"])).collect();
+            component_blocks(&dp, &members)
+                .into_iter()
+                .map(|(id, members)| LinkedView { id, name: dp.view(id).map_or(String::new(), |v| v.name.to_owned()), members })
+                .collect()
+        };
         let own = r["entityId"].as_str().and_then(Handle::parse_hex);
         self.at = views.iter().position(|lv| own.is_some_and(|h| lv.members.contains(&h))).unwrap_or(0);
         set_attention_blocks(views.iter().map(|lv| (view_block_name(lv.id), lv.members.clone())).collect());
@@ -471,7 +504,7 @@ mod tests {
     use super::*;
     use crate::commands::install_app;
     use crate::import::project_to_drawing;
-    use crate::overlays::halo::current_attention_blocks;
+    use crate::overlays::halo::{current_attention_blocks, current_hover_blocks};
     use crate::schema::{read_document, write_document};
     use lamb_core::model::Project;
     use lamb_core::persistence::files_to_project;
@@ -637,6 +670,49 @@ mod tests {
         assert!(s.running.is_none(), "ended");
         assert_eq!(s.log.last().map(String::as_str), Some("No links"));
         assert!(current_attention_blocks().is_empty(), "no halo");
+        Ok(())
+    }
+
+    #[test]
+    fn hover_links_haloes_the_rest_of_the_component_by_block_and_clears() -> E<()> {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, wall, _) = session(false)?;
+        let r = showlinks(&mut s, &json!({ "handle": hex(wall) }))?;
+        let mut want: BTreeSet<String> = ids(&r["component"]).into_iter().collect();
+        want.remove(&hex(wall));
+        hover_links(s.doc()?, Some(Handle(wall.0)));
+        let blocks = current_hover_blocks();
+        assert_eq!(halo_union(&blocks), want, "every member but the wall");
+        let views: BTreeSet<String> = r["component"]
+            .as_array()
+            .ok_or("component")?
+            .iter()
+            .filter(|c| c["entityId"] != json!(hex(wall)))
+            .filter_map(|c| c["viewId"].as_u64().map(|v| view_block_name(Id(v))))
+            .collect();
+        assert_eq!(blocks.iter().map(|(b, _)| b.clone()).collect::<BTreeSet<_>>(), views, "{blocks:?}");
+        assert!(views.len() >= 2, "both sections: {views:?}");
+        let dp = DrawingProject::new(s.doc()?)?;
+        for (b, hs) in &blocks {
+            assert!(hs.iter().all(|h| dp.entity_view_id(Id(h.0)).is_some_and(|v| view_block_name(v) == *b)), "{b}: {hs:?}");
+        }
+        drop(dp);
+
+        hover_links(s.doc()?, None);
+        assert!(current_hover_blocks().is_empty(), "nothing hovered");
+        hover_links(s.doc()?, Some(Handle(wall.0)));
+        hover_links(s.doc()?, Some(Handle(0xFF_FFFF)));
+        assert!(current_hover_blocks().is_empty(), "an entity in no view");
+
+        let view = r["component"].as_array().and_then(|c| c.iter().find(|c| c["entityId"] == json!(hex(wall)))).ok_or("wall")?["viewId"].clone();
+        s.execute("editview", &json!({ "viewId": view }))?;
+        let block = view_block_name(Id(view.as_u64().ok_or("view id")?));
+        let before: Vec<Handle> = s.doc()?.block(&block).ok_or("no block")?.entities.iter().map(|e| e.handle).collect();
+        s.execute("line", &json!({ "points": [[90_000, 90_000], [91_000, 90_000]] }))?;
+        let lone = s.doc()?.block(&block).ok_or("no block")?.entities.iter().map(|e| e.handle).find(|h| !before.contains(h)).ok_or("no line")?;
+        hover_links(s.doc()?, Some(Handle(wall.0)));
+        hover_links(s.doc()?, Some(lone));
+        assert!(current_hover_blocks().is_empty(), "an unlinked entity");
         Ok(())
     }
 

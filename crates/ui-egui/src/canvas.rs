@@ -798,6 +798,7 @@ fn update_canvas_cursor(
 fn update_hover(app: &mut CadApp, ui: &egui::Ui, inside: bool, hover_pos: Option<Pos2>, raw_world: Option<Vec2>, scale: f64) {
     // The cursor picks objects (pick box, rollover highlight): "Select objects" and single-object
     // prompts, or no command with PICKFIRST on; SELECTIONPREVIEW says in which of those it shows.
+    let before = app.canvas.hover; // LAMB (fork): T550
     let selecting = app.session.previews_selection();
     if inside && selecting && app.session.pending_window.is_none() {
         if hover_pos != app.canvas.hover_at
@@ -828,6 +829,7 @@ fn update_hover(app: &mut CadApp, ui: &egui::Ui, inside: bool, hover_pos: Option
         app.canvas.cycle_badge = false;
         app.canvas.cycle_badge_at = None;
     }
+    hoverext::notify(app, before); // LAMB (fork): T550
 }
 
 struct ReleaseContext<'a> {
@@ -1391,6 +1393,8 @@ pub(crate) mod tests;
 mod blockedit;
 /// The COMPARE overlay.
 mod compare;
+/// LAMB (fork-only, T550): the registered canvas hover observer.
+pub mod hoverext;
 /// LAMB (fork-only): overlay providers' markers and cut lines over the drawing.
 mod lamb_overlays;
 /// LAMB (fork-only): each model tile draws its own space.

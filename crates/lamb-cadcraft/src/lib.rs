@@ -101,6 +101,7 @@ pub use maintain::{MaintenanceReport, install, link_observer, maintain_links, tr
 pub use overlays::{lamb_overlay, lamb_snaps, register_providers};
 pub use project::DrawingProject;
 pub use project_mut::DrawingProjectMut;
+pub use querycmds::hover_links;
 pub use scene::{
     ConstructionState, Scene, SceneError, SceneMesh, SceneMeshKind, ScenePath, ScenePick, ghosts_hidden, pick, scene, set_ghosts_hidden,
     without_ghosts,
