@@ -94,8 +94,9 @@
 //! - `accept {handles?}` (`acc`), `setrole {handles?, role}`, `layerrole {layer, role}` (View ▸
 //!   LAMB): take ownership of AI lines, an entity's role, a layer's default role — see
 //!   [`crate::entitycmds`].
-//! - `showlinks {handle?}` (`sl`, typed only, off the menu) and `query {…}` (parameter-only):
-//!   read-only — an edit's link blast radius, and the filter lookup; see [`crate::querycmds`].
+//! - `showlinks {handle?}` (`sl`, LAMB ▸ Links ▸ Show Links) and `query {…}` (parameter-only):
+//!   read-only — an edit's link blast radius, haloed in every view, and the filter lookup; see
+//!   [`crate::querycmds`].
 //! - `duplicateview {viewId?, name?}`, `placeview {viewId, kind, …}` (interactive: PLACEVIEW / `pv`),
 //!   `unplaceview {viewId?}` and `level {mode, …}` (LAMB ▸ View Setup, LAMB ▸ Levels & Cuts): a view's lifecycle and the level
 //!   cascade — see [`crate::viewlife`].
@@ -893,6 +894,12 @@ pub fn commands() -> Vec<CommandSpec> {
             .noundo()
             .menu(MENU_LINKS)
             .interactive(crate::linkcmds::unlink_machine),
+        CommandSpec::new("showlinks", "Show Links", crate::querycmds::showlinks)
+            .alias(&["sl"])
+            .params("{handle?}")
+            .noundo()
+            .menu(MENU_LINKS)
+            .interactive(crate::querycmds::showlinks_machine),
         CommandSpec::new("detailtag", "Detail Tag", crate::detailtags::detailtag)
             .alias(&["dtag"])
             .params("{detailViewId, corner?: bool, tip:{x,y}, bubble:{x,y}}")
@@ -978,11 +985,6 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new(crate::assistant::START_ID, "Assistant Start", crate::assistant::start_cmd).params("{message, dryRun?}").noundo(),
         CommandSpec::new(crate::assistant::RESUME_ID, "Assistant Resume", crate::assistant::resume_cmd).params("{turn, reply}").noundo(),
         CommandSpec::new(crate::assistant::GHOST_ID, "Assistant Ghost", crate::assistant::ghost_cmd).params("{steps?}").noundo(),
-        CommandSpec::new("showlinks", "Show Links", crate::querycmds::showlinks)
-            .alias(&["sl"])
-            .params("{handle?}")
-            .noundo()
-            .interactive(crate::querycmds::showlinks_machine),
         CommandSpec::new("query", "Query", crate::querycmds::query)
             .params("{viewId?, layerName?, role?, kind?, closed?, near?: {entityIds?, layerName?, minMm?, maxMm?}, include?: \"geometry\", limit?}")
             .noundo(),
@@ -1051,7 +1053,7 @@ mod tests {
             ("View Setup", &["editview", "viewprops", "unplaceview", "placeview"]),
             ("Levels & Cuts", &["level", "levelline", "cutline", "viewhole"]),
             ("Display", &["refpane", "underlay", "panelock", "ucsalign", "ghosthide", "ghostshow"]),
-            ("Links", &["link", "unlink"]),
+            ("Links", &["link", "unlink", "showlinks"]),
             ("Details", &["detailtag", "detailtags", "detailref", "repeat", "outsidepoint"]),
             ("Walls & Framing", &["assemblyplan", "assemblyview", "wallrun", "wallfit", "wallconflicts", "studgrid", "studmove", "resolve"]),
             ("Line Roles", &["setrole", "layerrole", "accept"]),
@@ -1068,7 +1070,7 @@ mod tests {
         let menued = specs.iter().filter(|c| !c.menu.is_empty()).count();
         assert_eq!(menued, groups.iter().map(|(_, ids)| ids.len()).sum::<usize>(), "every menu item is in a listed submenu");
         assert!(specs.iter().all(|c| c.menu.first() != Some(&"View")), "View ▸ LAMB is gone");
-        for id in ["showlinks", "lambopen", "lambsave", "newsheet"] {
+        for id in ["lambopen", "lambsave", "newsheet"] {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
             assert!(c.menu.is_empty(), "{id} is typed only");
             assert!(c.interactive.is_some(), "{id}");

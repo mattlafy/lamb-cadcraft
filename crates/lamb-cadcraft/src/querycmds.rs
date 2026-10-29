@@ -1,11 +1,12 @@
 //! SHOWLINKS and QUERY (TS `commands/showlinks.ts`, `commands/query.ts`): read-only lookups. Both
 //! are `.noundo()` and only ever read through [`DrawingProject`]; neither calls `doc_mut`.
 //!
-//! - `showlinks {handle?}` (`sl`, typed only, off the menu): every entity an edit to `handle`
+//! - `showlinks {handle?}` (`sl`, LAMB ▸ Links ▸ Show Links): every entity an edit to `handle`
 //!   would propagate to (lamb-core `linked_entity_component`: automatic links only), the links
 //!   among them, and the boundary links (one end inside) that were not followed. No `handle` → the
 //!   one selected entity (`handles`, as `SelectRun` passes it, is accepted too). Echoes
-//!   `<N entities in M views; K links; B boundary links>`.
+//!   `<N entities in M views; K links; B boundary links>`. Interactively (LAMB T543) it haloes
+//!   the component in every view block and steps view to view on Next/Previous, like RESOLVE.
 //! - `query {viewId?, layerName?, role?, kind?, closed?, near?: {entityIds?, layerName?, minMm?,
 //!   maxMm?}, include?: "geometry", limit?}`: parameter-only, as in TS (it is the assistant's
 //!   lookup). No filter → the index of views, layers and per-(view, layer) counts; otherwise
@@ -17,9 +18,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use cadcraft_doc::{EntityKind, Handle};
-use cadcraft_engine::cmd::machines::SelectRun;
-use cadcraft_engine::{Interactive, Result, Session};
+use cadcraft_doc::{EntityKind, Handle, Space, entity_bounds};
+use cadcraft_engine::cmd::machines::{SelOutcome, SelectPhase};
+use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step, View};
+use cadcraft_geom::Bounds2;
 use lamb_core::derivation::linking::linked_entity_component;
 use lamb_core::derivation::read::{EntityRef, ProjectRead, ViewKind};
 use lamb_core::geometry::Polyline2;
@@ -28,8 +30,10 @@ use lamb_core::geometry::polyline::{is_arc, polyline_bbox, polyline_length};
 use lamb_core::model::{DrawingLayer, Id, LineRole, LinkAnchor, LinkOrigin, LinkRecord, resolve_entity_role};
 use serde_json::{Map, Value, json};
 
-use crate::commands::{bad, id_value, other};
+use crate::commands::{bad, enter_space, id_value, other};
+use crate::overlays::halo::set_attention_blocks;
 use crate::project::DrawingProject;
+use crate::schema::view_block_name;
 
 const DEFAULT_LIMIT: usize = 200;
 
@@ -114,8 +118,141 @@ pub(crate) fn showlinks(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// One view of a SHOWLINKS component: its id, name and the members drawn in it.
+struct LinkedView {
+    id: Id,
+    name: String,
+    members: Vec<Handle>,
+}
+
+/// Interactive SHOWLINKS: pick an entity, halo its linked component in every view block, then
+/// `<i>/<M> <view> [Next/Previous]:` steps view to view (clamped, as RESOLVE), centring the camera
+/// on each view's members. Starts at the picked entity's own view without moving the camera.
+/// Enter or Esc ends it; the halo goes when the machine is dropped.
+struct ShowLinks {
+    sel: SelectPhase,
+    views: Vec<LinkedView>,
+    at: usize,
+}
+
+impl ShowLinks {
+    fn line(&self) -> String {
+        let name = self.views.get(self.at).map_or("", |v| v.name.as_str());
+        format!("{}/{} {name}", self.at + 1, self.views.len())
+    }
+
+    /// Run SHOWLINKS on `hs`, halo the component and stay up to step it; `Done` with no links.
+    fn picked(&mut self, s: &mut Session, hs: &[Handle]) -> Result<Step> {
+        let r = showlinks(s, &json!({ "handles": hs.iter().map(|h| h.hex()).collect::<Vec<_>>() }))?;
+        if let Some(m) = r["message"].as_str() {
+            s.echo(m.to_string());
+        }
+        let comp = r["component"].as_array().cloned().unwrap_or_default();
+        if comp.len() <= 1 {
+            s.echo("No links");
+            return Ok(Step::Done);
+        }
+        let order: Vec<Id> = DrawingProject::new(s.doc()?).map_err(other)?.views().map(|v| v.id).collect();
+        let mut views: Vec<LinkedView> = Vec::new();
+        for c in &comp {
+            let (Some(v), Some(h)) = (c["viewId"].as_u64(), c["entityId"].as_str().and_then(Handle::parse_hex)) else { continue };
+            match views.iter_mut().find(|lv| lv.id.0 == v) {
+                Some(lv) => lv.members.push(h),
+                None => views.push(LinkedView { id: Id(v), name: c["viewName"].as_str().unwrap_or("").to_owned(), members: vec![h] }),
+            }
+        }
+        views.sort_by_key(|lv| order.iter().position(|o| *o == lv.id).unwrap_or(usize::MAX));
+        let own = r["entityId"].as_str().and_then(Handle::parse_hex);
+        self.at = views.iter().position(|lv| own.is_some_and(|h| lv.members.contains(&h))).unwrap_or(0);
+        set_attention_blocks(views.iter().map(|lv| (view_block_name(lv.id), lv.members.clone())).collect());
+        self.views = views;
+        // Objects picked at the prompt don't stay selected afterwards.
+        s.set_selection(Vec::new());
+        Ok(Step::Continue)
+    }
+
+    /// Edit view [`Self::at`]'s block, centred on its members' bounds.
+    fn show(&self, s: &mut Session) -> Result<()> {
+        let Some(lv) = self.views.get(self.at) else { return Ok(()) };
+        enter_space(s, Space::Block(view_block_name(lv.id)))?;
+        let d = s.doc()?;
+        let mut b = Bounds2::EMPTY;
+        for h in &lv.members {
+            if let Some(e) = d.entity(*h) {
+                b = b.union(&entity_bounds(d, e, 0));
+            }
+        }
+        let st = s.state_mut()?;
+        let v = st.view();
+        if !b.is_empty() {
+            st.set_view(View { center: b.center(), height: v.height, twist: v.twist });
+        }
+        Ok(())
+    }
+
+    fn step(&mut self, s: &mut Session, forward: bool) -> Result<Step> {
+        let to = if forward { (self.at + 1).min(self.views.len().saturating_sub(1)) } else { self.at.saturating_sub(1) };
+        if to != self.at {
+            self.at = to;
+            self.show(s)?;
+        }
+        Ok(Step::Continue)
+    }
+}
+
+impl Drop for ShowLinks {
+    fn drop(&mut self) {
+        set_attention_blocks(Vec::new());
+    }
+}
+
+impl Interactive for ShowLinks {
+    fn name(&self) -> &'static str {
+        "SHOWLINKS"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        if !self.views.is_empty() {
+            Prompt::new(self.line(), Accept::TEXT).kw(&["Next", "Previous"])
+        } else if self.sel.removing {
+            self.sel.prompt()
+        } else {
+            Prompt::new("Select an entity to show its links", Accept::SELECT)
+        }
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        self.sel = SelectPhase::begin(s);
+        if self.sel.done {
+            let hs = self.sel.picked.clone();
+            return self.picked(s, &hs);
+        }
+        self.sel.single = true;
+        Ok(Step::Continue)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if self.views.is_empty() {
+            return match self.sel.feed(s, &i)? {
+                SelOutcome::More => Ok(Step::Continue),
+                SelOutcome::Empty => Ok(Step::Done),
+                SelOutcome::Done(hs) => self.picked(s, &hs),
+            };
+        }
+        let text = match i {
+            Input::Enter => return Ok(Step::Done),
+            Input::Cancel => return Ok(Step::Cancel),
+            Input::Text(t) | Input::Keyword(t) => t.trim().to_ascii_lowercase(),
+            _ => return Ok(Step::Continue),
+        };
+        match text.as_str() {
+            "" => Ok(Step::Done),
+            ">" | "n" | "next" => self.step(s, true),
+            "<" | "p" | "previous" => self.step(s, false),
+            _ => Err(other("Enter Next, Previous, > or <.")),
+        }
+    }
+}
+
 pub(crate) fn showlinks_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(SelectRun::single("showlinks", "SHOWLINKS", "Select an entity to show its links")))
+    Ok(Box::new(ShowLinks { sel: SelectPhase::default(), views: Vec::new(), at: 0 }))
 }
 
 // ----------------------------------------------------------------------------------- QUERY --
@@ -334,8 +471,8 @@ mod tests {
     use super::*;
     use crate::commands::install_app;
     use crate::import::project_to_drawing;
+    use crate::overlays::halo::current_attention_blocks;
     use crate::schema::{read_document, write_document};
-    use cadcraft_engine::Input;
     use lamb_core::model::Project;
     use lamb_core::persistence::files_to_project;
     use std::collections::BTreeMap;
@@ -414,12 +551,92 @@ mod tests {
         assert!(e.to_string().contains("No such entity: FFFFFF"), "{e}");
         assert_eq!(s.state()?.undo.len(), undo);
 
+        let _g = crate::overlays::underlay::tests::lock();
         s.start("sl")?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select an entity to show its links:"));
         s.input(Input::Pick(vec![Handle(wall.0)]))?;
-        assert!(s.running.is_none());
+        assert!(s.running.is_some(), "stays up to step the views");
         assert!(s.log.iter().any(|l| l == "<4 entities in 3 views; 3 links; 0 boundary links>"), "{:?}", s.log);
+        s.input(Input::Cancel)?;
+        assert!(s.running.is_none());
         assert_eq!(s.state()?.undo.len(), undo);
+        Ok(())
+    }
+
+    /// The component's members grouped by view block, as the halo holds them.
+    fn halo_union(blocks: &[(String, Vec<Handle>)]) -> BTreeSet<String> {
+        blocks.iter().flat_map(|(_, hs)| hs.iter().map(|h| h.hex())).collect()
+    }
+
+    fn members_centre(s: &Session, block: &str) -> E<cadcraft_geom::Vec2> {
+        let blocks = current_attention_blocks();
+        let (_, hs) = blocks.iter().find(|(b, _)| b == block).ok_or("block not haloed")?;
+        let d = s.doc()?;
+        let mut b = Bounds2::EMPTY;
+        for h in hs {
+            b = b.union(&entity_bounds(d, d.entity(*h).ok_or("no entity")?, 0));
+        }
+        Ok(b.center())
+    }
+
+    #[test]
+    fn interactive_showlinks_haloes_every_view_and_steps_through_them() -> E<()> {
+        let _g = crate::overlays::underlay::tests::lock();
+        set_attention_blocks(Vec::new());
+        let (mut s, wall, _) = session(false)?;
+        let undo = s.state()?.undo.len();
+        let (space0, view0) = (s.state()?.space.clone(), s.state()?.view());
+        s.start("sl")?;
+        s.input(Input::Pick(vec![Handle(wall.0)]))?;
+        let blocks = current_attention_blocks();
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        let r = showlinks(&mut s, &json!({ "handle": hex(wall) }))?;
+        assert_eq!(halo_union(&blocks), ids(&r["component"]).into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(s.state()?.space, space0, "the edited space is unchanged");
+        assert_eq!(s.state()?.view().center, view0.center, "the camera did not move");
+        let own = blocks.iter().position(|(_, hs)| hs.contains(&Handle(wall.0))).ok_or("wall not haloed")?;
+        let prompt = s.current_prompt().map(|p| p.display()).unwrap_or_default();
+        assert!(prompt.starts_with(&format!("{}/3 ", own + 1)) && prompt.contains("[Next/Previous]"), "{prompt}");
+
+        // Step to the last view, past the end, and back.
+        let order: Vec<String> = blocks.iter().map(|(b, _)| b.clone()).collect();
+        for b in order.iter().skip(own + 1) {
+            s.input(Input::Keyword("Next".into()))?;
+            assert_eq!(s.state()?.space, Space::Block(b.clone()));
+            assert!(s.state()?.view().center.dist(members_centre(&s, b)?) < 1e-6, "centred on {b}'s members");
+        }
+        s.input(Input::Text(">".into()))?;
+        assert_eq!(s.state()?.space, Space::Block(order.last().ok_or("no views")?.clone()), "clamped at the end");
+        s.input(Input::Keyword("Previous".into()))?;
+        let back = order.len().saturating_sub(2);
+        assert_eq!(s.state()?.space, Space::Block(order[back].clone()));
+        assert!(s.state()?.view().center.dist(members_centre(&s, &order[back])?) < 1e-6);
+        assert_eq!(current_attention_blocks().len(), 3, "the halo stays while stepping");
+
+        s.input(Input::Cancel)?;
+        assert!(current_attention_blocks().is_empty(), "Esc clears every halo");
+        assert!(s.running.is_none());
+        assert_eq!(s.state()?.undo.len(), undo, "not an undo step");
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_showlinks_on_an_unlinked_entity_says_no_links_and_ends() -> E<()> {
+        let _g = crate::overlays::underlay::tests::lock();
+        set_attention_blocks(Vec::new());
+        let (mut s, wall, _) = session(false)?;
+        let r = showlinks(&mut s, &json!({ "handle": hex(wall) }))?;
+        let view = r["component"].as_array().and_then(|c| c.iter().find(|c| c["entityId"] == json!(hex(wall)))).ok_or("wall")?["viewId"].clone();
+        s.execute("editview", &json!({ "viewId": view }))?;
+        let block = view_block_name(Id(view.as_u64().ok_or("view id")?));
+        let before: Vec<Handle> = s.doc()?.block(&block).ok_or("no block")?.entities.iter().map(|e| e.handle).collect();
+        s.execute("line", &json!({ "points": [[90_000, 90_000], [91_000, 90_000]] }))?;
+        let lone = s.doc()?.block(&block).ok_or("no block")?.entities.iter().map(|e| e.handle).find(|h| !before.contains(h)).ok_or("no line")?;
+        s.start("sl")?;
+        s.input(Input::Pick(vec![lone]))?;
+        assert!(s.running.is_none(), "ended");
+        assert_eq!(s.log.last().map(String::as_str), Some("No links"));
+        assert!(current_attention_blocks().is_empty(), "no halo");
         Ok(())
     }
 

@@ -66,6 +66,13 @@ const CUT_LINE: IconDef = &[
 // Links.
 const LINK: IconDef = &[b(Circle(9.0, 12.0, 5.5)), a(Circle(15.0, 12.0, 5.5))];
 const UNLINK: IconDef = &[b(Circle(6.5, 12.0, 4.5)), b(Circle(17.5, 12.0, 4.5)), a(Line(&[(10.0, 21.0), (14.0, 3.0)]))];
+const SHOW_LINKS: IconDef = &[
+    b(Circle(9.0, 14.0, 4.5)),
+    b(Circle(15.0, 14.0, 4.5)),
+    a(Line(&[(12.0, 2.0), (12.0, 6.0)])),
+    a(Line(&[(4.0, 4.5), (6.5, 7.5)])),
+    a(Line(&[(20.0, 4.5), (17.5, 7.5)])),
+];
 const RESOLVE: IconDef = &[b(Circle(6.0, 9.0, 4.0)), b(Circle(12.0, 9.0, 4.0)), a(Line(&[(11.0, 17.0), (14.5, 21.0), (22.0, 12.0)]))];
 const ACCEPT: IconDef = &[
     b(Line(&[(2.0, 18.0), (5.0, 15.0)])),
@@ -200,7 +207,12 @@ pub const LAMB_TAB: ExtTab = ExtTab {
         },
         ExtGroup {
             name: "Links",
-            large: &[tool(LINK, "link", "Link"), tool(UNLINK, "unlink", "Unlink"), tool(RESOLVE, "resolve", "Review Issues")],
+            large: &[
+                tool(LINK, "link", "Link"),
+                tool(UNLINK, "unlink", "Unlink"),
+                tool(SHOW_LINKS, "showlinks", "Show Links"),
+                tool(RESOLVE, "resolve", "Review Issues"),
+            ],
             small: &[
                 tool(ACCEPT, "accept", "Accept AI Line"),
                 tool(SET_ROLE, "setrole", "Set Role"),
@@ -284,7 +296,7 @@ mod tests {
     #[test]
     fn typed_only_commands_stay_off_the_lamb_tab() {
         for t in tools() {
-            assert!(!["showlinks", "lambopen", "lambsave"].contains(&t.command), "{} is typed-only", t.command);
+            assert!(!["lambopen", "lambsave"].contains(&t.command), "{} is typed-only", t.command);
         }
     }
 

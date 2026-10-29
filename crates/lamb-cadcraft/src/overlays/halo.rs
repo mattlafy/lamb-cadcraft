@@ -1,8 +1,9 @@
 //! Halos over the edited view's own linework (LAMB T351, TS `paths.ts` `HALO_COLOR`): RESOLVE's
 //! attention halo on the current issue's entities ([`set_attention`], cleared when the command
-//! ends), and the tentative glow on every unaccepted AI line (`EntityData.ai_origin.accepted ==
-//! false`). Both are the entities rebuilt with [`cadcraft_render::build_entities`], recoloured,
-//! translucent and at least [`HALO_MIN_LW`] wide; CADCraft's renderer is unchanged. An entity in
+//! ends; SHOWLINKS haloes several blocks at once with [`set_attention_blocks`]), and the tentative
+//! glow on every unaccepted AI line (`EntityData.ai_origin.accepted == false`). Both are the entities
+//! rebuilt with [`cadcraft_render::build_entities`], recoloured, translucent and at least
+//! [`HALO_MIN_LW`] wide; CADCraft's renderer is unchanged. An entity in
 //! both draws the attention halo only (the TS rule).
 //!
 //! The assistant's candidate ghost ([`set_ghost`], `assistant.ghost`): clones of the entities a
@@ -29,15 +30,20 @@ const TENTATIVE_TRANSPARENCY: u8 = 60;
 /// Halo lineweight floor (mm), so a thin line still shows a wide halo.
 const HALO_MIN_LW: f32 = 0.7;
 
-/// The haloed block's name and the handles to halo in it.
-static ATTENTION: Mutex<Option<(String, Vec<Handle>)>> = Mutex::new(None);
+/// Each haloed block's name and the handles to halo in it.
+static ATTENTION: Mutex<Vec<(String, Vec<Handle>)>> = Mutex::new(Vec::new());
 
-fn attention() -> std::sync::MutexGuard<'static, Option<(String, Vec<Handle>)>> {
+fn attention() -> std::sync::MutexGuard<'static, Vec<(String, Vec<Handle>)>> {
     ATTENTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Halo `handles` in block `block` (RESOLVE's current issue), or nothing with `None`.
 pub(crate) fn set_attention(to: Option<(String, Vec<Handle>)>) {
+    set_attention_blocks(to.into_iter().collect());
+}
+
+/// Halo each block's handles at once (SHOWLINKS' linked component); empty halos nothing.
+pub(crate) fn set_attention_blocks(to: Vec<(String, Vec<Handle>)>) {
     *attention() = to;
     cadcraft_render::bump_overlays();
 }
@@ -62,6 +68,12 @@ pub(crate) fn set_ghost(to: Option<Vec<(String, Entity)>>) {
 /// The currently haloed block and handles.
 #[cfg(test)]
 pub(crate) fn current_attention() -> Option<(String, Vec<Handle>)> {
+    attention().first().cloned()
+}
+
+/// Every haloed block and its handles.
+#[cfg(test)]
+pub(crate) fn current_attention_blocks() -> Vec<(String, Vec<Handle>)> {
     attention().clone()
 }
 
@@ -102,10 +114,7 @@ pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     }
     let Some(block) = d.block(name) else { return out };
     let opts = Options { view: None, ..opts.clone() };
-    let haloed: Vec<Handle> = match &*attention() {
-        Some((b, hs)) if b == name => hs.clone(),
-        _ => Vec::new(),
-    };
+    let haloed: Vec<Handle> = attention().iter().filter(|(b, _)| b == name).flat_map(|(_, hs)| hs.iter().copied()).collect();
     let glow: Vec<&Entity> = block.entities.iter().map(|e| &**e).filter(|e| tentative(e) && !haloed.contains(&e.handle)).collect();
     if !glow.is_empty() {
         append(&mut out, &cadcraft_render::build_entities(d, glow, &opts), None, TENTATIVE_TRANSPARENCY);
