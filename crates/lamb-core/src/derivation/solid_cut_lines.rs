@@ -31,6 +31,13 @@ pub fn solid_cut_slot_key(source_entity_ids: &[Id], view: Id) -> String {
     format!("{SOLID_CUT_PROPOSAL_PREFIX}{joined}:{view}")
 }
 
+/// The slot for one piece of a (solid, view) cross-section (T542): [`solid_cut_slot_key`] for
+/// piece 0, so a solid cut in one piece keeps its key, and `{key}#{piece}` for the rest.
+pub fn solid_cut_piece_key(source_entity_ids: &[Id], view: Id, piece: usize) -> String {
+    let key = solid_cut_slot_key(source_entity_ids, view);
+    if piece == 0 { key } else { format!("{key}#{piece}") }
+}
+
 /// A closed loop (first vertex not repeated) as the straight-segment `Polyline2` an entity stores.
 fn loop_geometry(loop_: &[Point2]) -> Result<Polyline2, String> {
     let (&first, rest) = loop_.split_first().ok_or("reconcile_solid_cut_lines: empty solid-cut loop")?;
@@ -152,7 +159,7 @@ fn reconcile(doc: &mut impl ProjectWrite, mint: &mut impl FnMut() -> Id, keep_fi
                 continue;
             }
             for cut in compute_solid_cuts_for_view(rd, view_id, Some(&solids))? {
-                let key = solid_cut_slot_key(&cut.source_entity_ids, view_id);
+                let key = solid_cut_piece_key(&cut.source_entity_ids, view_id, cut.piece);
                 if filled.contains(&key) {
                     continue;
                 }

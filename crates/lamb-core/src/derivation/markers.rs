@@ -14,7 +14,7 @@ use super::read::{EntityRef, ProjectRead, ViewKind, ViewRef};
 use super::resolve::{ProvenanceKind, resolve_seen_z};
 use super::solids::SynthesizedSolid;
 use super::synthesis::synthesize;
-use crate::geometry::halfspace::{HalfSpace, section_convex_polyhedron};
+use crate::geometry::halfspace::{HalfSpace, section_polyhedron};
 use crate::geometry::intersect::{crossing_angle_deg, intersect_segment_with_infinite_line, intersect_segments, tangent_at_hit};
 use crate::geometry::point::{normalize2, sub2};
 use crate::geometry::polyline::{point_at_param, resolved_segments};
@@ -322,9 +322,18 @@ pub struct DerivedSolidCut {
     pub source_entity_ids: Vec<Id>,
     /// The solid's own provenance.
     pub provenance: ProvenanceKind,
-    /// Closed convex loop in the view's local 2D space, first vertex not repeated, wound CCW.
+    /// Closed loop in the view's local 2D space, first vertex not repeated, wound CCW: one boundary
+    /// of the solid's cross-section (an outer outline or a hole's), not its convex hull (T542).
     #[serde(rename = "loop")]
     pub loop_: Vec<Point2>,
+    /// This loop's index among its solid's loops in this view, largest first; 0 for a solid the
+    /// plane cuts in one piece. Fork-only (T542).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub piece: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Prefix of an `ai_origin.proposal_id` that a solid-cut sweep materialised.
@@ -401,21 +410,20 @@ pub fn compute_solid_cuts_for_view(doc: &impl ProjectRead, view_id: Id, solids: 
             continue;
         }
 
-        let loop3 = section_convex_polyhedron(&solid.faces, plane);
-        if loop3.len() < 3 {
-            continue;
+        for (piece, loop3) in section_polyhedron(&solid.faces, plane).into_iter().enumerate() {
+            let mut loop_ = loop3.into_iter().map(|p| to_local.map(p)).collect::<Result<Vec<_>, _>>()?;
+            if polygon_area_signed(&loop_) < 0.0 {
+                loop_.reverse();
+            }
+            cuts.push(DerivedSolidCut {
+                id: format!("{}:solidcut:{}", view_id, cuts.len()),
+                view_id,
+                source_entity_ids: solid.entity_ids.clone(),
+                provenance: solid.provenance,
+                loop_,
+                piece,
+            });
         }
-        let mut loop_ = loop3.into_iter().map(|p| to_local.map(p)).collect::<Result<Vec<_>, _>>()?;
-        if polygon_area_signed(&loop_) < 0.0 {
-            loop_.reverse();
-        }
-        cuts.push(DerivedSolidCut {
-            id: format!("{}:solidcut:{}", view_id, cuts.len()),
-            view_id,
-            source_entity_ids: solid.entity_ids.clone(),
-            provenance: solid.provenance,
-            loop_,
-        });
     }
     Ok(cuts)
 }
@@ -461,6 +469,11 @@ mod floor_cut_tests {
     /// A plan placed on a level at +3000 with the default cut height, and a section along plan
     /// y = 0 (identity transforms: section local = (u, z)).
     fn project(plan: Vec<DrawingEntity>, sec: Vec<DrawingEntity>) -> Project {
+        project_cut(plan, sec, pl(&[(0.0, 0.0), (5000.0, 0.0)], false))
+    }
+
+    /// [`project`] with the section's cut line given.
+    fn project_cut(plan: Vec<DrawingEntity>, sec: Vec<DrawingEntity>, cut_line: Polyline2) -> Project {
         let mut p = empty_project(None);
         p.levels.push(Level {
             id: LEVEL,
@@ -480,12 +493,7 @@ mod floor_cut_tests {
             name: "A-A".into(),
             intent: VerticalIntent::Section,
             entities: sec,
-            placement: Some(Placement::Vertical {
-                cut_line: pl(&[(0.0, 0.0), (5000.0, 0.0)], false),
-                host_view_id: PLAN,
-                transform: IDENTITY_TRANSFORM,
-                flipped: None,
-            }),
+            placement: Some(Placement::Vertical { cut_line, host_view_id: PLAN, transform: IDENTITY_TRANSFORM, flipped: None }),
         }));
         p
     }
@@ -568,6 +576,129 @@ mod floor_cut_tests {
         let lo = zs.iter().copied().fold(f64::INFINITY, f64::min);
         let hi = zs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         assert_eq!((lo, hi), (FLOOR, FLOOR + 2700.0));
+        Ok(())
+    }
+
+    // ---------------------------------------------- T542: concave and holed solids' real sections --
+
+    const PLAN2: Id = Id(30);
+    const MID: f64 = FLOOR + 1200.0;
+
+    fn square(id: u64, lo: f64, hi: f64) -> DrawingEntity {
+        ent(id, PLAN, "layer-wall-ext", pl(&[(lo, lo), (hi, lo), (hi, hi), (lo, hi), (lo, lo)], true))
+    }
+
+    /// A wall ring (T540 even/odd: two loops on one layer) and a section along plan x = 2000, so
+    /// the section's local u is plan y.
+    fn ring() -> Project {
+        project_cut(vec![square(1, 0.0, 4000.0), square(2, 200.0, 3800.0)], vec![], pl(&[(2000.0, 0.0), (2000.0, 5000.0)], false))
+    }
+
+    /// `p` plus a second, empty plan on the same level cutting at mid-height.
+    fn with_mid_plan(mut p: Project) -> Project {
+        p.views.push(AnyView::Plan(PlanView {
+            id: PLAN2,
+            name: "mid".into(),
+            entities: vec![],
+            placement: Some(Placement::Plan { level_id: LEVEL, cut_elevation: MID, transform: IDENTITY_TRANSFORM }),
+        }));
+        p
+    }
+
+    fn range(l: &[Point2], f: impl Fn(&Point2) -> f64) -> (f64, f64) {
+        l.iter().map(f).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)))
+    }
+
+    #[test]
+    fn a_rings_section_is_two_wall_slices() -> Result<(), String> {
+        let cuts = compute_solid_cuts_for_view(&ring(), SEC, None)?;
+        assert_eq!(cuts.len(), 2, "{cuts:?}");
+        let mut us: Vec<(f64, f64)> = cuts.iter().map(|c| range(&c.loop_, |p| p.x)).collect();
+        us.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(us, [(0.0, 200.0), (3800.0, 4000.0)], "{cuts:?}");
+        for c in &cuts {
+            assert_eq!(c.loop_.len(), 4, "{c:?}");
+            assert_eq!(range(&c.loop_, |p| p.y), (FLOOR, FLOOR + 2700.0));
+            assert!(polygon_area_signed(&c.loop_) > 0.0);
+        }
+        assert_eq!(cuts.iter().map(|c| c.piece).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(cuts.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["20:solidcut:0", "20:solidcut:1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_cut_through_a_ring_is_its_outer_and_hole_loops() -> Result<(), String> {
+        let cuts = compute_solid_cuts_for_view(&with_mid_plan(ring()), PLAN2, None)?;
+        assert_eq!(cuts.len(), 2, "{cuts:?}");
+        assert_eq!(range(&cuts[0].loop_, |p| p.x), (0.0, 4000.0), "outer, the larger, first");
+        assert_eq!(range(&cuts[1].loop_, |p| p.x), (200.0, 3800.0));
+        assert!(cuts.iter().all(|c| c.loop_.len() == 4), "{cuts:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_cut_through_an_l_is_its_six_vertex_outline() -> Result<(), String> {
+        let l = ent(
+            1,
+            PLAN,
+            "layer-wall-ext",
+            pl(&[(0.0, 0.0), (4000.0, 0.0), (4000.0, 1000.0), (1000.0, 1000.0), (1000.0, 3000.0), (0.0, 3000.0), (0.0, 0.0)], true),
+        );
+        let cuts = compute_solid_cuts_for_view(&with_mid_plan(project(vec![l], vec![])), PLAN2, None)?;
+        assert_eq!(cuts.len(), 1, "{cuts:?}");
+        assert_eq!(cuts[0].loop_.len(), 6, "{cuts:?}");
+        assert!((polygon_area_signed(&cuts[0].loop_) - 6_000_000.0).abs() < 1.0, "the L's area, not the hull's");
+        Ok(())
+    }
+
+    #[test]
+    fn a_boxs_section_is_the_convex_sections_loop() -> Result<(), String> {
+        use crate::geometry::halfspace::section_convex_polyhedron;
+        let wall = ent(1, PLAN, "layer-wall-ext", pl(&[(0.0, 1000.0), (4000.0, 1000.0), (4000.0, 3000.0), (0.0, 3000.0), (0.0, 1000.0)], true));
+        let p = project_cut(vec![wall], vec![], pl(&[(2000.0, 0.0), (2000.0, 5000.0)], false));
+        let cuts = compute_solid_cuts_for_view(&p, SEC, None)?;
+        assert_eq!(cuts.len(), 1, "{cuts:?}");
+        let solids = synthesize(&p)?.solids;
+        let old = section_convex_polyhedron(&solids[0].faces, HalfSpace { n: Point3 { x: -1.0, y: 0.0, z: 0.0 }, d: -2000.0 });
+        let mut old: Vec<Point2> = old.into_iter().map(|q| Point2 { x: q.y, y: q.z }).collect();
+        if polygon_area_signed(&old) < 0.0 {
+            old.reverse();
+        }
+        assert_eq!(cuts[0].loop_.len(), old.len());
+        for (a, b) in cuts[0].loop_.iter().zip(&old) {
+            assert!((a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9, "{:?} vs {old:?}", cuts[0].loop_);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_rings_pieces_are_keyed_and_suppressed_separately() -> Result<(), String> {
+        use super::super::solid_cut_lines::{reconcile_solid_cut_lines_once, solid_cut_slot_key};
+        use super::super::write::ProjectWrite;
+        let mut p = ring();
+        let mut n = 1u64 << 40;
+        let mut mint = || {
+            n += 1;
+            Id(n)
+        };
+        let keys = |p: &Project| -> Vec<String> {
+            let mut k: Vec<String> = p
+                .views
+                .iter()
+                .flat_map(|v| v.entities().iter())
+                .filter_map(|e| e.ai_origin.as_ref())
+                .filter(|o| !o.accepted)
+                .map(|o| o.proposal_id.clone())
+                .collect();
+            k.sort();
+            k
+        };
+        reconcile_solid_cut_lines_once(&mut p, &mut mint)?;
+        let k = solid_cut_slot_key(&[Id(1), Id(2)], SEC);
+        assert_eq!(keys(&p), [k.clone(), format!("{k}#1")]);
+        p.set_suppressed_proposals(vec![format!("{k}#1")]);
+        reconcile_solid_cut_lines_once(&mut p, &mut mint)?;
+        assert_eq!(keys(&p), [k]);
         Ok(())
     }
 }
