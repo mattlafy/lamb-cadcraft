@@ -204,3 +204,69 @@ fn a_selected_layout_viewport_shows_a_view_row_running_vpview() -> R {
     assert_eq!(property_group(s.doc()?, &[h], 0).ok_or("no group")?.rows[0].value, "(none)");
     Ok(())
 }
+
+/// The placed vertical views linked to (wall, seg), in document view order.
+fn linked_sections(d: &Drawing, wall: Handle, seg: usize) -> Result<Vec<(Id, String)>, Box<dyn std::error::Error>> {
+    let dp = DrawingProject::new(d)?;
+    let ids: Vec<Id> = dp.links_for_segment(Id(wall.0), seg).iter().filter_map(|l| dp.entity_view_id(l.other.entity_id)).collect();
+    Ok(dp
+        .views()
+        .filter(|v| v.kind == ViewKind::Vertical && v.placement.is_some() && ids.contains(&v.id))
+        .map(|v| (v.id, v.name.to_owned()))
+        .collect())
+}
+
+fn expected_go_to(views: &[(Id, String)]) -> Vec<(String, String, Value)> {
+    views.iter().map(|(id, name)| (format!("Go to {name}"), "editview".to_owned(), serde_json::json!({ "viewId": id.0 }))).collect()
+}
+
+#[test]
+fn a_height_source_row_offers_go_to_each_contributing_section() -> R {
+    let mut s = session()?;
+    let (wall, n, _) = cut_wall_and_other(s.doc()?)?;
+    let per_seg: Vec<Vec<(Id, String)>> = (0..n).map(|seg| linked_sections(s.doc()?, wall, seg)).collect::<Result<_, _>>()?;
+    let linked = (0..n).find(|seg| !per_seg[*seg].is_empty()).ok_or("no linked segment")?;
+    let want = expected_go_to(&per_seg[linked]);
+    let g = property_group(s.doc()?, &[wall], linked).ok_or("no group")?;
+    let mut offered: Vec<(String, String, Value)> = Vec::new();
+    for row in g.rows.iter().filter(|r| r.label == "Height source") {
+        for c in &row.choices {
+            if !offered.contains(c) {
+                offered.push(c.clone());
+            }
+        }
+    }
+    assert_eq!(offered, want, "the linked segment's rows offer exactly its linked sections");
+    let (_, cmd, params) = want.first().ok_or("no choice")?;
+    s.execute(cmd, params)?;
+    let id = Id(params["viewId"].as_u64().ok_or("viewId")?);
+    assert_eq!(s.state()?.space, cadcraft_doc::Space::Block(view_block_name(id)), "Go to opens that view");
+
+    // Set to Seen (a fresh session), a linked segment's Z source row offers its linked views. A
+    // seen line gets no proposals, so only the drawn (not AI-proposed) links survive the role change.
+    let mut s = session()?;
+    s.execute("setrole", &serde_json::json!({ "handles": [wall.hex()], "role": "seen" }))?;
+    let per_seg: Vec<Vec<(Id, String)>> = (0..n).map(|seg| linked_sections(s.doc()?, wall, seg)).collect::<Result<_, _>>()?;
+    let seen = (0..n).find(|seg| !per_seg[*seg].is_empty()).ok_or("no drawn link")?;
+    let g = property_group(s.doc()?, &[wall], seen).ok_or("no group")?;
+    let z = g.rows.iter().find(|r| r.label == "Z source").ok_or("no Z source")?;
+    assert_eq!(z.choices, expected_go_to(&per_seg[seen]), "{z:?}");
+    s.undo()?;
+
+    // An unlinked segment is Defaulted and read-only, as cut and as seen. (Unlinking re-runs
+    // proposals, which may also drop the unaccepted AI lines' links — so look for any.)
+    let unlinked = (0..n).find(|seg| *seg != linked).ok_or("one segment")?;
+    let ids: Vec<u64> = DrawingProject::new(s.doc()?)?.links_for_segment(Id(wall.0), unlinked).iter().map(|l| l.link.id.0).collect();
+    for id in ids {
+        s.execute("unlink.apply", &serde_json::json!({ "linkId": id }))?;
+    }
+    assert!(linked_sections(s.doc()?, wall, unlinked)?.is_empty());
+    let g = property_group(s.doc()?, &[wall], unlinked).ok_or("no group")?;
+    let rows: Vec<_> = g.rows.iter().filter(|r| r.label == "Height source").collect();
+    assert!(!rows.is_empty() && rows.iter().all(|r| r.value.starts_with("defaulted") && r.choices.is_empty()), "{rows:?}");
+    s.execute("setrole", &serde_json::json!({ "handles": [wall.hex()], "role": "seen" }))?;
+    let g = property_group(s.doc()?, &[wall], unlinked).ok_or("no group")?;
+    let z = g.rows.iter().find(|r| r.label == "Z source").ok_or("no Z source")?;
+    assert!(z.value.starts_with("defaulted") && z.choices.is_empty(), "defaulted Z is read-only: {z:?}");
+    Ok(())
+}

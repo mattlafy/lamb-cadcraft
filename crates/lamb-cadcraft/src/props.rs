@@ -1,13 +1,17 @@
 //! The LAMB group of the Properties palette (TS `PropertiesPanel.tsx`'s Role select, `CutSummary`,
 //! `SeenSummary`): a Role row whose choices run SETROLE, and for one plan polyline in a placed plan
-//! view whose resolved role is cut or seen, where its height comes from at the stepped segment.
+//! view whose resolved role is cut or seen, where its height comes from at the stepped segment —
+//! each such source row offering `Go to <view>` choices (EDITVIEW) for the placed vertical views
+//! whose linked lines supply it.
 //! One selected layout viewport gets a View row instead, whose choices run VPVIEW.
 //! The desktop app maps [`LambGroup`] onto the UI's generic property-group slot.
 
 use cadcraft_doc::Space;
 use cadcraft_doc::{Drawing, EntityKind, Handle};
 use lamb_core::derivation::read::{EntityRef, ProjectRead, ViewKind};
-use lamb_core::derivation::resolve::{ProvenanceKind, resolve_cut_segment, resolve_seen_z};
+use lamb_core::derivation::resolve::{ProvenanceKind, ResolvedSpan, resolve_cut_segment, resolve_seen_z};
+use lamb_core::geometry::polyline::resolved_segments;
+use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id, LineRole, Placement, VerticalIntent};
 use serde_json::{Value, json};
 
@@ -106,6 +110,33 @@ fn viewport_group(d: &Drawing, sel: &[Handle]) -> Option<LambGroup> {
     Some(LambGroup { title: "LAMB".into(), segments: 0, rows: vec![LambRow { label: "View".into(), value, tip: None, choices, edit: None }] })
 }
 
+/// The placed vertical views linked to (entity, segment), with the plan-side crossing param of each
+/// link; deduplication and ordering are left to [`go_to_choices`].
+fn linked_vertical_views(dp: &DrawingProject<'_>, entity: Id, segment: usize) -> Vec<(Id, f64)> {
+    dp.links_for_segment(entity, segment)
+        .iter()
+        .filter_map(|l| {
+            let v = dp.view(dp.entity_view_id(l.other.entity_id)?)?;
+            (v.kind == ViewKind::Vertical && v.placement.is_some()).then_some((v.id, l.mine.segment_param))
+        })
+        .collect()
+}
+
+/// `Go to <name>` / `editview {viewId}` for every view in `ids`, deduplicated, in document view order.
+fn go_to_choices(dp: &DrawingProject<'_>, ids: &[Id]) -> Vec<(String, String, Value)> {
+    dp.views().filter(|v| ids.contains(&v.id)).map(|v| (format!("Go to {}", v.name), "editview".to_owned(), json!({ "viewId": v.id.0 }))).collect()
+}
+
+/// The views a Height source span comes from: a conflicted span's candidates, else the links
+/// crossing inside `[from_t, to_t]` (± the grouping tolerance); none when ambiguous or defaulted.
+fn span_views(span: &ResolvedSpan, links: &[(Id, f64)], tol_t: f64) -> Vec<Id> {
+    match span.provenance {
+        ProvenanceKind::Ambiguous | ProvenanceKind::Defaulted => vec![],
+        ProvenanceKind::Conflicted => span.conflict_candidates.iter().flatten().map(|c| c.view_id).collect(),
+        _ => links.iter().filter(|(_, t)| *t >= span.from_t - tol_t && *t <= span.to_t + tol_t).map(|(id, _)| *id).collect(),
+    }
+}
+
 /// The LAMB group for `sel` at `segment` (clamped to the polyline's last segment): the View row for
 /// one layout viewport, else `None` unless every handle is a LAMB entity.
 pub fn property_group(d: &Drawing, sel: &[Handle], segment: usize) -> Option<LambGroup> {
@@ -137,7 +168,13 @@ pub fn property_group(d: &Drawing, sel: &[Handle], segment: usize) -> Option<Lam
         match dp.role_of(e) {
             LineRole::Cut => {
                 segments = n;
+                let links = linked_vertical_views(&dp, e.id, seg);
+                let tol_t = resolved_segments(poly).get(seg).map_or(0.0, |r| {
+                    let len = (r.to.x - r.from.x).hypot(r.to.y - r.from.y);
+                    TOLERANCE.grouping_mm / if len > 0.0 { len } else { 1.0 }
+                });
                 for s in resolve_cut_segment(&dp, e, seg).ok()? {
+                    let choices = go_to_choices(&dp, &span_views(&s, &links, tol_t));
                     let mut value = provenance_word(s.provenance);
                     if let Some(x) = s.extent {
                         value += &format!(" {:.0}…{:.0} mm", x.bottom, x.top);
@@ -145,17 +182,23 @@ pub fn property_group(d: &Drawing, sel: &[Handle], segment: usize) -> Option<Lam
                     if let Some(t) = s.tilt_deg {
                         value += &format!(", tilt {t:.1}°");
                     }
-                    rows.push(LambRow { label: "Height source".into(), value, tip: provenance_tip(s.provenance), choices: vec![], edit: None });
+                    rows.push(LambRow { label: "Height source".into(), value, tip: provenance_tip(s.provenance), choices, edit: None });
                 }
             }
             LineRole::Seen => {
                 segments = n;
                 let z = resolve_seen_z(&dp, e, seg).ok()?;
+                let choices = if z.provenance == ProvenanceKind::Defaulted {
+                    vec![]
+                } else {
+                    let ids: Vec<Id> = linked_vertical_views(&dp, e.id, seg).into_iter().map(|(id, _)| id).collect();
+                    go_to_choices(&dp, &ids)
+                };
                 rows.push(LambRow {
                     label: "Z source".into(),
                     value: format!("{} z = {:.0} mm", provenance_word(z.provenance), z.z),
                     tip: provenance_tip(z.provenance),
-                    choices: vec![],
+                    choices,
                     edit: None,
                 });
             }
