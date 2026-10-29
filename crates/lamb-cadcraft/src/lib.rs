@@ -98,6 +98,7 @@ pub use export::{ExportReport, drawing_to_project};
 pub use holes::hole_observer;
 pub use import::{IdMap, ImportError, ImportReport, project_to_drawing};
 pub use maintain::{MaintenanceReport, install, link_observer, maintain_links, travel_box_observer};
+pub use overlays::halo::highlight_3d;
 pub use overlays::{lamb_overlay, lamb_snaps, register_providers};
 pub use project::DrawingProject;
 pub use project_mut::DrawingProjectMut;

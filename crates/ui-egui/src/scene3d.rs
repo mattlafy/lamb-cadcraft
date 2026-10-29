@@ -4,6 +4,7 @@
 //! painter only: CPU projection, far-to-near sorted triangles, flat shading. It knows nothing of
 //! what the scene is; the LAMB desktop app registers its derived model into it.
 
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, pos2};
@@ -43,12 +44,14 @@ pub struct Path3 {
 
 /// The registered scene: `build` the scene for a drawing; `pick` the entities a ray (global
 /// origin, direction) hits, nearest first; `stamp` changes whenever the source's own display
-/// settings change what `build` returns, so the pane rebuilds without a drawing edit.
+/// settings change what `build` returns, so the pane rebuilds without a drawing edit;
+/// `highlight` names the entities whose meshes draw highlighted now (read every frame).
 #[derive(Clone, Copy)]
 pub struct SceneSource {
     pub build: fn(&Drawing) -> Option<Scene3>,
     pub pick: fn(&Drawing, [f64; 3], [f64; 3]) -> Vec<Handle>,
     pub stamp: fn() -> u64,
+    pub highlight: fn() -> Vec<Handle>,
 }
 
 static SOURCE: OnceLock<SceneSource> = OnceLock::new();
@@ -237,11 +240,22 @@ fn rgba(c: [u8; 4]) -> Color32 {
     Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
 }
 
-/// Every triangle of the scene in front of the near plane, shaded, sorted far to near.
-pub fn triangles(scene: &Scene3, cam: &Camera, rect: Rect) -> Vec<Tri> {
+/// A highlighted mesh's fill alpha floor.
+const LIT_MIN_ALPHA: u8 = 160;
+
+/// Every triangle of the scene in front of the near plane, shaded, sorted far to near. A mesh
+/// with any source in `lit` fills in `lit_rgb` (alpha at least [`LIT_MIN_ALPHA`]) and draws its
+/// edges in `lit_rgb`, opaque.
+pub fn triangles(scene: &Scene3, cam: &Camera, rect: Rect, lit: &HashSet<Handle>, lit_rgb: [u8; 3]) -> Vec<Tri> {
     let l = norm(LIGHT);
     let mut out = Vec::new();
     for m in &scene.meshes {
+        let on = !lit.is_empty() && m.sources.iter().any(|h| lit.contains(h));
+        let (fill, edges) = if on {
+            ([lit_rgb[0], lit_rgb[1], lit_rgb[2], m.rgba[3].max(LIT_MIN_ALPHA)], Some([lit_rgb[0], lit_rgb[1], lit_rgb[2], 255]))
+        } else {
+            (m.rgba, m.edges_rgba)
+        };
         let world = |i: u32| m.positions.get(i as usize).map(|p| add(scene.origin, [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]));
         for t in m.indices.as_chunks::<3>().0 {
             let (Some(a), Some(b), Some(c)) = (world(t[0]), world(t[1]), world(t[2])) else { continue };
@@ -252,8 +266,8 @@ pub fn triangles(scene: &Scene3, cam: &Camera, rect: Rect) -> Vec<Tri> {
             out.push(Tri {
                 pts: [pa.0, pb.0, pc.0],
                 depth: (pa.1 + pb.1 + pc.1) / 3.0,
-                fill: Color32::from_rgba_unmultiplied(ch(m.rgba[0]), ch(m.rgba[1]), ch(m.rgba[2]), m.rgba[3]),
-                edges: m.edges_rgba.map(rgba),
+                fill: Color32::from_rgba_unmultiplied(ch(fill[0]), ch(fill[1]), ch(fill[2]), fill[3]),
+                edges: edges.map(rgba),
             });
         }
     }
@@ -281,7 +295,7 @@ pub fn fit_scene(scene: Option<&Scene3>, rect: Rect) -> Camera {
     Camera::fit(lo, hi, rect)
 }
 
-fn draw(painter: &egui::Painter, scene: Option<&Scene3>, cam: &Camera, rect: Rect) {
+fn draw(painter: &egui::Painter, scene: Option<&Scene3>, cam: &Camera, rect: Rect, lit: &HashSet<Handle>, lit_rgb: [u8; 3]) {
     // Ground grid: 40 m, 40 divisions, XY at z = 0; the centre lines brighter. Then 2 m axes.
     let (centre, grid) = (Color32::from_gray(0x44), Color32::from_gray(0x2a));
     for i in -20..=20 {
@@ -299,7 +313,7 @@ fn draw(painter: &egui::Painter, scene: Option<&Scene3>, cam: &Camera, rect: Rec
         }
     }
     let Some(scene) = scene else { return };
-    let tris = triangles(scene, cam, rect);
+    let tris = triangles(scene, cam, rect, lit, lit_rgb);
     let mut mesh = egui::Mesh::default();
     for t in &tris {
         let base = mesh.vertices.len() as u32;
@@ -405,7 +419,8 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         click(app, &cam, rect, b);
     }
     app.scene3d.camera = Some(cam);
-    draw(&painter, scene.as_deref(), &cam, rect);
+    let lit: HashSet<Handle> = SOURCE.get().map(|src| (src.highlight)().into_iter().collect()).unwrap_or_default();
+    draw(&painter, scene.as_deref(), &cam, rect, &lit, [t.hover.r(), t.hover.g(), t.hover.b()]);
 }
 
 #[cfg(test)]
@@ -482,11 +497,46 @@ mod tests {
     fn triangles_sort_far_to_near() {
         let scene = Scene3 { origin: [0.0; 3], meshes: vec![quad(1000.0, [255, 0, 0, 255]), quad(0.0, [0, 0, 255, 255])], paths: Vec::new() };
         let c = Camera { eye: [500.0, -2000.0, 6000.0], target: [500.0, 500.0, 0.0] };
-        let tris = triangles(&scene, &c, rect());
+        let tris = triangles(&scene, &c, rect(), &HashSet::new(), [0, 0, 0]);
         assert_eq!(tris.len(), 4);
         assert!(tris.windows(2).all(|w| w[0].depth >= w[1].depth));
         // The lower (blue) quad is further from an eye above: drawn first.
         assert!(tris[0].fill.b() > 0 && tris[1].fill.b() > 0 && tris[3].fill.r() > 0, "{tris:?}");
+    }
+
+    #[test]
+    fn a_lit_source_draws_its_mesh_in_the_lit_colour_and_nothing_lit_changes_nothing() {
+        let (a, b) = (Handle(7), Handle(8));
+        let mut qa = quad(1000.0, [255, 0, 0, 100]);
+        qa.sources = vec![a];
+        let mut qb = quad(0.0, [0, 0, 255, 255]);
+        qb.sources = vec![b];
+        qb.edges_rgba = Some([1, 2, 3, 255]);
+        let scene = Scene3 { origin: [0.0; 3], meshes: vec![qa.clone(), qb.clone()], paths: Vec::new() };
+        let c = Camera { eye: [500.0, -2000.0, 6000.0], target: [500.0, 500.0, 0.0] };
+        let lit_rgb = [0x10, 0x80, 0xf0];
+        let none = HashSet::new();
+        let only_a = HashSet::from([a]);
+        let one = |m: Mesh3, lit: &HashSet<Handle>| triangles(&Scene3 { meshes: vec![m], ..scene.clone() }, &c, rect(), lit, lit_rgb);
+        // Lit, quad a fills exactly as a plain quad of lit_rgb (alpha raised to 160) would: same shading.
+        let lit_a = one(qa.clone(), &only_a);
+        let want_a = one(Mesh3 { rgba: [lit_rgb[0], lit_rgb[1], lit_rgb[2], LIT_MIN_ALPHA], ..qa.clone() }, &none);
+        assert_eq!(lit_a.len(), 2);
+        assert_eq!(lit_a.iter().map(|t| t.fill).collect::<Vec<_>>(), want_a.iter().map(|t| t.fill).collect::<Vec<_>>());
+        assert!(lit_a.iter().all(|t| t.edges == Some(Color32::from_rgb(lit_rgb[0], lit_rgb[1], lit_rgb[2]))));
+        // Quad b is unchanged.
+        let plain_b = one(qb.clone(), &none);
+        assert_eq!(one(qb, &only_a), plain_b);
+        assert!(plain_b.iter().all(|t| t.edges == Some(Color32::from_rgb(1, 2, 3))));
+        // The whole scene: lit differs, an unrelated or empty set is identical to plain.
+        let plain = triangles(&scene, &c, rect(), &none, lit_rgb);
+        assert_ne!(triangles(&scene, &c, rect(), &only_a, lit_rgb), plain);
+        assert_eq!(triangles(&scene, &c, rect(), &HashSet::from([Handle(99)]), lit_rgb), plain);
+        assert_eq!(one(qa.clone(), &none).iter().map(|t| t.fill.a()).collect::<Vec<_>>(), vec![100, 100], "unlit keeps its alpha");
+    }
+
+    fn highlight() -> Vec<Handle> {
+        Vec::new()
     }
 
     static H: AtomicU64 = AtomicU64::new(0);
@@ -511,8 +561,8 @@ mod tests {
 
     #[test]
     fn a_click_on_the_quad_selects_its_source_and_a_miss_leaves_the_selection() {
-        let _ = register_scene_source(SceneSource { build, pick, stamp });
-        assert!(register_scene_source(SceneSource { build, pick, stamp }).is_err(), "one source per process");
+        let _ = register_scene_source(SceneSource { build, pick, stamp, highlight });
+        assert!(register_scene_source(SceneSource { build, pick, stamp, highlight }).is_err(), "one source per process");
         let mut s = Session::new();
         s.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
         let h = s.doc().unwrap().model.iter().next().unwrap().handle;

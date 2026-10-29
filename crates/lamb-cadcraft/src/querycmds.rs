@@ -31,7 +31,7 @@ use lamb_core::model::{DrawingLayer, Id, LineRole, LinkAnchor, LinkOrigin, LinkR
 use serde_json::{Map, Value, json};
 
 use crate::commands::{bad, enter_space, id_value, other};
-use crate::overlays::halo::{set_attention_blocks, set_hover_blocks};
+use crate::overlays::halo::{set_attention_blocks, set_hover_blocks, set_hovered};
 use crate::project::DrawingProject;
 use crate::schema::view_block_name;
 
@@ -137,20 +137,24 @@ fn component_blocks(dp: &DrawingProject<'_>, comp: &BTreeSet<Id>) -> Vec<(Id, Ve
 /// The canvas hover observer (LAMB T550, registered by the app with
 /// `canvas::hoverext::register_hover_observer`): halo every other member of `hovered`'s linked
 /// component in its own view block, paler than SHOWLINKS. Nothing hovered, an entity in no LAMB
-/// view, or one with no links → no hover halo.
+/// view, or one with no links → no hover halo. The hovered entity itself, when in a LAMB view,
+/// is kept for the 3D pane's highlight (LAMB T552).
 pub fn hover_links(d: &Drawing, hovered: Option<Handle>) {
-    set_hover_blocks(hovered.map_or_else(Vec::new, |h| hover_blocks(d, h)));
+    let (own, blocks) = hovered.map_or((None, Vec::new()), |h| hover_blocks(d, h));
+    set_hovered(own);
+    set_hover_blocks(blocks);
 }
 
-fn hover_blocks(d: &Drawing, h: Handle) -> Vec<(String, Vec<Handle>)> {
-    let Ok(dp) = DrawingProject::new(d) else { return Vec::new() };
+/// The hovered entity when it is in a LAMB view, and the rest of its component by block.
+fn hover_blocks(d: &Drawing, h: Handle) -> (Option<Handle>, Vec<(String, Vec<Handle>)>) {
+    let Ok(dp) = DrawingProject::new(d) else { return (None, Vec::new()) };
     let id = Id(h.0);
     if dp.entity_view_id(id).is_none() {
-        return Vec::new();
+        return (None, Vec::new());
     }
     let mut comp = linked_entity_component(&dp, id);
     comp.remove(&id);
-    component_blocks(&dp, &comp).into_iter().map(|(v, hs)| (view_block_name(v), hs)).collect()
+    (Some(h), component_blocks(&dp, &comp).into_iter().map(|(v, hs)| (view_block_name(v), hs)).collect())
 }
 
 /// One view of a SHOWLINKS component: its id, name and the members drawn in it.
@@ -713,6 +717,39 @@ mod tests {
         hover_links(s.doc()?, Some(Handle(wall.0)));
         hover_links(s.doc()?, Some(lone));
         assert!(current_hover_blocks().is_empty(), "an unlinked entity");
+        Ok(())
+    }
+
+    #[test]
+    fn highlight_3d_holds_the_hovered_entity_its_component_and_the_attention_set() -> E<()> {
+        let _g = crate::overlays::underlay::tests::lock();
+        set_attention_blocks(Vec::new());
+        let (mut s, wall, _) = session(false)?;
+        let r = showlinks(&mut s, &json!({ "handle": hex(wall) }))?;
+        let comp: BTreeSet<String> = ids(&r["component"]).into_iter().collect();
+        let lit = || crate::overlays::halo::highlight_3d().iter().map(|h| h.hex()).collect::<Vec<_>>();
+        hover_links(s.doc()?, Some(Handle(wall.0)));
+        let got = lit();
+        assert_eq!(got.iter().cloned().collect::<BTreeSet<_>>(), comp, "the wall and every member");
+        assert_eq!(got.len(), comp.len(), "deduplicated");
+        hover_links(s.doc()?, None);
+        assert!(lit().is_empty(), "nothing hovered");
+
+        let view = r["component"].as_array().and_then(|c| c.iter().find(|c| c["entityId"] == json!(hex(wall)))).ok_or("wall")?["viewId"].clone();
+        s.execute("editview", &json!({ "viewId": view }))?;
+        let block = view_block_name(Id(view.as_u64().ok_or("view id")?));
+        let before: Vec<Handle> = s.doc()?.block(&block).ok_or("no block")?.entities.iter().map(|e| e.handle).collect();
+        s.execute("line", &json!({ "points": [[90_000, 90_000], [91_000, 90_000]] }))?;
+        let lone = s.doc()?.block(&block).ok_or("no block")?.entities.iter().map(|e| e.handle).find(|h| !before.contains(h)).ok_or("no line")?;
+        hover_links(s.doc()?, Some(lone));
+        assert_eq!(lit(), vec![lone.hex()], "an unlinked LAMB-view entity: just itself");
+        hover_links(s.doc()?, Some(Handle(0xFF_FFFF)));
+        assert!(lit().is_empty(), "an entity in no view");
+
+        set_attention_blocks(vec![(block.clone(), vec![lone])]);
+        assert_eq!(lit(), vec![lone.hex()], "the attention set alone");
+        set_attention_blocks(Vec::new());
+        assert!(lit().is_empty());
         Ok(())
     }
 

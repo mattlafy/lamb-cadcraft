@@ -70,6 +70,29 @@ pub(crate) fn set_hover_blocks(to: Vec<(String, Vec<Handle>)>) {
     }
 }
 
+/// The hovered entity itself when it is in a LAMB view (LAMB T552), for the 3D pane.
+static HOVERED: Mutex<Option<Handle>> = Mutex::new(None);
+
+fn hovered() -> std::sync::MutexGuard<'static, Option<Handle>> {
+    HOVERED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub(crate) fn set_hovered(h: Option<Handle>) {
+    *hovered() = h;
+}
+
+/// The entities whose 3D meshes draw highlighted (LAMB T552, the 3D pane's `highlight`): the
+/// hovered entity, its hover-haloed links and the attention halo's handles, deduplicated.
+pub fn highlight_3d() -> Vec<Handle> {
+    let mut out: Vec<Handle> = hovered().into_iter().collect();
+    for h in hover().iter().chain(attention().iter()).flat_map(|(_, hs)| hs.iter().copied()) {
+        if !out.contains(&h) {
+            out.push(h);
+        }
+    }
+    out
+}
+
 /// Every hover-haloed block and its handles.
 #[cfg(test)]
 pub(crate) fn current_hover_blocks() -> Vec<(String, Vec<Handle>)> {
