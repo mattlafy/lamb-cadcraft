@@ -26,7 +26,10 @@
 //! placed in a section (LAMB T548) adds, on the run at its end of the opening, strips and closed-chain
 //! prisms by the plan's corner and jamb rule, extruded along the gaze over the host-plan opening the
 //! cut crosses (the one whose crossing is nearest that run), `Authored`, else over the default depth
-//! centred on the cut, `Defaulted`. Corner details placed in a section add nothing.
+//! centred on the cut, `Defaulted`. Each corner detail placed in a section (LAMB T553) adds strips and
+//! closed-chain prisms by the same rule over the junction's arms, extruded along the gaze over the
+//! solid gaze range of the first arm that has one, else the default depth centred on the cut,
+//! `Defaulted`, replacing nothing.
 //! Each run those views lay or skip (a section's off-vertical ones only) also records a construction
 //! state on its two face segments (LAMB T493): laid → resolved, or detail-conflicted with a width
 //! conflict; skipped for conflicting details → detail-conflicted; skipped otherwise → massing. A
@@ -381,14 +384,8 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
             let Some(loops) = straight_loops(run, side, face, bands) else { break 'lay };
             let Some(origin) = lift(&[c0]).and_then(|o| o.first().copied()) else { break 'lay };
             let sources = [run.faces[0].from.entity_id, run.faces[1].from.entity_id];
-            let solid = result.solids.iter().position(|s| s.entity_ids.iter().any(|e| sources.contains(e)));
-            let along = |q: &Point3| (q.x - origin.x) * axis.x + (q.y - origin.y) * axis.y;
-            let span = solid.and_then(|i| result.solids.get(i)).and_then(|s| {
-                let v: Vec<f64> = s.faces.iter().flatten().map(along).filter(|t| t.is_finite()).collect();
-                let (lo, hi) = (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
-                (hi - lo > tol).then_some(((lo, hi), s.provenance))
-            });
-            let (range, provenance) = span.unwrap_or(((-depth / 2.0, depth / 2.0), ProvenanceKind::Defaulted));
+            let span = gaze_span(run, result, origin, axis, tol);
+            let (range, provenance) = span.map_or(((-depth / 2.0, depth / 2.0), ProvenanceKind::Defaulted), |(r, k, _)| (r, k));
             let mut emitted = false;
             for (ring, layer) in loops {
                 if let Some(base) = lift(&ring) {
@@ -403,7 +400,7 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
                     push_extrusion(&base, axis, range, sources, provenance, head.layer.clone(), out);
                 }
             }
-            if let (true, Some(i), Some(_)) = (emitted, solid, span) {
+            if let (true, Some((_, _, i))) = (emitted, span) {
                 out.dropped_solids.insert(i);
             }
         }
@@ -420,6 +417,35 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
     } else {
         Vec::new()
     };
+    // Placed corner details (LAMB T553): over the first arm's solid gaze span, replacing nothing.
+    for c in corner_assembly(d, view.id).unwrap_or_default().iter().filter(|c| c.skipped.is_none()) {
+        let Some(j) = graph.junctions.get(c.junction) else { continue };
+        let arms: Vec<usize> = j.arms.iter().map(|a| a.run).collect();
+        let faces_of = |i: usize| graph.runs.get(i).map(|r| [r.faces[0].from.entity_id, r.faces[1].from.entity_id]);
+        let spanned = arms.iter().find_map(|&i| {
+            let run = graph.runs.get(i)?;
+            let c0 = match run.centreline {
+                RunCurve::Line { from, .. } => from,
+                RunCurve::Arc { center, radius, start_angle, .. } => {
+                    Point2 { x: center.x + radius * start_angle.cos(), y: center.y + radius * start_angle.sin() }
+                }
+            };
+            let origin = lift(&[c0])?.first().copied()?;
+            gaze_span(run, result, origin, axis, tol).map(|(r, k, _)| (r, k, i))
+        });
+        let (range, provenance, src) = match spanned {
+            Some((r, k, i)) => (r, k, Some(i)),
+            None => ((-depth / 2.0, depth / 2.0), ProvenanceKind::Defaulted, arms.first().copied()),
+        };
+        let Some(sources) = src.and_then(faces_of) else { continue };
+        let loops = ctx.loops(&c.lines, &arms);
+        let rings = if loops.first.is_some() { loops.rings } else { Vec::new() };
+        for (ring, layer) in loops.strips.into_iter().map(|(_, q, l)| (q, l)).chain(rings) {
+            if let Some(base) = lift(&ring) {
+                push_extrusion(&base, axis, range, sources, provenance, layer, out);
+            }
+        }
+    }
     for o in openings.iter().filter(|o| o.skipped.is_none()) {
         let (Some(at_b), Some(b)) = (o.end, graph.bridges.get(o.bridge)) else { continue };
         let i = if at_b { b.b.0 } else { b.a.0 };
@@ -447,6 +473,19 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
             }
         }
     }
+}
+
+/// The gaze range of the solid of either of `run`'s face entities, as distances along `axis` from
+/// `origin`, with its provenance and index in `result.solids`; `None` without one or when it has no
+/// extent along the gaze.
+fn gaze_span(run: &WallRun, result: &SynthesisResult, origin: Point3, axis: Point3, tol: f64) -> Option<((f64, f64), ProvenanceKind, usize)> {
+    let sources = [run.faces[0].from.entity_id, run.faces[1].from.entity_id];
+    let i = result.solids.iter().position(|s| s.entity_ids.iter().any(|e| sources.contains(e)))?;
+    let s = result.solids.get(i)?;
+    let along = |q: &Point3| (q.x - origin.x) * axis.x + (q.y - origin.y) * axis.y;
+    let v: Vec<f64> = s.faces.iter().flatten().map(along).filter(|t| t.is_finite()).collect();
+    let (lo, hi) = (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+    (hi - lo > tol).then_some(((lo, hi), s.provenance, i))
 }
 
 /// Where segment `f`–`t` (global XY) crosses `basis`'s cut line, as u along it; `None` when it
@@ -1355,6 +1394,102 @@ pub(crate) mod tests {
         let (got, _) = head_sill(false, false)?;
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].0 == "GYP" && near(got[0].2, (2100.0, 2150.0)), "{got:?}");
+        Ok(())
+    }
+
+    /// `section_wall(300)` with its plan placed and, with `corner`, a vertical corner detail tagged
+    /// at (0, 0); then ASSEMBLYPLAN on the section. Returns the scene's `CRN-*` Layer meshes as
+    /// `(layer, gaze range about section (0, 0), provenance)`, the default depth, and the
+    /// section-wall solid's gaze range and provenance when it has one.
+    #[allow(clippy::type_complexity)]
+    fn section_corner(
+        corner: bool,
+    ) -> T<(
+        Vec<(String, (f64, f64), lamb_core::derivation::resolve::ProvenanceKind)>,
+        f64,
+        Option<((f64, f64), lamb_core::derivation::resolve::ProvenanceKind)>,
+    )> {
+        let (mut s, sec) = crate::assembly::tests::section_wall(300.0)?;
+        if corner {
+            crate::assembly::tests::corner_detail(&mut s, sec, "exterior_face", true, (0.0, 0.0))?;
+        }
+        let plan = {
+            let p = crate::project::DrawingProject::new(s.doc()?)?;
+            p.views().find(|v| v.kind == lamb_core::derivation::read::ViewKind::Plan).ok_or("no plan")?.id
+        };
+        place(&mut s, plan)?;
+        let (g, at) = (gaze(&s, sec)?, global_of(&s, sec, [0.0, 0.0])?);
+        let before = scene(s.doc()?)?;
+        let wall = {
+            let d = s.doc()?;
+            let b = d.block(&crate::schema::view_block_name(sec)).ok_or("no view block")?;
+            b.entities.iter().filter(|e| e.common.layer == "WALL-EXT").map(|e| e.handle).collect::<Vec<_>>()
+        };
+        let solid = before
+            .meshes
+            .iter()
+            .find(|m| m.kind == SceneMeshKind::Solid && m.sources.iter().any(|h| wall.contains(h)))
+            .map(|m| (along(&before, m, g, at), m.provenance));
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let sc = scene(s.doc()?)?;
+        let got = sc
+            .meshes
+            .iter()
+            .filter(|m| m.kind == SceneMeshKind::Layer && m.layer.starts_with("CRN-"))
+            .map(|m| (m.layer.clone(), along(&sc, m, g, at), m.provenance))
+            .collect();
+        Ok((got, crate::project::DrawingProject::new(s.doc()?)?.defaults().default_surface_depth_mm, solid))
+    }
+
+    #[test]
+    fn a_sections_corner_detail_extrudes_along_the_gaze() -> R {
+        let (none, ..) = section_corner(false)?;
+        assert!(none.is_empty(), "no corner, no corner meshes: {none:?}");
+        let (got, _, solid) = section_corner(true)?;
+        // The plan corner rule: CRN-B (parallel to the floor-line arm) is a strip; CRN-A lies on the
+        // cut wall's exterior face, so bounds none. One strip per corner the tag resolves to.
+        assert!(!got.is_empty() && got.iter().all(|m| m.0 == "CRN-B"), "{got:?}");
+        // The first arm's face entity (the closed section wall) has a solid: its gaze span and
+        // provenance, here a defaulted solid over the default depth.
+        let want = solid.ok_or("the section wall has a solid")?;
+        for m in &got {
+            assert!(near(m.1, want.0), "{m:?} vs {want:?}");
+            assert_eq!(m.2, want.1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gaze_span_is_the_face_entitys_solid_along_the_gaze() -> R {
+        let (mut s, sec) = crate::assembly::tests::section_wall(300.0)?;
+        let plan = {
+            let p = crate::project::DrawingProject::new(s.doc()?)?;
+            p.views().find(|v| v.kind == lamb_core::derivation::read::ViewKind::Plan).ok_or("no plan")?.id
+        };
+        place(&mut s, plan)?;
+        let p = crate::project::DrawingProject::new(s.doc()?)?;
+        let result = lamb_core::derivation::synthesis::synthesize(&p)?;
+        let v = p.view(sec).ok_or("no section")?;
+        let host = p.view(v.host_view_id().ok_or("no host")?).ok_or("no host view")?;
+        let b = lamb_core::derivation::projection::vertical_basis(&v, &host)?;
+        let g = lamb_core::derivation::projection::vertical_gaze_dir(b.c_hat, false);
+        let axis = lamb_core::geometry::Point3 { x: g.x, y: g.y, z: 0.0 };
+        let origin = lamb_core::derivation::projection::vertical_local_to_global3(&v, &host, lamb_core::geometry::Point2 { x: 0.0, y: 0.0 })?;
+        let (graph, _) = crate::detailtags::graph_and_sides(&p, sec);
+        let tol = lamb_core::geometry::tolerance::TOLERANCE.coincidence_mm;
+        let run = graph.runs.first().ok_or("no run")?;
+        let (range, provenance, i) = super::gaze_span(run, &result, origin, axis, tol).ok_or("no span")?;
+        let solid = result.solids.get(i).ok_or("no solid")?;
+        let ids = [run.faces[0].from.entity_id, run.faces[1].from.entity_id];
+        assert!(solid.entity_ids.iter().any(|e| ids.contains(e)));
+        assert_eq!(provenance, solid.provenance);
+        let t: Vec<f64> = solid.faces.iter().flatten().map(|q| (q.x - origin.x) * axis.x + (q.y - origin.y) * axis.y).collect();
+        let want = (t.iter().copied().fold(f64::INFINITY, f64::min), t.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+        assert!(near(range, want) && range.1 - range.0 > 1.0, "{range:?} vs {want:?}");
+        // No solid for the run's faces → none.
+        let empty = lamb_core::derivation::synthesis::SynthesisResult { solids: Vec::new(), ..result.clone() };
+        assert!(super::gaze_span(run, &empty, origin, axis, tol).is_none());
         Ok(())
     }
 }
