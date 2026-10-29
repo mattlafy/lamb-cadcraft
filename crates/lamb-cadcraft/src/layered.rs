@@ -22,8 +22,11 @@
 //! straight runs that are not within 1° of vertical — the floors and roofs it cuts; walls cut in
 //! section are left to the plan — each strip and closed repeat copy (joists) extruded along the gaze
 //! over the gaze range of the solid of either face's entity, which is then dropped, else over
-//! `default_surface_depth_mm` centred on the cut plane, `Defaulted`. Corner and jamb details placed
-//! in a section add nothing.
+//! `default_surface_depth_mm` centred on the cut plane, `Defaulted`. Each head and sill detail
+//! placed in a section (LAMB T548) adds, on the run at its end of the opening, strips and closed-chain
+//! prisms by the plan's corner and jamb rule, extruded along the gaze over the host-plan opening the
+//! cut crosses (the one whose crossing is nearest that run), `Authored`, else over the default depth
+//! centred on the cut, `Defaulted`. Corner details placed in a section add nothing.
 //! Each run those views lay or skip (a section's off-vertical ones only) also records a construction
 //! state on its two face segments (LAMB T493): laid → resolved, or detail-conflicted with a width
 //! conflict; skipped for conflicting details → detail-conflicted; skipped otherwise → massing. A
@@ -34,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use cadcraft_doc::Drawing;
 use lamb_core::derivation::assembly::{AssemblyLine, Band, FaceRef, lay_bands};
 use lamb_core::derivation::projection::{
-    plan_local_to_global_xy, vertical_basis, vertical_gaze_dir, vertical_local_to_global3, vertical_local_to_uz,
+    VerticalBasis, plan_local_to_global_xy, vertical_basis, vertical_gaze_dir, vertical_local_to_global3, vertical_local_to_uz,
 };
 use lamb_core::derivation::read::{ProjectRead, ViewKind, ViewRef};
 use lamb_core::derivation::resolve::ProvenanceKind;
@@ -406,6 +409,59 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
         }
         out.record(ra, run, first);
     }
+
+    // Placed head and sill details (LAMB T548): across the host-plan opening the cut crosses.
+    let faces: Vec<(usize, FaceRef)> = runs.iter().filter_map(|r| r.face.map(|f| (r.run, f))).collect();
+    let ctx = DetailCtx { view, runs: &graph.runs, sides: &sides.runs, faces: &faces, result };
+    let openings = opening_assembly(d, view.id).unwrap_or_default();
+    let bridges: Vec<(Point2, Point2)> = if host.kind == ViewKind::Plan && openings.iter().any(|o| o.end.is_some()) {
+        let to_global = |q: Point2| plan_local_to_global_xy(host, q).ok();
+        graph_and_sides(p, host.id).0.bridges.iter().filter_map(|b| Some((to_global(b.from)?, to_global(b.to)?))).collect()
+    } else {
+        Vec::new()
+    };
+    for o in openings.iter().filter(|o| o.skipped.is_none()) {
+        let (Some(at_b), Some(b)) = (o.end, graph.bridges.get(o.bridge)) else { continue };
+        let i = if at_b { b.b.0 } else { b.a.0 };
+        let Some(run) = graph.runs.get(i) else { continue };
+        let RunCurve::Line { from: c0, to: c1 } = run.centreline else { continue };
+        let Some(origin) = lift(&[c0]).and_then(|o| o.first().copied()) else { continue };
+        let along = |q: Point2| (q.x - origin.x) * axis.x + (q.y - origin.y) * axis.y;
+        let mean_u = (vertical_local_to_uz(view, c0).u + vertical_local_to_uz(view, c1).u) / 2.0;
+        let crossed = bridges
+            .iter()
+            .filter_map(|&(f, t)| crossing_u(&basis, f, t).map(|u| ((u - mean_u).abs(), f, t)))
+            .min_by(|x, y| x.0.total_cmp(&y.0))
+            .map(|(_, f, t)| (along(f).min(along(t)), along(f).max(along(t))))
+            .filter(|r| r.1 - r.0 > tol);
+        let (range, provenance) = match crossed {
+            Some(r) => (r, ProvenanceKind::Authored),
+            None => ((-depth / 2.0, depth / 2.0), ProvenanceKind::Defaulted),
+        };
+        let sources = [run.faces[0].from.entity_id, run.faces[1].from.entity_id];
+        let loops = ctx.loops(&o.lines, &[i]);
+        let rings = if loops.first.is_some() { loops.rings } else { Vec::new() };
+        for (ring, layer) in loops.strips.into_iter().map(|(_, q, l)| (q, l)).chain(rings) {
+            if let Some(base) = lift(&ring) {
+                push_extrusion(&base, axis, range, sources, provenance, layer, out);
+            }
+        }
+    }
+}
+
+/// Where segment `f`–`t` (global XY) crosses `basis`'s cut line, as u along it; `None` when it
+/// does not, or runs parallel to it.
+fn crossing_u(basis: &VerticalBasis, f: Point2, t: Point2) -> Option<f64> {
+    let tol = TOLERANCE.coincidence_mm;
+    let perp = Point2 { x: -basis.c_hat.y, y: basis.c_hat.x };
+    let (sf, st) = (dot(sub(f, basis.origin_xy), perp), dot(sub(t, basis.origin_xy), perp));
+    if (sf > tol && st > tol) || (sf < -tol && st < -tol) || (sf - st).abs() <= tol {
+        return None;
+    }
+    let k = sf / (sf - st);
+    let q = Point2 { x: f.x + (t.x - f.x) * k, y: f.y + (t.y - f.y) * k };
+    let u = dot(sub(q, basis.origin_xy), basis.c_hat);
+    (u >= -tol && u <= basis.length_mm + tol).then_some(u)
 }
 
 /// A straight run's layer loops (plan-local) with their layers, or `None` when its frame is
@@ -501,15 +557,23 @@ struct DetailCtx<'a> {
     result: &'a SynthesisResult,
 }
 
+/// One placed detail's meshes as local loops: strips, each with the adjoining run it lies along, and
+/// prisms of closed chains, which take the first adjoining run with a frame (`first`).
+struct DetailLoops {
+    strips: Vec<(usize, Vec<Point2>, String)>,
+    rings: Vec<(Vec<Point2>, String)>,
+    first: Option<usize>,
+}
+
 impl DetailCtx<'_> {
-    /// One placed detail's meshes: per `adjoining` straight run with a z range, `lines` parallel to
-    /// it as strips over the overlap of consecutive boundaries; then each closed chain of `lines` as
-    /// a prism over the first such run's z range. A closed chain's lines are not strip boundaries.
-    fn meshes(&self, lines: &[AssemblyLine], adjoining: &[usize], out: &mut Layered) {
+    /// One placed detail's loops: per `adjoining` straight run, `lines` parallel to it as strips over
+    /// the overlap of consecutive boundaries; then each closed chain of `lines`. A closed chain's
+    /// lines are not strip boundaries.
+    fn loops(&self, lines: &[AssemblyLine], adjoining: &[usize]) -> DetailLoops {
         let tol = TOLERANCE.coincidence_mm;
         let sin_tol = TOLERANCE.angle_deg.to_radians().sin();
         let near = |a: Point2, b: Point2| (a.x - b.x).hypot(a.y - b.y) <= tol;
-        let mut rings: Vec<(Vec<Point2>, String)> = Vec::new();
+        let mut out = DetailLoops { strips: Vec::new(), rings: Vec::new(), first: None };
         let mut in_ring = vec![false; lines.len()];
         let mut start = 0;
         for k in 1..=lines.len() {
@@ -518,16 +582,15 @@ impl DetailCtx<'_> {
                 continue;
             }
             if let Some(ring) = lines.get(start..k).and_then(|chain| closed_loop(chain, tol)) {
-                rings.push((ring, head.layer.clone()));
+                out.rings.push((ring, head.layer.clone()));
                 in_ring.iter_mut().take(k).skip(start).for_each(|f| *f = true);
             }
             start = k;
         }
-        let mut first_z: Option<ZRange> = None;
         for &i in adjoining {
             let (Some(run), Some(side)) = (self.runs.get(i), self.sides.get(i)) else { continue };
             let Some(&(_, face)) = self.faces.iter().find(|f| f.0 == i) else { continue };
-            let (Some(fr), Some(z)) = (run_frame(run, side, face), run_z(run, self.result)) else { continue };
+            let Some(fr) = run_frame(run, side, face) else { continue };
             let parallel = |l: &AssemblyLine| {
                 let v = sub(l.to, l.from);
                 let len = v.x.hypot(v.y);
@@ -555,15 +618,27 @@ impl DetailCtx<'_> {
                 if t1 - t0 <= tol {
                     continue;
                 }
-                let quad = [fr.at(t0, lo.offset), fr.at(t1, lo.offset), fr.at(t1, hi.offset), fr.at(t0, hi.offset)];
+                let quad = vec![fr.at(t0, lo.offset), fr.at(t1, lo.offset), fr.at(t1, hi.offset), fr.at(t0, hi.offset)];
+                out.strips.push((i, quad, layer));
+            }
+            out.first.get_or_insert(i);
+        }
+        out
+    }
+
+    /// One placed detail's meshes in a plan: [`Self::loops`] over the `adjoining` runs with a z
+    /// range, each strip over its run's z range and each closed chain over the first's.
+    fn meshes(&self, lines: &[AssemblyLine], adjoining: &[usize], out: &mut Layered) {
+        let with_z: Vec<usize> = adjoining.iter().copied().filter(|&i| self.runs.get(i).and_then(|r| run_z(r, self.result)).is_some()).collect();
+        let loops = self.loops(lines, &with_z);
+        let z_of = |i: usize| self.runs.get(i).and_then(|r| run_z(r, self.result));
+        for (i, quad, layer) in loops.strips {
+            if let Some(z) = z_of(i) {
                 push_prism(self.view, &quad, layer, &z, out);
             }
-            if first_z.is_none() {
-                first_z = Some(z);
-            }
         }
-        let Some(z) = first_z else { return };
-        for (ring, layer) in rings {
+        let Some(z) = loops.first.and_then(z_of) else { return };
+        for (ring, layer) in loops.rings {
             push_prism(self.view, &ring, layer, &z, out);
         }
     }
@@ -1197,6 +1272,89 @@ pub(crate) mod tests {
             assert!((lo - want.0).abs() < 0.01 && (hi - want.1).abs() < 0.01, "{lo}..{hi} vs {want:?}");
         }
         assert!(!sc.meshes.iter().any(|m| m.kind == SceneMeshKind::Solid && m.sources.iter().any(|h| fl.contains(h))), "the floor solid is gone");
+        Ok(())
+    }
+
+    /// [`window_section`](crate::assembly::tests::window_section) with its plan placed — with
+    /// `opening`, plus a 300 `WALL-EXT` plan wall along y at x 0/300 with a `WINDOW` gap y −500..500
+    /// that the cut line (y 0) crosses — and, without `sill`, the sill tag erased; then ASSEMBLYPLAN
+    /// on the section. Returns its scene's `(layer, x range, z range, gaze range about (150, 0),
+    /// provenance)` per Layer mesh, sorted by z.
+    #[allow(clippy::type_complexity)]
+    fn head_sill(
+        opening: bool,
+        sill: bool,
+    ) -> T<(Vec<(String, (f64, f64), (f64, f64), (f64, f64), lamb_core::derivation::resolve::ProvenanceKind)>, f64)> {
+        let (mut s, sec, st) = crate::assembly::tests::window_section(true)?;
+        let plan = {
+            let p = crate::project::DrawingProject::new(s.doc()?)?;
+            p.views().find(|v| v.kind == lamb_core::derivation::read::ViewKind::Plan).ok_or("no plan")?.id
+        };
+        if opening {
+            s.execute("editview", &json!({ "viewId": plan.0 }))?;
+            s.execute("layer.current", &json!({ "name": "WALL-EXT" }))?;
+            for (x, y0, y1) in [(0, -3000, -500), (300, -3000, -500), (0, 500, 3000), (300, 500, 3000)] {
+                s.execute("pline", &json!({ "vertices": [[x, y0], [x, y1]] }))?;
+            }
+            s.execute("layer.current", &json!({ "name": "WINDOW" }))?;
+            s.execute("pline", &json!({ "vertices": [[150, -500], [150, 500]] }))?;
+            let p = crate::project::DrawingProject::new(s.doc()?)?;
+            assert_eq!(crate::detailtags::graph_and_sides(&p, plan).0.bridges.len(), 1, "the plan wall has one opening");
+        }
+        if !sill {
+            s.execute("erase", &json!({ "handles": [st.ok_or("no sill tag")?] }))?;
+        }
+        place(&mut s, plan)?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let sc = scene(s.doc()?)?;
+        let (g, at) = (gaze(&s, sec)?, global_of(&s, sec, [150.0, 2100.0])?);
+        let mut out: Vec<_> = sc
+            .meshes
+            .iter()
+            .filter(|m| m.kind == SceneMeshKind::Layer)
+            .map(|m| (m.layer.clone(), range(&sc, m, 0), range(&sc, m, 2), along(&sc, m, g, at), m.provenance))
+            .collect();
+        out.sort_by(|a, b| a.2.0.total_cmp(&b.2.0));
+        Ok((out, crate::project::DrawingProject::new(s.doc()?)?.defaults().default_surface_depth_mm))
+    }
+
+    fn near(a: (f64, f64), b: (f64, f64)) -> bool {
+        let tol = lamb_core::geometry::tolerance::TOLERANCE.coincidence_mm.max(0.01);
+        (a.0 - b.0).abs() <= tol && (a.1 - b.1).abs() <= tol
+    }
+
+    #[test]
+    fn a_sections_head_and_sill_details_extrude_along_the_gaze() -> R {
+        let (got, depth) = head_sill(false, true)?;
+        assert_eq!(got.iter().map(|m| m.0.as_str()).collect::<Vec<_>>(), ["GYP", "GYP"], "{got:?}");
+        // The sill's GYP band (−50,200)–(0,200) placed at u 200, z 900 down to 850; the head's at z
+        // 2100 up to 2150; each strip from the exterior face (u 0) to u 200.
+        for (m, z) in got.iter().zip([(850.0, 900.0), (2100.0, 2150.0)]) {
+            assert!(near(m.1, (0.0, 200.0)) && near(m.2, z), "{m:?}");
+            assert!(near(m.3, (-depth / 2.0, depth / 2.0)), "{m:?}");
+            assert_eq!(m.4, lamb_core::derivation::resolve::ProvenanceKind::Defaulted);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_sections_head_and_sill_details_span_the_crossed_plan_openings_width() -> R {
+        let (got, _) = head_sill(true, true)?;
+        assert_eq!(got.len(), 2, "{got:?}");
+        for (m, z) in got.iter().zip([(850.0, 900.0), (2100.0, 2150.0)]) {
+            assert!(m.0 == "GYP" && near(m.1, (0.0, 200.0)) && near(m.2, z), "{m:?}");
+            assert!(near(m.3, (-500.0, 500.0)), "the bridge's 1000 width: {m:?}");
+            assert_eq!(m.4, lamb_core::derivation::resolve::ProvenanceKind::Authored);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_untagged_sill_adds_nothing_at_the_sill() -> R {
+        let (got, _) = head_sill(false, false)?;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].0 == "GYP" && near(got[0].2, (2100.0, 2150.0)), "{got:?}");
         Ok(())
     }
 }

@@ -3037,7 +3037,7 @@ pub(crate) mod tests {
     /// gap, `SD` edge-tagged on the lower run, and two vertical opening details drawn like `JD` —
     /// `H` on layer `HEAD`, `S` on layer `SILL` — corner-tagged near the head and near the sill (S
     /// only when `sill`). Returns (session, section, S's tag handle).
-    fn window_section(sill: bool) -> T<(Session, Id, Option<String>)> {
+    pub(crate) fn window_section(sill: bool) -> T<(Session, Id, Option<String>)> {
         let (mut s, sec) = section_fixture(150.0, Some((-1000.0, 450.0)), |s| {
             s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
             for (u, z0, z1) in [(0, 0, 900), (300, 0, 900), (0, 2100, 3000), (300, 2100, 3000)] {
