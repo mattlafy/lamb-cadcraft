@@ -100,6 +100,55 @@ const LIGHT: V3 = [5000.0, -8000.0, 10000.0];
 /// A press that moved less than this is a click (px).
 const CLICK_SLOP: f32 = 3.0;
 
+/// A standard view direction: the five orthographic faces (no Bottom) and the four isometrics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdView {
+    Top,
+    Front,
+    Right,
+    Back,
+    Left,
+    Sw,
+    Se,
+    Ne,
+    Nw,
+}
+
+impl StdView {
+    pub const ALL: [StdView; 9] =
+        [StdView::Top, StdView::Front, StdView::Right, StdView::Back, StdView::Left, StdView::Sw, StdView::Se, StdView::Ne, StdView::Nw];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StdView::Top => "Top",
+            StdView::Front => "Front",
+            StdView::Right => "Right",
+            StdView::Back => "Back",
+            StdView::Left => "Left",
+            StdView::Sw => "SW",
+            StdView::Se => "SE",
+            StdView::Ne => "NE",
+            StdView::Nw => "NW",
+        }
+    }
+
+    /// The unit vector from target to eye. Front looks from −Y (north), Right from +X; Top sits
+    /// 0.01 rad off the pole towards −Y (where `orbit` clamps), so +Y reads up on screen.
+    fn eye_dir(self) -> V3 {
+        match self {
+            StdView::Top => [0.0, -(0.01f64).sin(), (0.01f64).cos()],
+            StdView::Front => [0.0, -1.0, 0.0],
+            StdView::Right => [1.0, 0.0, 0.0],
+            StdView::Back => [0.0, 1.0, 0.0],
+            StdView::Left => [-1.0, 0.0, 0.0],
+            StdView::Sw => norm([-1.0, -1.0, 1.0]),
+            StdView::Se => norm([1.0, -1.0, 1.0]),
+            StdView::Ne => norm([1.0, 1.0, 1.0]),
+            StdView::Nw => norm([-1.0, 1.0, 1.0]),
+        }
+    }
+}
+
 /// An orbit camera in global mm.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
@@ -163,6 +212,11 @@ impl Camera {
         let m = add(mul(r, -f64::from(delta.x) * per_px), mul(u, f64::from(delta.y) * per_px));
         self.eye = add(self.eye, m);
         self.target = add(self.target, m);
+    }
+
+    /// Look at the target from a standard direction; target and distance are kept.
+    pub fn look_from(&mut self, v: StdView) {
+        self.eye = add(self.target, mul(v.eye_dir(), self.distance()));
     }
 
     /// Make `p` the orbit pivot: eye and target move by the same vector, so the distance and
@@ -440,6 +494,8 @@ pub struct Scene3dState {
     built: Option<((u64, u64, u64), Option<Arc<Scene3>>)>,
     pub camera: Option<Camera>,
     press: Option<Pos2>,
+    /// Where the view-button row sat last frame, so a press on it neither orbits nor picks.
+    buttons: Option<Rect>,
 }
 
 /// The scene for the current drawing, rebuilt when it changed; `None` unregistered or empty.
@@ -483,8 +539,11 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     let scene = scene(app);
     let mut cam = app.scene3d.camera.unwrap_or_else(|| fit_scene(scene.as_deref(), rect));
+    let app_buttons = app.scene3d.buttons;
     // Left drag orbits, middle drag dollies, right drag pans, the wheel dollies (LAMB T47).
-    let delta = resp.drag_delta();
+    let on_buttons = |p: Option<Pos2>| matches!((app_buttons, p), (Some(b), Some(p)) if b.contains(p));
+    let (pressed, released, pos) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released(), i.pointer.interact_pos()));
+    let delta = if on_buttons(app.scene3d.press) { egui::Vec2::ZERO } else { resp.drag_delta() };
     if resp.dragged_by(egui::PointerButton::Primary) {
         cam.orbit(delta);
     } else if resp.dragged_by(egui::PointerButton::Middle) {
@@ -498,12 +557,12 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             cam.dolly((-f64::from(scroll) * 0.002).exp());
         }
     }
-    let (pressed, released, pos) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released(), i.pointer.interact_pos()));
-    if pressed && resp.hovered() {
+    if pressed && (resp.hovered() || on_buttons(pos)) {
         app.scene3d.press = pos;
     }
     if released
         && let (Some(a), Some(b)) = (app.scene3d.press.take(), pos)
+        && !on_buttons(Some(a))
         && a.distance(b) < CLICK_SLOP
     {
         click(app, &cam, rect, b);
@@ -511,6 +570,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // Double-click: the hit becomes the orbit pivot; a miss refits the scene (ZOOMEXT's job).
     if resp.double_clicked()
         && let Some(p) = pos
+        && !on_buttons(Some(p))
     {
         let (o, d) = ray(&cam, rect, p);
         match scene.as_deref().and_then(|s| hit(s, o, d)) {
@@ -521,6 +581,25 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     app.scene3d.camera = Some(cam);
     let lit: HashSet<Handle> = SOURCE.get().map(|src| (src.highlight)().into_iter().collect()).unwrap_or_default();
     draw(&painter, scene.as_deref(), &cam, rect, &lit, [t.hover.r(), t.hover.g(), t.hover.b()]);
+    // Standard views, top-left, added after the picture so they paint over it (LAMB T555).
+    let row = ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(rect.min + egui::vec2(6.0, 6.0), rect.max)), |ui| {
+        let mut chosen = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for v in StdView::ALL {
+                if ui.add(egui::Button::new(crate::i18n::t(v.label())).small()).clicked() {
+                    chosen = Some(v);
+                }
+            }
+        });
+        chosen
+    });
+    app.scene3d.buttons = Some(row.response.rect);
+    if let Some(v) = row.inner {
+        cam.look_from(v);
+        app.scene3d.camera = Some(cam);
+        ui.ctx().request_repaint();
+    }
 }
 
 #[cfg(test)]
@@ -720,6 +799,49 @@ mod tests {
         assert_eq!(hit(&off, [500.0, 500.0, 3000.0], down), None);
         let g = hit(&off, [10_500.0, 20_500.0, 3000.0], down).unwrap();
         assert!(len(sub(g, [10_500.0, 20_500.0, 300.0])) < 1e-6, "{g:?}");
+    }
+
+    #[test]
+    fn every_standard_view_keeps_the_target_and_distance_and_centres_the_target() {
+        let r = rect();
+        for v in StdView::ALL {
+            let mut c = cam();
+            let d = c.distance();
+            c.look_from(v);
+            assert_eq!(c.target, cam().target, "{v:?}");
+            assert!((c.distance() - d).abs() < 1e-6, "{v:?}");
+            let (p, _) = project(&c, r, c.target).unwrap();
+            assert!(p.distance(r.center()) < 1e-3, "{v:?} {p:?}");
+        }
+    }
+
+    #[test]
+    fn standard_views_put_the_axes_where_a_drafter_expects() {
+        let r = rect();
+        let at = |v: StdView, off: V3| {
+            let mut c = cam();
+            c.look_from(v);
+            let (p, _) = project(&c, r, add(c.target, off)).unwrap();
+            p - r.center()
+        };
+        // Top: plan with +Y (north) up and +X right; Y-asymmetric offsets.
+        let n = at(StdView::Top, [0.0, 700.0, 0.0]);
+        assert!(n.y < -10.0 && n.x.abs() < 1.0, "{n:?}");
+        let e = at(StdView::Top, [300.0, 0.0, 0.0]);
+        assert!(e.x > 10.0 && e.y.abs() < 1.0, "{e:?}");
+        // Front: +Z up, +X right.
+        let up = at(StdView::Front, [0.0, 0.0, 700.0]);
+        assert!(up.y < -10.0 && up.x.abs() < 1e-3, "{up:?}");
+        let e = at(StdView::Front, [300.0, 0.0, 0.0]);
+        assert!(e.x > 10.0 && e.y.abs() < 1e-3, "{e:?}");
+        // Right: +Y to the right.
+        let n = at(StdView::Right, [0.0, 300.0, 0.0]);
+        assert!(n.x > 10.0 && n.y.abs() < 1e-3, "{n:?}");
+        // SW iso: the eye sits south-west and above.
+        let mut c = cam();
+        c.look_from(StdView::Sw);
+        let o = sub(c.eye, c.target);
+        assert!(o[0] < 0.0 && o[1] < 0.0 && o[2] > 0.0, "{o:?}");
     }
 
     #[test]
