@@ -156,6 +156,13 @@ impl Camera {
         self.eye = add(self.eye, m);
         self.target = add(self.target, m);
     }
+
+    /// Make `p` the orbit pivot: eye and target move by the same vector, so the distance and
+    /// direction are kept and the picture only translates (`p` moves to the centre).
+    pub fn recentre(&mut self, p: V3) {
+        self.eye = add(self.eye, sub(p, self.target));
+        self.target = p;
+    }
 }
 
 fn aspect(rect: Rect) -> f64 {
@@ -209,6 +216,41 @@ pub fn ray(cam: &Camera, rect: Rect, screen: Pos2) -> (V3, V3) {
     let y = -f64::from(screen.y - c.y) / (f64::from(rect.height().max(1.0)) * 0.5);
     let t = (FOV_DEG.to_radians() * 0.5).tan();
     (cam.eye, norm(add(f, add(mul(r, x * t * aspect(rect)), mul(u, y * t)))))
+}
+
+/// The nearest point past [`NEAR`] where the ray (`origin`, unit `dir`) crosses a mesh triangle
+/// (two-sided, global mm); paths are not hit. `None` when it misses every mesh.
+pub fn hit(scene: &Scene3, origin: V3, dir: V3) -> Option<V3> {
+    let mut best: Option<f64> = None;
+    for m in &scene.meshes {
+        let world = |i: u32| m.positions.get(i as usize).map(|p| add(scene.origin, [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]));
+        for t in m.indices.as_chunks::<3>().0 {
+            let (Some(a), Some(b), Some(c)) = (world(t[0]), world(t[1]), world(t[2])) else { continue };
+            // Möller–Trumbore.
+            let (e1, e2) = (sub(b, a), sub(c, a));
+            let pv = cross(dir, e2);
+            let det = dot(e1, pv);
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let inv = 1.0 / det;
+            let tv = sub(origin, a);
+            let u = dot(tv, pv) * inv;
+            if !(0.0..=1.0).contains(&u) {
+                continue;
+            }
+            let qv = cross(tv, e1);
+            let v = dot(dir, qv) * inv;
+            if v < 0.0 || u + v > 1.0 {
+                continue;
+            }
+            let d = dot(e2, qv) * inv;
+            if d > NEAR && best.is_none_or(|b| d < b) {
+                best = Some(d);
+            }
+        }
+    }
+    best.map(|d| add(origin, mul(dir, d)))
 }
 
 /// A segment clipped to the near plane, on screen.
@@ -418,6 +460,16 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     {
         click(app, &cam, rect, b);
     }
+    // Double-click: the hit becomes the orbit pivot; a miss refits the scene (ZOOMEXT's job).
+    if resp.double_clicked()
+        && let Some(p) = pos
+    {
+        let (o, d) = ray(&cam, rect, p);
+        match scene.as_deref().and_then(|s| hit(s, o, d)) {
+            Some(h) => cam.recentre(h),
+            None => cam = fit_scene(scene.as_deref(), rect),
+        }
+    }
     app.scene3d.camera = Some(cam);
     let lit: HashSet<Handle> = SOURCE.get().map(|src| (src.highlight)().into_iter().collect()).unwrap_or_default();
     draw(&painter, scene.as_deref(), &cam, rect, &lit, [t.hover.r(), t.hover.g(), t.hover.b()]);
@@ -533,6 +585,38 @@ mod tests {
         assert_ne!(triangles(&scene, &c, rect(), &only_a, lit_rgb), plain);
         assert_eq!(triangles(&scene, &c, rect(), &HashSet::from([Handle(99)]), lit_rgb), plain);
         assert_eq!(one(qa.clone(), &none).iter().map(|t| t.fill.a()).collect::<Vec<_>>(), vec![100, 100], "unlit keeps its alpha");
+    }
+
+    #[test]
+    fn a_ray_hits_the_nearest_mesh_in_global_coordinates_and_a_miss_is_none() {
+        let down = [0.0, 0.0, -1.0];
+        let one = Scene3 { origin: [0.0; 3], meshes: vec![quad(0.0, [0; 4])], paths: Vec::new() };
+        let p = hit(&one, [500.0, 500.0, 3000.0], down).unwrap();
+        assert!(len(sub(p, [500.0, 500.0, 0.0])) < 1e-6, "{p:?}");
+        // From below too (two-sided).
+        assert!(len(sub(hit(&one, [500.0, 500.0, -3000.0], [0.0, 0.0, 1.0]).unwrap(), [500.0, 500.0, 0.0])) < 1e-6);
+        // Stacked: the nearer quad (z 500) wins, whichever order the meshes come in.
+        let two = Scene3 { origin: [0.0; 3], meshes: vec![quad(0.0, [0; 4]), quad(500.0, [0; 4])], paths: Vec::new() };
+        assert!(len(sub(hit(&two, [250.0, 700.0, 3000.0], down).unwrap(), [250.0, 700.0, 500.0])) < 1e-6);
+        // Beside the quad, or pointing away: nothing.
+        assert_eq!(hit(&one, [1500.0, 500.0, 3000.0], down), None);
+        assert_eq!(hit(&one, [500.0, 500.0, 3000.0], [0.0, 0.0, 1.0]), None);
+        // An offset origin lifts the mesh into global coordinates.
+        let off = Scene3 { origin: [10_000.0, 20_000.0, 300.0], ..one.clone() };
+        assert_eq!(hit(&off, [500.0, 500.0, 3000.0], down), None);
+        let g = hit(&off, [10_500.0, 20_500.0, 3000.0], down).unwrap();
+        assert!(len(sub(g, [10_500.0, 20_500.0, 300.0])) < 1e-6, "{g:?}");
+    }
+
+    #[test]
+    fn recentre_keeps_the_offset_and_puts_the_pivot_at_the_centre() {
+        let (mut c, r) = (cam(), rect());
+        let o = sub(c.eye, c.target);
+        let p = [1234.0, -567.0, 890.0];
+        c.recentre(p);
+        assert_eq!(c.target, p);
+        assert!(len(sub(sub(c.eye, c.target), o)) < 1e-9);
+        assert!(project(&c, r, p).unwrap().0.distance(r.center()) < 1e-3);
     }
 
     fn highlight() -> Vec<Handle> {
