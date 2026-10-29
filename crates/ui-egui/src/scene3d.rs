@@ -91,6 +91,8 @@ fn norm(a: V3) -> V3 {
 /// Vertical field of view, near and far planes (the TS app's `PerspectiveCamera(50, …, 10, 200000)`).
 pub const FOV_DEG: f64 = 50.0;
 pub const NEAR: f64 = 10.0;
+/// The near plane's floor: [`Camera::near`] scales between this and [`NEAR`].
+pub const MIN_NEAR: f64 = 0.5;
 pub const FAR: f64 = 200_000.0;
 const UP: V3 = [0.0, 0.0, 1.0];
 /// The TS directional light's position (light comes from there).
@@ -118,6 +120,12 @@ impl Camera {
     }
     fn distance(&self) -> f64 {
         len(sub(self.eye, self.target))
+    }
+
+    /// The near plane: a hundredth of the eye-to-target distance, between [`MIN_NEAR`] and
+    /// [`NEAR`], so a camera dollied right up to a face still sees it.
+    pub fn near(&self) -> f64 {
+        (self.distance() / 100.0).clamp(MIN_NEAR, NEAR)
     }
 
     /// Fit a box (global min, max) into `rect`: target at its centre, eye along (1, −1.5, 1).
@@ -176,11 +184,12 @@ pub fn view_proj(cam: &Camera, aspect: f64) -> [[f64; 4]; 4] {
     // View: rows r, u, −f with translation.
     let view = [[r[0], u[0], -f[0], 0.0], [r[1], u[1], -f[1], 0.0], [r[2], u[2], -f[2], 0.0], [-dot(r, e), -dot(u, e), dot(f, e), 1.0]];
     let t = 1.0 / (FOV_DEG.to_radians() * 0.5).tan();
+    let near = cam.near();
     let proj = [
         [t / aspect, 0.0, 0.0, 0.0],
         [0.0, t, 0.0, 0.0],
-        [0.0, 0.0, (FAR + NEAR) / (NEAR - FAR), -1.0],
-        [0.0, 0.0, 2.0 * FAR * NEAR / (NEAR - FAR), 0.0],
+        [0.0, 0.0, (FAR + near) / (near - FAR), -1.0],
+        [0.0, 0.0, 2.0 * FAR * near / (near - FAR), 0.0],
     ];
     let mut m = [[0.0; 4]; 4];
     for (c, col) in m.iter_mut().enumerate() {
@@ -192,12 +201,12 @@ pub fn view_proj(cam: &Camera, aspect: f64) -> [[f64; 4]; 4] {
 }
 
 /// A point's screen position and its depth (distance in front of the eye along the view), or
-/// `None` in front of the near plane or past the far plane.
+/// `None` in front of the camera's near plane ([`Camera::near`]) or past the far plane.
 pub fn project(cam: &Camera, rect: Rect, p: V3) -> Option<(Pos2, f64)> {
     let m = view_proj(cam, aspect(rect));
     let c: [f64; 4] = std::array::from_fn(|row| m[0][row] * p[0] + m[1][row] * p[1] + m[2][row] * p[2] + m[3][row]);
     let w = c[3];
-    if !(NEAR..=FAR).contains(&w) {
+    if !(cam.near()..=FAR).contains(&w) {
         return None;
     }
     Some((ndc_to_screen(rect, c[0] / w, c[1] / w), w))
@@ -257,7 +266,7 @@ pub fn hit(scene: &Scene3, origin: V3, dir: V3) -> Option<V3> {
 fn segment(cam: &Camera, rect: Rect, a: V3, b: V3) -> Option<(Pos2, Pos2)> {
     let (f, ..) = cam.basis();
     let (za, zb) = (dot(sub(a, cam.eye), f), dot(sub(b, cam.eye), f));
-    let near = NEAR * 1.001;
+    let near = cam.near() * 1.001;
     if za < near && zb < near {
         return None;
     }
@@ -276,6 +285,38 @@ pub struct Tri {
     pub depth: f64,
     pub fill: Color32,
     pub edges: Option<Color32>,
+    /// Which edges to stroke: edge `i` runs `pts[i]` -> `pts[(i + 1) % 3]`. A piece of a
+    /// triangle clipped at the near plane leaves out the clip seam and the fan diagonal.
+    pub edges_mask: [bool; 3],
+}
+
+/// The triangle `v` clipped to view depth `z >= near` (Sutherland-Hodgman), split into a fan of
+/// 0, 1 or 2 triangles, each with its edge mask (true only along the original triangle's edges).
+fn clip_near(v: [V3; 3], z: [f64; 3], near: f64) -> Vec<([V3; 3], [bool; 3])> {
+    if z.iter().all(|&d| d >= near) {
+        return vec![(v, [true; 3])];
+    }
+    // Each output vertex carries whether the edge leaving it (to the next) is original.
+    let mut poly: Vec<(V3, bool)> = Vec::with_capacity(4);
+    for i in 0..3 {
+        let j = (i + 1) % 3;
+        let (p, q, zp, zq) = (v[i], v[j], z[i], z[j]);
+        let cut = || add(p, mul(sub(q, p), (near - zp) / (zq - zp)));
+        match (zp >= near, zq >= near) {
+            (true, true) => poly.push((p, true)),
+            (true, false) => {
+                poly.push((p, true));
+                poly.push((cut(), false));
+            }
+            (false, true) => poly.push((cut(), true)),
+            (false, false) => {}
+        }
+    }
+    let n = poly.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    (1..n - 1).map(|k| ([poly[0].0, poly[k].0, poly[k + 1].0], [k == 1 && poly[0].1, poly[k].1, k + 1 == n - 1 && poly[n - 1].1])).collect()
 }
 
 fn rgba(c: [u8; 4]) -> Color32 {
@@ -285,11 +326,14 @@ fn rgba(c: [u8; 4]) -> Color32 {
 /// A highlighted mesh's fill alpha floor.
 const LIT_MIN_ALPHA: u8 = 160;
 
-/// Every triangle of the scene in front of the near plane, shaded, sorted far to near. A mesh
+/// Every triangle of the scene in front of the near plane, shaded, sorted far to near; one that
+/// crosses the near plane is clipped to it and its visible part kept. A mesh
 /// with any source in `lit` fills in `lit_rgb` (alpha at least [`LIT_MIN_ALPHA`]) and draws its
 /// edges in `lit_rgb`, opaque.
 pub fn triangles(scene: &Scene3, cam: &Camera, rect: Rect, lit: &HashSet<Handle>, lit_rgb: [u8; 3]) -> Vec<Tri> {
     let l = norm(LIGHT);
+    let (f, ..) = cam.basis();
+    let near = cam.near() * 1.001;
     let mut out = Vec::new();
     for m in &scene.meshes {
         let on = !lit.is_empty() && m.sources.iter().any(|h| lit.contains(h));
@@ -301,16 +345,20 @@ pub fn triangles(scene: &Scene3, cam: &Camera, rect: Rect, lit: &HashSet<Handle>
         let world = |i: u32| m.positions.get(i as usize).map(|p| add(scene.origin, [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]));
         for t in m.indices.as_chunks::<3>().0 {
             let (Some(a), Some(b), Some(c)) = (world(t[0]), world(t[1]), world(t[2])) else { continue };
-            let (Some(pa), Some(pb), Some(pc)) = (project(cam, rect, a), project(cam, rect, b), project(cam, rect, c)) else { continue };
             let n = norm(cross(sub(b, a), sub(c, a)));
             let k = 0.6 + 0.8 * dot(n, l).abs();
             let ch = |v: u8| (f64::from(v) * k).clamp(0.0, 255.0) as u8;
-            out.push(Tri {
-                pts: [pa.0, pb.0, pc.0],
-                depth: (pa.1 + pb.1 + pc.1) / 3.0,
-                fill: Color32::from_rgba_unmultiplied(ch(fill[0]), ch(fill[1]), ch(fill[2]), fill[3]),
-                edges: edges.map(rgba),
-            });
+            let z = [a, b, c].map(|p| dot(sub(p, cam.eye), f));
+            for ([a, b, c], edges_mask) in clip_near([a, b, c], z, near) {
+                let (Some(pa), Some(pb), Some(pc)) = (project(cam, rect, a), project(cam, rect, b), project(cam, rect, c)) else { continue };
+                out.push(Tri {
+                    pts: [pa.0, pb.0, pc.0],
+                    depth: (pa.1 + pb.1 + pc.1) / 3.0,
+                    fill: Color32::from_rgba_unmultiplied(ch(fill[0]), ch(fill[1]), ch(fill[2]), fill[3]),
+                    edges: edges.map(rgba),
+                    edges_mask,
+                });
+            }
         }
     }
     out.sort_by(|a, b| b.depth.total_cmp(&a.depth));
@@ -368,9 +416,9 @@ fn draw(painter: &egui::Painter, scene: Option<&Scene3>, cam: &Camera, rect: Rec
     for t in &tris {
         if let Some(c) = t.edges {
             let s = Stroke::new(1.0, c);
-            painter.line_segment([t.pts[0], t.pts[1]], s);
-            painter.line_segment([t.pts[1], t.pts[2]], s);
-            painter.line_segment([t.pts[2], t.pts[0]], s);
+            for i in (0..3).filter(|&i| t.edges_mask[i]) {
+                painter.line_segment([t.pts[i], t.pts[(i + 1) % 3]], s);
+            }
         }
     }
     for path in &scene.paths {
@@ -543,6 +591,72 @@ mod tests {
             edges_rgba: None,
             sources: Vec::new(),
         }
+    }
+
+    fn screen_area(t: &Tri) -> f32 {
+        let [a, b, c] = t.pts;
+        ((b - a).x * (c - a).y - (b - a).y * (c - a).x).abs() * 0.5
+    }
+
+    #[test]
+    fn a_10_m_floor_half_behind_a_close_eye_still_draws_its_visible_half() {
+        let floor = Mesh3 {
+            positions: vec![[-5000.0, -5000.0, 0.0], [5000.0, -5000.0, 0.0], [5000.0, 5000.0, 0.0], [-5000.0, 5000.0, 0.0]],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            rgba: [200, 200, 200, 255],
+            edges_rgba: Some([0, 0, 0, 255]),
+            sources: Vec::new(),
+        };
+        let scene = Scene3 { origin: [0.0; 3], meshes: vec![floor], paths: Vec::new() };
+        // 100 mm above the floor, looking along +Y: the y < 0 half is behind the eye.
+        let c = Camera { eye: [0.0, 0.0, 100.0], target: [0.0, 1000.0, 0.0] };
+        let tris = triangles(&scene, &c, rect(), &HashSet::new(), [0, 0, 0]);
+        assert!(!tris.is_empty());
+        assert!(tris.iter().all(|t| t.pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) && t.depth.is_finite()), "{tris:?}");
+        assert!(tris.iter().map(screen_area).sum::<f32>() > 0.0);
+    }
+
+    #[test]
+    fn a_triangle_crossing_the_near_plane_splits_into_pieces_without_seam_edges() {
+        // Eye at the origin looking along +Y (near = 10): y = 1000 is in front, y = -1000 behind.
+        let c = Camera { eye: [0.0; 3], target: [0.0, 1000.0, 0.0] };
+        let run = |ys: [f32; 3]| {
+            let m = Mesh3 {
+                positions: vec![[-500.0, ys[0], -200.0], [500.0, ys[1], -100.0], [0.0, ys[2], 400.0]],
+                indices: vec![0, 1, 2],
+                rgba: [255; 4],
+                edges_rgba: Some([0, 0, 0, 255]),
+                sources: Vec::new(),
+            };
+            triangles(&Scene3 { origin: [0.0; 3], meshes: vec![m], paths: Vec::new() }, &c, rect(), &HashSet::new(), [0, 0, 0])
+        };
+        let stroked = |t: &[Tri]| t.iter().flat_map(|t| t.edges_mask).filter(|&e| e).count();
+        let none = run([1000.0, 1000.0, 1000.0]);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].edges_mask, [true; 3]);
+        // One vertex behind: a quad -> 2 triangles; 3 original edges stroked (two cut, one whole).
+        let one = run([1000.0, 1000.0, -1000.0]);
+        assert_eq!(one.len(), 2);
+        assert_eq!(stroked(&one), 3);
+        // Two behind: 1 triangle; the clip seam is not stroked.
+        let two = run([1000.0, -1000.0, -1000.0]);
+        assert_eq!(two.len(), 1);
+        assert_eq!(stroked(&two), 2);
+        assert!(run([-1000.0, -1000.0, -1000.0]).is_empty());
+        assert!([one, two].iter().flatten().all(|t| screen_area(t) > 0.0 && t.depth >= c.near()));
+    }
+
+    #[test]
+    fn the_near_plane_scales_with_the_distance() {
+        let at = |d: f64| Camera { eye: [0.0, -d, 0.0], target: [0.0; 3] }.near();
+        assert!((at(5000.0) - NEAR).abs() < 1e-9);
+        assert!((at(20.0) - MIN_NEAR).abs() < 1e-9);
+        assert!((at(500.0) - 5.0).abs() < 1e-9);
+        assert!((at(250.0) - 2.5).abs() < 1e-9);
+        // 100 mm from the target (near = 1): a point 2 mm in front of the eye projects.
+        let c = Camera { eye: [0.0, -100.0, 0.0], target: [0.0; 3] };
+        assert!(project(&c, rect(), [0.0, -98.0, 0.0]).is_some());
+        assert!(project(&c, rect(), [0.0, -99.5, 0.0]).is_none());
     }
 
     #[test]
