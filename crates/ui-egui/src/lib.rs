@@ -667,9 +667,16 @@ impl CadApp {
     pub fn touch_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         let canvas = self.canvas.rect;
         let now = raw.time.unwrap_or_else(|| now_ms() / 1000.0);
-        let on_canvas =
-            |p: egui::Pos2| canvas.is_some_and(|r| r.contains(p)) && ctx.layer_id_at(p).is_none_or(|l| l.order == egui::Order::Background);
-        self.touch.filter(&mut raw.events, now, canvas, &on_canvas);
+        let mut touch = std::mem::take(&mut self.touch);
+        // The menus painted on the canvas itself (selection cycling, Dynamic Input options) share
+        // its layer: a touch on one of their rows is a touch on that row.
+        let on_canvas = |p: egui::Pos2| {
+            canvas.is_some_and(|r| r.contains(p))
+                && ctx.layer_id_at(p).is_none_or(|l| l.order == egui::Order::Background)
+                && !canvas::over_canvas_menu(self, p)
+        };
+        touch.filter(&mut raw.events, now, canvas, &on_canvas);
+        self.touch = touch;
     }
 
     /// Queue keys typed in a floating panel's own OS window (craft-ui's

@@ -157,6 +157,12 @@ impl TouchMouse {
         self.crosshair
     }
 
+    /// Whether the touch sequence in progress started off the canvas, so its fingers belong to
+    /// whatever they landed on (a panel, a menu) and never navigate the drawing.
+    pub fn passing(&self) -> bool {
+        self.mode == Mode::Pass
+    }
+
     /// Whether frames must keep coming without input (a click waiting out the double-tap
     /// window, a double tap's second touch that may become a hold, or queued pointer events).
     pub fn busy(&self) -> bool {
@@ -221,7 +227,7 @@ impl TouchMouse {
             TouchPhase::End | TouchPhase::Cancel => {
                 self.fingers.retain(|f| *f != id);
                 if self.mode == Mode::Canvas && self.seq.is_some_and(|s| s.primary == id) {
-                    self.lift(pos, now, phase == TouchPhase::Cancel);
+                    self.lift(pos, now, phase == TouchPhase::Cancel, canvas);
                 }
                 if self.fingers.is_empty() {
                     if self.mode == Mode::Canvas {
@@ -293,7 +299,7 @@ impl TouchMouse {
         }
     }
 
-    fn lift(&mut self, pos: Pos2, now: f64, cancelled: bool) {
+    fn lift(&mut self, pos: Pos2, now: f64, cancelled: bool, canvas: Option<Rect>) {
         let Some(seq) = self.seq else { return };
         match seq.class {
             Class::Gesture => {}
@@ -306,6 +312,11 @@ impl TouchMouse {
                 let tap = !cancelled && seq.moved.max(seq.start.distance(pos)) <= SLOP && now - seq.start_time < TAP_TIME;
                 self.fire_pending();
                 if !tap {
+                    // A one-finger drag that lifts before it settled still moves the crosshair.
+                    let moved = seq.moved.max(seq.start.distance(pos));
+                    if !cancelled && !seq.double && moved > SLOP {
+                        self.nudge(pos - seq.start, canvas);
+                    }
                     self.last_tap = None;
                 } else if seq.double {
                     // The second tap of a double tap: its click follows the first.
@@ -565,6 +576,41 @@ mod tests {
         r.wait(0.5);
         assert!(r.buttons().is_empty(), "{:?}", r.buttons());
         assert_eq!(r.m.crosshair(), Some(Pos2::new(450.0, 270.0)));
+    }
+
+    #[test]
+    fn a_quick_drag_lifting_before_it_settles_still_moves_the_crosshair() {
+        let mut r = Rig::shown();
+        r.down(1, 600.0, 500.0);
+        r.t += 0.02;
+        r.mv(1, 630.0, 480.0);
+        r.t += 0.02;
+        r.up(1, 640.0, 470.0);
+        r.wait(0.5);
+        let end = CENTRE + Vec2::new(40.0, -30.0);
+        assert!(r.buttons().is_empty(), "{:?}", r.buttons());
+        assert_eq!(r.m.crosshair(), Some(end));
+        assert_eq!(r.pointer(), Some(end));
+    }
+
+    #[test]
+    fn a_touch_starting_off_the_canvas_passes_until_every_finger_lifts() {
+        let mut m = TouchMouse::default();
+        let on = |p: Pos2| p.y < 500.0;
+        let panel = Pos2::new(50.0, 550.0);
+        let canvas = Pos2::new(300.0, 300.0);
+        let mut ev = vec![Rig::touch(1, TouchPhase::Start, panel)];
+        m.filter(&mut ev, 1.0, Some(CANVAS), &on);
+        assert!(m.passing());
+        let mut ev = vec![Rig::touch(2, TouchPhase::Start, canvas), Rig::touch(1, TouchPhase::Move, canvas)];
+        m.filter(&mut ev, 1.05, Some(CANVAS), &on);
+        assert!(m.passing(), "a second finger on the canvas does not take the gesture over");
+        let mut ev = vec![Rig::touch(1, TouchPhase::End, canvas), Rig::touch(2, TouchPhase::End, canvas)];
+        m.filter(&mut ev, 1.1, Some(CANVAS), &on);
+        assert!(!m.passing());
+        let mut ev = vec![Rig::touch(3, TouchPhase::Start, canvas)];
+        m.filter(&mut ev, 1.2, Some(CANVAS), &on);
+        assert!(!m.passing(), "a canvas touch is the canvas's own");
     }
 
     #[test]

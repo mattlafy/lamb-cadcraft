@@ -24,7 +24,8 @@ mod viewport;
 mod widgets;
 
 use cursor::{draw_crosshair, draw_snap_marker, draw_tracking, effective_point, override_cursor};
-use cycle::{CycleList, cycle_badge, cycle_click, cycle_list, over_canvas_menu, shift_space_cycle};
+pub(crate) use cycle::over_canvas_menu;
+use cycle::{CycleList, cycle_badge, cycle_click, cycle_list, shift_space_cycle};
 pub(crate) use draw::{Look, draw_highlight, draw_list};
 use draw::{draw_drag_gpu, draw_highlight_gpu, draw_list_gpu, list_mesh_key, selection_area_fill};
 use dyn_boxes::dynamic_input;
@@ -295,7 +296,10 @@ fn handle_scroll_zoom(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>,
     let pinch = ui.input(|i| crate::animation::zoom_delta(i, &opts, app.shows_animations()));
     // A touch-screen pinch zooms about the fingers, not the (virtual) mouse crosshair.
     let pinch_centre = ui.input(|i| i.multi_touch().map(|t| t.center_pos)).filter(|at| nav.rect.contains(*at));
+    // Fingers that landed off the canvas (on a panel, a menu) belong there, wherever they move.
+    let touch_elsewhere = app.touch.passing();
     if inside
+        && !touch_elsewhere
         && (pinch - 1.0).abs() > 1e-4
         && let Some(at) = pinch_centre.or(p.hover_pos)
     {
@@ -306,7 +310,7 @@ fn handle_scroll_zoom(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>,
     // Keep the existing egui pinch-to-zoom handling above unchanged.
     #[cfg(target_arch = "wasm32")]
     if let Some(touch) = ui.input(|i| i.multi_touch()) {
-        if nav.rect.contains(touch.center_pos) && touch.translation_delta != egui::Vec2::ZERO {
+        if !touch_elsewhere && nav.rect.contains(touch.center_pos) && touch.translation_delta != egui::Vec2::ZERO {
             if let Ok(st) = app.session.state_mut() {
                 let v = st.view();
                 st.set_view_quiet(cadcraft_engine::View {
@@ -841,7 +845,8 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         app,
         DoubleClickContext {
             inside,
-            double: dbl_primary,
+            // Pan Mode's taps navigate: a double tap edits nothing.
+            double: dbl_primary && !mobile_pan,
             hover: hover_pos,
             xf,
             xf_paper,
