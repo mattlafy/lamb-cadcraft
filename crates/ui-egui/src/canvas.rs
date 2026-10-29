@@ -190,6 +190,9 @@ pub struct CanvasState {
     /// The held press is a drag that selects nothing: PICKDRAG 0 (two clicks only) over objects
     /// being selected. Its release is no input.
     drag_ignored: bool,
+    /// The primary drag in progress moved the view (realtime PAN or ZOOM): its release is no
+    /// point, even once the command has ended.
+    nav_drag: bool,
     /// The right-click that opened the shortcut menu held Shift or Ctrl: it is the object snap
     /// menu ([`crate::context_menu`]).
     pub snap_menu: bool,
@@ -294,10 +297,12 @@ fn navigate_canvas(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>) ->
     handle_scroll_zoom(app, ui, nav, inside);
     handle_button_navigation(app, nav, inside);
     if nav.response.dragged_by(egui::PointerButton::Primary) && app.session.realtime_zoom_active() {
+        app.canvas.nav_drag = true;
         let _ = app.session.realtime_zoom(f64::from(nav.response.drag_delta().y));
     }
     // PAN (realtime): the drawing follows a left-button drag.
     if nav.response.dragged_by(egui::PointerButton::Primary) && app.session.realtime_pan_active() {
+        app.canvas.nav_drag = true;
         let d = nav.response.drag_delta();
         let _ = app.session.realtime_pan(f64::from(d.x), f64::from(d.y));
     }
@@ -887,7 +892,10 @@ fn handle_releases(app: &mut CadApp, ui: &egui::Ui, c: &ReleaseContext<'_>) {
             }
             continue;
         }
-        if r.far && (app.session.realtime_zoom_active() || app.session.realtime_pan_active()) {
+        // A drag that panned or zoomed places nothing, also once Enter ended the command
+        // mid-drag and handed the prompt back.
+        let nav_drag = std::mem::take(&mut app.canvas.nav_drag);
+        if r.far && (nav_drag || app.session.realtime_zoom_active() || app.session.realtime_pan_active()) {
             continue;
         }
         let at = r.tap_at();
