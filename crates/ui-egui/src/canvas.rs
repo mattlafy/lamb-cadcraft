@@ -24,7 +24,8 @@ mod viewport;
 mod widgets;
 
 use cursor::{draw_crosshair, draw_snap_marker, draw_tracking, effective_point, override_cursor};
-use cycle::{CycleList, cycle_badge, cycle_click, cycle_list, over_canvas_menu, shift_space_cycle};
+pub(crate) use cycle::over_canvas_menu;
+use cycle::{CycleList, cycle_badge, cycle_click, cycle_list, shift_space_cycle};
 pub(crate) use draw::{Look, draw_highlight, draw_list};
 use draw::{Press, PressPick, Release, clip_infinite, track_press};
 use draw::{draw_drag_gpu, draw_highlight_gpu, draw_list_gpu, list_mesh_key, selection_area_fill};
@@ -347,12 +348,67 @@ fn handle_scroll_zoom(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>,
         let _ = app.session.zoom_about(factor, about);
     }
     let pinch = ui.input(|i| crate::animation::zoom_delta(i, &opts, app.shows_animations()));
+    // A touch-screen pinch zooms about the fingers, not the (virtual) mouse crosshair.
+    let pinch_centre = ui.input(|i| i.multi_touch().map(|t| t.center_pos)).filter(|at| nav.rect.contains(*at));
+    // Fingers that landed off the canvas (on a panel, a menu) belong there, wherever they move.
+    let touch_elsewhere = app.touch.passing();
     if inside
+        && !touch_elsewhere
         && (pinch - 1.0).abs() > 1e-4
-        && let Some(at) = p.hover_pos
+        && let Some(at) = pinch_centre.or(p.hover_pos)
     {
         let _ = app.session.zoom_about(f64::from(pinch), nav.xf.to_world(at));
     }
+    // CADCRAFT_MOBILE_TWO_FINGER_PAN
+    // Move the model viewport with the midpoint of a multitouch gesture.
+    // Keep the existing egui pinch-to-zoom handling above unchanged.
+    #[cfg(target_arch = "wasm32")]
+    if let Some(touch) = ui.input(|i| i.multi_touch()) {
+        if !touch_elsewhere && nav.rect.contains(touch.center_pos) && touch.translation_delta != egui::Vec2::ZERO {
+            if let Ok(st) = app.session.state_mut() {
+                let v = st.view();
+                st.set_view_quiet(cadcraft_engine::View {
+                    center: v.center - nav.xf.screen_delta_to_world(touch.translation_delta),
+                    height: v.height,
+                    twist: v.twist,
+                });
+            }
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// CADCRAFT_MOBILE_PAN_MODE
+/// In mobile Pan Mode, one-finger primary dragging navigates the viewport instead of selecting or
+/// placing CAD entities. Returns whether Pan Mode is on.
+fn handle_mobile_pan(app: &mut CadApp, ui: &egui::Ui, response: &egui::Response, scale: f64) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    let mobile_pan = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::unique("cadcraft-mobile-pan-enabled")).unwrap_or(false));
+    #[cfg(not(target_arch = "wasm32"))]
+    let mobile_pan = false;
+
+    if mobile_pan {
+        let delta = ui.input(|i| i.pointer.delta());
+        if response.dragged_by(egui::PointerButton::Primary) && delta != egui::Vec2::ZERO {
+            if let Ok(st) = app.session.state_mut() {
+                let v = st.view();
+                st.set_view_quiet(cadcraft_engine::View {
+                    center: v.center - Vec2::new(f64::from(delta.x) / scale, -f64::from(delta.y) / scale).rotate(v.twist),
+                    height: v.height,
+                    twist: v.twist,
+                });
+            }
+            ui.ctx().request_repaint();
+        }
+
+        // Paint the drawing normally, but prevent this gesture
+        // from reaching entity selection and point-placement logic.
+        if response.dragged_by(egui::PointerButton::Primary) {
+            app.canvas.drag_window = false;
+            app.session.pending_window = None;
+        }
+    }
+    mobile_pan
 }
 
 fn handle_button_navigation(app: &mut CadApp, nav: &Navigation<'_>, inside: bool) {
@@ -785,6 +841,8 @@ struct ReleaseContext<'a> {
     dyn_frame: Option<crate::dyninput::Frame>,
     /// The press is used up already (a hatch edit dialog opened, an idle double-click).
     used: bool,
+    /// Pan Mode is on: primary drags and taps navigate, so they place, pick and window nothing.
+    mobile_pan: bool,
 }
 
 /// A press that became a drag this frame: with PICKDRAG 0 (two clicks only) over objects being
@@ -873,6 +931,11 @@ fn click_at(app: &mut CadApp, c: &ReleaseContext<'_>, at: Pos2, pick: PressPick,
 /// counts where it went down, with the cursor and snap as they stood then, or, a fast one that
 /// moved further than `slop`, where it came up ([`Release::tap_at`]).
 fn handle_releases(app: &mut CadApp, ui: &egui::Ui, c: &ReleaseContext<'_>) {
+    if c.mobile_pan {
+        app.canvas.drag_window = false;
+        app.session.pending_window = None;
+        return;
+    }
     start_drag(app, c);
     let xf = &c.xf;
     let last = c.releases.len().saturating_sub(1);
@@ -980,6 +1043,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let (became_far, releases) = ui.input(|i| track_press(&mut app.canvas.press, &i.events, i.time, slop, |p| hovered && full.contains(p)));
     let navigation = Navigation { rect, tiles: &tiles, response: &resp, xf, pointer, releases: &releases };
     let Some((inside, on_menu)) = navigate_canvas(app, ui, &navigation) else { return };
+    let mobile_pan = handle_mobile_pan(app, ui, &resp, scale);
     let PointerInput { hover_pos, mods, middle_down, pressed_secondary, dbl_primary, .. } = pointer;
     // Re-read the view after navigation.
     let view = app.session.state().map(|s| s.view()).unwrap_or(view);
@@ -1002,7 +1066,8 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         app,
         DoubleClickContext {
             inside,
-            double: dbl_primary,
+            // Pan Mode's taps navigate: a double tap edits nothing.
+            double: dbl_primary && !mobile_pan,
             hover: hover_pos,
             xf,
             xf_paper,
@@ -1048,7 +1113,18 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     handle_releases(
         app,
         ui,
-        &ReleaseContext { rect, xf, mods, middle_down, became_far, releases: &releases, raw_world, dyn_frame, used: hatch_dialog || idle_dbl },
+        &ReleaseContext {
+            rect,
+            xf,
+            mods,
+            middle_down,
+            became_far,
+            releases: &releases,
+            raw_world,
+            dyn_frame,
+            used: hatch_dialog || idle_dbl,
+            mobile_pan,
+        },
     );
     // Right-click acts as Enter while a command runs (the classic CAD default; held, it opens the
     // command menu); otherwise it opens the shortcut menu (Repeat, Clipboard, …).

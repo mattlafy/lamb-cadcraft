@@ -812,6 +812,8 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "wasm-bindgen",
+ "web-sys",
  "web-time",
 ]
 
@@ -824,6 +826,7 @@ dependencies = [
  "cadcraft-ui-egui",
  "eframe",
  "egui",
+ "js-sys",
  "log",
  "serde_json",
  "wasm-bindgen",
