@@ -23,7 +23,7 @@ const CONFLICT_EDGES: u32 = 0xe2543a;
 
 /// Register LAMB's derived model as the 3D pane's scene.
 pub fn register() -> Result<(), &'static str> {
-    register_scene_source(SceneSource { build, pick, stamp, highlight: lamb_cadcraft::highlight_3d })
+    register_scene_source(SceneSource { build, pick, stamp, highlight: lamb_cadcraft::highlight_3d, hover: lamb_cadcraft::hover_3d })
 }
 
 /// GHOSTHIDE / GHOSTSHOW change what `build` returns without editing the drawing.

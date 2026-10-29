@@ -45,13 +45,15 @@ pub struct Path3 {
 /// The registered scene: `build` the scene for a drawing; `pick` the entities a ray (global
 /// origin, direction) hits, nearest first; `stamp` changes whenever the source's own display
 /// settings change what `build` returns, so the pane rebuilds without a drawing edit;
-/// `highlight` names the entities whose meshes draw highlighted now (read every frame).
+/// `highlight` names the entities whose meshes draw highlighted now (read every frame);
+/// `hover` is told the source entities under the pointer whenever they change (empty: none).
 #[derive(Clone, Copy)]
 pub struct SceneSource {
     pub build: fn(&Drawing) -> Option<Scene3>,
     pub pick: fn(&Drawing, [f64; 3], [f64; 3]) -> Vec<Handle>,
     pub stamp: fn() -> u64,
     pub highlight: fn() -> Vec<Handle>,
+    pub hover: fn(&Drawing, Vec<Handle>),
 }
 
 static SOURCE: OnceLock<SceneSource> = OnceLock::new();
@@ -284,8 +286,13 @@ pub fn ray(cam: &Camera, rect: Rect, screen: Pos2) -> (V3, V3) {
 /// The nearest point past [`NEAR`] where the ray (`origin`, unit `dir`) crosses a mesh triangle
 /// (two-sided, global mm); paths are not hit. `None` when it misses every mesh.
 pub fn hit(scene: &Scene3, origin: V3, dir: V3) -> Option<V3> {
-    let mut best: Option<f64> = None;
-    for m in &scene.meshes {
+    hit_mesh(scene, origin, dir).map(|(p, _)| p)
+}
+
+/// [`hit`], with the index of the mesh it crossed.
+pub fn hit_mesh(scene: &Scene3, origin: V3, dir: V3) -> Option<(V3, usize)> {
+    let mut best: Option<(f64, usize)> = None;
+    for (mi, m) in scene.meshes.iter().enumerate() {
         let world = |i: u32| m.positions.get(i as usize).map(|p| add(scene.origin, [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]));
         for t in m.indices.as_chunks::<3>().0 {
             let (Some(a), Some(b), Some(c)) = (world(t[0]), world(t[1]), world(t[2])) else { continue };
@@ -308,12 +315,19 @@ pub fn hit(scene: &Scene3, origin: V3, dir: V3) -> Option<V3> {
                 continue;
             }
             let d = dot(e2, qv) * inv;
-            if d > NEAR && best.is_none_or(|b| d < b) {
-                best = Some(d);
+            if d > NEAR && best.is_none_or(|(b, _)| d < b) {
+                best = Some((d, mi));
             }
         }
     }
-    best.map(|d| add(origin, mul(dir, d)))
+    best.map(|(d, mi)| (add(origin, mul(dir, d)), mi))
+}
+
+/// The source entities of the nearest mesh under screen position `pos` (empty on a miss), from
+/// the cached scene, so hovering never rebuilds it.
+pub fn hover_sources(scene: &Scene3, cam: &Camera, rect: Rect, pos: Pos2) -> Vec<Handle> {
+    let (o, d) = ray(cam, rect, pos);
+    hit_mesh(scene, o, d).and_then(|(_, i)| scene.meshes.get(i)).map(|m| m.sources.clone()).unwrap_or_default()
 }
 
 /// A segment clipped to the near plane, on screen.
@@ -494,6 +508,10 @@ pub struct Scene3dState {
     built: Option<((u64, u64, u64), Option<Arc<Scene3>>)>,
     pub camera: Option<Camera>,
     press: Option<Pos2>,
+    /// The source entities last reported to the scene source's `hover`, and where the pointer
+    /// was when they were worked out.
+    hovered: Vec<Handle>,
+    hover_pos: Option<Pos2>,
     /// Where the view-button row sat last frame, so a press on it neither orbits nor picks.
     buttons: Option<Rect>,
 }
@@ -579,6 +597,30 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     }
     app.scene3d.camera = Some(cam);
+    // Hover: the meshes under a resting pointer light their source lines (LAMB T554).
+    let idle = ui.input(|i| !i.pointer.any_down());
+    let target = match (resp.hovered() && idle, ui.input(|i| i.pointer.hover_pos())) {
+        (true, Some(p)) if !on_buttons(Some(p)) => {
+            if app.scene3d.hover_pos == Some(p) {
+                Some(app.scene3d.hovered.clone())
+            } else {
+                app.scene3d.hover_pos = Some(p);
+                Some(scene.as_deref().map(|s| hover_sources(s, &cam, rect, p)).unwrap_or_default())
+            }
+        }
+        _ => None,
+    };
+    let target = target.unwrap_or_else(|| {
+        app.scene3d.hover_pos = None;
+        Vec::new()
+    });
+    if target != app.scene3d.hovered
+        && let Some(src) = SOURCE.get()
+        && let Ok(doc) = app.session.doc()
+    {
+        (src.hover)(doc, target.clone());
+        app.scene3d.hovered = target;
+    }
     let lit: HashSet<Handle> = SOURCE.get().map(|src| (src.highlight)().into_iter().collect()).unwrap_or_default();
     draw(&painter, scene.as_deref(), &cam, rect, &lit, [t.hover.r(), t.hover.g(), t.hover.b()]);
     // Standard views, top-left, added after the picture so they paint over it (LAMB T555).
@@ -858,6 +900,23 @@ mod tests {
     fn highlight() -> Vec<Handle> {
         Vec::new()
     }
+    fn hover(_: &Drawing, _: Vec<Handle>) {}
+
+    #[test]
+    fn hover_sources_names_the_nearer_mesh_and_nothing_on_a_miss() {
+        let (r, c) = (rect(), Camera { eye: [500.0, 400.0, 5000.0], target: [500.0, 500.0, 0.0] });
+        let mut low = quad(0.0, [200, 200, 200, 255]);
+        low.sources = vec![Handle(0x10)];
+        let mut high = quad(300.0, [200, 200, 200, 255]);
+        high.sources = vec![Handle(0x20), Handle(0x21)];
+        // The far quad first, so the nearer one wins on depth, not on order.
+        let sc = Scene3 { origin: [0.0; 3], meshes: vec![low, high], paths: Vec::new() };
+        let (over, _) = project(&c, r, [500.0, 500.0, 0.0]).unwrap();
+        assert_eq!(hover_sources(&sc, &c, r, over), vec![Handle(0x20), Handle(0x21)]);
+        assert_eq!(hit_mesh(&sc, c.eye, [0.0, 0.0, -1.0]).map(|(_, i)| i), Some(1));
+        let (off, _) = project(&c, r, [3000.0, 3000.0, 0.0]).unwrap();
+        assert!(hover_sources(&sc, &c, r, off).is_empty());
+    }
 
     static H: AtomicU64 = AtomicU64::new(0);
     static STAMP: AtomicU64 = AtomicU64::new(0);
@@ -881,8 +940,8 @@ mod tests {
 
     #[test]
     fn a_click_on_the_quad_selects_its_source_and_a_miss_leaves_the_selection() {
-        let _ = register_scene_source(SceneSource { build, pick, stamp, highlight });
-        assert!(register_scene_source(SceneSource { build, pick, stamp, highlight }).is_err(), "one source per process");
+        let _ = register_scene_source(SceneSource { build, pick, stamp, highlight, hover });
+        assert!(register_scene_source(SceneSource { build, pick, stamp, highlight, hover }).is_err(), "one source per process");
         let mut s = Session::new();
         s.execute("line", &json!({"points": [[0, 0], [10, 0]]})).unwrap();
         let h = s.doc().unwrap().model.iter().next().unwrap().handle;

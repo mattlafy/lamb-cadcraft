@@ -145,6 +145,31 @@ pub fn hover_links(d: &Drawing, hovered: Option<Handle>) {
     set_hover_blocks(blocks);
 }
 
+/// The 3D pane's hover (LAMB T554, `SceneSource::hover`): halo the whole linked component of
+/// every hit source entity in a LAMB view — the hits included, since no 2D rollover draws them —
+/// in its own view block; `highlight_3d` picks the same set up, so the hovered meshes light too.
+/// No hits, or none in a LAMB view → no hover halo.
+pub fn hover_3d(d: &Drawing, hits: Vec<Handle>) {
+    set_hovered(None);
+    set_hover_blocks(hover_3d_blocks(d, &hits));
+}
+
+fn hover_3d_blocks(d: &Drawing, hits: &[Handle]) -> Vec<(String, Vec<Handle>)> {
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let Ok(dp) = DrawingProject::new(d) else { return Vec::new() };
+    let mut comp: BTreeSet<Id> = BTreeSet::new();
+    for h in hits {
+        let id = Id(h.0);
+        if dp.entity_view_id(id).is_some() {
+            comp.extend(linked_entity_component(&dp, id));
+            comp.insert(id);
+        }
+    }
+    component_blocks(&dp, &comp).into_iter().map(|(v, hs)| (view_block_name(v), hs)).collect()
+}
+
 /// The hovered entity when it is in a LAMB view, and the rest of its component by block.
 fn hover_blocks(d: &Drawing, h: Handle) -> (Option<Handle>, Vec<(String, Vec<Handle>)>) {
     let Ok(dp) = DrawingProject::new(d) else { return (None, Vec::new()) };
@@ -717,6 +742,30 @@ mod tests {
         hover_links(s.doc()?, Some(Handle(wall.0)));
         hover_links(s.doc()?, Some(lone));
         assert!(current_hover_blocks().is_empty(), "an unlinked entity");
+        Ok(())
+    }
+
+    #[test]
+    fn hover_3d_haloes_the_whole_component_including_the_hit_and_clears() -> E<()> {
+        let _g = crate::overlays::underlay::tests::lock();
+        set_attention_blocks(Vec::new());
+        let (mut s, wall, _) = session(false)?;
+        let r = showlinks(&mut s, &json!({ "handle": hex(wall) }))?;
+        let want: BTreeSet<String> = ids(&r["component"]).into_iter().collect();
+        assert!(want.contains(&hex(wall)));
+        hover_3d(s.doc()?, vec![Handle(wall.0)]);
+        let blocks = current_hover_blocks();
+        assert_eq!(halo_union(&blocks), want, "every member, the wall included");
+        assert!(blocks.len() >= 2, "spread over the views: {blocks:?}");
+        let lit: BTreeSet<String> = crate::overlays::halo::highlight_3d().iter().map(|h| h.hex()).collect();
+        assert_eq!(lit, want, "the meshes light too");
+        hover_3d(s.doc()?, vec![]);
+        assert!(current_hover_blocks().is_empty(), "nothing hovered");
+        assert!(crate::overlays::halo::highlight_3d().is_empty());
+        hover_3d(s.doc()?, vec![Handle(wall.0)]);
+        hover_3d(s.doc()?, vec![Handle(0xFF_FFFF)]);
+        assert!(current_hover_blocks().is_empty(), "a non-LAMB handle");
+        assert!(crate::overlays::halo::highlight_3d().is_empty());
         Ok(())
     }
 

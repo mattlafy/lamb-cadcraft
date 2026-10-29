@@ -102,7 +102,7 @@ pub use overlays::halo::highlight_3d;
 pub use overlays::{lamb_overlay, lamb_snaps, register_providers};
 pub use project::DrawingProject;
 pub use project_mut::DrawingProjectMut;
-pub use querycmds::hover_links;
+pub use querycmds::{hover_3d, hover_links};
 pub use scene::{
     ConstructionState, Scene, SceneError, SceneMesh, SceneMeshKind, ScenePath, ScenePick, ghosts_hidden, pick, scene, set_ghosts_hidden,
     without_ghosts,
