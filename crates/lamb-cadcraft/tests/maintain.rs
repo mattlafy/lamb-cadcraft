@@ -1226,3 +1226,68 @@ fn fillet_closing_a_polyline_reindexes_its_links() -> R {
     assert_eq!(links(&s)?, original, "undo restores all three");
     Ok(())
 }
+
+/// The section entity of `wall_link`'s link and its crossing segment's u (local x).
+fn face_u(d: &Drawing, link: &LinkRecord, plan_e: Id) -> Result<(Id, f64), Box<dyn std::error::Error>> {
+    let sec_e = if link.a.entity_id == plan_e { link.b.entity_id } else { link.a.entity_id };
+    Ok((sec_e, resolved_segments(&poly(d, sec_e)?)[1].from.x))
+}
+
+/// LAMB T568 (`selection-and-link-editing.md` §7 "Rotate / scale — same as move"): ROTATE or SCALE
+/// of a linked plan wall whose link is in the travel set carries the section partner to the new
+/// crossing and the link survives, in the command's own undo step; outside the set, or a MIRROR,
+/// nothing travels.
+#[test]
+fn rotate_and_scale_travel_the_partner() -> R {
+    register();
+    let face = [[4000.0, 0.0], [5000.0, 0.0], [5000.0, 2400.0], [6000.0, 2400.0]];
+    let d = wall_and_face([[5000.0, -5000.0], [5000.0, 5000.0]], &face)?;
+    let (link, plan_e, plan_view) = wall_link(&d)?;
+    let rot = json!({"handles": [hex(plan_e)], "base": [5000, -5000], "angle": 10});
+    let (after, report) = raw_report(&d, plan_view, "rotate", &rot, &[link.id])?;
+    let (sec_e, u) = face_u(&after, &link, plan_e)?;
+    assert_eq!(report.travelled, vec![sec_e], "{report:?}");
+    assert!((u - (5000.0 - 5000.0 * 10f64.to_radians().tan())).abs() < 0.1, "rotated crossing at {u}");
+    let kept = read_document(&after)?.links.into_iter().find(|l| l.id == link.id).ok_or("the link survives")?;
+    assert!(link_still_coincides(&DrawingProject::new(&after)?, &kept)?, "and holds");
+
+    // Outside the travel set: nothing travels.
+    let (after, report) = raw_report(&d, plan_view, "rotate", &rot, &[])?;
+    assert!(report.travelled.is_empty(), "{report:?}");
+    assert_eq!(poly(&after, sec_e)?, poly(&d, sec_e)?);
+    // MIRROR travels nothing: a kept source is unchanged, and mirrored in place about the cut the
+    // anchor stays put.
+    for erase in [false, true] {
+        let mi = json!({"handles": [hex(plan_e)], "p1": [0, 0], "p2": [10000, 0], "erase": erase});
+        let (after, report) = raw_report(&d, plan_view, "mirror", &mi, &[link.id])?;
+        assert!(report.travelled.is_empty(), "erase {erase}: {report:?}");
+        assert_eq!(poly(&after, sec_e)?, poly(&d, sec_e)?);
+    }
+
+    // SCALE an oblique wall (y = x − 5000) about (0, 1000) by 1.1 → y = x − 5600, crossing u 5600.
+    let od = wall_and_face([[0.0, -5000.0], [10000.0, 5000.0]], &face)?;
+    let (olink, oplan, oview) = wall_link(&od)?;
+    let sc = json!({"handles": [hex(oplan)], "base": [0, 1000], "factor": 1.1});
+    let (after, report) = raw_report(&od, oview, "scale", &sc, &[olink.id])?;
+    let (osec, u) = face_u(&after, &olink, oplan)?;
+    assert_eq!(report.travelled, vec![osec], "{report:?}");
+    assert!((u - 5600.0).abs() < 0.1, "scaled crossing at {u}");
+    let kept = read_document(&after)?.links.into_iter().find(|l| l.id == olink.id).ok_or("the scaled link survives")?;
+    assert!(link_still_coincides(&DrawingProject::new(&after)?, &kept)?, "and holds");
+
+    // Through the observer: one undo after the ROTATE restores both entities.
+    let mut s = Session::new();
+    s.open_drawing(d.clone(), "t568", None);
+    install_link_maintenance(&mut s);
+    let (plan_ent, sec_ent) = (s.doc()?.entity(Handle(plan_e.0)).cloned(), s.doc()?.entity(Handle(sec_e.0)).cloned());
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    s.set_travel(vec![link.id.0]);
+    s.execute("rotate", &rot)?;
+    let (_, u) = face_u(s.doc()?, &link, plan_e)?;
+    assert!((u - 4118.4).abs() < 0.1, "observer travelled the face to {u}");
+    assert!(links(&s)?.iter().any(|l| l.id == link.id), "the link survives the observer");
+    s.undo()?;
+    assert_eq!(s.doc()?.entity(Handle(plan_e.0)).cloned(), plan_ent, "one undo restores the plan wall");
+    assert_eq!(s.doc()?.entity(Handle(sec_e.0)).cloned(), sec_ent, "and the section face");
+    Ok(())
+}

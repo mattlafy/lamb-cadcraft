@@ -3,12 +3,14 @@
 //! maintained or dropped").
 //!
 //! [`maintain_links`] compares the drawing before and after one command and, in order:
-//! 0. travels: a linked segment the command rigidly translated carries its unchanged partner in the
+//! 0. travels: a linked segment the command moved by a similarity (ROTATE, SCALE, MOVE, STRETCH,
+//!    grips — rotation, uniform scale and translation; no reflection) carries its unchanged partner in the
 //!    other view with it — only for a link in the selection's **travel set** (TS T109/T110: an idle
 //!    crossing box seeds every link touching a swept entity, a window box seeds none, the set dies
 //!    with the selection; [`travel_box_observer`] seeds it, engine patch 19 holds it). Any command
-//!    whose rigid translation this step detects travels (MOVE, STRETCH, grips) — a superset of TS's
-//!    MOVE, kept because §13 phase 3's gate is STRETCH. A touched link outside the set is left to
+//!    whose similarity this step detects travels — a superset of TS's MOVE, kept because §13 phase
+//!    3's gate is STRETCH and `selection-and-link-editing.md` §7 settles "Rotate / scale — same as
+//!    move". A touched link outside the set is left to
 //!    step 2, which drops it once its lines no longer cross (TS separation parity; LAMB T514)
 //!    (`selection-and-link-editing.md` §4b ray-sliding, lamb-core `travel_segment_move`), so a
 //!    travelled link stays live — §13 phase 3 "STRETCH a linked plan line → the section follows in
@@ -144,23 +146,68 @@ fn touched_views(before: &[AnyView], after: &[AnyView]) -> BTreeSet<Id> {
     out
 }
 
-/// The delta that rigidly translated segment `index` from `before` to `after`: same segment count,
-/// both ends moved by the same delta, bulge unchanged, and the delta longer than coincidence.
-fn rigid_delta(before: &Polyline2, after: &Polyline2, index: usize) -> Option<Point2> {
+/// The displacement of the anchor at `param` on segment `index` when the command moved it by a
+/// **similarity** (rotation, uniform scale, translation, or a mix), else `None`. Same segment count
+/// and the segment's bulge unchanged, and either
+/// - the anchored segment alone was translated (both its ends by one delta — STRETCH of a whole
+///   segment, its neighbours stretching, the §13 phase 3 gate), or
+/// - one similarity maps the **whole** polyline: same `closed` flag, every bulge equal, and every
+///   before vertex landing on its after vertex within coincidence under the map fitted from `start`
+///   and the vertex farthest from it (complex ratio z = (a_k − a_0)/(b_k − b_0)) — ROTATE, SCALE,
+///   or a single-segment line with one end stretched.
+///
+/// A multi-segment polyline with one vertex moved fits neither, nor does a reflection (an arc's
+/// bulge flips; non-collinear vertices fail the direct fit); a collinear straight polyline mirrored
+/// in place is indistinguishable from a rotation and travels as one. `None` too when the anchor did
+/// not move (unchanged, or the rotation's fixed point). The anchor is assumed to sit at its link's
+/// crossing, as auto-links create it, so `travel_segment_move`'s after-direction slide lands the
+/// partner on the new crossing.
+fn similarity_delta(before: &Polyline2, after: &Polyline2, index: usize, param: f64) -> Option<Point2> {
     let tol = TOLERANCE.coincidence_mm;
     if before.segments.len() != after.segments.len() {
         return None;
     }
     let b = resolved_segments(before).into_iter().nth(index)?;
     let a = resolved_segments(after).into_iter().nth(index)?;
-    let d = Point2 { x: a.from.x - b.from.x, y: a.from.y - b.from.y };
-    let d_end = Point2 { x: a.to.x - b.to.x, y: a.to.y - b.to.y };
-    let rigid = (d.x - d_end.x).hypot(d.y - d_end.y) <= tol && (a.bulge - b.bulge).abs() <= 1e-9;
-    (rigid && d.x.hypot(d.y) > tol).then_some(d)
+    if (a.bulge - b.bulge).abs() > 1e-9 {
+        return None;
+    }
+    let (pb, pa) = (point_at_param(&b, param), point_at_param(&a, param));
+    let d = Point2 { x: pa.x - pb.x, y: pa.y - pb.y };
+    let moved = d.x.hypot(d.y) > tol;
+    let (d_from, d_to) = (Point2 { x: a.from.x - b.from.x, y: a.from.y - b.from.y }, Point2 { x: a.to.x - b.to.x, y: a.to.y - b.to.y });
+    if (d_from.x - d_to.x).hypot(d_from.y - d_to.y) <= tol {
+        return moved.then_some(d);
+    }
+    if before.closed != after.closed || before.segments.iter().zip(&after.segments).any(|(b, a)| (a.bulge - b.bulge).abs() > 1e-9) {
+        return None;
+    }
+    let verts = |p: &Polyline2| std::iter::once(p.start).chain(p.segments.iter().map(|s| s.to)).collect::<Vec<_>>();
+    let (bv, av) = (verts(before), verts(after));
+    let (b0, a0) = (bv[0], av[0]);
+    let far = (0..bv.len()).max_by(|&i, &j| {
+        let d = |k: usize| (bv[k].x - b0.x).hypot(bv[k].y - b0.y);
+        d(i).total_cmp(&d(j))
+    })?;
+    let (bx, by) = (bv[far].x - b0.x, bv[far].y - b0.y);
+    let den = bx * bx + by * by;
+    // z as (re, im); a degenerate (all-coincident) polyline can only translate.
+    let z = if den.sqrt() <= tol {
+        (1.0, 0.0)
+    } else {
+        let (ax, ay) = (av[far].x - a0.x, av[far].y - a0.y);
+        ((ax * bx + ay * by) / den, (ay * bx - ax * by) / den)
+    };
+    let maps = bv.iter().zip(&av).all(|(b, a)| {
+        let (dx, dy) = (b.x - b0.x, b.y - b0.y);
+        let m = Point2 { x: a0.x + z.0 * dx - z.1 * dy, y: a0.y + z.0 * dy + z.1 * dx };
+        (m.x - a.x).hypot(m.y - a.y) <= tol
+    });
+    (maps && moved).then_some(d)
 }
 
 /// Step 0, travel. For each link in `travel` with exactly one end's entity changed by the command (same view,
-/// different polyline) and the other unchanged, when the anchored segment was rigidly translated,
+/// different polyline) and the other unchanged, when [`similarity_delta`] finds the anchor moved,
 /// slides the partner by `travel_segment_move` and writes its new geometry into `after` (keeping
 /// the entity's handle, layer and `ext`). Each partner travels at most once, first link in
 /// `doc.links` order; nothing cascades — the partner's other links are left to step 2's re-check.
@@ -187,7 +234,7 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -
                 if p.entity(other.entity_id).and_then(|e| e.ai_origin).is_some_and(|o| !o.accepted) {
                     continue;
                 }
-                let Some(d) = rigid_delta(bp, ap, mine.segment_index) else { continue };
+                let Some(d) = similarity_delta(bp, ap, mine.segment_index, mine.segment_param) else { continue };
                 let Some(t) = travel_segment_move(&p, link, mine, d).map_err(derivation_error)? else { continue };
                 if t.entity_id != other.entity_id {
                     continue;

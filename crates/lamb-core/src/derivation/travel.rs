@@ -101,8 +101,9 @@ pub fn travel_segment_move(
         let t = plan_transform(&moved_view)?;
         let (vt, c_hat) = vertical_frame(project, &partner_view)?;
         // The crossing of a segment translated by `d` with the fixed cut line moves along the cut by
-        // s = (d·n)/(c·n), n the segment's normal (for an arc, at the link's crossing). A rigid
-        // translation keeps the direction, so reading it from the current drawing is exact.
+        // s = (d·n)/(c·n), n the segment's normal (for an arc, at the link's crossing). Reading the
+        // direction from the current (after) drawing makes it exact for any similarity — a
+        // translation keeps it, a rotation or scale gives the moved segment's own new normal.
         let dir = local_to_world_dir2(t, tangent_at_param(&seg, mine.segment_param));
         let n = Point2 { x: -dir.y, y: dir.x };
         let cn = dot2(c_hat, n);
