@@ -2,10 +2,10 @@
 
 use std::f64::consts::{FRAC_PI_2, PI};
 
-use cadcraft_engine::Session;
 use cadcraft_engine::doc::{EntityKind, Handle};
 use cadcraft_engine::geom::{Ellipse, Spline, Vec2};
-use serde_json::{Value, json};
+use cadcraft_engine::Session;
+use serde_json::{json, Value};
 
 fn h(r: &Value) -> String {
     r["handle"].as_str().or_else(|| r["handles"][0].as_str()).unwrap().to_string()
@@ -618,6 +618,31 @@ fn fillet_removes_any_number_of_segments_on_the_picked_side() {
     let before = verts(&s, &p);
     let err = s.execute("fillet", &json!({ "h1": p, "p1": [5, 0], "h2": p, "p2": [5, 5], "radius": 1 })).unwrap_err();
     assert!(err.to_string().contains("parallel"), "{err}");
+    assert_eq!(verts(&s, &p), before);
+}
+
+#[test]
+fn fillet_refuses_picks_that_trim_the_picked_part_away() {
+    // A triangle with its hypotenuse pinched in at (3, 3). The pinched edge from (10, 0) meets the
+    // left edge at (0, 30/7). Picking the left edge below that point removes the other pinched
+    // edge and leaves a triangle.
+    let pts = [[0.0, 0.0], [10.0, 0.0], [3.0, 3.0], [0.0, 10.0]];
+    let mut s = Session::new();
+    let p = pline(&mut s, &pts, true);
+    s.execute("fillet", &json!({ "h1": p, "p1": [6.5, 1.5], "h2": p, "p2": [0, 2], "radius": 0 })).unwrap();
+    assert_eq!(verts(&s, &p).len(), 3);
+    assert!(closed(&s, &p));
+    // Picking it above that point would keep the other pinched edge only by trimming the first
+    // pick's own part away, so it is refused and the polyline left alone.
+    let mut s = Session::new();
+    let p = pline(&mut s, &pts, true);
+    let before = verts(&s, &p);
+    let err = s.execute("fillet", &json!({ "h1": p, "p1": [6.5, 1.5], "h2": p, "p2": [0, 7], "radius": 0 })).unwrap_err();
+    assert!(err.to_string().contains("one side"), "{err}");
+    assert_eq!(verts(&s, &p), before);
+    // The same picks with CHAMFER.
+    let err = s.execute("chamfer", &json!({ "h1": p, "p1": [6.5, 1.5], "h2": p, "p2": [0, 7], "d1": 1, "d2": 1 })).unwrap_err();
+    assert!(err.to_string().contains("one side"), "{err}");
     assert_eq!(verts(&s, &p), before);
 }
 
