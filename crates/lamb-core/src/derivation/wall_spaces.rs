@@ -13,8 +13,8 @@
 //! Overrides, passed as [`SideParams`] until a later task stores them: an outside pick point turns
 //! the smallest space containing it into `Outside` (a courtyard); a run with a face on an exterior
 //! layer is `exterior` whatever its sides say. A structure that doesn't close (both sides of a run
-//! `Outside`) takes a straight run's exterior side from the nearest outside pick point beside it
-//! ([`RunSides::open_outside_left`]).
+//! `Outside`) takes a straight or arc run's exterior side from the nearest outside pick point beside
+//! it ([`RunSides::open_outside_left`]).
 //!
 //! Not handled: a structure standing inside another's room (a separate component nested in a
 //! space) — its outer face is reported `Outside` and the enclosing space does not know about it.
@@ -43,8 +43,8 @@ pub struct RunSides {
     pub right: SideKind,
     /// A side is `Outside`, or a face is on an exterior layer.
     pub exterior: bool,
-    /// For a straight run with both sides `Outside`: whether the nearest outside pick point beside
-    /// it lies to the left. `None` when no point resolves it, and for every other run.
+    /// For a straight or arc run with both sides `Outside`: whether the nearest outside pick point
+    /// beside it lies to the left. `None` when no point resolves it, and for every other run.
     pub open_outside_left: Option<bool>,
 }
 
@@ -78,6 +78,35 @@ fn open_side(from: Point2, to: Point2, width: f64, points: &[Point2]) -> Option<
         }
         if best.is_none_or(|(d, _)| c.abs() < d) {
             best = Some((c.abs(), c > 0.0));
+        }
+    }
+    best.map(|(_, left)| left)
+}
+
+/// The side (left = `true`) of the arc centreline about `center` holding the nearest of `points`
+/// beside the run: within its angular span (widened at each end by `TOLERANCE.grouping_mm` of arc
+/// length) and off its faces. Left of a ccw arc's travel is toward the centre.
+fn open_side_arc(center: Point2, radius: f64, start_angle: f64, sweep: f64, width: f64, points: &[Point2]) -> Option<bool> {
+    if radius <= TOLERANCE.coincidence_mm || sweep.abs() <= f64::EPSILON {
+        return None;
+    }
+    let tau = std::f64::consts::TAU;
+    let w = TOLERANCE.grouping_mm / radius;
+    let mut best: Option<(f64, bool)> = None;
+    for &q in points {
+        let r = dist2(q, center);
+        let off = (r - radius).abs();
+        if off <= width / 2.0 + TOLERANCE.coincidence_mm {
+            continue;
+        }
+        // Angle from the start, measured in the direction of travel, in [0, 2π).
+        let a = angle_of2(sub2(q, center));
+        let d = (if sweep > 0.0 { a - start_angle } else { start_angle - a }).rem_euclid(tau);
+        if d > sweep.abs() + w && d < tau - w {
+            continue;
+        }
+        if best.is_none_or(|(b, _)| off < b) {
+            best = Some((off, if sweep > 0.0 { r < radius } else { r > radius }));
         }
     }
     best.map(|(_, left)| left)
@@ -306,6 +335,9 @@ pub fn wall_sides(p: &impl ProjectRead, graph: &WallGraph, params: &SideParams) 
             let open_outside_left = match runs[r].centreline {
                 RunCurve::Line { from, to } if left == SideKind::Outside && right == SideKind::Outside => {
                     open_side(from, to, runs[r].width, &params.outside_points)
+                }
+                RunCurve::Arc { center, radius, start_angle, sweep } if left == SideKind::Outside && right == SideKind::Outside => {
+                    open_side_arc(center, radius, start_angle, sweep, runs[r].width, &params.outside_points)
                 }
                 _ => None,
             };

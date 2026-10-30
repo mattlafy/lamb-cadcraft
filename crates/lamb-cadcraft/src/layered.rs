@@ -22,7 +22,8 @@
 //! straight runs that are not within 1° of vertical — the floors and roofs it cuts; walls cut in
 //! section are left to the plan — each strip and closed repeat copy (joists) extruded along the gaze
 //! over the gaze range of the solid of either face's entity, which is then dropped, else over
-//! `default_surface_depth_mm` centred on the cut plane, `Defaulted`. Each head and sill detail
+//! `default_surface_depth_mm` centred on the cut plane, `Defaulted`. Its laid arc runs (a barrel
+//! vault, a curved roof) lay as a plan's arc runs do, always, over the same gaze range. Each head and sill detail
 //! placed in a section (LAMB T548) adds, on the run at its end of the opening, strips and closed-chain
 //! prisms by the plan's corner and jamb rule, extruded along the gaze over the host-plan opening the
 //! cut crosses (the one whose crossing is nearest that run), `Authored`, else over the default depth
@@ -30,7 +31,7 @@
 //! closed-chain prisms by the same rule over the junction's arms, extruded along the gaze over the
 //! solid gaze range of the first arm that has one, else the default depth centred on the cut,
 //! `Defaulted`, replacing nothing.
-//! Each run those views lay or skip (a section's off-vertical ones only) also records a construction
+//! Each run those views lay or skip (a section's arc and off-vertical straight ones only) also records a construction
 //! state on its two face segments (LAMB T493): laid → resolved, or detail-conflicted with a width
 //! conflict; skipped for conflicting details → detail-conflicted; skipped otherwise → massing. A
 //! run's strips take its state; corner and jamb strips are resolved.
@@ -358,7 +359,8 @@ fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, result: 
     }
 }
 
-/// A section's laid straight runs off vertical (floors and roofs), extruded along the gaze.
+/// A section's laid straight runs off vertical (floors and roofs) and arc runs (vaults), extruded
+/// along the gaze.
 fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host: &ViewRef<'_>, result: &SynthesisResult, out: &mut Layered) {
     let Ok(runs) = assembly_lines(d, view.id) else { return };
     let Ok(basis) = vertical_basis(view, host) else { return };
@@ -371,18 +373,24 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
     let lift = |ring: &[Point2]| ring.iter().map(|&q| vertical_local_to_global3(view, host, q)).collect::<Result<Vec<_>, _>>().ok();
     for ra in &runs {
         let Some(run) = graph.runs.get(ra.run) else { continue };
-        let RunCurve::Line { from: c0, to: c1 } = run.centreline else { continue };
-        let (a, b) = (vertical_local_to_uz(view, c0), vertical_local_to_uz(view, c1));
-        let len = (b.u - a.u).hypot(b.z - a.z);
-        if len <= tol || (b.u - a.u).abs() / len <= sin_vertical {
-            continue;
+        // Straight runs within 1° of vertical are walls, left to the plan; arc runs always lay.
+        if let RunCurve::Line { from: c0, to: c1 } = run.centreline {
+            let (a, b) = (vertical_local_to_uz(view, c0), vertical_local_to_uz(view, c1));
+            let len = (b.u - a.u).hypot(b.z - a.z);
+            if len <= tol || (b.u - a.u).abs() / len <= sin_vertical {
+                continue;
+            }
         }
         let first = out.strips.len();
         'lay: {
             let (None, Some(face), Some(side), true) = (&ra.skipped, ra.face, sides.runs.get(ra.run), ra.bands > 0) else { break 'lay };
             let Some(bands) = ra.lines.get(..ra.bands) else { break 'lay };
-            let Some(loops) = straight_loops(run, side, face, bands) else { break 'lay };
-            let Some(origin) = lift(&[c0]).and_then(|o| o.first().copied()) else { break 'lay };
+            let loops = match run.centreline {
+                RunCurve::Line { .. } => straight_loops(run, side, face, bands),
+                RunCurve::Arc { radius, .. } => arc_loops(run, side, face, bands, radius),
+            };
+            let Some(loops) = loops else { break 'lay };
+            let Some(origin) = lift(&[centreline_start(run)]).and_then(|o| o.first().copied()) else { break 'lay };
             let sources = [run.faces[0].from.entity_id, run.faces[1].from.entity_id];
             let span = gaze_span(run, result, origin, axis, tol);
             let (range, provenance) = span.map_or(((-depth / 2.0, depth / 2.0), ProvenanceKind::Defaulted), |(r, k, _)| (r, k));
@@ -424,13 +432,7 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
         let faces_of = |i: usize| graph.runs.get(i).map(|r| [r.faces[0].from.entity_id, r.faces[1].from.entity_id]);
         let spanned = arms.iter().find_map(|&i| {
             let run = graph.runs.get(i)?;
-            let c0 = match run.centreline {
-                RunCurve::Line { from, .. } => from,
-                RunCurve::Arc { center, radius, start_angle, .. } => {
-                    Point2 { x: center.x + radius * start_angle.cos(), y: center.y + radius * start_angle.sin() }
-                }
-            };
-            let origin = lift(&[c0])?.first().copied()?;
+            let origin = lift(&[centreline_start(run)])?.first().copied()?;
             gaze_span(run, result, origin, axis, tol).map(|(r, k, _)| (r, k, i))
         });
         let (range, provenance, src) = match spanned {
@@ -471,6 +473,16 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
             if let Some(base) = lift(&ring) {
                 push_extrusion(&base, axis, range, sources, provenance, layer, out);
             }
+        }
+    }
+}
+
+/// The start point of `run`'s centreline (view-local).
+fn centreline_start(run: &WallRun) -> Point2 {
+    match run.centreline {
+        RunCurve::Line { from, .. } => from,
+        RunCurve::Arc { center, radius, start_angle, .. } => {
+            Point2 { x: center.x + radius * start_angle.cos(), y: center.y + radius * start_angle.sin() }
         }
     }
 }
@@ -1311,6 +1323,104 @@ pub(crate) mod tests {
             assert!((lo - want.0).abs() < 0.01 && (hi - want.1).abs() < 0.01, "{lo}..{hi} vs {want:?}");
         }
         assert!(!sc.meshes.iter().any(|m| m.kind == SceneMeshKind::Solid && m.sources.iter().any(|h| fl.contains(h))), "the floor solid is gone");
+        Ok(())
+    }
+
+    /// A section roof of two concentric semicircular arcs on `FLOOR` (radii 2000 and 2250 about
+    /// section-local (2500, 0)), open or (`closed`) joined into one loop by its end caps, tagged at
+    /// (2000, 2000) with the outside point (−1000, 1500); its plan placed, then ASSEMBLYPLAN on it.
+    fn vault_section(closed: bool) -> T<(Session, Id, crate::scene::Scene, crate::scene::Scene)> {
+        let (mut s, sec) = crate::assembly::tests::section_fixture(2000.0, Some((-1000.0, 1500.0)), |s| {
+            s.execute("layer.new", &json!({ "name": "FLOOR", "current": true }))?;
+            let v = |x: f64, bulge: f64| json!({ "p": [x, 0.0], "bulge": bulge });
+            if closed {
+                s.execute("pline", &json!({ "vertices": [v(4750.0, 1.0), v(250.0, 0.0), v(500.0, -1.0), v(4500.0, 0.0)], "closed": true }))?;
+            } else {
+                s.execute("pline", &json!({ "vertices": [v(4750.0, 1.0), v(250.0, 0.0)] }))?;
+                s.execute("pline", &json!({ "vertices": [v(4500.0, 1.0), v(500.0, 0.0)] }))?;
+            }
+            Ok(())
+        })?;
+        let plan = {
+            let p = crate::project::DrawingProject::new(s.doc()?)?;
+            p.views().find(|v| v.kind == lamb_core::derivation::read::ViewKind::Plan).ok_or("no plan")?.id
+        };
+        place(&mut s, plan)?;
+        let before = scene(s.doc()?)?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let after = scene(s.doc()?)?;
+        Ok((s, sec, before, after))
+    }
+
+    /// `m`'s vertex radii in the section's (u, z) plane about section-local (2500, 0): (min, max).
+    fn vault_radii(s: &Session, sec: Id, sc: &crate::scene::Scene, m: &crate::scene::SceneMesh) -> T<(f64, f64)> {
+        let p = crate::project::DrawingProject::new(s.doc()?)?;
+        let v = p.view(sec).ok_or("no section")?;
+        let host = p.view(v.host_view_id().ok_or("no host")?).ok_or("no host view")?;
+        let c = lamb_core::derivation::projection::vertical_local_to_global3(&v, &host, lamb_core::geometry::Point2 { x: 2500.0, y: 0.0 })?;
+        let g = gaze(s, sec)?;
+        let r = m.positions.iter().map(|q| {
+            let (x, y, z) = (sc.origin[0] + f64::from(q[0]) - c.x, sc.origin[1] + f64::from(q[1]) - c.y, sc.origin[2] + f64::from(q[2]) - c.z);
+            (-x * g[1] + y * g[0]).hypot(z)
+        });
+        Ok((r.clone().fold(f64::INFINITY, f64::min), r.fold(f64::NEG_INFINITY, f64::max)))
+    }
+
+    #[test]
+    fn a_section_s_laid_vault_shows_as_curved_layer_slabs_over_the_default_depth() -> R {
+        let (s, sec, _, sc) = vault_section(false)?;
+        let fl = floor_handles(&s, sec)?;
+        assert_eq!(fl.len(), 2);
+        let layers: Vec<_> = sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer && m.sources.iter().all(|h| fl.contains(h))).collect();
+        let mut bands: Vec<(String, f64, f64)> = Vec::new();
+        for m in layers.iter().filter(|m| m.layer != "STUD") {
+            let (lo, hi) = vault_radii(&s, sec, &sc, m)?;
+            bands.push((m.layer.clone(), (lo * 10.0).round() / 10.0, (hi * 10.0).round() / 10.0));
+        }
+        bands.sort_by(|a, b| a.1.total_cmp(&b.1));
+        // Exterior (outer) face r 2250; GYP bands at offsets 50 and 300 toward the centre.
+        assert_eq!(bands, [("GYP".to_string(), 1950.0, 2200.0), ("GYP".to_string(), 2200.0, 2250.0)]);
+        let (g, at) = (gaze(&s, sec)?, global_of(&s, sec, [4750.0, 0.0])?);
+        let depth = crate::project::DrawingProject::new(s.doc()?)?.defaults().default_surface_depth_mm;
+        for m in &layers {
+            let (lo, hi) = along(&sc, m, g, at);
+            assert!((lo + depth / 2.0).abs() < 0.01 && (hi - depth / 2.0).abs() < 0.01, "{lo}..{hi}");
+            assert_eq!(m.provenance, lamb_core::derivation::resolve::ProvenanceKind::Defaulted);
+            assert!(m.construction.is_some());
+        }
+        // The arc run's face segments record a construction state.
+        let p = crate::project::DrawingProject::new(s.doc()?)?;
+        let result = lamb_core::derivation::synthesis::synthesize(&p)?;
+        let out = super::layered(&p, &result);
+        let (graph, _) = crate::detailtags::graph_and_sides(&p, sec);
+        let run = graph.runs.iter().find(|r| matches!(r.centreline, lamb_core::derivation::walls::RunCurve::Arc { .. })).ok_or("no arc run")?;
+        for f in &run.faces {
+            assert!(out.states.contains_key(&(f.from.entity_id, f.from.segment_index)), "{:?}", out.states);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_closed_section_vault_s_slabs_take_its_solid_s_gaze_range_and_replace_it() -> R {
+        let (s, sec, before, sc) = vault_section(true)?;
+        let fl = floor_handles(&s, sec)?;
+        let solid =
+            before.meshes.iter().find(|m| m.kind == SceneMeshKind::Solid && m.sources.iter().any(|h| fl.contains(h))).ok_or("no vault solid")?;
+        let (g, at) = (gaze(&s, sec)?, global_of(&s, sec, [4750.0, 0.0])?);
+        let want = along(&before, solid, g, at);
+        assert!(want.1 - want.0 > 1.0);
+        let layers: Vec<_> = sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer && m.sources.iter().any(|h| fl.contains(h))).collect();
+        assert!(layers.iter().filter(|m| m.layer == "GYP").count() >= 2, "the closed vault is laid");
+        for m in &layers {
+            let (lo, hi) = along(&sc, m, g, at);
+            assert!((lo - want.0).abs() < 0.01 && (hi - want.1).abs() < 0.01, "{lo}..{hi} vs {want:?}");
+        }
+        for m in layers.iter().filter(|m| m.layer == "GYP") {
+            let (lo, hi) = vault_radii(&s, sec, &sc, m)?;
+            assert!(lo > 1950.0 - 0.1 && hi < 2250.0 + 0.1, "{lo}..{hi}");
+        }
+        assert!(!sc.meshes.iter().any(|m| m.kind == SceneMeshKind::Solid && m.sources.iter().any(|h| fl.contains(h))), "the vault solid is gone");
         Ok(())
     }
 

@@ -251,6 +251,48 @@ fn open_run_takes_its_exterior_side_from_an_outside_point_beside_it() {
     assert_eq!(one(Vec::new()), (None, None));
 }
 
+/// A lone semicircular garden wall about the origin (faces at radii 2000 and 2250, upper half),
+/// drawn ccw, or cw when `reversed`.
+fn semicircular_garden_wall(reversed: bool) -> Project {
+    let arc = |id: u64, r: f64| {
+        if reversed {
+            on_layer(id, "layer-wall-ext", &[(-r, 0.0), (r, 0.0)], &[-1.0])
+        } else {
+            on_layer(id, "layer-wall-ext", &[(r, 0.0), (-r, 0.0)], &[1.0])
+        }
+    };
+    project(vec![arc(1, 2250.0), arc(2, 2000.0)])
+}
+
+#[test]
+fn open_arc_run_takes_its_exterior_side_from_an_outside_point_beside_it() {
+    for reversed in [false, true] {
+        let p = semicircular_garden_wall(reversed);
+        let runs = graph_runs(&p);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let RunCurve::Arc { sweep, .. } = runs[0] else { panic!("{:?}", runs[0]) };
+        // Left of a ccw arc's travel is toward the centre.
+        let inner_is_left = sweep > 0.0;
+        let one = |pts: Vec<Point2>| {
+            let r = sides(&p, &SideParams { outside_points: pts, ..SideParams::default() }).runs[0].clone();
+            assert_eq!((r.left, r.right, r.exterior), (SideKind::Outside, SideKind::Outside, true));
+            let got = r.open_outside_left;
+            assert_eq!(got, outside_on_left(&r));
+            got
+        };
+        let (outer, inner) = (pt(0.0, 3000.0), pt(500.0, 1000.0));
+        assert_eq!(one(vec![outer]), Some(!inner_is_left), "reversed {reversed}");
+        assert_eq!(one(vec![inner]), Some(inner_is_left), "reversed {reversed}");
+        // The nearest point wins; the centre counts as inside.
+        assert_eq!(one(vec![pt(0.0, 9000.0), inner]), Some(inner_is_left));
+        assert_eq!(one(vec![pt(0.0, 0.0)]), Some(inner_is_left));
+        // Past the arc's span, within its faces, or no point at all: undecided.
+        assert_eq!(one(vec![pt(0.0, -3000.0)]), None);
+        assert_eq!(one(vec![pt(0.0, 2125.0)]), None);
+        assert_eq!(one(Vec::new()), None);
+    }
+}
+
 #[test]
 fn closed_room_sides_ignore_open_resolution() {
     let p = project(closed_room(1, 0.0));
