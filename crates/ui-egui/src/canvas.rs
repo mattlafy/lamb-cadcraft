@@ -704,6 +704,10 @@ fn collect_prompt_clicks(app: &mut CadApp, ui: &egui::Ui, context: PromptClickCo
     // The release of a drag that panned or zoomed (Enter can end the command mid-drag) places
     // nothing in the command it returns to.
     let nav_release = drag_stopped && std::mem::take(&mut app.canvas.nav_drag);
+    // A drag Escape stopped early ends with no drag stop: its release still ends it.
+    if ui.input(|i| i.pointer.primary_released()) {
+        app.canvas.nav_drag = false;
+    }
     let pressed_primary = context.primary_clicked || (point_prompt && drag_stopped && !nav_release);
     if point_prompt && context.inside && pressed_primary && !context.middle_down && app.cmd.options.is_none() && app.cmd.buffer.is_empty() {
         let releases: Vec<egui::Pos2> = ui.input(|i| {
