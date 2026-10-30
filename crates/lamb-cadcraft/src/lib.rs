@@ -65,6 +65,7 @@ pub mod project_mut;
 pub mod props;
 pub mod provider;
 mod querycmds;
+mod refillet;
 mod refpane;
 mod relayer;
 pub mod repeats;

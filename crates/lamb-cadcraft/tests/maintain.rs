@@ -237,6 +237,18 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6
 }
 
+/// `original`'s links, none dropped or stale, each holding, and `travelled` unchanged.
+fn all_hold(s: &Session, original: &[LinkRecord], travelled: &LinkRecord) -> R {
+    let now = links(s)?;
+    assert_eq!(now.iter().map(|l| l.id).collect::<Vec<_>>(), original.iter().map(|l| l.id).collect::<Vec<_>>(), "nothing dropped");
+    let p = DrawingProject::new(s.doc()?)?;
+    for l in &now {
+        assert!(l.stale.is_none() && link_still_coincides(&p, l)?, "link {} holds, not stale", l.id);
+    }
+    assert_eq!(&find_link(&now, travelled.id)?, travelled, "the travelled link's anchors unchanged");
+    Ok(())
+}
+
 /// §13 phase 3 gate: STRETCH a linked plan line, its link in the travel set → the section follows in
 /// one undo step; the same from the section side. Moving both ends, or a non-rigid edit, travels
 /// nothing.
@@ -274,7 +286,8 @@ fn rigid_move_travels_partner() -> R {
         let p = DrawingProject::new(s.doc()?)?;
         assert!(link_still_coincides(&p, &link)?, "the travelled link holds");
     }
-    assert_eq!(links(&s)?, original, "nothing stale, nothing dropped");
+    // The partner's ray-slid legs keep their links' anchor points, not their params (LAMB T567 step 0e).
+    all_hold(&s, &original, &link)?;
     s.undo()?;
     assert_eq!(s.doc()?.entity(Handle(plan_e.0)).cloned(), plan_ent, "one undo restores the plan entity");
     assert_eq!(s.doc()?.entity(Handle(sec_e.0)).cloned(), sec_ent, "and the section entity");
@@ -297,7 +310,7 @@ fn rigid_move_travels_partner() -> R {
     }
     assert_eq!(a[i - 1].from, b[i - 1].from, "the neighbour's far end stays put");
     assert!(close(a[i - 1].to.x, b[i - 1].to.x), "the neighbour ray-slides along itself");
-    assert_eq!(links(&s)?, original, "link not stale");
+    all_hold(&s, &original, &link)?;
     s.undo()?;
     assert_eq!(s.doc()?.entity(Handle(plan_e.0)).cloned(), plan_ent);
     assert_eq!(s.doc()?.entity(Handle(sec_e.0)).cloned(), sec_ent);
@@ -1068,5 +1081,148 @@ fn an_unreachable_travel_is_reported_and_echoed() -> R {
     s.execute("move", &mv)?;
     let line = format!("LAMB: 100 mm of the move could not travel to entity {} (its neighbours cannot absorb it)", hex(sec_e));
     assert!(s.log.contains(&line), "{:?}", s.log);
+    Ok(())
+}
+
+/// LAMB T567's fixture: plan polylines `plans` and section faces `faces` on [`wall_and_face`]'s
+/// views (the cut along global +X from the origin), linked in order by `links` as (plan index,
+/// segment, param, face index, segment, param). Import re-numbers entities and views, so read them
+/// back from the links.
+fn plans_and_faces(
+    plans: &[&[[f64; 2]]],
+    faces: &[&[[f64; 2]]],
+    links: &[(u64, usize, f64, u64, usize, f64)],
+) -> Result<Drawing, Box<dyn std::error::Error>> {
+    let poly = |pts: &[[f64; 2]]| {
+        json!({"kind": "polyline", "geometry": {"closed": false, "start": {"x": pts[0][0], "y": pts[0][1]},
+            "segments": pts[1..].iter().map(|p| json!({"bulge": 0, "to": {"x": p[0], "y": p[1]}})).collect::<Vec<_>>()}})
+    };
+    let ents = |base: u64, view: u64, list: &[&[[f64; 2]]]| {
+        list.iter()
+            .zip(base..)
+            .map(|(pts, id)| json!({"id": id, "layerId": "layer-0", "role": "cut", "viewId": view, "geometry": poly(pts)}))
+            .collect::<Vec<_>>()
+    };
+    let links: Vec<serde_json::Value> = links
+        .iter()
+        .zip(31u64..)
+        .map(|(&(pi, ps, pt, fi, fs, ft), id)| {
+            json!({"a": {"entityId": 11 + pi, "segmentIndex": ps, "segmentParam": pt}, "b": {"entityId": 21 + fi, "segmentIndex": fs, "segmentParam": ft},
+                "createdAt": "2026-01-01T00:00:00.000Z", "createdBy": {"kind": "user", "userId": "t"}, "id": id, "origin": "automatic"})
+        })
+        .collect();
+    let ident = json!({"originX": 0, "originY": 0, "rotation": 0});
+    let project: Project = serde_json::from_value(json!({
+        "commandLog": [], "name": "T567", "patterns": {}, "schemaVersion": 3,
+        "levels": [],
+        "defaults": {"defaultCutHeightMm": 1000, "defaultFloorToFloorMm": 3000, "defaultSurfaceDepthMm": 2700,
+            "defaultSurfaceHeightMm": 2700, "dimTextHeightPaperMm": 3, "plotScale": 50, "units": "mm"},
+        "layers": [{"color": "#d0d0d0", "defaultRole": "cut", "id": "layer-0", "lineweight": 0.25, "locked": false, "name": "0", "visible": true}],
+        "links": links,
+        "views": [
+            {"id": 1, "kind": "plan", "name": "plan", "entities": ents(11, 1, plans),
+             "placement": {"kind": "plan", "cutElevation": 1200, "levelId": 41, "transform": ident}},
+            {"id": 2, "kind": "vertical", "intent": "section", "name": "sec", "entities": ents(21, 2, faces),
+             "placement": {"kind": "vertical", "hostViewId": 1, "transform": ident,
+                "cutLine": {"closed": false, "start": {"x": 0, "y": 0}, "segments": [{"bulge": 0, "to": {"x": 20000, "y": 0}}]}}}
+        ]
+    }))?;
+    Ok(project_to_drawing(&project)?.0)
+}
+
+/// A section face whose segment 1 is vertical at `u`, holding a plan crossing there at its middle.
+fn face_at(u: f64) -> [[f64; 2]; 4] {
+    [[u - 100.0, 0.0], [u, 0.0], [u, 2400.0], [u + 100.0, 2400.0]]
+}
+
+/// Each named link holds, and its plan end lies at the given plan point.
+fn hold_at(s: &Session, want: &[(Id, Point2)]) -> R {
+    let d = s.doc()?;
+    let p = DrawingProject::new(d)?;
+    for (id, at) in want {
+        let l = find_link(&links(s)?, *id)?;
+        assert!(link_still_coincides(&p, &l)?, "link {id} holds: {l:?}");
+        let plan_e = if is_plan(d, view_of(d, l.a.entity_id)?)? { l.a.entity_id } else { l.b.entity_id };
+        let got = anchor_point(d, &l, plan_e)?;
+        assert!(close(got.x, at.x) && close(got.y, at.y), "link {id} at {got:?}, want {at:?}");
+    }
+    Ok(())
+}
+
+/// The segment index of `link`'s end on `e`.
+fn seg_on(link: &LinkRecord, e: Id) -> usize {
+    if link.a.entity_id == e { link.a.segment_index } else { link.b.segment_index }
+}
+
+/// LAMB T567: FILLET radius 0 joining two plan polylines, each linked where it crosses the cut,
+/// keeps both links on the joined polyline's segments that hold their crossings; undo restores
+/// both originals.
+#[test]
+fn fillet_joining_two_polylines_keeps_both_links() -> R {
+    register();
+    // A's last segment x = 1000 crosses at (1000, 0), t = 2/3; B's first segment, on
+    // y = 1500 - 1.5 (x - 2000), crosses at (3000, 0), t = 1/2; the lines meet at (1000, 3000).
+    let a: &[[f64; 2]] = &[[-2000.0, -2000.0], [1000.0, -2000.0], [1000.0, 1000.0]];
+    let b: &[[f64; 2]] = &[[2000.0, 1500.0], [4000.0, -1500.0], [6000.0, -1500.0]];
+    let d = plans_and_faces(&[a, b], &[&face_at(1000.0), &face_at(3000.0)], &[(0, 1, 2.0 / 3.0, 0, 1, 0.5), (1, 0, 0.5, 1, 1, 0.5)])?;
+    let original = read_document(&d)?.links;
+    let (la, lb) = (original[0].id, original[1].id);
+    let (pa, pb) = (Point2 { x: 1000.0, y: 0.0 }, Point2 { x: 3000.0, y: 0.0 });
+    let (ea, eb) = (original[0].a.entity_id, original[1].a.entity_id);
+    let plan_view = view_of(&d, ea)?;
+    let mut s = Session::new();
+    s.open_drawing(d, "t567", None);
+    install_link_maintenance(&mut s);
+    hold_at(&s, &[(la, pa), (lb, pb)])?;
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    s.execute("fillet", &json!({"h1": hex(ea), "p1": [1000, 500], "h2": hex(eb), "p2": [2500, 750], "radius": 0}))?;
+    assert!(DrawingProject::new(s.doc()?)?.entity(eb).is_none(), "B joined into A");
+    assert_eq!(resolved_segments(&poly(s.doc()?, ea)?).len(), 4, "the joined polyline");
+    let now = links(&s)?;
+    assert_eq!(now.len(), 2, "both links survive: {now:?}");
+    assert!(now.iter().all(|l| on(l, ea)), "both on the joined polyline: {now:?}");
+    assert_eq!((seg_on(&find_link(&now, la)?, ea), seg_on(&find_link(&now, lb)?, ea)), (1, 2));
+    hold_at(&s, &[(la, pa), (lb, pb)])?;
+    s.undo()?;
+    assert_eq!(links(&s)?, original, "undo restores the original two links");
+    Ok(())
+}
+
+/// LAMB T567: FILLET closing an open polyline through its gap (T559) re-indexes the links on its
+/// kept sides (the extended first side becomes the closing segment, the far side shifts), and a
+/// link whose crossing was on a removed tail drops.
+#[test]
+fn fillet_closing_a_polyline_reindexes_its_links() -> R {
+    register();
+    // Tail (2000,1000)-(5000,-2000) crosses at (3000,0); the first side x = 5000 at (5000,0); the
+    // far side x = 15000 at (15000,0). The first and last sides meet in the gap at (5000,-5000).
+    let c: &[[f64; 2]] =
+        &[[2000.0, 1000.0], [5000.0, -2000.0], [5000.0, 5000.0], [15000.0, 5000.0], [15000.0, -5000.0], [8000.0, -5000.0], [9000.0, -8000.0]];
+    let (f0, f1, f2) = (face_at(3000.0), face_at(5000.0), face_at(15000.0));
+    let d = plans_and_faces(&[c], &[&f0, &f1, &f2], &[(0, 0, 1.0 / 3.0, 0, 1, 0.5), (0, 1, 2.0 / 7.0, 1, 1, 0.5), (0, 3, 0.5, 2, 1, 0.5)])?;
+    let original = read_document(&d)?.links;
+    let (tail, first, far) = (original[0].id, original[1].id, original[2].id);
+    let (p_first, p_far) = (Point2 { x: 5000.0, y: 0.0 }, Point2 { x: 15000.0, y: 0.0 });
+    let e = original[0].a.entity_id;
+    let plan_view = view_of(&d, e)?;
+    let mut s = Session::new();
+    s.open_drawing(d, "t567", None);
+    install_link_maintenance(&mut s);
+    hold_at(&s, &[(tail, Point2 { x: 3000.0, y: 0.0 }), (first, p_first), (far, p_far)])?;
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    s.execute("fillet", &json!({"h1": hex(e), "p1": [5000, 1000], "h2": hex(e), "p2": [11000, -5000], "radius": 0}))?;
+    let pl = poly(s.doc()?, e)?;
+    assert!(pl.closed, "closed through the gap: {pl:?}");
+    let now = links(&s)?;
+    assert_eq!(now.len(), 2, "the tail's link dropped: {now:?}");
+    assert!(now.iter().all(|l| l.id != tail));
+    hold_at(&s, &[(first, p_first), (far, p_far)])?;
+    let segs = resolved_segments(&pl);
+    for id in [first, far] {
+        let sg = segs.get(seg_on(&find_link(&now, id)?, e)).ok_or("no segment")?;
+        assert!(close(sg.from.x, sg.to.x), "link {id} on a vertical side: {sg:?}");
+    }
+    s.undo()?;
+    assert_eq!(links(&s)?, original, "undo restores all three");
     Ok(())
 }

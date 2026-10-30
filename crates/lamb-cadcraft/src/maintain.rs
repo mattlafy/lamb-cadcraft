@@ -23,6 +23,11 @@
 //!    Remove Vertex, `pedit` insert / straighten / reverse — same handle, so 0b never runs) keeps
 //!    each anchor on its segment; one exactly at a removed vertex drops its link (TS `vertex.ts`
 //!    parity, [`crate::revertex`]);
+//! 0e. re-anchors on carriers: an end 0b and 0d left alone, whose polyline was joined into another
+//!    (FILLET/CHAMFER of two polylines), trimmed, extended, re-ordered or rotated (FILLET removing
+//!    segments, closing through a gap) and whose anchor no longer holds its point, moves onto the
+//!    segment of its own or another changed entity in the view that lies on the old segment's line
+//!    or circle and holds that point ([`crate::refillet`]); none — step 1 or 2 drops it;
 //! 1. drops every link with an anchor whose entity is no longer in any view block (ERASE) — the
 //!    partner in the other view stays, its marker hollow (LAMB T514: erasing a line never erases its
 //!    partner);
@@ -364,6 +369,7 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
     let before_project = DrawingProject::new(before)?;
     let before_entities = entity_map(&before_project);
     let before_views = before_project.document().views.clone();
+    let before_links = before_project.document().links.clone();
     drop(before_project);
 
     // 0: travel, before anything reads `after`.
@@ -374,6 +380,12 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
     let (remapped, dropped) = crate::revertex::remap_vertex_edits(&before_entities, after)?;
     report.reanchored.extend(remapped);
     report.dropped.extend(dropped);
+    // 0e: joined, trimmed, extended or re-ordered polylines keep anchors on the segment holding them.
+    for id in crate::refillet::reanchor_on_carriers(&before_entities, &before_links, after)? {
+        if !report.reanchored.contains(&id) {
+            report.reanchored.push(id);
+        }
+    }
 
     // 1 + 2: drop and re-check, against one read of `after`.
     let (new_entities, links) = {
