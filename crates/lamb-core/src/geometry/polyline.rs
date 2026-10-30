@@ -330,7 +330,8 @@ fn slide_endpoint(
     let target = add2(shared_original, delta);
 
     if is_arc(neighbor.bulge) {
-        // R0 scope: an arc neighbour reconnects to the closest point on its CHORD's line.
+        // A non-tangent arc neighbour (a tangent fillet is handled by `slide_fillet` before this
+        // is reached) reconnects to the closest point on its CHORD's line.
         let shared = if shared_is_to { neighbor.to } else { neighbor.from };
         let chord_dir = normalize2(sub2(shared, far));
         return (closest_point_on_infinite_line(far, chord_dir, target), None);
@@ -354,6 +355,45 @@ fn slide_endpoint(
     (hit.unwrap_or(target), None)
 }
 
+/// §4b: a tangent fillet beside the moved segment keeps its radius. `fillet` is the arc neighbour,
+/// `beyond` the straight segment past it, `fillet_is_prev` says which side of the moved segment
+/// (`moved_shared` is its vertex shared with the fillet). When the arc is tangent to both lines,
+/// it translates by the shift of the two lines' intersection, so turn angle, radius and both
+/// tangencies are unchanged. Returns the moved segment's new shared end and the new position of
+/// the fillet's other end (the vertex it shares with `beyond`), or `None` when the arc is not a
+/// tangent fillet (the chord rule applies).
+fn slide_fillet(
+    moved_shared: Point2,
+    fillet: &ResolvedSegment,
+    beyond: Option<&ResolvedSegment>,
+    fillet_is_prev: bool,
+    moved_dir: Point2,
+    delta: Point2,
+) -> Option<(Point2, Point2)> {
+    let beyond = beyond.filter(|b| !is_arc(b.bulge))?;
+    if !is_arc(fillet.bulge) {
+        return None;
+    }
+    let beyond_dir = normalize2(sub2(beyond.to, beyond.from));
+    // Tangent directions of the arc at its two ends, in travel order.
+    let (at_moved, at_beyond) = if fillet_is_prev {
+        (tangent_at_param(fillet, 1.0), tangent_at_param(fillet, 0.0))
+    } else {
+        (tangent_at_param(fillet, 0.0), tangent_at_param(fillet, 1.0))
+    };
+    let tol = TOLERANCE.angle_deg.to_radians();
+    let aligned = |a: Point2, b: Point2| dot2(a, b) > 0.0 && cross2(a, b).abs() < tol.sin();
+    if !aligned(at_moved, moved_dir) || !aligned(at_beyond, beyond_dir) {
+        return None;
+    }
+    let beyond_shared = if fillet_is_prev { beyond.to } else { beyond.from };
+    let corner = intersect_rays(moved_shared, moved_dir, beyond_shared, beyond_dir)?;
+    let perp = sub2(delta, scale2(moved_dir, dot2(delta, moved_dir)));
+    let shifted = intersect_rays(add2(moved_shared, perp), moved_dir, beyond_shared, beyond_dir)?;
+    let v = sub2(shifted, corner);
+    Some((add2(moved_shared, v), add2(beyond_shared, v)))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentSlideResult {
@@ -365,7 +405,9 @@ pub struct SegmentSlideResult {
 }
 
 /// T108: translate `poly`'s segment `segment_index` by `delta`, stretching (never deforming) its
-/// neighbours to reconnect. An open end translates freely. `corner_at_to` tags are left untouched.
+/// neighbours to reconnect. An open end translates freely. A tangent fillet arc beside a straight
+/// moved segment translates with the corner it rounds, keeping its radius and tangencies (§4b); a
+/// non-tangent arc neighbour keeps the chord rule. `corner_at_to` tags are left untouched.
 pub fn slide_segment_by_delta(poly: &Polyline2, segment_index: usize, delta: Point2) -> SegmentSlideResult {
     let resolved = resolved_segments(poly);
     let n = resolved.len();
@@ -394,12 +436,60 @@ pub fn slide_segment_by_delta(poly: &Polyline2, segment_index: usize, delta: Poi
     // R0: an arc moved segment translates rigidly and uses its CHORD direction.
     let moved_dir = normalize2(sub2(seg.to, seg.from));
 
-    let (from_point, from_unreachable) = slide_endpoint(seg.from, prev_seg, true, moved_dir, delta);
-    let (to_point, to_unreachable) = slide_endpoint(seg.to, next_seg, false, moved_dir, delta);
+    // The segment past a neighbour (cyclically when closed), never the moved segment itself.
+    let beyond = |i: usize, before: bool| -> Option<&ResolvedSegment> {
+        let j = if before {
+            if i > 0 {
+                Some(i - 1)
+            } else if wrap {
+                Some(n - 1)
+            } else {
+                None
+            }
+        } else if i + 1 < n {
+            Some(i + 1)
+        } else if wrap {
+            Some(0)
+        } else {
+            None
+        };
+        j.filter(|&j| j != segment_index && j != i).and_then(|j| resolved.get(j))
+    };
+    let straight_moved = !is_arc(seg.bulge);
+    // A tangent fillet's far vertex moves too: (index of the segment ending there, new point).
+    let mut fillet_vertices: Vec<(usize, Point2)> = Vec::new();
+
+    let prev_fillet =
+        prev_seg.filter(|_| straight_moved).and_then(|f| slide_fillet(seg.from, f, beyond(f.index, true), true, moved_dir, delta).map(|r| (f, r)));
+    let (from_point, from_unreachable) = match prev_fillet {
+        Some((f, (shared, far))) => {
+            // The fillet's `from` is the end of the segment before it.
+            fillet_vertices.push((if f.index > 0 { f.index - 1 } else { n - 1 }, far));
+            (shared, None)
+        }
+        None => slide_endpoint(seg.from, prev_seg, true, moved_dir, delta),
+    };
+    let next_fillet =
+        next_seg.filter(|_| straight_moved).and_then(|f| slide_fillet(seg.to, f, beyond(f.index, false), false, moved_dir, delta).map(|r| (f, r)));
+    let (to_point, to_unreachable) = match next_fillet {
+        Some((f, (shared, far))) => {
+            fillet_vertices.push((f.index, far));
+            (shared, None)
+        }
+        None => slide_endpoint(seg.to, next_seg, false, moved_dir, delta),
+    };
     let unreachable = from_unreachable.or(to_unreachable);
 
     let mut segments = poly.segments.clone();
     let mut start = poly.start;
+    for (i, point) in fillet_vertices {
+        if let Some(s) = segments.get_mut(i) {
+            s.to = point;
+        }
+        if wrap && i == n - 1 {
+            start = point;
+        }
+    }
 
     if segment_index == 0 {
         start = from_point;
