@@ -1,5 +1,6 @@
 //! FILLET and CHAMFER with polyline segments (#466): two straight segments of one polyline
-//! (adjacent, or with one segment between them, which the corner replaces), or a straight end
+//! (with any segments between them on the picked side removed, closing an open polyline when
+//! the corner lies in its gap), or a straight end
 //! segment of an open polyline with a line, which joins the polyline.
 
 use cadcraft_doc::{EntityKind, Handle, LwPolyline};
@@ -75,7 +76,11 @@ fn add_loose(s: &mut Session, near: Handle, c: &Corner) -> Result<Option<Handle>
     Ok(Some(push_entity(s, &space, e.common.clone(), k)?))
 }
 
-/// Two segments of one polyline.
+/// Two segments of one polyline. LAMB fork patch 31: any number of segments may lie between them.
+/// The polyline is a cycle of `n` segments (segment `k` from vertex `k` to `k + 1`), an open one
+/// closed by a virtual gap segment `n - 1`. Each pick keeps the part of its segment containing it
+/// and trims or extends the other end to the corner; the run beyond those trimmed ends is removed.
+/// When that run holds an open polyline's gap, the polyline's tails go with it and it closes.
 fn same_polyline(
     s: &mut Session,
     h: Handle,
@@ -89,71 +94,98 @@ fn same_polyline(
     let n = pl.vertices.len();
     let ns = segs.len();
     let (Some(a), Some(b)) = (picked_segment(&segs, p1), picked_segment(&segs, p2)) else { return Err(other("Select two segments.")) };
-    if a == b {
+    if a == b || n < 2 {
         return Err(other("Select two different segments of the polyline."));
     }
     let next = |k: usize| if pl.closed { Some((k + 1) % ns) } else { (k + 1 < ns).then_some(k + 1) };
-    // (first segment, second segment, segments between, picked in that order?)
-    let (i, j, gap, in_order) = if next(a) == Some(b) {
-        (a, b, 0, true)
+    // Adjacent through a real vertex: (arriving segment, leaving segment).
+    let adjacent = if next(a) == Some(b) {
+        Some((a, b))
     } else if next(b) == Some(a) {
-        (b, a, 0, false)
-    } else if next(a).and_then(next) == Some(b) {
-        (a, b, 1, true)
-    } else if next(b).and_then(next) == Some(a) {
-        (b, a, 1, false)
+        Some((b, a))
     } else {
-        return Err(other("The segments must be adjacent or separated by one segment."));
+        None
     };
     // LAMB fork patch 10: an adapter may keep the shared vertex and tag it instead (crate::vcorner).
-    let hook = crate::vcorner::virtual_corner_hook().filter(|_| gap == 0 && trim);
-    let vertex = (i + 1) % n.max(1);
+    let hook = crate::vcorner::virtual_corner_hook().filter(|_| adjacent.is_some() && trim);
+    let vertex = adjacent.map_or(0, |(i, _)| (i + 1) % n);
     if let Some(f) = hook
         && chamfer.is_none()
         && f(s, h, vertex, crate::vcorner::CornerOp::Fillet { radius: r })?
     {
         return Ok(Some(h));
     }
-    let (Some(Segment::Line(si)), Some(Segment::Line(sj))) = (segs.get(i), segs.get(j)) else {
+    let (Some(Segment::Line(sa)), Some(Segment::Line(sb))) = (segs.get(a), segs.get(b)) else {
         return Err(other("Fillet and chamfer work on straight polyline segments."));
     };
+    let (sa, sb) = (*sa, *sb);
     if let Some(f) = hook
         && let Some(ch) = chamfer
+        && let Some((i, _)) = adjacent
     {
+        let (si, sj) = if i == a { (sa, sb) } else { (sb, sa) };
         let (ui, uj) = ((si.a - si.b).normalized(), (sj.b - sj.a).normalized());
+        let in_order = i == a;
         let (df, ds) = if in_order { ch(ui, uj)? } else { ch(uj, ui)? };
         let (distance1, distance2) = if in_order { (df, ds) } else { (ds, df) };
         if f(s, h, vertex, crate::vcorner::CornerOp::Chamfer { distance1, distance2 })? {
             return Ok(Some(h));
         }
     }
-    let x =
-        if gap == 0 { si.b } else { line_line_infinite(si.a, si.b, sj.a, sj.b).map(|r| r.0).ok_or_else(|| other("The segments are parallel."))? };
+    // The corner, and which picked segment arrives at it along its direction (A) and which
+    // leaves it (B).
+    let (x, arrive) = if let Some((i, _)) = adjacent {
+        (if i == a { sa.b } else { sb.b }, i)
+    } else {
+        let x = line_line_infinite(sa.a, sa.b, sb.a, sb.b).map(|r| r.0).ok_or_else(|| other("The segments are parallel."))?;
+        let forward = |sg: &Line, p: Vec2| sg.param_of(x) > sg.param_of(p);
+        match (forward(&sa, p1), forward(&sb, p2)) {
+            (true, false) => (x, a),
+            (false, true) => (x, b),
+            _ => return Err(other("The picks do not meet on one side of the polyline.")),
+        }
+    };
+    let leave = if arrive == a { b } else { a };
+    let (s_arr, s_lv) = if arrive == a { (sa, sb) } else { (sb, sa) };
     let side = |keep: Vec2| ((keep - x).normalized(), keep.dist(x));
     // CHAMFER's first distance goes on the first picked segment.
-    let c = if in_order {
-        corner(x, side(si.a), side(sj.b), r, chamfer)?
+    let c = if arrive == a {
+        corner(x, side(s_arr.a), side(s_lv.b), r, chamfer)?
     } else {
-        let c = corner(x, side(sj.b), side(si.a), r, chamfer)?;
+        let c = corner(x, side(s_lv.b), side(s_arr.a), r, chamfer)?;
         Corner { t1: c.t2, t2: c.t1, bulge: -c.bulge }
     };
     if !trim {
         return add_loose(s, h, &c);
     }
-    // Rotate a closed polyline so the first segment starts at vertex 0 (nothing wraps).
-    let mut vs = pl.vertices.clone();
-    if pl.closed {
-        vs.rotate_left(i % n.max(1));
+    // The kept cycle: t2, B's kept end … A's kept end, t1 (the corner's bulge back to t2). An
+    // open polyline's gap is segment n - 1; it is kept unless it lies in the removed run.
+    let offset = |k: usize| (k + n - arrive) % n;
+    let removed = |k: usize| offset(k) > 0 && offset(k) < offset(leave);
+    let closed = pl.closed || removed(n - 1);
+    let tmpl = |k: usize| pl.vertices.get(k).copied().unwrap_or_default();
+    let mut cyc: Vec<(PolyVertex, Option<usize>)> = vec![(PolyVertex { p: c.t2, bulge: 0.0, ..tmpl(leave) }, None)];
+    let mut k = (leave + 1) % n;
+    loop {
+        cyc.push((tmpl(k), Some(k)));
+        if k == arrive {
+            break;
+        }
+        k = (k + 1) % n;
     }
-    let (i, j) = if pl.closed { (0, (j + ns - i) % ns) } else { (i, j) };
-    let tmpl = vs.get(i + 1).copied().unwrap_or_default();
-    let mut out: Vec<PolyVertex> = vs.get(..=i).map(<[PolyVertex]>::to_vec).unwrap_or_default();
-    push_point(&mut out, PolyVertex { p: c.t1, bulge: c.bulge, ..tmpl });
-    push_point(&mut out, PolyVertex { p: c.t2, bulge: 0.0, ..tmpl });
-    for v in vs.iter().skip(j + 1) {
-        push_point(&mut out, *v);
+    cyc.push((PolyVertex { p: c.t1, bulge: c.bulge, ..tmpl(arrive) }, None));
+    // Start at the lowest surviving original vertex: an open result then runs from vertex 0 to
+    // vertex n - 1 as before.
+    let start = cyc.iter().enumerate().filter_map(|(at, (_, k))| k.map(|k| (k, at))).min().map_or(0, |(_, at)| at);
+    cyc.rotate_left(start);
+    let mut out: Vec<PolyVertex> = Vec::with_capacity(cyc.len());
+    for (v, _) in cyc {
+        push_point(&mut out, v);
     }
-    set_kind(s, h, EntityKind::LwPolyline(LwPolyline { vertices: out, ..pl.clone() }))?;
+    if closed && out.len() > 1 && out.first().zip(out.last()).is_some_and(|(f, l)| f.p.near(l.p, 1e-12)) {
+        out.pop();
+    }
+    set_kind(s, h, EntityKind::LwPolyline(LwPolyline { vertices: out, closed, ..pl.clone() }))?;
     Ok(Some(h))
 }
 

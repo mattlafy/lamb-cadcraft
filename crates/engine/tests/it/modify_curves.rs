@@ -549,6 +549,78 @@ fn fillet_and_chamfer_two_segments_of_one_polyline() {
     assert!(!v.iter().any(|(x, y, _)| *x == 0.0 && *y == 0.0));
 }
 
+fn closed(s: &Session, h: &str) -> bool {
+    matches!(kind(s, h), EntityKind::LwPolyline(p) if p.closed)
+}
+
+/// An open polyline round three sides of a square whose first and last sides stop short of the
+/// corner at the origin, optionally with tails beyond both.
+fn open_square(s: &mut Session, tails: bool) -> String {
+    let mut pts = vec![[3.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 3.0]];
+    if tails {
+        pts.insert(0, [4.0, -3.0]);
+        pts.push([-3.0, 4.0]);
+    }
+    pline(s, &pts, false)
+}
+
+#[test]
+fn fillet_closes_an_open_polyline_through_its_gap() {
+    // Three sides of a triangle: the first and last sides meet in the gap, which the arc closes.
+    let mut s = Session::new();
+    let p = pline(&mut s, &[[3.0, 0.0], [10.0, 0.0], [0.0, 10.0], [0.0, 3.0]], false);
+    let before = verts(&s, &p);
+    s.execute("fillet", &json!({ "h1": p, "p1": [6, 0], "h2": p, "p2": [0, 6], "radius": 1 })).unwrap();
+    assert_eq!(verts(&s, &p), vec![(10.0, 0.0, 0.0), (0.0, 10.0, 0.0), (0.0, 1.0, quarter()), (1.0, 0.0, 0.0)]);
+    assert!(closed(&s, &p));
+    s.undo().unwrap();
+    assert_eq!(verts(&s, &p), before);
+    assert!(!closed(&s, &p));
+    // Three sides of a square, with and without tails beyond both picks: the tails go too.
+    for tails in [false, true] {
+        let mut s = Session::new();
+        let p = open_square(&mut s, tails);
+        s.execute("fillet", &json!({ "h1": p, "p1": [6, 0], "h2": p, "p2": [0, 6], "radius": 1 })).unwrap();
+        assert_eq!(verts(&s, &p), vec![(10.0, 0.0, 0.0), (10.0, 10.0, 0.0), (0.0, 10.0, 0.0), (0.0, 1.0, quarter()), (1.0, 0.0, 0.0)], "{tails}");
+        assert!(closed(&s, &p));
+    }
+    // CHAMFER the same way, the first distance on the first pick.
+    let mut s = Session::new();
+    let p = open_square(&mut s, false);
+    s.execute("chamfer", &json!({ "h1": p, "p1": [6, 0], "h2": p, "p2": [0, 6], "d1": 1, "d2": 2 })).unwrap();
+    assert_eq!(verts(&s, &p), vec![(10.0, 0.0, 0.0), (10.0, 10.0, 0.0), (0.0, 10.0, 0.0), (0.0, 2.0, 0.0), (1.0, 0.0, 0.0)]);
+    assert!(closed(&s, &p));
+}
+
+#[test]
+fn fillet_removes_any_number_of_segments_on_the_picked_side() {
+    // A closed polyline: the two segments past the picks, through the closing one, are removed.
+    let mut s = Session::new();
+    let pts = [[3.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 3.0], [1.0, 1.0]];
+    let p = pline(&mut s, &pts, true);
+    s.execute("fillet", &json!({ "h1": p, "p1": [6, 0], "h2": p, "p2": [0, 6], "radius": 1 })).unwrap();
+    assert_eq!(verts(&s, &p), vec![(10.0, 0.0, 0.0), (10.0, 10.0, 0.0), (0.0, 10.0, 0.0), (0.0, 1.0, quarter()), (1.0, 0.0, 0.0)]);
+    assert!(closed(&s, &p));
+    // CHAMFER, picks the other way round: the first distance on the left side.
+    let mut s = Session::new();
+    let p = pline(&mut s, &pts, true);
+    s.execute("chamfer", &json!({ "h1": p, "p1": [0, 6], "h2": p, "p2": [6, 0], "d1": 1, "d2": 2 })).unwrap();
+    assert_eq!(verts(&s, &p), vec![(10.0, 0.0, 0.0), (10.0, 10.0, 0.0), (0.0, 10.0, 0.0), (0.0, 1.0, 0.0), (2.0, 0.0, 0.0)]);
+    // An open polyline: three segments between the picks are replaced by the corner.
+    let mut s = Session::new();
+    let p = pline(&mut s, &[[0.0, 0.0], [10.0, 0.0], [12.0, 2.0], [12.0, 4.0], [11.0, 6.0], [11.0, 10.0]], false);
+    s.execute("fillet", &json!({ "h1": p, "p1": [5, 0], "h2": p, "p2": [11, 8], "radius": 0 })).unwrap();
+    assert_eq!(verts(&s, &p), vec![(0.0, 0.0, 0.0), (11.0, 0.0, 0.0), (11.0, 10.0, 0.0)]);
+    assert!(!closed(&s, &p));
+    // Parallel segments are still refused, and the polyline left alone.
+    let mut s = Session::new();
+    let p = pline(&mut s, &[[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]], false);
+    let before = verts(&s, &p);
+    let err = s.execute("fillet", &json!({ "h1": p, "p1": [5, 0], "h2": p, "p2": [5, 5], "radius": 1 })).unwrap_err();
+    assert!(err.to_string().contains("parallel"), "{err}");
+    assert_eq!(verts(&s, &p), before);
+}
+
 #[test]
 fn fillet_and_chamfer_a_line_into_a_polyline() {
     // The polyline's last segment with a line: the line joins the polyline.
@@ -592,7 +664,8 @@ fn polyline_fillet_refusals_leave_it_alone() {
     let c = h(&s.execute("circle", &json!({ "center": [30, 0], "radius": 1 })).unwrap());
     let l = h(&s.execute("line", &json!({ "points": [[20, -5], [20, 5]] })).unwrap());
     for q in [
-        // Segments too far apart, the same segment, a circle, a middle segment with a line, too big.
+        // Picks whose trimmed ends point away from each other, the same segment, a circle, a middle
+        // segment with a line, too big.
         json!({ "h1": p, "p1": [5, 0], "h2": p, "p2": [0, 15], "radius": 1 }),
         json!({ "h1": p, "p1": [5, 0], "h2": p, "p2": [6, 0], "radius": 1 }),
         json!({ "h1": p, "p1": [5, 0], "h2": c, "p2": [31, 0], "radius": 1 }),
