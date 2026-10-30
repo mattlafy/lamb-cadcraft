@@ -36,11 +36,26 @@ fn text_box(t: &crate::Text, len: usize) -> Bounds2 {
 /// as when drawing. Dimensional constraints of dynamic blocks (layer `*ADSK_CONSTRAINTS`) and the
 /// entities a visibility state hides are invisible this way, and they sit far from the block's
 /// geometry in real drawings. Layer "0" takes the insert's layer, which the caller has checked.
-fn in_block_visible(d: &Drawing, e: &Entity) -> bool {
+/// `off_counts`: a layer turned off counts too, as in the drawing's extents ([`extent_bounds`]).
+fn in_block_visible(d: &Drawing, e: &Entity, off_counts: bool) -> bool {
     // Attribute definitions are not drawn in an insert (its attribs are, see below).
-    !matches!(e.kind, EntityKind::AttDef(_))
-        && e.common.visible
-        && (e.common.layer == "0" || d.layer(&e.common.layer).is_none_or(crate::Layer::visible))
+    !matches!(e.kind, EntityKind::AttDef(_)) && e.common.visible && layer_counts(d, &e.common.layer, off_counts)
+}
+
+/// Whether what lies on `layer` inside an insert counts: layer "0" takes the insert's layer, which
+/// the caller has checked; a frozen layer never counts, one turned off only with `off_counts`.
+fn layer_counts(d: &Drawing, layer: &str, off_counts: bool) -> bool {
+    layer == "0" || d.layer(layer).is_none_or(|l| !l.frozen && (l.on || off_counts))
+}
+
+/// The layer an insert's attribute draws on, as the renderer takes it: its own, else its
+/// definition's (layer "0" being the insert's).
+fn attrib_layer<'a>(d: &'a Drawing, ins: &crate::Insert, a: &'a crate::Attrib) -> &'a str {
+    a.props.layer.as_deref().unwrap_or_else(|| {
+        d.block(&ins.block)
+            .and_then(|blk| blk.entities.iter().find(|be| matches!(&be.kind, EntityKind::AttDef(ad) if ad.tag.eq_ignore_ascii_case(&a.tag))))
+            .map_or("0", |be| be.common.layer.as_str())
+    })
 }
 
 /// A text that draws no glyph (empty, or only blanks and non-breaking spaces) takes no room.
@@ -190,7 +205,21 @@ fn mtext_box(t: &crate::MText, width_factor: f64) -> Bounds2 {
     let wrap = t.width.is_finite() && t.width > 0.0;
     // Each line's width and tallest character (in text heights).
     let mut lines: Vec<(f64, f64)> = Vec::new();
+    // The widest paragraph if nothing wrapped.
+    let mut unwrapped = 0.0f64;
     for (atoms, end_height) in mtext_atoms(&t.contents, h0, width_factor) {
+        let mut run = 0.0f64;
+        let mut gap = 0.0f64;
+        for a in &atoms {
+            match *a {
+                MTextAtom::Space(f) => gap += cw * f,
+                MTextAtom::Word { width, .. } => {
+                    run += if run > 0.0 { gap } else { 0.0 } + cw * width;
+                    gap = 0.0;
+                }
+            }
+        }
+        unwrapped = unwrapped.max(run);
         let mut line: Option<(f64, f64)> = None;
         let mut space = None;
         for a in atoms {
@@ -217,7 +246,9 @@ fn mtext_box(t: &crate::MText, width_factor: f64) -> Bounds2 {
         lines.push(line.unwrap_or((0.0, end_height)));
     }
     let longest = lines.iter().map(|l| l.0).fold(0.0, f64::max);
-    let mut w = if wrap { t.width.max(longest) } else { longest.max(cw) };
+    // The wrap width only narrows the box: a garbage width must not stretch the drawing extents
+    // past the unwrapped text (#2465); a word wider than the column still widens it.
+    let mut w = if wrap { t.width.min(unwrapped.max(cw)).max(longest) } else { longest.max(cw) };
     // The first line is as tall as its tallest character; each further one adds 5/3 of its own
     // (or, spaced exactly, of the text height) times the spacing.
     let ls = if t.line_spacing.is_finite() && t.line_spacing > 0.0 { t.line_spacing } else { 1.0 };
@@ -256,16 +287,27 @@ fn mtext_box(t: &crate::MText, width_factor: f64) -> Bounds2 {
     Bounds2::from_points(pts)
 }
 
+/// The box of what `e` draws (block contents on layers turned off left out).
 pub fn entity_bounds(d: &Drawing, e: &Entity, depth: usize) -> Bounds2 {
+    bounds_of(d, e, depth, false)
+}
+
+/// The box `e` takes in the drawing's extents: as [`entity_bounds`], but block contents on a layer
+/// turned off count, as AutoCAD 2024's ZOOM Extents counts them (a frozen layer's do not).
+pub fn extent_bounds(d: &Drawing, e: &Entity) -> Bounds2 {
+    bounds_of(d, e, 0, true)
+}
+
+fn bounds_of(d: &Drawing, e: &Entity, depth: usize, off_counts: bool) -> Bounds2 {
     // A top-level annotative object measures as it draws at the current annotation scale.
     if depth == 0 {
         match d.anno_draw(e) {
             crate::AnnoDraw::Plain => {}
             crate::AnnoDraw::Hidden => return Bounds2::EMPTY,
-            crate::AnnoDraw::Scaled(f) => return bounds_in(d, &crate::anno_scaled(e, f), 0, &mut HashMap::new()),
+            crate::AnnoDraw::Scaled(f) => return bounds_in(d, &crate::anno_scaled(e, f), 0, &mut HashMap::new(), off_counts),
         }
     }
-    bounds_in(d, e, depth, &mut HashMap::new())
+    bounds_in(d, e, depth, &mut HashMap::new(), off_counts)
 }
 
 /// [`entity_bounds`] with the bounds of block contents (in block coordinates) already computed,
@@ -274,11 +316,16 @@ pub fn entity_bounds(d: &Drawing, e: &Entity, depth: usize) -> Bounds2 {
 /// definition per depth instead of one per reference (which grows exponentially with the nesting
 /// depth). The depth is part of the key because [`MAX_BLOCK_DEPTH`] cuts a deep visit short: its
 /// bounds must not stand in for a shallower reference to the same block (#706).
-fn bounds_in<'a>(d: &'a Drawing, e: &Entity, depth: usize, blocks: &mut HashMap<(&'a str, usize), Bounds2>) -> Bounds2 {
+fn bounds_in<'a>(d: &'a Drawing, e: &Entity, depth: usize, blocks: &mut HashMap<(&'a str, usize), Bounds2>, off_counts: bool) -> Bounds2 {
     match &e.kind {
         EntityKind::Table(t) if t.is_broken() => t.bounds(),
         EntityKind::Text(t) if blank(&t.value) => Bounds2::EMPTY,
         EntityKind::MText(t) if blank(&t.contents) => Bounds2::EMPTY,
+        // Text that matches the layout's orientation is drawn upright (#2498).
+        EntityKind::Text(t) if e.common.matches_layout_orientation() => {
+            text_box(&crate::Text { rotation: 0.0, ..t.clone() }, t.value.chars().count())
+        }
+        EntityKind::MText(t) if e.common.matches_layout_orientation() => mtext_bounds(d, &crate::MText { rotation: 0.0, ..t.clone() }),
         EntityKind::Text(t) => text_box(t, t.value.chars().count()),
         EntityKind::AttDef(a) => text_box(&a.text, a.tag.chars().count()),
         EntityKind::MText(t) => mtext_bounds(d, t),
@@ -296,8 +343,8 @@ fn bounds_in<'a>(d: &'a Drawing, e: &Entity, depth: usize, blocks: &mut HashMap<
                     Some(b) => *b,
                     None => {
                         let mut inner = Bounds2::EMPTY;
-                        for be in blk.entities.iter().filter(|be| in_block_visible(d, be)) {
-                            inner = inner.union(&bounds_in(d, be, depth + 1, blocks));
+                        for be in blk.entities.iter().filter(|be| in_block_visible(d, be, off_counts)) {
+                            inner = inner.union(&bounds_in(d, be, depth + 1, blocks, off_counts));
                         }
                         blocks.insert((blk.name.as_str(), depth), inner);
                         inner
@@ -312,7 +359,7 @@ fn bounds_in<'a>(d: &'a Drawing, e: &Entity, depth: usize, blocks: &mut HashMap<
                 }
             }
             for a in &ins.attribs {
-                if !a.invisible {
+                if !a.invisible && layer_counts(d, attrib_layer(d, ins, a), off_counts) {
                     b = b.union(&match a.multiline_text() {
                         Some(m) => mtext_bounds(d, &m),
                         None => text_box(&a.text, a.text.value.chars().count()),
@@ -353,8 +400,8 @@ fn bounds_in<'a>(d: &'a Drawing, e: &Entity, depth: usize, blocks: &mut HashMap<
                     Some(cached) => *cached,
                     None => {
                         let mut inner = Bounds2::EMPTY;
-                        for be in blk.entities.iter().filter(|be| in_block_visible(d, be)) {
-                            inner = inner.union(&bounds_in(d, be, depth + 1, blocks));
+                        for be in blk.entities.iter().filter(|be| in_block_visible(d, be, off_counts)) {
+                            inner = inner.union(&bounds_in(d, be, depth + 1, blocks, off_counts));
                         }
                         blocks.insert((blk.name.as_str(), depth), inner);
                         inner
@@ -374,7 +421,7 @@ fn bounds_in<'a>(d: &'a Drawing, e: &Entity, depth: usize, blocks: &mut HashMap<
             }
             if let Some(ins) = &m.block {
                 let be = Entity { handle: e.handle, common: e.common.clone(), kind: EntityKind::Insert(ins.clone()) };
-                b = b.union(&bounds_in(d, &be, depth, blocks));
+                b = b.union(&bounds_in(d, &be, depth, blocks, off_counts));
             }
             b
         }
@@ -490,6 +537,38 @@ mod tests {
         entity_bounds(&Drawing::default(), &Entity::new(crate::Handle(1), kind), 0)
     }
 
+    fn mtext(contents: &str, width: f64) -> crate::MText {
+        crate::MText {
+            insert: Vec3::new(10.0, 10.0, 0.0),
+            height: 2.5,
+            width,
+            attach: 1,
+            rotation: 0.0,
+            style: "Standard".into(),
+            contents: contents.into(),
+            line_spacing: 1.0,
+            line_spacing_exact: false,
+            columns: None,
+        }
+    }
+
+    /// A garbage wrap width only narrows an MTEXT's box, never widens it: a huge group 41 must not
+    /// stretch the drawing extents (#2465).
+    #[test]
+    fn a_huge_mtext_wrap_width_does_not_inflate_the_extents() {
+        let b = bounds(EntityKind::MText(mtext("AB", 300_000_009_519_104.0)));
+        // "AB" at height 2.5 is 2 chars * 0.9 * 2.5 = 4.5 wide.
+        assert!(b.max.x <= 10.0 + 4.5 + 1e-9, "box ends at x = {}", b.max.x);
+        assert!(b.min.x >= 10.0 - 1e-9);
+    }
+
+    /// A wrap width narrower than the text still bounds the box to that width.
+    #[test]
+    fn a_narrow_mtext_wrap_width_still_sets_the_box_width() {
+        // Two-character words, 4.5 wide each at height 2.5, wrapping one to a 5-wide line.
+        let b = bounds(EntityKind::MText(mtext("AB AB AB AB AB", 5.0)));
+        assert!((b.max.x - b.min.x - 5.0).abs() < 1e-9, "width {}", b.max.x - b.min.x);
+    }
     #[test]
     fn right_justified_text_is_left_of_alignment_point() {
         let b = bounds(EntityKind::Text(text(HAlign::Right, VAlign::Baseline)));
