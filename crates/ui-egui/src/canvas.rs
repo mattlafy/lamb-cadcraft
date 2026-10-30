@@ -29,6 +29,7 @@ use cycle::{CycleList, cycle_badge, cycle_click, cycle_list, shift_space_cycle};
 pub(crate) use draw::{Look, draw_highlight, draw_list};
 use draw::{Press, PressPick, Release, clip_infinite, track_press};
 use draw::{draw_drag_gpu, draw_highlight_gpu, draw_list_gpu, list_mesh_key, selection_area_fill};
+use draw::{draw_pick_preview, pick_lists}; // LAMB (fork): T561
 use dyn_boxes::dynamic_input;
 pub(crate) use dyn_boxes::length_units;
 use grid::draw_grid;
@@ -508,7 +509,21 @@ fn paint_drawing(frame: &mut CanvasPaint<'_>, bg: Rgb) -> bool {
     masked
 }
 
-fn paint_content_highlights(frame: &mut CanvasPaint<'_>, bg: Rgb, sel: &[Handle], preview_look: Look, selection_look: Option<Look>) {
+// LAMB (fork): T561 — while a pick preview shows, it replaces the whole-object hover highlight.
+/// The object to draw the hover highlight on: the hovered one unless it is selected, and none
+/// while a command's pick preview (`picking`) shows what the pick acts on instead.
+fn hover_target(hover: Option<Handle>, sel: &[Handle], picking: bool) -> Option<Handle> {
+    hover.filter(|h| !picking && !sel.contains(h))
+}
+
+fn paint_content_highlights(
+    frame: &mut CanvasPaint<'_>,
+    bg: Rgb,
+    sel: &[Handle],
+    preview_look: Look,
+    selection_look: Option<Look>,
+    picking: bool, // LAMB (fork): T561
+) {
     // The active viewport's contents, drawn apart from the layout's list, under its own objects.
     // `masked`: its outline is in the stencil buffer this frame.
     let masked = paint_drawing(frame, bg);
@@ -546,9 +561,7 @@ fn paint_content_highlights(frame: &mut CanvasPaint<'_>, bg: Rgb, sel: &[Handle]
             });
             let clipped = painter.with_clip_rect(bounds.intersect(rect));
             let c = &mut app.canvas;
-            if let Some(h) = c.hover
-                && !sel.contains(&h)
-            {
+            if let Some(h) = hover_target(c.hover, sel, picking) {
                 c.vp_hover.update(st, &[h], scale);
                 let list = &c.vp_hover.list;
                 draw_highlight(&clipped, &xf, list, &(0..list.prims.len()).collect::<Vec<_>>(), t.hover, preview_look);
@@ -573,9 +586,7 @@ fn paint_content_highlights(frame: &mut CanvasPaint<'_>, bg: Rgb, sel: &[Handle]
             }
         }
     } else if let CanvasState { list: Some(list), list_gen, prim_index, hover, gpu, hl_key, hl_slot, hl_origin, hl_infinite, .. } = &mut app.canvas {
-        if let Some(h) = *hover
-            && !sel.contains(&h)
-        {
+        if let Some(h) = hover_target(*hover, sel, picking) {
             draw_highlight(painter, &xf, list, &prim_index.prims(*list_gen, list, &[h]), t.hover, preview_look);
         }
         if let Some(look) = selection_look {
@@ -1233,6 +1244,8 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
     // How the object under the cursor and the selected ones are highlighted (PREVIEWEFFECT,
     // HIGHLIGHT, SELECTIONEFFECT); with HIGHLIGHT off only their grips show.
     let (preview_look, selection_look) = (Look::preview(&app.session.settings), Look::selection(&app.session.settings));
+    // LAMB (fork): T561 — FILLET/CHAMFER's pick preview, once per frame.
+    let pick = app.canvas.cursor.and_then(|c| app.session.pick_preview(c));
     paint_content_highlights(
         &mut CanvasPaint {
             app,
@@ -1258,6 +1271,7 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
         &sel,
         preview_look,
         selection_look,
+        pick.is_some(),
     );
     app.canvas.draw_ms = crate::now_ms() - t0;
     compare::paint(app, ui.ctx(), painter, &xf_paper, rect);
@@ -1339,6 +1353,12 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
             let list = rebuilt_preview(&st.doc, ents.iter(), scale);
             draw_list(painter, &xf, &list, bg, false);
         }
+    }
+    // LAMB (fork): T561 — the pick preview: removed pieces greyed, added ones, the picked parts.
+    if let Some(pp) = &pick
+        && let Ok(st) = app.session.state()
+    {
+        draw_pick_preview(painter, &xf, &pick_lists(&st.doc, pp, scale), bg, t.text, t.hover, preview_look);
     }
     // Pending selection window.
     if let (Some(pw), Some(c)) = (app.session.pending_window, raw_world) {

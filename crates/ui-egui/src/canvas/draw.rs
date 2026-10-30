@@ -439,6 +439,43 @@ pub(super) fn track_press(
     (became_far, releases)
 }
 
+// LAMB (fork): T561 — FILLET/CHAMFER's pick preview (patch 32, `Session::pick_preview`).
+/// The three lists a pick preview draws, rebuilt with the current properties.
+pub(super) struct PickLists {
+    /// What the pick would remove: blanked, then drawn greyed and dashed.
+    pub removed: DisplayList,
+    /// What the pick would draw: drawn like the rubber band.
+    pub added: DisplayList,
+    /// The picked and hovered parts: drawn in the hover highlight.
+    pub highlight: DisplayList,
+}
+
+pub(super) fn pick_lists(doc: &cadcraft_doc::Drawing, pp: &cadcraft_engine::PickPreview, scale: f64) -> PickLists {
+    PickLists {
+        removed: super::rebuilt_preview(doc, pp.removed.iter(), scale),
+        added: super::rebuilt_preview(doc, pp.added.iter(), scale),
+        highlight: super::rebuilt_preview(doc, pp.highlight.iter(), scale),
+    }
+}
+
+/// The grey a removed piece is drawn in: 35 % of the way from the background to the foreground.
+pub(super) fn removed_grey(bg: Rgb, fg: Color32) -> Color32 {
+    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * 0.35).round() as u8;
+    Color32::from_rgb(mix(bg.0, fg.r()), mix(bg.1, fg.g()), mix(bg.2, fg.b()))
+}
+
+/// Draw a pick preview over the drawing: the removed pieces blanked in `bg` and greyed, the added
+/// ones as the rubber band draws, then the highlighted parts in `hover` with `look`. Blanking also
+/// hides other lines where they cross a removed piece, while the preview shows.
+pub(super) fn draw_pick_preview(p: &egui::Painter, xf: &Xf, lists: &PickLists, bg: Rgb, fg: Color32, hover: Color32, look: Look) {
+    let all = |l: &DisplayList| (0..l.prims.len()).collect::<Vec<_>>();
+    let removed = all(&lists.removed);
+    draw_highlight(p, xf, &lists.removed, &removed, color32(bg), Look { width: look.width + 2.0, dashed: false });
+    draw_highlight(p, xf, &lists.removed, &removed, removed_grey(bg, fg), Look { width: look.width, dashed: true });
+    draw_list(p, xf, &lists.added, bg, false);
+    draw_highlight(p, xf, &lists.highlight, &all(&lists.highlight), hover, look);
+}
+
 #[cfg(test)]
 mod highlight_stability_tests {
     use super::*;

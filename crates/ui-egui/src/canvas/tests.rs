@@ -325,3 +325,37 @@ fn dynamic_input_distance_follows_the_drawing_units() {
     let text = painted_text(&mut app, &ctx, at);
     assert!(text.contains(&format!("   {}  <", arch(c.len()))), "no {} in:\n{text}", arch(c.len()));
 }
+
+// LAMB (fork): T561
+/// FILLET with a first pick on one line, hovering the other: the frame's pick-preview lists are
+/// all non-empty, the hovered line gets no whole-object hover highlight, and drawing them works.
+#[test]
+fn fillet_pick_preview_replaces_the_hover_highlight() {
+    let mut s = cadcraft_engine::Session::new();
+    s.execute("line", &serde_json::json!({"points": [[0, 0], [10, 0]]})).unwrap();
+    s.execute("line", &serde_json::json!({"points": [[0, 0], [0, 10]]})).unwrap();
+    s.doc_mut().unwrap().header.set_f64("FILLETRAD", 2.0);
+    // Nothing running: the normal rollover.
+    assert!(s.pick_preview(Vec2::new(0.0, 6.0)).is_none());
+    s.start("fillet").unwrap();
+    s.input(Input::Point(Vec2::new(6.0, 0.0))).unwrap();
+    assert!(s.running.is_some(), "{:?}", s.log);
+    let pp = s.pick_preview(Vec2::new(0.0, 6.0)).expect("a pick preview");
+    let lists = pick_lists(s.doc().unwrap(), &pp, 1.0);
+    assert!(!lists.removed.prims.is_empty());
+    assert!(!lists.added.prims.is_empty());
+    assert!(!lists.highlight.prims.is_empty());
+    // The hovered line's whole-object highlight is skipped while the preview shows.
+    let hovered = Handle(2);
+    assert_eq!(hover_target(Some(hovered), &[], true), None);
+    assert_eq!(hover_target(Some(hovered), &[], false), Some(hovered));
+    assert_eq!(hover_target(Some(hovered), &[hovered], false), None);
+    // The grey sits between the background and the foreground.
+    let g = draw::removed_grey(Rgb(0, 0, 0), Color32::from_rgb(200, 200, 200));
+    assert_eq!(g, Color32::from_rgb(70, 70, 70));
+    let rect = Rect::from_min_size(Pos2::ZERO, vec2(200.0, 100.0));
+    let xf = Xf { rect, center: Vec2::new(5.0, 5.0), scale: 10.0, twist: 0.0 };
+    let painter = egui::Painter::new(egui::Context::default(), egui::LayerId::background(), rect);
+    let look = Look { width: 1.0, dashed: true };
+    draw_pick_preview(&painter, &xf, &lists, Rgb(0, 0, 0), Color32::WHITE, Color32::YELLOW, look);
+}
