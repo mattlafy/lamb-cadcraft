@@ -114,4 +114,3 @@ fn a_pan_drag_stopped_by_escape_leaves_the_next_drag_placing_a_point() {
     h.run_steps(2);
     assert_eq!(lines(&h), 1, "the drag after an Escape-stopped pan drag placed no point");
 }
-
