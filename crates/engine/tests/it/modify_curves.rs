@@ -2,10 +2,10 @@
 
 use std::f64::consts::{FRAC_PI_2, PI};
 
+use cadcraft_engine::Session;
 use cadcraft_engine::doc::{EntityKind, Handle};
 use cadcraft_engine::geom::{Ellipse, Spline, Vec2};
-use cadcraft_engine::Session;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn h(r: &Value) -> String {
     r["handle"].as_str().or_else(|| r["handles"][0].as_str()).unwrap().to_string()
