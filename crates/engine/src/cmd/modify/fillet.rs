@@ -360,8 +360,8 @@ impl Interactive for FilletM {
                 }
                 match self.first {
                     None => {
+                        // Not selected: the pick preview highlights the picked part instead.
                         self.first = Some((h, p));
-                        s.set_selection(vec![h]);
                         Ok(Step::Continue)
                     }
                     Some((h1, p1)) => {
@@ -385,6 +385,146 @@ impl Interactive for FilletM {
             _ => Ok(Step::Continue),
         }
     }
+    /// LAMB fork patch 32: at the select prompts, the picked and hovered parts (a polyline's
+    /// segment, else the object), and with a first pick what picking here would remove and draw,
+    /// from a dry run of the very call a click makes, on a copy-on-write scratch session.
+    fn pick_preview(&self, s: &Session, cursor: Vec2) -> Option<crate::PickPreview> {
+        if self.asking > 0 || self.ask.is_some() || self.polyline {
+            return None;
+        }
+        let d = s.doc().ok()?;
+        let ap = s.pixel_size() * s.settings.pickbox.max(1.0) * 1.5;
+        let hovered = crate::select::pick(d, &s.space(), cursor, ap);
+        let common = s.current_common();
+        let ent = |kind: EntityKind| Entity { handle: Handle(0), common: common.clone(), kind };
+        let part = |h: Handle, p: Vec2| d.entity(h).map(|e| part_at(&e.kind, p));
+        let mut out = crate::PickPreview::default();
+        if let Some((h1, p1)) = self.first {
+            out.highlight.extend(part(h1, p1).map(ent));
+        }
+        if let Some(h) = hovered {
+            out.highlight.extend(part(h, cursor).map(ent));
+        }
+        let (Some((h1, p1)), Some(h)) = (self.first, hovered) else {
+            return (!out.highlight.is_empty()).then_some(out);
+        };
+        let r = d.header.f64("FILLETRAD", 0.0);
+        let cut = if self.chamfer { Some(chamfer_cut(s).ok()?) } else { None };
+        let trim = trim_mode(s);
+        let mut scratch = s.scratch().ok()?;
+        let Ok(made) = fillet_corner(&mut scratch, h1, p1, h, cursor, r, cut, trim) else { return Some(out) };
+        let after = scratch.doc().ok()?;
+        let mut handles = vec![h1];
+        for x in [Some(h), made].into_iter().flatten() {
+            if !handles.contains(&x) {
+                handles.push(x);
+            }
+        }
+        for x in handles {
+            let of = |dr: &cadcraft_doc::Drawing| dr.entity(x).map(|e| pieces(&e.kind)).unwrap_or_default();
+            let (removed, added) = piece_diff(&of(d), &of(after));
+            if removed.len() <= PREVIEW_REMOVED_MAX {
+                out.removed.extend(removed.into_iter().map(&ent));
+            }
+            out.added.extend(added.into_iter().map(&ent));
+        }
+        Some(out)
+    }
+}
+
+/// Most pieces one object greys out in a pick preview; past it, that object greys out nothing.
+const PREVIEW_REMOVED_MAX: usize = 2000;
+
+fn segment_kind(sg: &cadcraft_geom::Segment) -> EntityKind {
+    match sg {
+        cadcraft_geom::Segment::Line(l) => line(l.a, l.b),
+        cadcraft_geom::Segment::Arc { arc: a, .. } => arc(a),
+    }
+}
+
+fn pline_segments(pl: &cadcraft_doc::LwPolyline) -> Vec<cadcraft_geom::Segment> {
+    cadcraft_geom::Polyline { vertices: pl.vertices.clone(), closed: pl.closed }.segments()
+}
+
+/// The pieces a pick preview compares and draws: a polyline's segments as lines and arcs, any
+/// other object whole.
+fn pieces(k: &EntityKind) -> Vec<EntityKind> {
+    match k {
+        EntityKind::LwPolyline(pl) => pline_segments(pl).iter().map(segment_kind).collect(),
+        _ => vec![k.clone()],
+    }
+}
+
+/// The part of an object a pick at `p` names: a polyline's nearest segment, else the object.
+fn part_at(k: &EntityKind, p: Vec2) -> EntityKind {
+    if let EntityKind::LwPolyline(pl) = k {
+        let segs = pline_segments(pl);
+        if let Some(sg) = crate::cmd::modify2::picked_segment(&segs, p).and_then(|i| segs.get(i)) {
+            return segment_kind(sg);
+        }
+    }
+    k.clone()
+}
+
+/// A line's or an arc's end points.
+fn piece_ends(k: &EntityKind) -> Option<(Vec2, Vec2)> {
+    match k {
+        EntityKind::Line(l) => Some((l.a.xy(), l.b.xy())),
+        EntityKind::Arc(a) => {
+            let g = Arc::new(a.center.xy(), a.radius, a.start, a.end);
+            Some((g.start_point(), g.end_point()))
+        }
+        _ => None,
+    }
+}
+
+/// Same kind, end points equal in either direction, and for arcs the same centre and radius.
+fn same_piece(a: &EntityKind, b: &EntityKind) -> bool {
+    let tol = cadcraft_geom::EPS;
+    let ends = || match (piece_ends(a), piece_ends(b)) {
+        (Some((a0, a1)), Some((b0, b1))) => (a0.near(b0, tol) && a1.near(b1, tol)) || (a0.near(b1, tol) && a1.near(b0, tol)),
+        _ => false,
+    };
+    match (a, b) {
+        (EntityKind::Line(_), EntityKind::Line(_)) => ends(),
+        (EntityKind::Arc(x), EntityKind::Arc(y)) => x.center.xy().near(y.center.xy(), tol) && (x.radius - y.radius).abs() <= tol && ends(),
+        (EntityKind::Line(_) | EntityKind::Arc(_), _) | (_, EntityKind::Line(_) | EntityKind::Arc(_)) => false,
+        _ => a == b,
+    }
+}
+
+/// The hash bucket of a piece: its end points rounded and ordered (other kinds share one bucket).
+fn piece_key(k: &EntityKind) -> [i64; 4] {
+    let q = |v: f64| (v * 1e6).round() as i64;
+    match piece_ends(k) {
+        Some((a, b)) => {
+            let (a, b) = ((q(a.x), q(a.y)), (q(b.x), q(b.y)));
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            [lo.0, lo.1, hi.0, hi.1]
+        }
+        None => [i64::MIN; 4],
+    }
+}
+
+/// The pieces in `before` with no equal piece in `after` (removed), and the reverse (added).
+fn piece_diff(before: &[EntityKind], after: &[EntityKind]) -> (Vec<EntityKind>, Vec<EntityKind>) {
+    let mut buckets: std::collections::HashMap<[i64; 4], Vec<usize>> = std::collections::HashMap::new();
+    for (i, k) in after.iter().enumerate() {
+        buckets.entry(piece_key(k)).or_default().push(i);
+    }
+    let mut used = vec![false; after.len()];
+    let mut removed = Vec::new();
+    for b in before {
+        let hit = buckets
+            .get(&piece_key(b))
+            .and_then(|v| v.iter().copied().find(|i| !used.get(*i).copied().unwrap_or(true) && after.get(*i).is_some_and(|a| same_piece(b, a))));
+        match hit.and_then(|i| used.get_mut(i)) {
+            Some(u) => *u = true,
+            None => removed.push(b.clone()),
+        }
+    }
+    let added = after.iter().zip(&used).filter(|(_, u)| !**u).map(|(k, _)| k.clone()).collect();
+    (removed, added)
 }
 
 impl FilletM {

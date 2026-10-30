@@ -57,7 +57,7 @@ fn push_point(vs: &mut Vec<PolyVertex>, v: PolyVertex) {
 }
 
 /// The index of the polyline segment nearest `p`.
-fn picked_segment(segs: &[Segment], p: Vec2) -> Option<usize> {
+pub(crate) fn picked_segment(segs: &[Segment], p: Vec2) -> Option<usize> {
     (0..segs.len()).min_by(|a, b| {
         let d = |i: &usize| segs.get(*i).map_or(f64::INFINITY, |s| s.closest(p).dist(p));
         d(a).total_cmp(&d(b))

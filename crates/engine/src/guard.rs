@@ -119,6 +119,15 @@ impl Interactive for Guarded {
             None
         })
     }
+    fn pick_preview(&self, s: &Session, cursor: Vec2) -> Option<crate::prompt::PickPreview> {
+        if self.broken.get().is_some() {
+            return None;
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.pick_preview(s, cursor))).unwrap_or_else(|_| {
+            self.broken.set(Some("panic in preview"));
+            None
+        })
+    }
 }
 
 #[cfg(test)]

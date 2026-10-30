@@ -20,7 +20,7 @@ mod curve_edits;
 mod fillet_pline;
 mod mocoro;
 pub(crate) use curve_edits::{closed_kind, join_close, join_curves};
-pub(crate) use fillet_pline::{ChamferDistances, fillet_pline};
+pub(crate) use fillet_pline::{ChamferDistances, fillet_pline, picked_segment};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![

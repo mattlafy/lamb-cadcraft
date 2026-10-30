@@ -510,6 +510,29 @@ impl Session {
         out
     }
 
+    /// What picking under the cursor would act on and do in the running command (LAMB fork
+    /// patch 32, [`Interactive::pick_preview`]). `None`: the normal rollover.
+    pub fn pick_preview(&self, cursor: Vec2) -> Option<crate::PickPreview> {
+        self.running.as_ref()?.machine.pick_preview(self, cursor)
+    }
+
+    /// A session over the active drawing for dry runs (LAMB fork patch 32): it shares the
+    /// drawing's `Arc` (an edit copies one chunk of its store) and its space, never walking the
+    /// drawing, so it costs the same whatever the drawing's size.
+    pub(crate) fn scratch(&self) -> Result<Session> {
+        let live = self.state()?;
+        let mut st = crate::DocState::new(Drawing::default(), &live.title, None);
+        st.doc = live.doc.clone();
+        st.saved = live.doc.clone();
+        st.space = live.space.clone();
+        st.mspace = live.mspace;
+        let mut s = Session::empty();
+        s.settings = self.settings.clone();
+        s.viewport_px = self.viewport_px;
+        s.docs.push(st);
+        Ok(s)
+    }
+
     /// What the drawing area shows in place of the drawing while a command runs (DVIEW's preview
     /// set, see [`Interactive::display_only`]), also while a transparent command interrupts it.
     /// `None`: the drawing.

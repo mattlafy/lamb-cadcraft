@@ -702,3 +702,210 @@ fn polyline_fillet_refusals_leave_it_alone() {
     }
     assert_eq!(count(&s), 3);
 }
+
+// ---------------- FILLET / CHAMFER pick preview (LAMB fork patch 32) ----------------
+
+use cadcraft_engine::{Input, PickPreview};
+
+fn p(x: f64, y: f64) -> Vec2 {
+    Vec2::new(x, y)
+}
+
+/// A line's end points, or an arc's centre in both slots.
+fn piece(k: &EntityKind) -> (&'static str, Vec2, Vec2) {
+    match k {
+        EntityKind::Line(l) => ("line", l.a.xy(), l.b.xy()),
+        EntityKind::Arc(a) => ("arc", a.center.xy(), a.center.xy()),
+        k => panic!("not a piece: {k:?}"),
+    }
+}
+
+fn kinds(v: &[cadcraft_engine::doc::Entity]) -> Vec<&'static str> {
+    let mut k: Vec<_> = v.iter().map(|e| piece(&e.kind).0).collect();
+    k.sort_unstable();
+    k
+}
+
+fn has_line(v: &[cadcraft_engine::doc::Entity], a: Vec2, b: Vec2) -> bool {
+    v.iter().any(|e| matches!(piece(&e.kind), ("line", x, y) if (x.near(a, 1e-9) && y.near(b, 1e-9)) || (x.near(b, 1e-9) && y.near(a, 1e-9))))
+}
+
+/// FILLET (or CHAMFER) started, with a first pick at `first` when given, previewed at `at`.
+fn preview_at(s: &mut Session, cmd: &str, first: Option<Vec2>, at: Vec2) -> PickPreview {
+    s.start(cmd).unwrap();
+    if let Some(f) = first {
+        s.input(Input::Point(f)).unwrap();
+        assert!(s.running.is_some(), "{:?}", s.log);
+    }
+    s.pick_preview(at).expect("a pick preview")
+}
+
+fn radius(s: &mut Session, r: f64) {
+    s.doc_mut().unwrap().header.set_f64("FILLETRAD", r);
+}
+
+const TRIANGLE: [[f64; 2]; 4] = [[3.0, 0.0], [10.0, 0.0], [0.0, 10.0], [0.0, 3.0]];
+
+#[test]
+fn pick_preview_highlights_the_hovered_segment() {
+    let mut s = Session::new();
+    pline(&mut s, &TRIANGLE, false);
+    let pv = preview_at(&mut s, "fillet", None, p(6.0, 0.0));
+    assert_eq!(pv.highlight.len(), 1);
+    assert!(has_line(&pv.highlight, p(3.0, 0.0), p(10.0, 0.0)), "{:?}", pv.highlight);
+    assert!(pv.removed.is_empty() && pv.added.is_empty());
+    // Nothing under the cursor and nothing picked: the normal rollover.
+    assert!(s.pick_preview(p(50.0, 50.0)).is_none());
+}
+
+#[test]
+fn pick_preview_closes_the_open_triangle() {
+    let mut s = Session::new();
+    pline(&mut s, &TRIANGLE, false);
+    radius(&mut s, 1.0);
+    let pv = preview_at(&mut s, "fillet", Some(p(6.0, 0.0)), p(0.0, 6.0));
+    assert_eq!(pv.highlight.len(), 2);
+    assert!(has_line(&pv.highlight, p(3.0, 0.0), p(10.0, 0.0)) && has_line(&pv.highlight, p(0.0, 10.0), p(0.0, 3.0)));
+    // The trimmed legs go; the closing corner and the legs' new extents are drawn.
+    assert_eq!(kinds(&pv.removed), vec!["line", "line"], "{:?}", pv.removed);
+    assert!(has_line(&pv.removed, p(3.0, 0.0), p(10.0, 0.0)) && has_line(&pv.removed, p(0.0, 10.0), p(0.0, 3.0)));
+    assert_eq!(kinds(&pv.added), vec!["arc", "line", "line"], "{:?}", pv.added);
+    assert!(pv.added.iter().any(|e| matches!(piece(&e.kind), ("arc", c, _) if c.near(p(1.0, 1.0), 1e-9))));
+    assert!(has_line(&pv.added, p(1.0, 0.0), p(10.0, 0.0)) && has_line(&pv.added, p(0.0, 10.0), p(0.0, 1.0)));
+    // Off everything, the first pick still shows.
+    let pv = s.pick_preview(p(50.0, 50.0)).unwrap();
+    assert_eq!(pv.highlight.len(), 1);
+    assert!(pv.removed.is_empty() && pv.added.is_empty());
+}
+
+#[test]
+fn pick_preview_works_for_any_pair_a_click_would_take() {
+    // Line and line.
+    let mut s = Session::new();
+    s.execute("line", &json!({ "points": [[0, 0], [8, 0]] })).unwrap();
+    s.execute("line", &json!({ "points": [[10, 2], [10, 10]] })).unwrap();
+    radius(&mut s, 1.0);
+    let pv = preview_at(&mut s, "fillet", Some(p(4.0, 0.0)), p(10.0, 8.0));
+    assert_eq!(kinds(&pv.added), vec!["arc", "line", "line"], "{:?}", pv.added);
+    assert_eq!(pv.removed.len(), 2);
+    // Polyline and line.
+    let mut s = Session::new();
+    pline(&mut s, &[[0.0, 5.0], [0.0, 0.0], [8.0, 0.0]], false);
+    s.execute("line", &json!({ "points": [[10, 2], [10, 10]] })).unwrap();
+    radius(&mut s, 1.0);
+    let pv = preview_at(&mut s, "fillet", Some(p(4.0, 0.0)), p(10.0, 8.0));
+    assert!(pv.added.iter().any(|e| piece(&e.kind).0 == "arc"), "{:?}", pv.added);
+    // The line joins the polyline: the line goes, the polyline's end segment is lengthened.
+    assert!(has_line(&pv.removed, p(10.0, 2.0), p(10.0, 10.0)) && has_line(&pv.removed, p(0.0, 0.0), p(8.0, 0.0)));
+    assert!(has_line(&pv.added, p(10.0, 1.0), p(10.0, 10.0)) && has_line(&pv.added, p(0.0, 0.0), p(9.0, 0.0)));
+    assert!(!has_line(&pv.added, p(0.0, 5.0), p(0.0, 0.0)) && !has_line(&pv.removed, p(0.0, 5.0), p(0.0, 0.0)));
+    // Two segments of the same polyline.
+    let mut s = Session::new();
+    pline(&mut s, &[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]], false);
+    radius(&mut s, 2.0);
+    let pv = preview_at(&mut s, "fillet", Some(p(5.0, 0.0)), p(10.0, 5.0));
+    assert_eq!(kinds(&pv.added), vec!["arc", "line", "line"], "{:?}", pv.added);
+    assert_eq!(pv.removed.len(), 2);
+}
+
+#[test]
+fn pick_preview_of_a_refused_pair_only_highlights() {
+    let mut s = Session::new();
+    s.execute("line", &json!({ "points": [[0, 0], [10, 0]] })).unwrap();
+    s.execute("line", &json!({ "points": [[0, 5], [10, 5]] })).unwrap();
+    radius(&mut s, 1.0);
+    let pv = preview_at(&mut s, "fillet", Some(p(5.0, 0.0)), p(5.0, 5.0));
+    assert_eq!(pv.highlight.len(), 2);
+    assert!(pv.removed.is_empty() && pv.added.is_empty(), "{pv:?}");
+    // The pinched triangle picked above the crossing (refused by a click too).
+    let mut s = Session::new();
+    pline(&mut s, &[[0.0, 0.0], [10.0, 0.0], [3.0, 3.0], [0.0, 10.0]], true);
+    let pv = preview_at(&mut s, "fillet", Some(p(6.5, 1.5)), p(0.0, 7.0));
+    assert_eq!(pv.highlight.len(), 2);
+    assert!(pv.removed.is_empty() && pv.added.is_empty(), "{pv:?}");
+}
+
+#[test]
+fn pick_preview_with_no_trim_and_for_chamfer() {
+    // TRIMMODE 0: only the arc is drawn, nothing goes.
+    let mut s = Session::new();
+    s.execute("line", &json!({ "points": [[0, 0], [10, 0]] })).unwrap();
+    s.execute("line", &json!({ "points": [[10, 0], [10, 10]] })).unwrap();
+    radius(&mut s, 1.0);
+    s.doc_mut().unwrap().header.set_i64("TRIMMODE", 0);
+    let pv = preview_at(&mut s, "fillet", Some(p(5.0, 0.0)), p(10.0, 5.0));
+    assert!(pv.removed.is_empty(), "{:?}", pv.removed);
+    assert_eq!(kinds(&pv.added), vec!["arc"]);
+    s.cancel();
+    // CHAMFER the same way: the chamfer line only; with trimming, the lines are shortened too.
+    s.doc_mut().unwrap().header.set_f64("CHAMFERA", 1.0);
+    s.doc_mut().unwrap().header.set_f64("CHAMFERB", 2.0);
+    let pv = preview_at(&mut s, "chamfer", Some(p(5.0, 0.0)), p(10.0, 5.0));
+    assert!(pv.removed.is_empty(), "{:?}", pv.removed);
+    assert_eq!(pv.added.len(), 1);
+    assert!(has_line(&pv.added, p(9.0, 0.0), p(10.0, 2.0)), "{:?}", pv.added);
+    s.cancel();
+    s.doc_mut().unwrap().header.set_i64("TRIMMODE", 1);
+    let pv = preview_at(&mut s, "chamfer", Some(p(5.0, 0.0)), p(10.0, 5.0));
+    assert_eq!(pv.removed.len(), 2);
+    assert!(has_line(&pv.added, p(9.0, 0.0), p(10.0, 2.0)) && has_line(&pv.added, p(0.0, 0.0), p(9.0, 0.0)));
+    assert!(has_line(&pv.added, p(10.0, 2.0), p(10.0, 10.0)));
+}
+
+#[test]
+fn pick_preview_leaves_the_drawing_and_selection_alone() {
+    let mut s = Session::new();
+    let pl = pline(&mut s, &TRIANGLE, false);
+    radius(&mut s, 1.0);
+    let before: Vec<EntityKind> = s.doc().unwrap().model.iter().map(|e| e.kind.clone()).collect();
+    let pv = preview_at(&mut s, "fillet", Some(p(6.0, 0.0)), p(0.0, 6.0));
+    assert!(!pv.added.is_empty());
+    let now: Vec<EntityKind> = s.doc().unwrap().model.iter().map(|e| e.kind.clone()).collect();
+    assert_eq!(now, before);
+    assert!(!closed(&s, &pl));
+    // The first pick is not selected: the preview's highlight shows it instead.
+    assert!(s.selection().is_empty());
+    // At an option prompt, and with the Polyline option, the normal rollover.
+    s.input(Input::Keyword("Radius".into())).unwrap();
+    assert!(s.pick_preview(p(0.0, 6.0)).is_none());
+    s.cancel();
+    s.start("fillet").unwrap();
+    s.input(Input::Keyword("Polyline".into())).unwrap();
+    assert!(s.pick_preview(p(6.0, 0.0)).is_none());
+}
+
+/// Release: `cargo test --release -p cadcraft-engine --test it pick_preview_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn pick_preview_cost_does_not_grow_with_the_drawing() {
+    let time = |lines: usize| {
+        let mut s = Session::new();
+        let mut d = s.doc().unwrap().clone();
+        for i in 0..lines {
+            let y = 100.0 + i as f64;
+            let l = cadcraft_engine::doc::Line {
+                a: cadcraft_engine::geom::Vec3::new(1000.0, y, 0.0),
+                b: cadcraft_engine::geom::Vec3::new(1010.0, y, 0.0),
+            };
+            d.add(&cadcraft_engine::doc::Space::Model, Default::default(), EntityKind::Line(l)).unwrap();
+        }
+        s.state_mut().unwrap().doc = std::sync::Arc::new(d);
+        // A 20k-vertex zigzag: a first pick on one straight segment, hovering one far along.
+        let pts: Vec<[f64; 2]> = (0..20_000).map(|i| [i as f64, if i % 2 == 0 { 0.0 } else { 1.0 }]).collect();
+        pline(&mut s, &pts, false);
+        radius(&mut s, 0.0);
+        s.start("fillet").unwrap();
+        s.input(Input::Point(p(100.5, 0.5))).unwrap();
+        let _ = s.pick_preview(p(19_001.5, 0.5));
+        let n = 50;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            assert!(!std::hint::black_box(s.pick_preview(p(19_001.5, 0.5)).unwrap()).added.is_empty());
+        }
+        t.elapsed().as_secs_f64() / n as f64
+    };
+    let small = time(1_000);
+    let big = time(200_000);
+    println!("pick_preview: 1k lines {:.3} ms, 200k lines {:.3} ms, ratio {:.2}", small * 1e3, big * 1e3, big / small);
+    assert!(big / small < 3.0);
+}

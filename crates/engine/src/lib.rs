@@ -54,7 +54,7 @@ pub use cadcraft_geom as geom;
 pub use cadcraft_render as render;
 pub use cmd::hatch::{HatchPicks, PatternChoice, PickMode, pattern_choices};
 pub use cmd::{CommandInfo, CommandSpec, Provider, command_specs, find_command, register_command_provider};
-pub use prompt::{Accept, DisplayOnly, Drag, Input, Interactive, Picker, Prompt, Step};
+pub use prompt::{Accept, DisplayOnly, Drag, Input, Interactive, PickPreview, Picker, Prompt, Step};
 
 mod doc_state;
 mod error;

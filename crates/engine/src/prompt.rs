@@ -265,6 +265,24 @@ pub trait Interactive: Send {
     fn display_only(&self, _s: &Session) -> Option<DisplayOnly> {
         None
     }
+    /// What picking under the cursor would act on and do (LAMB fork patch 32): the part of each
+    /// picked or hovered object to highlight, and the pieces the pick would remove and draw.
+    /// `None`: the UI shows its normal whole-object rollover.
+    fn pick_preview(&self, _s: &Session, _cursor: Vec2) -> Option<PickPreview> {
+        None
+    }
+}
+
+/// See [`Interactive::pick_preview`]. Pieces are lines, arcs or whole objects, with `Handle(0)`
+/// and the current properties.
+#[derive(Clone, Debug, Default)]
+pub struct PickPreview {
+    /// The parts picked so far and the part under the cursor (a polyline segment, else the object).
+    pub highlight: Vec<cadcraft_doc::Entity>,
+    /// What the pick would remove: drawn greyed.
+    pub removed: Vec<cadcraft_doc::Entity>,
+    /// What the pick would draw: drawn highlighted, over `removed`.
+    pub added: Vec<cadcraft_doc::Entity>,
 }
 
 /// See [`Interactive::display_only`]: the only things drawn in the current view while a command
