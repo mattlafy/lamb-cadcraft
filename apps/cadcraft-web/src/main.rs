@@ -135,9 +135,10 @@ mod web {
     /// after a touch. Canvas touches then reach the app only as touch events, which
     /// [`cadcraft_ui_egui::touch::TouchMouse`] turns into pointer events at the crosshair.
     /// Registered before eframe's listeners, so stopping an event here skips them; a touch's
-    /// `pointerup` still focuses the canvas, as eframe's listener does.
+    /// `pointerup` still focuses the canvas, as eframe's listener does, unless the page's command
+    /// input holds focus.
     fn install_touch_gate(canvas: &web_sys::HtmlCanvasElement) {
-        use cadcraft_ui_egui::touch::{DomEvent, NativeGate};
+        use cadcraft_ui_egui::touch::{DomEvent, NativeGate, focus_canvas_on_lift};
         let gate = std::rc::Rc::new(std::cell::Cell::new(NativeGate::default()));
         let pointer = ["pointerdown", "pointerup", "pointermove", "pointercancel"];
         let touch = ["touchstart", "touchmove", "touchend", "touchcancel"];
@@ -159,7 +160,8 @@ mod web {
                 gate.set(g);
                 if !admit {
                     event.stop_immediate_propagation();
-                    if kind == "pointerup" {
+                    let focused = || web_sys::window().and_then(|w| w.document()).and_then(|d| d.active_element()).map(|a| a.id());
+                    if kind == "pointerup" && focus_canvas_on_lift(focused().as_deref()) {
                         let options = web_sys::FocusOptions::new();
                         options.set_prevent_scroll(true);
                         let _ = element.focus_with_options(&options);
