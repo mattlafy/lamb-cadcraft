@@ -689,8 +689,8 @@ fn polyline_fillet_refusals_leave_it_alone() {
     let c = h(&s.execute("circle", &json!({ "center": [30, 0], "radius": 1 })).unwrap());
     let l = h(&s.execute("line", &json!({ "points": [[20, -5], [20, 5]] })).unwrap());
     for q in [
-        // Picks whose trimmed ends point away from each other, the same segment, a circle, a middle
-        // segment with a line, too big.
+        // Picks whose trimmed ends point away from each other, the same segment, a circle, a
+        // segment parallel to a line, too big.
         json!({ "h1": p, "p1": [5, 0], "h2": p, "p2": [0, 15], "radius": 1 }),
         json!({ "h1": p, "p1": [5, 0], "h2": p, "p2": [6, 0], "radius": 1 }),
         json!({ "h1": p, "p1": [5, 0], "h2": c, "p2": [31, 0], "radius": 1 }),
@@ -701,6 +701,116 @@ fn polyline_fillet_refusals_leave_it_alone() {
         assert_eq!(verts(&s, &p), before);
     }
     assert_eq!(count(&s), 3);
+}
+
+/// A polyline's last segment meets `zag`'s first segment at (10, 0).
+fn two_plines(s: &mut Session) -> (String, String) {
+    (pline(s, &[[0.0, 5.0], [0.0, 0.0], [8.0, 0.0]], false), pline(s, &[[10.0, 2.0], [10.0, 10.0], [15.0, 10.0]], false))
+}
+
+/// Four segments; segment 2 runs (2, 2) to (6, 2).
+const ZIGZAG: [[f64; 2]; 5] = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [6.0, 2.0], [6.0, 4.0]];
+
+#[test]
+fn fillet_joins_two_polylines_through_the_corner() {
+    for (r, corner) in [(0.0, vec![(10.0, 0.0, 0.0)]), (1.0, vec![(9.0, 0.0, quarter()), (10.0, 1.0, 0.0)])] {
+        let mut s = Session::new();
+        let (a, b) = two_plines(&mut s);
+        let (va, vb) = (verts(&s, &a), verts(&s, &b));
+        s.execute("fillet", &json!({ "h1": a, "p1": [4, 0], "h2": b, "p2": [10, 5], "radius": r })).unwrap();
+        let mut want = vec![(0.0, 5.0, 0.0), (0.0, 0.0, 0.0)];
+        want.extend(corner.iter().copied());
+        want.extend([(10.0, 10.0, 0.0), (15.0, 10.0, 0.0)]);
+        assert_eq!(verts(&s, &a), want, "{r}");
+        assert_eq!(count(&s), 1);
+        assert!(!closed(&s, &a));
+        // Undo brings both back.
+        s.undo().unwrap();
+        assert_eq!((verts(&s, &a), verts(&s, &b)), (va, vb));
+        assert_eq!(count(&s), 2);
+    }
+    // Middle segments of two zigzags: the segments past both trimmed ends go.
+    for (r, corner) in [(0.0, vec![(10.0, 2.0, 0.0)]), (1.0, vec![(9.0, 2.0, quarter()), (10.0, 3.0, 0.0)])] {
+        let mut s = Session::new();
+        let a = pline(&mut s, &ZIGZAG, false);
+        let b = pline(&mut s, &[[8.0, 10.0], [10.0, 10.0], [10.0, 6.0], [12.0, 6.0], [12.0, 0.0]], false);
+        s.execute("fillet", &json!({ "h1": a, "p1": [4, 2], "h2": b, "p2": [10, 8], "radius": r })).unwrap();
+        let mut want = vec![(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (2.0, 2.0, 0.0)];
+        want.extend(corner.iter().copied());
+        want.extend([(10.0, 10.0, 0.0), (8.0, 10.0, 0.0)]);
+        assert_eq!(verts(&s, &a), want, "{r}");
+        assert_eq!(count(&s), 1);
+    }
+}
+
+#[test]
+fn fillet_joins_a_line_to_a_middle_segment_of_a_polyline() {
+    // The polyline first: the result runs from its free end and the line joins in.
+    let mut s = Session::new();
+    let a = pline(&mut s, &ZIGZAG, false);
+    let l = h(&s.execute("line", &json!({ "points": [[10, 8], [10, 12]] })).unwrap());
+    s.execute("fillet", &json!({ "h1": a, "p1": [4, 2], "h2": l, "p2": [10, 10], "radius": 0 })).unwrap();
+    assert_eq!(verts(&s, &a), vec![(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (2.0, 2.0, 0.0), (10.0, 2.0, 0.0), (10.0, 12.0, 0.0)]);
+    assert_eq!(count(&s), 1);
+    // The line first: the polyline's handle holds the result, which runs from the line's free end.
+    let mut s = Session::new();
+    let a = pline(&mut s, &ZIGZAG, false);
+    let l = h(&s.execute("line", &json!({ "points": [[10, 8], [10, 12]] })).unwrap());
+    s.execute("fillet", &json!({ "h1": l, "p1": [10, 10], "h2": a, "p2": [4, 2], "radius": 0 })).unwrap();
+    assert_eq!(verts(&s, &a), vec![(10.0, 12.0, 0.0), (10.0, 2.0, 0.0), (2.0, 2.0, 0.0), (2.0, 0.0, 0.0), (0.0, 0.0, 0.0)]);
+    assert_eq!(count(&s), 1);
+    // A kept arc segment keeps its bulge, its sign turned with the polyline.
+    let mut s = Session::new();
+    let a = h(&s.execute("pline", &json!({ "vertices": [[10, 0], { "p": [4, 0], "bulge": 0.5 }, [0, 4]] })).unwrap());
+    let l = h(&s.execute("line", &json!({ "points": [[12, 2], [12, 10]] })).unwrap());
+    s.execute("fillet", &json!({ "h1": a, "p1": [7, 0], "h2": l, "p2": [12, 8], "radius": 0 })).unwrap();
+    assert_eq!(verts(&s, &a), vec![(0.0, 4.0, -0.5), (4.0, 0.0, 0.0), (12.0, 0.0, 0.0), (12.0, 10.0, 0.0)]);
+}
+
+#[test]
+fn two_object_polyline_chamfer_no_trim_and_refusals() {
+    // CHAMFER: the first distance on the first pick.
+    let mut s2 = Session::new();
+    let (a2, b2) = two_plines(&mut s2);
+    s2.execute("chamfer", &json!({ "h1": b2, "p1": [10, 5], "h2": a2, "p2": [4, 0], "d1": 1, "d2": 2 })).unwrap();
+    assert_eq!(verts(&s2, &b2), vec![(15.0, 10.0, 0.0), (10.0, 10.0, 0.0), (10.0, 1.0, 0.0), (8.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 5.0, 0.0)]);
+    assert_eq!(count(&s2), 1);
+    // TRIMMODE 0: a loose arc only.
+    let mut s = Session::new();
+    let (a, b) = two_plines(&mut s);
+    let (va, vb) = (verts(&s, &a), verts(&s, &b));
+    s.execute("fillet", &json!({ "h1": a, "p1": [4, 0], "h2": b, "p2": [10, 5], "radius": 1, "trim": false })).unwrap();
+    assert_eq!((verts(&s, &a), verts(&s, &b)), (va, vb));
+    assert_eq!(count(&s), 3);
+    let (c, r, _, _) = last_arc(&s);
+    assert!(c.near(Vec2::new(9.0, 1.0), 1e-9) && (r - 1.0).abs() < 1e-9, "{c:?} {r}");
+    // Refusals leave the drawing alone.
+    let mut s = Session::new();
+    let sq = pline(&mut s, &[[0.0, 0.0], [8.0, 0.0], [8.0, -8.0], [0.0, -8.0]], true);
+    let arc = h(&s.execute("pline", &json!({ "vertices": [{ "p": [20, 0], "bulge": 0.5 }, [20, 6]] })).unwrap());
+    let open = pline(&mut s, &[[0.0, 5.0], [0.0, 3.0], [5.0, 3.0]], false);
+    let up = h(&s.execute("line", &json!({ "points": [[10, 2], [10, 10]] })).unwrap());
+    let flat = h(&s.execute("line", &json!({ "points": [[20, 3], [30, 3]] })).unwrap());
+    // A line one unit above the polyline's plane.
+    let mut d = s.doc().unwrap().clone();
+    let at = |y: f64| cadcraft_engine::geom::Vec3::new(12.0, y, 1.0);
+    let high = d
+        .add(&cadcraft_engine::doc::Space::Model, Default::default(), EntityKind::Line(cadcraft_engine::doc::Line { a: at(2.0), b: at(10.0) }))
+        .unwrap()
+        .hex();
+    s.state_mut().unwrap().doc = std::sync::Arc::new(d);
+    let before: Vec<EntityKind> = s.doc().unwrap().model.iter().map(|e| e.kind.clone()).collect();
+    for (q, why) in [
+        (json!({ "h1": sq, "p1": [4, 0], "h2": up, "p2": [10, 8], "radius": 0 }), "closed"),
+        (json!({ "h1": arc, "p1": [21, 3], "h2": open, "p2": [2, 3], "radius": 0 }), "straight"),
+        (json!({ "h1": open, "p1": [2, 3], "h2": flat, "p2": [25, 3], "radius": 0 }), "parallel"),
+        (json!({ "h1": open, "p1": [2, 3], "h2": high, "p2": [12, 8], "radius": 0 }), "plane"),
+    ] {
+        let err = s.execute("fillet", &q).expect_err(why);
+        assert!(err.to_string().contains(why), "{q} {err}");
+        let now: Vec<EntityKind> = s.doc().unwrap().model.iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(now, before);
+    }
 }
 
 // ---------------- FILLET / CHAMFER pick preview (LAMB fork patch 32) ----------------

@@ -1,10 +1,10 @@
 //! FILLET and CHAMFER with polyline segments (#466): two straight segments of one polyline
 //! (with any segments between them on the picked side removed, closing an open polyline when
-//! the corner lies in its gap), or a straight end
-//! segment of an open polyline with a line, which joins the polyline.
+//! the corner lies in its gap), or a straight segment of an open polyline with a line or with a
+//! segment of another open polyline, which join into one polyline through the corner.
 
-use cadcraft_doc::{EntityKind, Handle, LwPolyline};
-use cadcraft_geom::{Line, PolyVertex, Polyline, Segment, Vec2, arc_to_bulge, bulge_to_arc, line_line_infinite};
+use cadcraft_doc::{Entity, EntityKind, Handle, LwPolyline};
+use cadcraft_geom::{EPS, Line, PolyVertex, Polyline, Segment, Vec2, Vec3, arc_to_bulge, bulge_to_arc, line_line_infinite};
 
 use super::{curves, other, push_entity, set_kind};
 use crate::cmd::helpers::{arc, line};
@@ -62,6 +62,22 @@ pub(crate) fn picked_segment(segs: &[Segment], p: Vec2) -> Option<usize> {
         let d = |i: &usize| segs.get(*i).map_or(f64::INFINITY, |s| s.closest(p).dist(p));
         d(a).total_cmp(&d(b))
     })
+}
+
+/// The straight segment nearest `pick`.
+fn picked_line(segs: &[Segment], pick: Vec2) -> Result<(usize, Line)> {
+    let k = picked_segment(segs, pick).ok_or_else(|| other("Select a polyline segment."))?;
+    match segs.get(k) {
+        Some(Segment::Line(l)) => Ok((k, *l)),
+        _ => Err(other("Fillet and chamfer work on straight polyline segments.")),
+    }
+}
+
+/// One pick against the corner `x`: the picked segment, and whether its trimmed end is the
+/// segment's end vertex (the corner lies ahead of the pick).
+fn pick_side(segs: &[Segment], pick: Vec2, x: Vec2) -> Result<(usize, bool)> {
+    let (k, l) = picked_line(segs, pick)?;
+    Ok((k, l.param_of(x) > l.param_of(pick)))
 }
 
 /// With TRIMMODE 0: the arc (or chamfer line) on its own, both objects left as they are.
@@ -138,8 +154,7 @@ fn same_polyline(
         (if i == a { sa.b } else { sb.b }, i)
     } else {
         let x = line_line_infinite(sa.a, sa.b, sb.a, sb.b).map(|r| r.0).ok_or_else(|| other("The segments are parallel."))?;
-        let forward = |sg: &Line, p: Vec2| sg.param_of(x) > sg.param_of(p);
-        match (forward(&sa, p1), forward(&sb, p2)) {
+        match (pick_side(&segs, p1, x)?.1, pick_side(&segs, p2, x)?.1) {
             (true, false) => (x, a),
             (false, true) => (x, b),
             _ => return Err(other("The picks do not meet on one side of the polyline.")),
@@ -189,61 +204,80 @@ fn same_polyline(
     Ok(Some(h))
 }
 
-/// An open polyline's straight end segment with a line: the corner is cut and the line joins
-/// the polyline.
-#[allow(clippy::too_many_arguments)]
-fn polyline_and_line(
+/// A polyline's vertices and whether it is closed; a line is an open chain of one segment.
+fn chain(kind: &EntityKind) -> Option<(Vec<PolyVertex>, bool)> {
+    match kind {
+        EntityKind::LwPolyline(p) => Some((p.vertices.clone(), p.closed)),
+        EntityKind::Line(l) => Some((vec![PolyVertex::new(l.a.xy()), PolyVertex::new(l.b.xy())], false)),
+        _ => None,
+    }
+}
+
+/// The plane a chain lies in: its elevation and normal. `None` for a line that is not level.
+fn plane(e: &Entity) -> Option<(f64, Vec3)> {
+    match &e.kind {
+        EntityKind::LwPolyline(p) => Some((p.elevation, e.common.extrusion)),
+        EntityKind::Line(l) => ((l.a.z - l.b.z).abs() <= EPS).then_some((l.a.z, Vec3::Z)),
+        _ => None,
+    }
+}
+
+/// Two different objects, at least one a polyline, each a line or an open polyline (LAMB fork
+/// patch 31). Each pick keeps its chain from the free end through the pick to the kept end of the
+/// picked segment; everything past the trimmed end goes. The result is one open polyline from the
+/// first pick's free end through the corner, held by the first picked polyline; the other object
+/// is removed.
+fn two_chains(
     s: &mut Session,
-    (hp, pl, pp): (Handle, &LwPolyline, Vec2),
-    (hl, ln, lp): (Handle, Line, Vec2),
-    polyline_first: bool,
+    (h1, e1, p1): (Handle, &Entity, Vec2),
+    (h2, e2, p2): (Handle, &Entity, Vec2),
     r: f64,
     chamfer: Option<ChamferDistances>,
     trim: bool,
 ) -> Result<Option<Handle>> {
-    let segs = Polyline { vertices: pl.vertices.clone(), closed: pl.closed }.segments();
-    let k = picked_segment(&segs, pp).ok_or_else(|| other("Select a polyline segment."))?;
-    let last = segs.len().checked_sub(1).ok_or_else(|| other("Select a polyline segment."))?;
-    if pl.closed || (k != 0 && k != last) {
-        return Err(other("A line fillets or chamfers with an end segment of an open polyline."));
-    }
-    let at_end = match segs.get(k) {
-        // A single segment: the end nearer the corner is cut.
-        Some(sg) if k == 0 && k == last => {
-            line_line_infinite(sg.start(), sg.end(), ln.a, ln.b).is_none_or(|(x, _, _)| x.dist(sg.end()) <= x.dist(sg.start()))
-        }
-        _ => k == last,
+    let (Some((v1, c1)), Some((v2, c2))) = (chain(&e1.kind), chain(&e2.kind)) else {
+        return Err(other("Select a line or a polyline."));
     };
-    // Work at the polyline's end; turn it round if the first segment was picked.
-    let mut vs = if at_end { pl.vertices.clone() } else { curves::reverse_vertices(&pl.vertices, false) };
-    let n = vs.len();
-    let (Some(inner), Some(end)) = (vs.get(n.wrapping_sub(2)).copied(), vs.get(n.wrapping_sub(1)).copied()) else {
+    let (hp, pl) = match (&e1.kind, &e2.kind) {
+        (EntityKind::LwPolyline(p), _) => (h1, p.clone()),
+        (_, EntityKind::LwPolyline(p)) => (h2, p.clone()),
+        _ => return Err(other("Select a polyline.")),
+    };
+    if c1 || c2 {
+        return Err(other("A closed polyline fillets or chamfers only with another segment of itself."));
+    }
+    match (plane(e1), plane(e2)) {
+        (Some((z1, n1)), Some((z2, n2))) if (z1 - z2).abs() <= EPS && (n1 - n2).len() <= EPS => {}
+        _ => return Err(other("The polylines are not in the same plane.")),
+    }
+    let segs = |v: &[PolyVertex]| Polyline { vertices: v.to_vec(), closed: false }.segments();
+    let (s1, s2) = (segs(&v1), segs(&v2));
+    let ((_, l1), (_, l2)) = (picked_line(&s1, p1)?, picked_line(&s2, p2)?);
+    let x = line_line_infinite(l1.a, l1.b, l2.a, l2.b).map(|r| r.0).ok_or_else(|| other("Lines are parallel."))?;
+    let ((k1, f1), (k2, f2)) = (pick_side(&s1, p1, x)?, pick_side(&s2, p2, x)?);
+    // The first chain arrives at the corner (its trimmed end is vertex ka + 1); the second leaves
+    // it (its trimmed end is vertex kb).
+    let (a, ka) = if f1 { (v1, k1) } else { (curves::reverse_vertices(&v1, false), s1.len() - 1 - k1) };
+    let (b, kb) = if f2 { (curves::reverse_vertices(&v2, false), s2.len() - 1 - k2) } else { (v2, k2) };
+    let (Some(keep1), Some(cut2), Some(keep2)) = (a.get(ka).copied(), b.get(kb).copied(), b.get(kb + 1).copied()) else {
         return Err(other("Select a polyline segment."));
     };
-    if inner.bulge.abs() > 1e-12 {
-        return Err(other("Fillet and chamfer work on straight polyline segments."));
-    }
-    let x = line_line_infinite(inner.p, end.p, ln.a, ln.b).map(|r| r.0).ok_or_else(|| other("Lines are parallel."))?;
-    let keep_line = if (ln.a - x).dot(lp - x) >= (ln.b - x).dot(lp - x) { ln.a } else { ln.b };
     let side = |keep: Vec2| ((keep - x).normalized(), keep.dist(x));
-    let c = if polyline_first {
-        corner(x, side(inner.p), side(keep_line), r, chamfer)?
-    } else {
-        let c = corner(x, side(keep_line), side(inner.p), r, chamfer)?;
-        Corner { t1: c.t2, t2: c.t1, bulge: -c.bulge }
-    };
+    let c = corner(x, side(keep1.p), side(keep2.p), r, chamfer)?;
     if !trim {
         return add_loose(s, hp, &c);
     }
-    vs.truncate(n - 1);
-    push_point(&mut vs, PolyVertex { p: c.t1, bulge: c.bulge, ..end });
-    push_point(&mut vs, PolyVertex { p: c.t2, bulge: 0.0, ..end });
-    push_point(&mut vs, PolyVertex { p: keep_line, bulge: 0.0, ..end });
-    if !at_end {
-        vs = curves::reverse_vertices(&vs, false);
+    let mut out: Vec<PolyVertex> = Vec::with_capacity(ka + b.len() + 2);
+    for v in a.iter().take(ka + 1) {
+        push_point(&mut out, *v);
     }
-    set_kind(s, hp, EntityKind::LwPolyline(LwPolyline { vertices: vs, ..pl.clone() }))?;
-    s.doc_mut()?.remove_entity(hl);
+    push_point(&mut out, PolyVertex { p: c.t1, bulge: c.bulge, ..keep1 });
+    push_point(&mut out, PolyVertex { p: c.t2, bulge: 0.0, ..cut2 });
+    for v in b.iter().skip(kb + 1) {
+        push_point(&mut out, *v);
+    }
+    set_kind(s, hp, EntityKind::LwPolyline(LwPolyline { vertices: out, closed: false, ..pl }))?;
+    s.doc_mut()?.remove_entity(if hp == h1 { h2 } else { h1 });
     Ok(Some(hp))
 }
 
@@ -268,24 +302,10 @@ pub(crate) fn fillet_pline(
     if curves::is_locked(s, h1) || curves::is_locked(s, h2) {
         return Err(other("The object is on a locked layer."));
     }
-    let as_line = |k: &EntityKind| match k {
-        EntityKind::Line(l) => Some(Line::new(l.a.xy(), l.b.xy())),
-        _ => None,
-    };
-    let made = match (&e1.kind, &e2.kind) {
-        (EntityKind::LwPolyline(pl), _) if h1 == h2 => same_polyline(s, h1, pl, (p1, p2), r, chamfer, trim)?,
-        (EntityKind::LwPolyline(pl), k) if as_line(k).is_some() => {
-            let ln = as_line(k).ok_or_else(|| other("Select a line."))?;
-            polyline_and_line(s, (h1, pl, p1), (h2, ln, p2), true, r, chamfer, trim)?
-        }
-        (k, EntityKind::LwPolyline(pl)) if as_line(k).is_some() => {
-            let ln = as_line(k).ok_or_else(|| other("Select a line."))?;
-            polyline_and_line(s, (h2, pl, p2), (h1, ln, p1), false, r, chamfer, trim)?
-        }
-        (EntityKind::LwPolyline(_), _) | (_, EntityKind::LwPolyline(_)) => {
-            return Err(other("A polyline fillets or chamfers with a line, or with another segment of itself."));
-        }
-        _ => return Ok(None),
+    let made = match &e1.kind {
+        EntityKind::LwPolyline(pl) if h1 == h2 => same_polyline(s, h1, pl, (p1, p2), r, chamfer, trim)?,
+        _ if h1 != h2 && chain(&e1.kind).is_some() && chain(&e2.kind).is_some() => two_chains(s, (h1, &e1, p1), (h2, &e2, p2), r, chamfer, trim)?,
+        _ => return Err(other("A polyline fillets or chamfers with a line, another polyline, or another segment of itself.")),
     };
     Ok(Some(made))
 }
