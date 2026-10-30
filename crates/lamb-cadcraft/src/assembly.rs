@@ -28,7 +28,9 @@
 //! then the corner lines in junction order. A placed corner owns the region around its junction
 //! (LAMB T462): on each straight arm's run, band lines are clipped to start at the corner's reach
 //! (lamb-core's [`corner_reach`], [`trim_to_reach`]; dropped when wholly inside) and every repeat
-//! copy with a line end inside the reach is dropped whole. Before that trim, each stud-move point
+//! copy with a line end inside the reach is dropped whole. On an arc arm's run (LAMB T571) the reach
+//! is an angle about the arc's centre (lamb-core's [`corner_arc_reach`]) and [`trim_arc_run`] moves
+//! each band's junction end along its own circle to it. Before that trim, each stud-move point
 //! ([`crate::studgrid`], LAMB T464) shifts its run's nearest repeat copy along the run onto itself.
 //! A structural-centre detail (LAMB T476) is laid from the exterior face, its farthest band there;
 //! a grid detail (LAMB T477) from the exterior face too, its reference on the run's nearest parallel
@@ -46,8 +48,8 @@ use cadcraft_doc::{Arc as ArcEntity, Block, Common, Drawing, Entity, EntityKind,
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
 use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
-    AssemblyLine, FaceRef, WidthConflict, arm_direction, corner_reach, detail_bands, detail_frame, jamb_reach, junction_bisector, lay_bands,
-    lay_repeat, mitre_end, place_corner, place_opening, place_opening_end, tee_butt, trim_to_reach, width_conflict,
+    AssemblyLine, FaceRef, WidthConflict, arc_delta, arc_end, arm_direction, corner_arc_reach, corner_reach, detail_bands, detail_frame, jamb_reach,
+    junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner, place_opening, place_opening_end, tee_butt, trim_to_reach, width_conflict,
 };
 use lamb_core::derivation::detail_tags::{EndLevel, RunDetail};
 use lamb_core::derivation::issues::{Issue, IssueKind};
@@ -373,6 +375,12 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             let Some(r) = runs.get_mut(j.arms[i].run).filter(|r| r.skipped.is_none()) else { continue };
             trim_run(r, j.point, u, reach);
         }
+        for (i, reach) in corner_arc_reach(j, &graph.runs, &c.lines).into_iter().enumerate() {
+            let arm = &j.arms[i];
+            let Some((center, end, toward)) = graph.runs.get(arm.run).and_then(|run| arc_end(run, arm.end)).filter(|_| reach > 0.0) else { continue };
+            let Some(r) = runs.get_mut(arm.run).filter(|r| r.skipped.is_none()) else { continue };
+            trim_arc_run(r, center, end, toward, reach);
+        }
     }
     for o in opening_assembly(d, plan)?.iter().filter(|o| o.skipped.is_none()) {
         let Some(b) = graph.bridges.get(o.bridge) else { continue };
@@ -406,6 +414,58 @@ fn trim_run(r: &mut RunAssembly, node: Point2, u: Point2, reach: f64) {
     let mut rest = r.lines.split_off(r.bands);
     r.lines.retain_mut(|l| trim_to_reach(l, node, u, reach));
     r.bands = r.lines.len();
+    let mut copies = Vec::new();
+    for n in std::mem::take(&mut r.copies) {
+        let copy: Vec<AssemblyLine> = rest.drain(..n.min(rest.len())).collect();
+        if !copy.iter().any(|l| inside(l.from) || inside(l.to)) {
+            r.lines.extend(copy);
+            copies.push(n);
+        }
+    }
+    r.lines.extend(rest);
+    r.copies = copies;
+}
+
+/// The angular [`trim_run`] for an arc run (LAMB T571): angles are about `center` from the run's
+/// junction end at `end_angle`, positive in the `toward` (±1) sense into the run. Each arc band
+/// line's end nearer that end, if inside `reach`, moves along its own circle to `end_angle +
+/// toward·reach`; a band whose span would fall to `TOLERANCE.angle_deg` or less is dropped. Every
+/// repeat copy with a line end inside the reached sector is dropped whole.
+fn trim_arc_run(r: &mut RunAssembly, center: Point2, end_angle: f64, toward: f64, reach: f64) {
+    use std::f64::consts::TAU;
+    let tol = TOLERANCE.angle_deg.to_radians();
+    let delta = |p: Point2| arc_delta(center, end_angle, toward, p);
+    let at = |radius: f64| {
+        let a = end_angle + toward * reach;
+        Point2 { x: center.x + radius * a.cos(), y: center.y + radius * a.sin() }
+    };
+    let mut rest = r.lines.split_off(r.bands);
+    r.lines.retain_mut(|l| {
+        let Some(arc) = l.arc else { return true };
+        let ang = |p: Point2| (p.y - center.y).atan2(p.x - center.x);
+        let span = if arc.ccw { ang(l.to) - ang(l.from) } else { ang(l.from) - ang(l.to) }.rem_euclid(TAU);
+        let (df, dt) = (delta(l.from), delta(l.to));
+        let from_near = df.abs() <= dt.abs();
+        let near = if from_near { df } else { dt };
+        if near >= reach - tol {
+            return true;
+        }
+        if span - (reach - near) <= tol {
+            return false;
+        }
+        let q = at(arc.radius);
+        if from_near {
+            l.from = q;
+        } else {
+            l.to = q;
+        }
+        true
+    });
+    r.bands = r.lines.len();
+    let inside = |p: Point2| {
+        let d = delta(p);
+        d > -reach && d < reach - tol
+    };
     let mut copies = Vec::new();
     for n in std::mem::take(&mut r.copies) {
         let copy: Vec<AssemblyLine> = rest.drain(..n.min(rest.len())).collect();
@@ -2751,6 +2811,75 @@ pub(crate) mod tests {
                     let Some(a) = along(j, &graph.runs, i, l) else { continue };
                     assert!(a.iter().all(|a| *a >= reach - TOLERANCE.coincidence_mm), "junction {} arm {i} reach {reach}: {l:?}", c.junction);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// A plan room of 200 mm walls whose right wall is a 60° arc about (1094.74, 1100) — outer face
+    /// radius 2200 through (3000,0) and (3000,2200), inner 2000 — meeting the straight bottom and
+    /// top walls at an angle, the bottom tagged with [`room`]'s exterior-face detail.
+    fn angled_arc_room() -> T<(Session, Id)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let detail = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": format!("{:X}", r.0), "kind": "exterior_face" }))?;
+        s.execute("layer.new", &json!({ "name": "CLAD", "current": true }))?;
+        line(&mut s, [0.0, -20.0], [1000.0, -20.0])?;
+        s.execute("layer.new", &json!({ "name": "GYP", "current": true }))?;
+        line(&mut s, [0.0, 50.0], [1000.0, 50.0])?;
+        line(&mut s, [0.0, 200.0], [1000.0, 200.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        let cx = 3000.0 - (2200.0f64.powi(2) - 1100.0f64.powi(2)).sqrt();
+        let half_in = (900.0f64 / 2000.0).asin();
+        let xi = cx + 2000.0 * half_in.cos();
+        let v = |x: f64, y: f64, bulge: f64| json!({ "p": [x, y], "bulge": bulge });
+        let (bo, bi) = ((30.0f64.to_radians() / 2.0).tan(), (half_in / 2.0).tan());
+        s.execute(
+            "pline",
+            &json!({ "vertices": [v(0.0, 0.0, 0.0), v(3000.0, 0.0, bo), v(3000.0, 2200.0, 0.0), v(0.0, 2200.0, 0.0)], "closed": true }),
+        )?;
+        s.execute(
+            "pline",
+            &json!({ "vertices": [v(200.0, 200.0, 0.0), v(xi, 200.0, bi), v(xi, 2000.0, 0.0), v(200.0, 2000.0, 0.0)], "closed": true }),
+        )?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 1500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
+        Ok((s, plan))
+    }
+
+    #[test]
+    fn a_corner_detail_at_an_angled_arc_junction_is_placed_and_the_arc_bands_stop_at_its_reach() -> R {
+        let (mut s, plan) = angled_arc_room()?;
+        corner_detail(&mut s, plan, "exterior_face", false, (3000.0, 0.0))?;
+        let d = s.doc()?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, plan);
+        let arc = graph.runs.iter().position(|r| matches!(r.centreline, RunCurve::Arc { .. })).ok_or("no arc run")?;
+        let corners = corner_assembly(d, plan)?;
+        let at_arc: Vec<_> = corners.iter().filter(|c| graph.junctions[c.junction].arms.iter().any(|a| a.run == arc)).collect();
+        assert!(!at_arc.is_empty(), "{corners:?}");
+        assert!(at_arc.iter().all(|c| c.skipped.is_none() && c.lines.len() == 2), "{at_arc:?}");
+        // The bottom-right corner sits at the faces' crossing, the outer vertex (3000,0).
+        let all = corner_xy(&corners);
+        assert!(all.iter().any(|l| l.4 == "CRN-A" && l.0 == 3000.0 && l.1 == 0.0), "{all:?}");
+        let runs = assembly_lines(d, plan)?;
+        let ra = &runs[arc];
+        assert_eq!((ra.skipped.clone(), ra.bands), (None, 3), "{ra:?}");
+        for c in &at_arc {
+            let j = &graph.junctions[c.junction];
+            let i = j.arms.iter().position(|a| a.run == arc).ok_or("no arm")?;
+            let reach = corner_arc_reach(j, &graph.runs, &c.lines)[i];
+            assert!(reach > 0.0, "junction {}", c.junction);
+            let (center, end, toward) = arc_end(&graph.runs[arc], j.arms[i].end).ok_or("not an arc")?;
+            for l in &ra.lines[..ra.bands] {
+                assert!(l.arc.is_some());
+                let near = arc_delta(center, end, toward, l.from).min(arc_delta(center, end, toward, l.to));
+                assert!((near - reach).abs() < 1e-9, "junction {} reach {reach}: {l:?} at {near}", c.junction);
             }
         }
         Ok(())

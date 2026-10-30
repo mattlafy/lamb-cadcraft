@@ -16,7 +16,8 @@ use super::wall_openings::OpeningBridge;
 use super::wall_spaces::{RunSides, outside_on_left};
 use super::walls::{RunCurve, WallRun};
 use crate::geometry::Point2;
-use crate::geometry::intersect::infinite_line_intersect;
+use crate::geometry::intersect::{infinite_line_intersect, intersect_line_with_boundary_circle};
+use crate::geometry::tangent_circle::circle_circle_intersect;
 use crate::geometry::tolerance::TOLERANCE;
 
 /// One continuous band of a detail: a line parallel to the reference, `offset` mm from it,
@@ -148,6 +149,29 @@ impl FaceFrame {
 fn face_on_left(sides: &RunSides, face: FaceRef) -> Result<bool, String> {
     let outside_left = outside_on_left(sides).ok_or("no single exterior side")?;
     Ok(outside_left == (face == FaceRef::Exterior))
+}
+
+/// One arm's face at a corner: a straight run's face line through two points, or an arc run's face
+/// circle (centre, radius).
+#[derive(Clone, Copy)]
+enum FaceCurve {
+    Line(Point2, Point2),
+    Circle(Point2, f64),
+}
+
+/// An arc run's `face` circle moved `inset` into the wall: `(centre, radius, outward)`, the radius
+/// `radius + outward·(width/2 − inset)` with `outward` `+1` when the face side is away from the
+/// centre (as [`lay_bands`]). Errors on a straight run, an undecided face side or a radius not above
+/// `TOLERANCE.coincidence_mm`.
+fn face_circle(run: &WallRun, sides: &RunSides, face: FaceRef, inset: f64) -> Result<(Point2, f64, f64), String> {
+    let RunCurve::Arc { center, radius, sweep, .. } = run.centreline else { return Err("not an arc run".into()) };
+    let toward_left = face_on_left(sides, face)?;
+    let outward = if toward_left == (sweep > 0.0) { -1.0 } else { 1.0 };
+    let r = radius + outward * (run.width / 2.0 - inset);
+    if r <= TOLERANCE.coincidence_mm {
+        return Err("the face radius is not positive".into());
+    }
+    Ok((center, r, outward))
 }
 
 fn face_frame(run: &WallRun, sides: &RunSides, face: FaceRef) -> Result<FaceFrame, String> {
@@ -295,7 +319,10 @@ pub fn lay_repeat(
 ///
 /// - **Two arms**: the `to` end lands where the arms' `face` lines cross and the reference runs
 ///   along the arm whose handedness — travel toward the corner against the wall side — matches the
-///   detail's, the wall side away from that face.
+///   detail's, the wall side away from that face. An arc arm (LAMB T571) contributes its face
+///   circle instead of a line — the corner is the crossing nearest `j.point` — and its travel and
+///   wall side come from the arc's tangent and radius at its junction end; the mapped lines stay
+///   straight. Arms whose travels are parallel there (a tangent arc continuation) are an error.
 /// - **Three arms (T)**: exactly one gap within `TOLERANCE.angle_deg` of 180° and straight through
 ///   arms of equal width ([`tee_butt`]). The through run's face opposite the branch carries the
 ///   reference — it must be the `face` side (per the first through arm whose `sides` decide it),
@@ -336,21 +363,44 @@ pub fn place_corner(
             for (k, arm) in [a0, a1].into_iter().enumerate() {
                 let run = runs.get(arm.run).ok_or("junction arm names no run")?;
                 let side = sides.get(arm.run).ok_or("junction arm has no sides")?;
-                let f = face_frame(run, side, face)?;
-                let h = run.width / 2.0 - inset(k);
-                let a = Point2 { x: f.from.x + f.normal.x * h, y: f.from.y + f.normal.y * h };
-                let b = Point2 { x: f.to.x + f.normal.x * h, y: f.to.y + f.normal.y * h };
                 let s = match arm.end {
                     RunEnd::Start => -1.0,
                     RunEnd::End => 1.0,
                 };
+                if let RunCurve::Arc { start_angle, sweep, .. } = run.centreline {
+                    let (center, r, outward) = face_circle(run, side, face, inset(k))?;
+                    let a = if arm.end == RunEnd::Start { start_angle } else { start_angle + sweep };
+                    // Along the arc's travel at `a`, then toward the junction.
+                    let s = s * sweep.signum();
+                    let t = Point2 { x: -a.sin() * s, y: a.cos() * s };
+                    let ni = Point2 { x: -a.cos() * outward, y: -a.sin() * outward };
+                    arms.push((FaceCurve::Circle(center, r), t, ni));
+                    continue;
+                }
+                let f = face_frame(run, side, face)?;
+                let h = run.width / 2.0 - inset(k);
+                let a = Point2 { x: f.from.x + f.normal.x * h, y: f.from.y + f.normal.y * h };
+                let b = Point2 { x: f.to.x + f.normal.x * h, y: f.to.y + f.normal.y * h };
                 let t = Point2 { x: f.dir.x * s, y: f.dir.y * s };
                 let ni = Point2 { x: -f.normal.x, y: -f.normal.y };
-                arms.push((a, b, t, ni));
+                arms.push((FaceCurve::Line(a, b), t, ni));
             }
-            let c = infinite_line_intersect(arms[0].0, arms[0].1, arms[1].0, arms[1].1).ok_or("the corner's arms are parallel")?.point;
-            let fits: Vec<_> = arms.iter().filter(|(_, _, t, ni)| cross(*t, image(*ni)).signum() == want).collect();
-            let &[&(_, _, t, ni)] = fits.as_slice() else { return Err("the corner's arms do not fit the detail".into()) };
+            let parallel = || "the corner's arms are parallel".to_string();
+            let hits = match (arms[0].0, arms[1].0) {
+                (FaceCurve::Line(a, b), FaceCurve::Line(c, d)) => vec![infinite_line_intersect(a, b, c, d).ok_or_else(parallel)?.point],
+                (FaceCurve::Line(a, b), FaceCurve::Circle(o, r)) | (FaceCurve::Circle(o, r), FaceCurve::Line(a, b)) => {
+                    intersect_line_with_boundary_circle(a, b, o, r)
+                }
+                (FaceCurve::Circle(o0, r0), FaceCurve::Circle(o1, r1)) => circle_circle_intersect(o0, r0, o1, r1),
+            };
+            let curved = arms.iter().any(|a| matches!(a.0, FaceCurve::Circle(..)));
+            if curved && cross(arms[0].1, arms[1].1).abs() <= TOLERANCE.angle_deg.to_radians().sin() {
+                return Err(parallel());
+            }
+            let d2 = |q: Point2| (q.x - j.point.x).powi(2) + (q.y - j.point.y).powi(2);
+            let c = hits.into_iter().min_by(|p, q| d2(*p).total_cmp(&d2(*q))).ok_or_else(parallel)?;
+            let fits: Vec<_> = arms.iter().filter(|(_, t, ni)| cross(*t, image(*ni)).signum() == want).collect();
+            let &[&(_, t, ni)] = fits.as_slice() else { return Err("the corner's arms do not fit the detail".into()) };
             (c, t, ni)
         }
         [_, _, _] => {
@@ -595,7 +645,8 @@ pub fn tee_butt(j: &Junction, runs: &[WallRun]) -> Option<(usize, Point2, Point2
 
 /// How far a placed corner detail (§10 step 3, LAMB T462) reaches into each arm of `j`, in arm
 /// order: the farthest along-arm distance, from `j.point` along [`arm_direction`], of any end of
-/// the `corner` lines, floored at 0. An arc arm's reach is 0.
+/// the `corner` lines, floored at 0. An arc arm's reach is 0 — its reach is an angle,
+/// [`corner_arc_reach`] (LAMB T571).
 pub fn corner_reach(j: &Junction, runs: &[WallRun], corner: &[AssemblyLine]) -> Vec<f64> {
     (0..j.arms.len())
         .map(|i| {
@@ -603,6 +654,37 @@ pub fn corner_reach(j: &Junction, runs: &[WallRun], corner: &[AssemblyLine]) -> 
             corner.iter().flat_map(|l| [l.from, l.to]).map(|p| (p.x - j.point.x) * u.x + (p.y - j.point.y) * u.y).fold(0.0, f64::max)
         })
         .collect()
+}
+
+/// The angular counterpart of [`corner_reach`] (LAMB T571), in arm order: for an arc arm the
+/// largest angle (radians, floored at 0), about the arc's centre, from its junction end toward its
+/// other end, of any end of the `corner` lines; 0 for a straight arm.
+pub fn corner_arc_reach(j: &Junction, runs: &[WallRun], corner: &[AssemblyLine]) -> Vec<f64> {
+    j.arms
+        .iter()
+        .map(|arm| {
+            let Some((center, end, toward)) = runs.get(arm.run).and_then(|r| arc_end(r, arm.end)) else { return 0.0 };
+            corner.iter().flat_map(|l| [l.from, l.to]).map(|p| arc_delta(center, end, toward, p)).fold(0.0, f64::max)
+        })
+        .collect()
+}
+
+/// An arc run's `(centre, angle of its end, toward)`: `toward` is ±1, the sense of increasing angle
+/// from that end into the run. `None` for a straight run.
+pub fn arc_end(run: &WallRun, end: RunEnd) -> Option<(Point2, f64, f64)> {
+    let RunCurve::Arc { center, start_angle, sweep, .. } = run.centreline else { return None };
+    Some(match end {
+        RunEnd::Start => (center, start_angle, sweep.signum()),
+        RunEnd::End => (center, start_angle + sweep, -sweep.signum()),
+    })
+}
+
+/// The angle of `p` about `center` from `end`, positive in the `toward` (±1) sense, wrapped into
+/// (−π, π].
+pub fn arc_delta(center: Point2, end: f64, toward: f64, p: Point2) -> f64 {
+    use std::f64::consts::{PI, TAU};
+    let w = (((p.y - center.y).atan2(p.x - center.x) - end) * toward).rem_euclid(TAU);
+    if w > PI { w - TAU } else { w }
 }
 
 /// Clips `line` to the part at least `reach` along `u` from `node` (`a(x) = (x − node)·u`): both
@@ -1165,6 +1247,79 @@ mod tests {
         let mut arc = runs.clone();
         arc[0].centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
         assert_eq!(corner_reach(&j, &arc, &short)[0], 0.0);
+    }
+
+    /// `l_corner` with arm 1 an arc of radius 1000 about (−900,100) leaving the junction (100,100)
+    /// along +y (a quarter turn ccw from angle 0, or ending there cw when `reversed`); its exterior
+    /// face is the inner circle, radius 900.
+    fn arc_l_corner(reversed: bool) -> (Junction, Vec<WallRun>, Vec<RunSides>) {
+        use std::f64::consts::FRAC_PI_2;
+        let (j, mut runs, sides) = l_corner(reversed);
+        runs[1].centreline = if reversed {
+            RunCurve::Arc { center: p(-900.0, 100.0), radius: 1000.0, start_angle: FRAC_PI_2, sweep: -FRAC_PI_2 }
+        } else {
+            RunCurve::Arc { center: p(-900.0, 100.0), radius: 1000.0, start_angle: 0.0, sweep: FRAC_PI_2 }
+        };
+        (j, runs, sides)
+    }
+
+    fn near(a: Point2, b: Point2) -> bool {
+        (a.x - b.x).abs() < 1e-6 && (a.y - b.y).abs() < 1e-6
+    }
+
+    #[test]
+    fn a_corner_detail_with_an_arc_arm_lands_on_the_line_and_circle_crossing() {
+        let (reference, lines) = crn();
+        // y = 0 meets (x + 900)² + 100² = 900² nearest the junction.
+        let c = p(-900.0 + 800000f64.sqrt(), 0.0);
+        for reversed in [false, true] {
+            let (j, runs, sides) = arc_l_corner(reversed);
+            let out = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap();
+            // CRN-A runs from the corner along the straight arm; CRN-B is the band along the arc
+            // arm's tangent, 200 into the wall.
+            assert!(near(out[0].from, c) && near(out[0].to, p(c.x + 1000.0, 0.0)), "reversed {reversed}: {out:?}");
+            assert!(near(out[1].from, p(c.x + 200.0, 1000.0)) && near(out[1].to, p(c.x + 200.0, 0.0)), "reversed {reversed}: {out:?}");
+            assert!(out.iter().all(|l| l.arc.is_none()));
+        }
+    }
+
+    #[test]
+    fn a_corner_detail_between_two_arc_arms_lands_on_the_circles_crossing() {
+        use std::f64::consts::FRAC_PI_2;
+        let (reference, lines) = crn();
+        let (j, mut runs, sides) = arc_l_corner(false);
+        // Arm 0 leaves along +x, curving ccw about (100,1100); outside right = away from the centre.
+        runs[0].centreline = RunCurve::Arc { center: p(100.0, 1100.0), radius: 1000.0, start_angle: -FRAC_PI_2, sweep: FRAC_PI_2 };
+        let out = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap();
+        let c = out[0].from;
+        let on = |o: Point2, r: f64| ((c.x - o.x).hypot(c.y - o.y) - r).abs() < 1e-6;
+        assert!(on(p(100.0, 1100.0), 1100.0) && on(p(-900.0, 100.0), 900.0), "{c:?}");
+        assert!((c.x - 100.0).hypot(c.y - 100.0) < 300.0, "{c:?}");
+        // The reference runs along arm 1's tangent at the junction (+y), the wall side +x.
+        assert!(near(out[1].to, p(c.x + 200.0, c.y)) && near(out[1].from, p(c.x + 200.0, c.y + 1000.0)), "{out:?}");
+    }
+
+    #[test]
+    fn a_tangent_arc_arm_is_still_the_parallel_error() {
+        use std::f64::consts::FRAC_PI_2;
+        let (reference, lines) = crn();
+        let (j, mut runs, sides) = arc_l_corner(false);
+        // Leaves the junction along −x, continuing arm 0's line.
+        runs[1].centreline = RunCurve::Arc { center: p(100.0, 1100.0), radius: 1000.0, start_angle: -FRAC_PI_2, sweep: -FRAC_PI_2 };
+        assert_eq!(place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap_err(), "the corner's arms are parallel");
+    }
+
+    #[test]
+    fn corner_arc_reach_is_the_angle_from_the_arc_arm_s_junction_end() {
+        let q = p(-900.0 + 1000.0 * 0.3f64.cos(), 100.0 + 1000.0 * 0.3f64.sin());
+        let corner = [AssemblyLine { from: p(100.0, 100.0), to: q, layer: "A".into(), arc: None }];
+        for reversed in [false, true] {
+            let (j, runs, _) = arc_l_corner(reversed);
+            let reach = corner_arc_reach(&j, &runs, &corner);
+            assert_eq!(reach[0], 0.0, "reversed {reversed}");
+            assert!((reach[1] - 0.3).abs() < 1e-9, "reversed {reversed}: {reach:?}");
+            assert_eq!(corner_reach(&j, &runs, &corner)[1], 0.0);
+        }
     }
 
     #[test]
