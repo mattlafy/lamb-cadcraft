@@ -78,6 +78,16 @@ impl NativeGate {
     }
 }
 
+/// The id of the page's command-line input on touch screens, which a touch on the command bar
+/// focuses to open the on-screen keyboard.
+pub const COMMAND_INPUT_ID: &str = "mobile_command_input";
+
+/// Whether a stopped touch `pointerup` focuses the canvas, given the id of the element holding
+/// focus: not while the page's command input holds it, so typing keeps reaching that input.
+pub fn focus_canvas_on_lift(active_id: Option<&str>) -> bool {
+    active_id != Some(COMMAND_INPUT_ID)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Class {
     /// Not yet a drag: may still be a tap or become a gesture.
@@ -864,5 +874,13 @@ mod tests {
         assert!(!g.admit(DomEvent::Mouse, 2.5), "emulated after a touch");
         assert!(g.admit(DomEvent::Pointer { touch: false }, 2.5), "a real mouse's pointer events pass");
         assert!(g.admit(DomEvent::Mouse, 3.5));
+    }
+
+    #[test]
+    fn a_lift_keeps_focus_on_the_command_input() {
+        assert!(!focus_canvas_on_lift(Some(COMMAND_INPUT_ID)));
+        assert!(focus_canvas_on_lift(Some("cadcraft_canvas")));
+        assert!(focus_canvas_on_lift(Some("")));
+        assert!(focus_canvas_on_lift(None));
     }
 }
