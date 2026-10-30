@@ -156,7 +156,7 @@ mod tests {
         // A directory symlink pointing back at `real` would be re-scanned if followed.
         symlink(&real, base.join("alias")).unwrap();
         let mut c = Counts::default();
-        walk(&base, &mut c).unwrap();
+        super::walk(&base, &mut c).unwrap();
         assert_eq!(c.files, 1, "the aliased directory was followed and counted twice");
         std::fs::remove_dir_all(&base).ok();
     }
