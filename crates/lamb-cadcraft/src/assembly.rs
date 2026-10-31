@@ -19,7 +19,8 @@
 //! band end at a two-arm junction with no corner detail (`Untyped` or `Conflict`) moved onto that
 //! junction's bisector (lamb-core's [`junction_bisector`], [`mitre_end`]), and at such a T junction
 //! the branch run's band ends butted onto the through run's face on its side (lamb-core's
-//! [`tee_butt`], LAMB T472); repeats are not mitred.
+//! [`tee_butt`], LAMB T472) — onto its face circle when the through run is an arc (lamb-core's
+//! [`tee_face_circle`], [`end_on_circle`], LAMB T583); repeats are not mitred.
 //! The project's stud grid ([`crate::studgrid`], LAMB T458, T463) lays each straight run's repeat whose
 //! pitch is near the grid's on that grid's lines — every plan run, and a section's runs along its cut line.
 //! At each L or T junction a corner tag resolves to (§10 step 3, LAMB T461, T481), [`corner_assembly`]
@@ -50,8 +51,8 @@ use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult
 use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
     AssemblyLine, FaceRef, WidthConflict, arc_delta, arc_end, arm_direction, corner_arc_reach, corner_reach, detail_bands, detail_frame,
-    jamb_arc_reach, jamb_reach, junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner, place_opening, place_opening_end, tee_butt,
-    trim_to_reach, width_conflict,
+    end_on_circle, jamb_arc_reach, jamb_reach, junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner, place_opening, place_opening_end,
+    tee_butt, tee_face_circle, trim_to_reach, width_conflict,
 };
 use lamb_core::derivation::detail_tags::{EndLevel, RunDetail};
 use lamb_core::derivation::issues::{Issue, IssueKind};
@@ -419,8 +420,12 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
                 let arm = &j.arms[b];
                 let Some(r) = runs.get_mut(arm.run).filter(|r| r.skipped.is_none()) else { continue };
                 let n = r.bands;
+                let circle = tee_face_circle(j, &graph.runs);
                 for l in &mut r.lines[..n] {
-                    mitre_end(l, arm.end, point, dir);
+                    match circle {
+                        Some((center, radius)) => end_on_circle(l, arm.end, center, radius),
+                        None => mitre_end(l, arm.end, point, dir),
+                    }
                 }
             }
         }
@@ -2912,6 +2917,95 @@ pub(crate) mod tests {
         s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
         s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 1500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
         Ok((s, plan))
+    }
+
+    /// [`angled_arc_room`] with an annex of 200 mm walls built outside its arc wall: horizontal
+    /// bottom and top walls (outer faces y 600 and 1600, inner 800 and 1400) whose wall-side ends lie
+    /// on the arc's outer face circle, and a far wall at x 4600..4800. The arc run splits into
+    /// exterior / shared / exterior parts and both annex walls are T branches onto it. Returns
+    /// (session, plan, centre).
+    fn arc_t_plan() -> T<(Session, Id, Point2)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let detail = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": r.hex(), "kind": "exterior_face" }))?;
+        s.execute("layer.new", &json!({ "name": "CLAD", "current": true }))?;
+        line(&mut s, [0.0, -20.0], [1000.0, -20.0])?;
+        s.execute("layer.new", &json!({ "name": "GYP", "current": true }))?;
+        line(&mut s, [0.0, 50.0], [1000.0, 50.0])?;
+        line(&mut s, [0.0, 200.0], [1000.0, 200.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        let c = Point2 { x: 3000.0 - (2200.0f64.powi(2) - 1100.0f64.powi(2)).sqrt(), y: 1100.0 };
+        let ang = |y: f64| ((y - c.y) / 2200.0).asin();
+        let on = |y: f64| [c.x + 2200.0 * ang(y).cos(), y];
+        let bulge = |from: f64, to: f64| ((to - from) / 4.0).tan();
+        let half_in = (900.0f64 / 2000.0).asin();
+        let xi = c.x + 2000.0 * half_in.cos();
+        let v = |p: [f64; 2], bulge: f64| json!({ "p": p, "bulge": bulge });
+        let a30 = 30.0f64.to_radians();
+        let outer = [
+            v([0.0, 0.0], 0.0),
+            v([3000.0, 0.0], bulge(-a30, ang(600.0))),
+            v(on(600.0), 0.0),
+            v([4800.0, 600.0], 0.0),
+            v([4800.0, 1600.0], 0.0),
+            v(on(1600.0), bulge(ang(1600.0), a30)),
+            v([3000.0, 2200.0], 0.0),
+            v([0.0, 2200.0], 0.0),
+        ];
+        s.execute("pline", &json!({ "vertices": outer, "closed": true }))?;
+        let bi = (half_in / 2.0).tan();
+        s.execute(
+            "pline",
+            &json!({ "vertices": [v([200.0, 200.0], 0.0), v([xi, 200.0], bi), v([xi, 2000.0], 0.0), v([200.0, 2000.0], 0.0)], "closed": true }),
+        )?;
+        let annex = [v(on(800.0), 0.0), v([4600.0, 800.0], 0.0), v([4600.0, 1400.0], 0.0), v(on(1400.0), bulge(ang(1400.0), ang(800.0)))];
+        s.execute("pline", &json!({ "vertices": annex, "closed": true }))?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 1500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
+        Ok((s, plan, c))
+    }
+
+    #[test]
+    fn mitre_butts_a_t_branch_s_bands_onto_an_arc_through_run_s_face_circle() -> R {
+        let (mut s, plan, c) = arc_t_plan()?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, plan);
+        let tees = tees(&graph);
+        assert_eq!(tees.len(), 2, "{:?}", graph.junctions);
+        let off = assembly_lines(s.doc()?, plan)?;
+        for &(_, run, _) in &tees {
+            assert!(off[run].skipped.is_none() && off[run].bands == 3, "{:?}", off[run]);
+        }
+        s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": true }))?;
+        let d = s.doc()?;
+        let on = assembly_lines(d, plan)?;
+        for (j, &(node, run, end)) in graph.junctions.iter().filter(|j| tee_butt(j, &graph.runs).is_some()).zip(&tees) {
+            let (_, point, dir) = tee_butt(j, &graph.runs).ok_or("no butt")?;
+            let (centre, radius) = tee_face_circle(j, &graph.runs).ok_or("not an arc T")?;
+            assert!((centre.x - c.x).abs() < 1.0 && (centre.y - c.y).abs() < 1.0 && (radius - 2200.0).abs() < 1e-6, "{centre:?} {radius}");
+            let a = &on[run];
+            let ends: Vec<Point2> = a.lines[..a.bands].iter().map(|l| if end == RunEnd::Start { l.from } else { l.to }).collect();
+            for (k, q) in ends.iter().enumerate() {
+                let r = (q.x - centre.x).hypot(q.y - centre.y);
+                assert!((r - radius).abs() < 1e-6, "T at {node:?}, band {k}: {q:?} at {r}");
+                let off_tangent = ((q.x - point.x) * dir.y - (q.y - point.y) * dir.x).abs();
+                if k != 1 {
+                    assert!(off_tangent > 0.1, "T at {node:?}, band {k} on the tangent: {off_tangent}");
+                }
+            }
+            assert_ne!(on[run].lines, off[run].lines);
+        }
+        let corners: Vec<Issue> = wall_issues(d)?.into_iter().filter(|c| c.kind == IssueKind::UndetailedCorner).collect();
+        for t in &tees {
+            let c = corners.iter().find(|c| c.location == t.0).ok_or("no T issue")?;
+            assert!(c.note.ends_with("(mitred)"), "{}", c.note);
+        }
+        Ok(())
     }
 
     /// [`angled_arc_room`] with a 20° gap in the middle of its arc wall (±10° about the circle's

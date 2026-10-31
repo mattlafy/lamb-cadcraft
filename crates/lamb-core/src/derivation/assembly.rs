@@ -7,7 +7,8 @@
 //! Junctions are not trimmed by default; for a plan that opts into mitring (§10 step 3, LAMB T385)
 //! the adapter moves band ends at undetailed two-arm junctions onto [`junction_bisector`] with
 //! [`mitre_end`], and a T's branch band ends onto the through run's face with [`tee_butt`] (LAMB
-//! T472). Computed on demand.
+//! T472) — onto its face circle with [`tee_face_circle`] and [`end_on_circle`] when the through run
+//! is an arc (LAMB T583). Computed on demand.
 //!
 //! Not the AI-line sweep (`crate::sweeps` in the adapter); everything here is "assembly".
 
@@ -324,7 +325,8 @@ pub fn lay_repeat(
 ///   wall side come from the arc's tangent and radius at its junction end; the mapped lines stay
 ///   straight. Arms whose travels are parallel there (a tangent arc continuation) are an error.
 /// - **Three arms (T)**: exactly one gap within `TOLERANCE.angle_deg` of 180° and straight through
-///   arms of equal width ([`tee_butt`]). The through run's face opposite the branch carries the
+///   arms of equal width ([`tee_butt`]; arc through arms, which [`tee_butt`] accepts since LAMB
+///   T583, are still an error here — their face has no straight frame). The through run's face opposite the branch carries the
 ///   reference — it must be the `face` side (per the first through arm whose `sides` decide it),
 ///   else an error — its `to` end at the foot of the
 ///   branch's centreline on that face, the wall side toward the branch, the travel the along-face
@@ -631,23 +633,76 @@ pub fn arm_direction(j: &Junction, runs: &[WallRun], i: usize) -> Option<Point2>
     (len > 0.0).then(|| Point2 { x: dx / len, y: dy / len })
 }
 
+/// The unit direction from `j.point` into arm `i` (LAMB T583): [`arm_direction`] for a straight
+/// run; for an arc run, the tangent of its circle at `j.point`'s angle `a` about the centre, in the
+/// sense of travel from its junction end into the run — `toward · (−sin a, cos a)` with `toward`
+/// from [`arc_end`]. (An arc run's own end sits on a face crossing, not always at `j.point`, so the
+/// tangent is taken at the node.) `None` for a degenerate run or a missing arm.
+pub fn arm_tangent(j: &Junction, runs: &[WallRun], i: usize) -> Option<Point2> {
+    let arm = j.arms.get(i)?;
+    match arc_end(runs.get(arm.run)?, arm.end) {
+        Some((c, _, toward)) => {
+            let a = (j.point.y - c.y).atan2(j.point.x - c.x);
+            Some(Point2 { x: -toward * a.sin(), y: toward * a.cos() })
+        }
+        None => arm_direction(j, runs, i),
+    }
+}
+
+/// The through arms `a`, `b` of a T: `Some(None)` when both runs are straight, `Some(Some((centre,
+/// centreline radius)))` of `a` when both are arcs on one circle (centres and centreline radii
+/// within `TOLERANCE.grouping_mm`), `None` for a straight-and-arc pair, two circles or a missing
+/// arm.
+fn through_circle(j: &Junction, runs: &[WallRun], a: usize, b: usize) -> Option<Option<(Point2, f64)>> {
+    let ra = &runs.get(j.arms.get(a)?.run)?.centreline;
+    let rb = &runs.get(j.arms.get(b)?.run)?.centreline;
+    match (ra, rb) {
+        (RunCurve::Line { .. }, RunCurve::Line { .. }) => Some(None),
+        (RunCurve::Arc { center: ca, radius: r1, .. }, RunCurve::Arc { center: cb, radius: r2, .. }) => {
+            let g = TOLERANCE.grouping_mm;
+            ((ca.x - cb.x).hypot(ca.y - cb.y) <= g && (r1 - r2).abs() <= g).then_some(Some((*ca, *r1)))
+        }
+        _ => None,
+    }
+}
+
 /// The butt line for an undetailed T junction (§10 step 3, LAMB T472): `None` unless `j` has three
 /// arms and exactly one gap within `TOLERANCE.angle_deg` of 180°, whose two through arms
-/// (`arms[i]`, `arms[(i + 1) % 3]`) are straight and of equal `width` within
-/// `TOLERANCE.coincidence_mm`. Returns `(branch arm index, face point, face dir)`: the through run's
-/// drawn face on the branch's side — `j.point + n · width / 2`, along the first through arm `t`.
+/// (`arms[i]`, `arms[(i + 1) % 3]`) are both straight — or both arcs on one circle, centres and
+/// radii within `TOLERANCE.grouping_mm` (LAMB T583) — and of equal `width` within
+/// `TOLERANCE.coincidence_mm`; a straight-and-arc through pair is `None`. The gaps are `j.gaps_deg`
+/// with each arc arm's direction replaced by its [`arm_tangent`] at the node (an arc arm's
+/// `direction_deg` is its tangent at its own end, which is off the node by the branch's width).
+/// Returns `(branch arm index, face point, face dir)`: the through run's drawn face on the branch's
+/// side and the first through arm's [`arm_tangent`] `t`. Straight, the face point is `j.point + n ·
+/// width / 2`; on an arc through it is the node's radial projection onto the face circle on the
+/// branch's side ([`tee_face_circle`]), and `t` is the tangent there.
 pub fn tee_butt(j: &Junction, runs: &[WallRun]) -> Option<(usize, Point2, Point2)> {
     if j.arms.len() != 3 || j.gaps_deg.len() != 3 {
         return None;
     }
-    let mut straight = (0..3).filter(|&i| (j.gaps_deg[i] - 180.0).abs() <= TOLERANCE.angle_deg);
+    let mut dirs = [0.0; 3];
+    let mut any_arc = false;
+    for (k, arm) in j.arms.iter().enumerate() {
+        dirs[k] = match runs.get(arm.run).map(|r| &r.centreline) {
+            Some(RunCurve::Arc { .. }) => {
+                any_arc = true;
+                let t = arm_tangent(j, runs, k)?;
+                t.y.atan2(t.x).to_degrees()
+            }
+            _ => arm.direction_deg,
+        };
+    }
+    let gap = |k: usize| if any_arc { (dirs[(k + 1) % 3] - dirs[k]).rem_euclid(360.0) } else { j.gaps_deg[k] };
+    let mut straight = (0..3).filter(|&i| (gap(i) - 180.0).abs() <= TOLERANCE.angle_deg);
     let i = straight.next()?;
     if straight.next().is_some() {
         return None;
     }
     let (a, b, branch) = (i, (i + 1) % 3, (i + 2) % 3);
-    let t = arm_direction(j, runs, a)?;
-    arm_direction(j, runs, b)?;
+    let circle = through_circle(j, runs, a, b)?;
+    let t = arm_tangent(j, runs, a)?;
+    arm_tangent(j, runs, b)?;
     let (wa, wb) = (runs.get(j.arms[a].run)?.width, runs.get(j.arms[b].run)?.width);
     if (wa - wb).abs() > TOLERANCE.coincidence_mm {
         return None;
@@ -656,7 +711,49 @@ pub fn tee_butt(j: &Junction, runs: &[WallRun]) -> Option<(usize, Point2, Point2
     let left = Point2 { x: -t.y, y: t.x };
     let s = if left.x * r.cos() + left.y * r.sin() >= 0.0 { 1.0 } else { -1.0 };
     let half = wa / 2.0 * s;
-    Some((branch, Point2 { x: j.point.x + left.x * half, y: j.point.y + left.y * half }, t))
+    let point = match circle {
+        None => Point2 { x: j.point.x + left.x * half, y: j.point.y + left.y * half },
+        Some((c, rc)) => {
+            let (ux, uy) = (j.point.x - c.x, j.point.y - c.y);
+            let len = ux.hypot(uy);
+            if len <= 0.0 {
+                return None;
+            }
+            let (ux, uy) = (ux / len, uy / len);
+            let face = rc + half * (left.x * ux + left.y * uy);
+            Point2 { x: c.x + ux * face, y: c.y + uy * face }
+        }
+    };
+    Some((branch, point, t))
+}
+
+/// The through run's face circle at an arc T (LAMB T583): `Some((centre, |face point − centre|))`
+/// when [`tee_butt`] is `Some` and its through arms are arcs; `None` otherwise.
+pub fn tee_face_circle(j: &Junction, runs: &[WallRun]) -> Option<(Point2, f64)> {
+    let (branch, point, _) = tee_butt(j, runs)?;
+    let (center, _) = through_circle(j, runs, (branch + 1) % 3, (branch + 2) % 3)??;
+    Some((center, (point.x - center.x).hypot(point.y - center.y)))
+}
+
+/// Moves a straight `line`'s `end` (`Start` → `from`, `End` → `to`) to the crossing of its infinite
+/// extension with the circle (`center`, `r`) nearest that end (LAMB T583); an arc line, or a line
+/// that misses the circle, is unchanged.
+pub fn end_on_circle(line: &mut AssemblyLine, end: RunEnd, center: Point2, r: f64) {
+    if line.arc.is_some() {
+        return;
+    }
+    let at = match end {
+        RunEnd::Start => line.from,
+        RunEnd::End => line.to,
+    };
+    let d = |p: &Point2| (p.x - at.x).hypot(p.y - at.y);
+    let Some(hit) = intersect_line_with_boundary_circle(line.from, line.to, center, r).into_iter().min_by(|p, q| d(p).total_cmp(&d(q))) else {
+        return;
+    };
+    match end {
+        RunEnd::Start => line.from = hit,
+        RunEnd::End => line.to = hit,
+    }
 }
 
 /// How far a placed corner detail (§10 step 3, LAMB T462) reaches into each arm of `j`, in arm
@@ -1140,6 +1237,99 @@ mod tests {
         assert_eq!(tee_butt(&x, &runs), None);
         let (l, lruns, _) = l_corner(false);
         assert_eq!(tee_butt(&Junction { gaps_deg: vec![90.0, 270.0], ..l }, &lruns), None);
+    }
+
+    fn arc_at(center: Point2, radius: f64, start_deg: f64, sweep_deg: f64) -> WallRun {
+        let mut r = run(p(0.0, 0.0), p(1.0, 0.0), 200.0);
+        r.centreline = RunCurve::Arc { center, radius, start_angle: start_deg.to_radians(), sweep: sweep_deg.to_radians() };
+        r
+    }
+
+    /// A T at (0,2000) on a 200 mm arc wall about the origin (centreline radius 2000) split there:
+    /// run 0 the arc from 45° to 90° (ending at the node), run 1 a straight branch out along +y, run
+    /// 2 the arc from 90° to 135°. Arms east, north, west; gaps [90, 90, 180].
+    fn arc_t_junction() -> (Junction, Vec<WallRun>) {
+        use crate::derivation::wall_junctions::JunctionArm;
+        let o = p(0.0, 2000.0);
+        let runs = vec![arc_at(p(0.0, 0.0), 2000.0, 45.0, 45.0), run(o, p(0.0, 5000.0), 200.0), arc_at(p(0.0, 0.0), 2000.0, 90.0, 45.0)];
+        let arms = vec![
+            JunctionArm { run: 0, end: RunEnd::End, direction_deg: 0.0 },
+            JunctionArm { run: 1, end: RunEnd::Start, direction_deg: 90.0 },
+            JunctionArm { run: 2, end: RunEnd::Start, direction_deg: 180.0 },
+        ];
+        (Junction { point: o, arms, gaps_deg: vec![90.0, 90.0, 180.0] }, runs)
+    }
+
+    #[test]
+    fn arm_tangent_follows_an_arc_from_either_end_in_either_sweep() {
+        use crate::derivation::wall_junctions::JunctionArm;
+        use std::f64::consts::FRAC_PI_2;
+        let cases = [
+            (FRAC_PI_2, RunEnd::Start, (0.0, 1.0)),
+            (-FRAC_PI_2, RunEnd::Start, (0.0, -1.0)),
+            (FRAC_PI_2, RunEnd::End, (1.0, 0.0)),
+            (-FRAC_PI_2, RunEnd::End, (1.0, 0.0)),
+        ];
+        for (sweep, end, (x, y)) in cases {
+            let runs = vec![arc_run(1000.0, sweep)];
+            let at = if end == RunEnd::Start { 0.0 } else { sweep };
+            let j = Junction {
+                point: p(1000.0 * at.cos(), 1000.0 * at.sin()),
+                arms: vec![JunctionArm { run: 0, end, direction_deg: 0.0 }],
+                gaps_deg: Vec::new(),
+            };
+            let t = arm_tangent(&j, &runs, 0).unwrap();
+            assert!((t.x - x).abs() < 1e-12 && (t.y - y).abs() < 1e-12, "{sweep} {end:?}: {t:?}");
+            assert_eq!(arm_direction(&j, &runs, 0), None);
+        }
+        let (j, runs) = t_junction();
+        assert_eq!(arm_tangent(&j, &runs, 1), arm_direction(&j, &runs, 1));
+    }
+
+    #[test]
+    fn tee_butt_on_an_arc_through_run_lands_on_its_face_circle() {
+        let (j, runs) = arc_t_junction();
+        let (b, point, dir) = tee_butt(&j, &runs).unwrap();
+        assert_eq!(b, 1);
+        assert!(point.x.abs() < 1e-9 && (point.x.hypot(point.y) - 2100.0).abs() < 1e-9, "{point:?}");
+        assert!((dir.x.abs() - 1.0).abs() < 1e-12 && dir.y.abs() < 1e-12, "{dir:?}");
+        let (c, r) = tee_face_circle(&j, &runs).unwrap();
+        assert!(c.x.abs() < 1e-12 && c.y.abs() < 1e-12 && (r - 2100.0).abs() < 1e-9, "{c:?} {r}");
+        // Within grouping of one circle still butts; two circles do not.
+        let mut near = runs.clone();
+        near[2] = arc_at(p(0.0, -20.0), 2020.0, 90.0, 45.0);
+        assert!(tee_butt(&j, &near).is_some());
+        let mut far = runs.clone();
+        far[2] = arc_at(p(0.0, -1000.0), 3000.0, 90.0, 45.0);
+        assert_eq!(tee_butt(&j, &far), None);
+        // A straight-and-arc through pair stays unbutted.
+        let mut mixed = runs.clone();
+        mixed[2] = run(j.point, p(-5000.0, 2000.0), 200.0);
+        assert_eq!(tee_butt(&j, &mixed), None);
+        // A straight T has no face circle.
+        let (sj, sruns) = t_junction();
+        assert_eq!(tee_face_circle(&sj, &sruns), None);
+    }
+
+    #[test]
+    fn end_on_circle_moves_a_straight_end_to_the_nearest_crossing() {
+        let c = p(0.0, 0.0);
+        let mut line = AssemblyLine { from: p(50.0, 5000.0), to: p(50.0, 2500.0), layer: "A".into(), arc: None };
+        end_on_circle(&mut line, RunEnd::End, c, 2100.0);
+        assert!((line.to.x - 50.0).abs() < 1e-9 && (line.to.y - (2100.0f64.powi(2) - 2500.0).sqrt()).abs() < 1e-9, "{line:?}");
+        assert_eq!(line.from, p(50.0, 5000.0));
+        let mut start = AssemblyLine { from: p(50.0, 2500.0), to: p(50.0, 5000.0), layer: "A".into(), arc: None };
+        end_on_circle(&mut start, RunEnd::Start, c, 2100.0);
+        assert!((start.from.y - line.to.y).abs() < 1e-9);
+        // A miss and an arc line are unchanged.
+        let miss = AssemblyLine { from: p(3000.0, 0.0), to: p(3000.0, 10.0), layer: "A".into(), arc: None };
+        let mut m = miss.clone();
+        end_on_circle(&mut m, RunEnd::End, c, 2100.0);
+        assert_eq!(m, miss);
+        let arc = AssemblyLine { arc: Some(ArcSpan { center: c, radius: 2500.0, ccw: true }), ..miss.clone() };
+        let mut a = arc.clone();
+        end_on_circle(&mut a, RunEnd::End, c, 2100.0);
+        assert_eq!(a, arc);
     }
 
     #[test]
