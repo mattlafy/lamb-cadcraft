@@ -2,7 +2,8 @@
 //! `SeenSummary`): a Role row whose choices run SETROLE, and for one plan polyline in a placed plan
 //! view whose resolved role is cut or seen, where its height comes from at the stepped segment —
 //! each such source row offering `Go to <view>` choices (EDITVIEW) for the placed vertical views
-//! whose linked lines supply it.
+//! whose linked lines supply it. One ellipse or spline whose resolved role reaches 3D (cut, seen,
+//! datum) gets a read-only `3D` row saying it is not supported (§6: flagged, never silently ignored).
 //! One selected layout viewport gets a View row instead, whose choices run VPVIEW.
 //! The desktop app maps [`LambGroup`] onto the UI's generic property-group slot.
 
@@ -137,6 +138,23 @@ fn span_views(span: &ResolvedSpan, links: &[(Id, f64)], tol_t: f64) -> Vec<Id> {
     }
 }
 
+/// The read-only `3D` row of an ellipse or spline whose role reaches 3D (cut, seen, datum): such a
+/// curve converts to no polyline, so it contributes nothing to derivation. `None` otherwise.
+fn not_3d_row(d: &Drawing, h: Handle, role: LineRole) -> Option<LambRow> {
+    let kind = match d.entity(h)?.kind {
+        EntityKind::Ellipse(_) => "ellipse",
+        EntityKind::Spline(_) => "spline",
+        _ => return None,
+    };
+    matches!(role, LineRole::Cut | LineRole::Seen | LineRole::Datum).then(|| LambRow {
+        label: "3D".into(),
+        value: format!("not supported for {kind}"),
+        tip: Some("LAMB derives 3D from lines, arcs, circles and polylines only; this entity contributes nothing to 3D.".into()),
+        choices: vec![],
+        edit: None,
+    })
+}
+
 /// The LAMB group for `sel` at `segment` (clamped to the polyline's last segment): the View row for
 /// one layout viewport, else `None` unless every handle is a LAMB entity.
 pub fn property_group(d: &Drawing, sel: &[Handle], segment: usize) -> Option<LambGroup> {
@@ -154,6 +172,11 @@ pub fn property_group(d: &Drawing, sel: &[Handle], segment: usize) -> Option<Lam
     {
         let value = if o.accepted { "Accepted" } else { "Proposed — ACCEPT to keep" };
         rows.push(LambRow { label: "AI line".into(), value: value.into(), tip: None, choices: vec![], edit: None });
+    }
+    if let [e] = ents.as_slice()
+        && let Some(r) = not_3d_row(d, sel[0], dp.role_of(e))
+    {
+        rows.push(r);
     }
     let mut segments = 0;
     if let [e] = ents.as_slice()

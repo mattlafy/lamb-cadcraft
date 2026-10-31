@@ -1,6 +1,7 @@
 //! The LAMB group of the Properties palette (`props::property_group`) on the imported
 //! `u-wall-two-sections`: the Role row and its SETROLE choices, the cut wall's per-segment height
-//! source matching `resolve_cut_segment`, `*VARIES*`, and `None` for a non-LAMB entity.
+//! source matching `resolve_cut_segment`, `*VARIES*`, `None` for a non-LAMB entity, and the `3D`
+//! row of an ellipse or spline whose role reaches 3D.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -268,5 +269,41 @@ fn a_height_source_row_offers_go_to_each_contributing_section() -> R {
     let g = property_group(s.doc()?, &[wall], unlinked).ok_or("no group")?;
     let z = g.rows.iter().find(|r| r.label == "Z source").ok_or("no Z source")?;
     assert!(z.value.starts_with("defaulted") && z.choices.is_empty(), "defaulted Z is read-only: {z:?}");
+    Ok(())
+}
+
+fn handle_of(out: &Value) -> Result<Handle, Box<dyn std::error::Error>> {
+    Ok(Handle::parse_hex(out["handle"].as_str().ok_or("no handle")?).ok_or("bad handle")?)
+}
+
+fn three_d_row(d: &Drawing, sel: &[Handle]) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let g = property_group(d, sel, 0).ok_or("no group")?;
+    Ok(g.rows.iter().find(|r| r.label == "3D").map(|r| {
+        assert!(r.choices.is_empty() && r.edit.is_none() && r.tip.is_some(), "read-only with a tip: {r:?}");
+        r.value.clone()
+    }))
+}
+
+#[test]
+fn an_ellipse_or_spline_with_a_3d_role_says_3d_is_not_supported() -> R {
+    let mut s = session()?;
+    let (wall, _, _) = cut_wall_and_other(s.doc()?)?;
+    let plan = DrawingProject::new(s.doc()?)?.views().find(|v| v.kind == ViewKind::Plan && v.placement.is_some()).ok_or("no placed plan")?.id;
+    s.execute("editview", &serde_json::json!({ "viewId": plan.0 }))?;
+    let el = handle_of(&s.execute("ellipse", &serde_json::json!({ "center": [0, 0], "major": [500, 0], "ratio": 0.5 }))?)?;
+    let sp = handle_of(&s.execute("spline", &serde_json::json!({ "fit": [[0, 0], [300, 200], [600, 0]] }))?)?;
+    let set = |s: &mut Session, h: Handle, role: &str| s.execute("setrole", &serde_json::json!({ "handles": [h.hex()], "role": role })).map(|_| ());
+
+    set(&mut s, el, "cut")?;
+    assert_eq!(three_d_row(s.doc()?, &[el])?.as_deref(), Some("not supported for ellipse"));
+    set(&mut s, sp, "seen")?;
+    assert_eq!(three_d_row(s.doc()?, &[sp])?.as_deref(), Some("not supported for spline"));
+    set(&mut s, el, "datum")?;
+    assert_eq!(three_d_row(s.doc()?, &[el])?.as_deref(), Some("not supported for ellipse"));
+    set(&mut s, el, "annotation")?;
+    assert_eq!(three_d_row(s.doc()?, &[el])?, None, "an annotation ellipse reaches no 3D");
+    set(&mut s, el, "cut")?;
+    assert_eq!(three_d_row(s.doc()?, &[wall])?, None, "a cut polyline participates");
+    assert_eq!(three_d_row(s.doc()?, &[el, wall])?, None, "no 3D row for a multi-selection");
     Ok(())
 }
