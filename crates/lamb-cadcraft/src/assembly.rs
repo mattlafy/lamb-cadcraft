@@ -2819,7 +2819,7 @@ pub(crate) mod tests {
     /// A plan room of 200 mm walls whose right wall is a 60° arc about (1094.74, 1100) — outer face
     /// radius 2200 through (3000,0) and (3000,2200), inner 2000 — meeting the straight bottom and
     /// top walls at an angle, the bottom tagged with [`room`]'s exterior-face detail.
-    fn angled_arc_room() -> T<(Session, Id)> {
+    pub(crate) fn angled_arc_room() -> T<(Session, Id)> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);

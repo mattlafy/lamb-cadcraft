@@ -14,8 +14,9 @@
 //! Each repeat copy of such a run (studs, LAMB T489) whose lines chain end to start into one closed
 //! loop becomes a prism of that loop over the same z range, in its first line's layer, after the
 //! run's strips; a copy that does not close stays 2D.
-//! Each placed corner and jamb detail (LAMB T491) then adds, per adjoining straight run with a z
-//! range, strips from its lines parallel to that run (same boundary rule, each strip over the
+//! Each placed corner and jamb detail (LAMB T491) then adds, per adjoining run with a z range,
+//! strips from its lines parallel to that run's reference face — an arc run's taken as its tangent at
+//! the end nearer the junction (LAMB T570) — (same boundary rule, each strip over the
 //! overlap of its two boundaries' extents) and a prism per closed chain of its lines (whose lines
 //! bound no strip), replacing nothing.
 //! A placed vertical view (section) with an assembly block (LAMB T494) does the same for its laid
@@ -200,6 +201,26 @@ fn run_frame(run: &WallRun, side: &RunSides, face: FaceRef) -> Option<Frame> {
     Some(Frame { a, u, n })
 }
 
+/// An arc run's `face` frame at the end nearer `node` (LAMB T570): origin `a` at the face arc's end
+/// nearer `node`, unit `u` its tangent there and unit `n` the radial normal toward the centreline.
+/// `None` for a straight run or a degenerate arc.
+fn arc_end_frame(run: &WallRun, side: &RunSides, face: FaceRef, node: Point2) -> Option<Frame> {
+    let RunCurve::Arc { radius: centre_r, .. } = run.centreline else { return None };
+    let reference = lay_bands(run, side, face, &[Band { offset: 0.0, layer: String::new() }]).ok()?;
+    let reference = reference.first()?;
+    let arc = reference.arc?;
+    let dist = |q: Point2| (q.x - node.x).hypot(q.y - node.y);
+    let a = if dist(reference.from) <= dist(reference.to) { reference.from } else { reference.to };
+    let r = sub(a, arc.center);
+    let len = r.x.hypot(r.y);
+    if len <= TOLERANCE.coincidence_mm || (centre_r - len).abs() <= TOLERANCE.coincidence_mm {
+        return None;
+    }
+    let out = Point2 { x: r.x / len, y: r.y / len };
+    let n = if centre_r < len { Point2 { x: -out.x, y: -out.y } } else { out };
+    Some(Frame { a, u: Point2 { x: -out.y, y: out.x }, n })
+}
+
 /// The z range a run's massing has, with the run's face keys and the most doubtful provenance.
 struct ZRange {
     bottom: f64,
@@ -334,28 +355,28 @@ fn plan_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, result: 
     let faces: Vec<(usize, FaceRef)> = runs.iter().filter_map(|r| r.face.map(|f| (r.run, f))).collect();
     let corners = corner_assembly(d, view.id).unwrap_or_default();
     let openings = opening_assembly(d, view.id).unwrap_or_default();
-    let mut groups: Vec<(&[AssemblyLine], Vec<usize>)> = Vec::new();
+    let mut groups: Vec<(&[AssemblyLine], Vec<usize>, Point2)> = Vec::new();
     for c in corners.iter().filter(|c| c.skipped.is_none()) {
         let Some(j) = graph.junctions.get(c.junction) else { continue };
-        groups.push((&c.lines, j.arms.iter().map(|a| a.run).collect()));
+        groups.push((&c.lines, j.arms.iter().map(|a| a.run).collect(), j.point));
     }
     for o in openings.iter().filter(|o| o.skipped.is_none()) {
         let Some(b) = graph.bridges.get(o.bridge) else { continue };
         if let Some(at_b) = o.end {
             // A section's head or sill (LAMB T505): one end, all its lines.
-            groups.push((&o.lines, vec![if at_b { b.b.0 } else { b.a.0 }]));
+            groups.push((&o.lines, vec![if at_b { b.b.0 } else { b.a.0 }], if at_b { b.to } else { b.from }));
             continue;
         }
         if o.lines.len() % 2 != 0 {
             continue;
         }
         let (first, second) = o.lines.split_at(o.lines.len() / 2);
-        groups.push((first, vec![b.a.0]));
-        groups.push((second, vec![b.b.0]));
+        groups.push((first, vec![b.a.0], b.from));
+        groups.push((second, vec![b.b.0], b.to));
     }
     let ctx = DetailCtx { view, runs: &graph.runs, sides: &sides.runs, faces: &faces, result };
-    for (lines, adjoining) in groups {
-        ctx.meshes(lines, &adjoining, out);
+    for (lines, adjoining, node) in groups {
+        ctx.meshes(lines, &adjoining, node, out);
     }
 }
 
@@ -440,7 +461,7 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
             None => ((-depth / 2.0, depth / 2.0), ProvenanceKind::Defaulted, arms.first().copied()),
         };
         let Some(sources) = src.and_then(faces_of) else { continue };
-        let loops = ctx.loops(&c.lines, &arms);
+        let loops = ctx.loops(&c.lines, &arms, j.point);
         let rings = if loops.first.is_some() { loops.rings } else { Vec::new() };
         for (ring, layer) in loops.strips.into_iter().map(|(_, q, l)| (q, l)).chain(rings) {
             if let Some(base) = lift(&ring) {
@@ -467,7 +488,7 @@ fn section_strips(d: &Drawing, p: &DrawingProject<'_>, view: &ViewRef<'_>, host:
             None => ((-depth / 2.0, depth / 2.0), ProvenanceKind::Defaulted),
         };
         let sources = [run.faces[0].from.entity_id, run.faces[1].from.entity_id];
-        let loops = ctx.loops(&o.lines, &[i]);
+        let loops = ctx.loops(&o.lines, &[i], if at_b { b.to } else { b.from });
         let rings = if loops.first.is_some() { loops.rings } else { Vec::new() };
         for (ring, layer) in loops.strips.into_iter().map(|(_, q, l)| (q, l)).chain(rings) {
             if let Some(base) = lift(&ring) {
@@ -617,10 +638,11 @@ struct DetailLoops {
 }
 
 impl DetailCtx<'_> {
-    /// One placed detail's loops: per `adjoining` straight run, `lines` parallel to it as strips over
+    /// One placed detail's loops: per `adjoining` run, `lines` parallel to its reference face — an
+    /// arc run's taken as its tangent at the end nearer `node` ([`arc_end_frame`]) — as strips over
     /// the overlap of consecutive boundaries; then each closed chain of `lines`. A closed chain's
     /// lines are not strip boundaries.
-    fn loops(&self, lines: &[AssemblyLine], adjoining: &[usize]) -> DetailLoops {
+    fn loops(&self, lines: &[AssemblyLine], adjoining: &[usize], node: Point2) -> DetailLoops {
         let tol = TOLERANCE.coincidence_mm;
         let sin_tol = TOLERANCE.angle_deg.to_radians().sin();
         let near = |a: Point2, b: Point2| (a.x - b.x).hypot(a.y - b.y) <= tol;
@@ -641,7 +663,7 @@ impl DetailCtx<'_> {
         for &i in adjoining {
             let (Some(run), Some(side)) = (self.runs.get(i), self.sides.get(i)) else { continue };
             let Some(&(_, face)) = self.faces.iter().find(|f| f.0 == i) else { continue };
-            let Some(fr) = run_frame(run, side, face) else { continue };
+            let Some(fr) = run_frame(run, side, face).or_else(|| arc_end_frame(run, side, face, node)) else { continue };
             let parallel = |l: &AssemblyLine| {
                 let v = sub(l.to, l.from);
                 let len = v.x.hypot(v.y);
@@ -679,9 +701,9 @@ impl DetailCtx<'_> {
 
     /// One placed detail's meshes in a plan: [`Self::loops`] over the `adjoining` runs with a z
     /// range, each strip over its run's z range and each closed chain over the first's.
-    fn meshes(&self, lines: &[AssemblyLine], adjoining: &[usize], out: &mut Layered) {
+    fn meshes(&self, lines: &[AssemblyLine], adjoining: &[usize], node: Point2, out: &mut Layered) {
         let with_z: Vec<usize> = adjoining.iter().copied().filter(|&i| self.runs.get(i).and_then(|r| run_z(r, self.result)).is_some()).collect();
-        let loops = self.loops(lines, &with_z);
+        let loops = self.loops(lines, &with_z, node);
         let z_of = |i: usize| self.runs.get(i).and_then(|r| run_z(r, self.result));
         for (i, quad, layer) in loops.strips {
             if let Some(z) = z_of(i) {
@@ -1161,6 +1183,78 @@ pub(crate) mod tests {
         // Every run is layered, so both plines' solids — arc segment included — are replaced.
         assert!(sc.meshes.iter().all(|m| m.kind != SceneMeshKind::Solid));
         assert_eq!(sc.meshes.iter().filter(|m| m.kind == SceneMeshKind::Layer).count(), 12);
+        Ok(())
+    }
+
+    #[test]
+    fn an_arc_end_frame_is_the_face_tangent_at_the_end_nearer_the_node() -> R {
+        use super::{FaceRef, Point2, RunCurve, arc_end_frame, graph_and_sides, run_frame};
+        let (s, plan) = crate::assembly::tests::d_room()?;
+        let p = crate::project::DrawingProject::new(s.doc()?)?;
+        let (graph, sides) = graph_and_sides(&p, plan);
+        let i = graph.runs.iter().position(|r| matches!(r.centreline, RunCurve::Arc { .. })).ok_or("no arc run")?;
+        let (run, side) = (&graph.runs[i], &sides.runs[i]);
+        let (c, centre_r) = (Point2 { x: 3000.0, y: 1100.0 }, 1000.0);
+        let r = |q: Point2| (q.x - c.x).hypot(q.y - c.y);
+        let mut radii = Vec::new();
+        for face in [FaceRef::Exterior, FaceRef::Interior] {
+            for (node, top) in [(Point2 { x: 3000.0, y: -5.0 }, false), (Point2 { x: 2990.0, y: 2210.0 }, true)] {
+                let fr = arc_end_frame(run, side, face, node).ok_or("no frame")?;
+                let ra = r(fr.a);
+                assert!((ra - 1100.0).abs() < 0.01 || (ra - 900.0).abs() < 0.01, "{ra}");
+                assert!((fr.a.x - 3000.0).abs() < 0.01 && (fr.a.y > 1100.0) == top, "the end nearer the node: {:?}", (fr.a.x, fr.a.y));
+                // u: unit, perpendicular to the radius at a; n: unit radial, toward the centreline.
+                let rad = Point2 { x: (fr.a.x - c.x) / ra, y: (fr.a.y - c.y) / ra };
+                assert!((fr.u.x.hypot(fr.u.y) - 1.0).abs() < 1e-9 && (fr.u.x * rad.x + fr.u.y * rad.y).abs() < 1e-9);
+                assert!((fr.n.x.hypot(fr.n.y) - 1.0).abs() < 1e-9 && (fr.n.x * rad.y - fr.n.y * rad.x).abs() < 1e-9);
+                let step = r(fr.at(0.0, 10.0));
+                assert!((step - centre_r).abs() < (ra - centre_r).abs(), "{face:?}: n leads toward the centreline");
+                radii.push(ra.round());
+            }
+        }
+        radii.sort_by(f64::total_cmp);
+        assert_eq!(radii, [900.0, 900.0, 1100.0, 1100.0], "outer and inner faces both framed");
+        // A straight run has no arc frame (run_frame takes it), and an arc run has no run_frame.
+        let j = graph.runs.iter().position(|r| matches!(r.centreline, RunCurve::Line { .. })).ok_or("no line run")?;
+        assert!(arc_end_frame(&graph.runs[j], &sides.runs[j], FaceRef::Exterior, Point2 { x: 0.0, y: 0.0 }).is_none());
+        assert!(run_frame(run, side, FaceRef::Exterior).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_corner_at_an_arc_arm_lays_strips_along_its_tangent_at_the_corner() -> R {
+        let (mut s, plan) = crate::assembly::tests::angled_arc_room()?;
+        crate::assembly::tests::corner_detail(&mut s, plan, "exterior_face", false, (3000.0, 0.0))?;
+        place(&mut s, plan)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let sc = scene(s.doc()?)?;
+        // The arc run's outer (reference) face: centre (cx, 1100), radius 2200; the run, and so its
+        // face arc, ends at y 2090 by the top junction. The top corner sits in the arc arm's frame (its
+        // CRN-B parallel to that tangent); the bottom one sits in the straight arm's, with no line
+        // parallel to the arc's tangent there.
+        let cx = 3000.0 - (2200.0f64.powi(2) - 1100.0f64.powi(2)).sqrt();
+        let a = [cx + (2200.0f64.powi(2) - 990.0f64.powi(2)).sqrt(), 2090.0];
+        let rad = [(a[0] - cx) / 2200.0, 990.0 / 2200.0];
+        let (u, n) = ([-rad[1], rad[0]], [-rad[0], -rad[1]]);
+        let xy = |p: &[f32; 3]| (sc.origin[0] + f64::from(p[0]) - a[0], sc.origin[1] + f64::from(p[1]) - a[1]);
+        let along: Vec<_> = sc
+            .meshes
+            .iter()
+            .filter(|m| m.kind == SceneMeshKind::Layer && m.layer.starts_with("CRN"))
+            .filter(|m| m.positions.iter().all(|p| xy(p).0.hypot(xy(p).1) < 1500.0))
+            .filter_map(|m| {
+                let off: Vec<f64> = m.positions.iter().map(|p| xy(p).0 * n[0] + xy(p).1 * n[1]).collect();
+                let t: Vec<f64> = m.positions.iter().map(|p| xy(p).0 * u[0] + xy(p).1 * u[1]).collect();
+                let lo_hi = |v: &[f64]| (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+                let (o, tt) = (lo_hi(&off), lo_hi(&t));
+                // Every vertex at offset lo or hi from the tangent line: a strip parallel to it.
+                let banded = off.iter().all(|&h| (h - o.0).abs() < 0.01 || (h - o.1).abs() < 0.01);
+                (banded && o.0 > -0.01 && o.1 - o.0 > 1.0 && tt.1 - tt.0 > 1.0).then_some((m.layer.clone(), o, tt))
+            })
+            .collect();
+        assert!(!along.is_empty(), "a corner strip lies along the arc arm's tangent at the corner");
+        // CRN-B's strip: from the face (offset 0) inward toward the centreline, along the tangent.
+        assert!(along.iter().any(|(l, o, t)| l == "CRN-B" && o.0.abs() < 0.01 && o.1 > 150.0 && t.1 - t.0 > 500.0), "{along:?}");
         Ok(())
     }
 
