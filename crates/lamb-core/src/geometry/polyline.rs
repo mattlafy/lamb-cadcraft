@@ -334,11 +334,19 @@ fn slide_endpoint(shared_original: Point2, neighbor: Option<&ResolvedSegment>, s
     let far = if shared_is_to { neighbor.from } else { neighbor.to };
 
     if is_arc(neighbor.bulge) {
-        // A non-tangent arc neighbour (a tangent fillet is handled by `slide_fillet` before this
-        // is reached) reconnects to the closest point on its CHORD's line.
+        // LAMB T574: a real arc neighbour (a tangent fillet is handled by `slide_fillet` before
+        // this is reached) keeps its far end and the heading at both ends, so its bulge and its
+        // chord direction from the far end are unchanged; centre and radius are free. The shared
+        // end lands where that chord ray meets the moved segment's line shifted by delta's
+        // perpendicular component, so the moved segment keeps its heading. A chord parallel to
+        // the moved line falls back to the closest point on the chord's line.
         let shared = if shared_is_to { neighbor.to } else { neighbor.from };
         let chord_dir = normalize2(sub2(shared, far));
-        return SlidEnd { moved: closest_point_on_infinite_line(far, chord_dir, target), neighbor: None };
+        let perp = sub2(delta, scale2(moved_dir, dot2(delta, moved_dir)));
+        let shifted_anchor = add2(shared_original, perp);
+        let moved =
+            intersect_rays(far, chord_dir, shifted_anchor, moved_dir).unwrap_or_else(|| closest_point_on_infinite_line(far, chord_dir, target));
+        return SlidEnd { moved, neighbor: None };
     }
 
     let neighbor_dir = normalize2(sub2(neighbor.to, neighbor.from));
@@ -417,8 +425,9 @@ pub struct SegmentSlideResult {
 
 /// T108: translate `poly`'s segment `segment_index` by `delta`, stretching (never deforming) its
 /// neighbours to reconnect. An open end translates freely. A tangent fillet arc beside a straight
-/// moved segment translates with the corner it rounds, keeping its radius and tangencies (§4b); a
-/// non-tangent arc neighbour keeps the chord rule. A straight neighbour collinear with the moved
+/// moved segment translates with the corner it rounds, keeping its radius and tangencies (§4b); any
+/// other arc neighbour keeps its far end, its bulge and both end headings, with centre and radius
+/// free (T574). A straight neighbour collinear with the moved
 /// segment keeps its line and gets a perpendicular connector at the doubled vertex (T573,
 /// [`SegmentSlideResult::inserted`]). `corner_at_to` tags are left untouched.
 pub fn slide_segment_by_delta(poly: &Polyline2, segment_index: usize, delta: Point2) -> SegmentSlideResult {

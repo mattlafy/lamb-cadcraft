@@ -1,5 +1,6 @@
 //! §4b: a tangent fillet arc beside a travelling segment keeps its radius and both tangencies
-//! (`slide_segment_by_delta`, LAMB T565); a non-tangent arc neighbour keeps the chord rule.
+//! (`slide_segment_by_delta`, LAMB T565); any other arc neighbour keeps its far end, bulge and end
+//! headings, with centre and radius free (LAMB T574).
 
 use lamb_core::geometry::Point2;
 use lamb_core::geometry::polyline::{
@@ -101,17 +102,47 @@ fn closed_rectangle_side_moves_out_with_both_fillets() {
 }
 
 #[test]
-fn non_tangent_arc_neighbour_keeps_the_chord_rule() {
+fn non_tangent_arc_neighbour_keeps_its_far_end_and_headings() {
     // The arc from (0,500) to (500,0) bulges the other way: not tangent to either line.
     let poly =
         Polyline2 { start: p(0.0, 8000.0), segments: vec![seg(0.0, 500.0, 0.0), seg(500.0, 0.0, -QUARTER), seg(10000.0, 0.0, 0.0)], closed: false };
     let out = slide_segment_by_delta(&poly, 2, p(0.0, -1500.0));
     let r = resolved_segments(&out.poly);
-    // Chord rule: the shared end lands on the chord line x + y = 500, closest to (500, -1500).
+    // T574: the far end and bulge stay; the shared end runs down the chord ray x + y = 500 to the
+    // moved segment's shifted line y = -1500, so the moved segment stays horizontal.
     near(r[0].to, p(0.0, 500.0));
     near(r[1].from, p(0.0, 500.0));
-    near(r[1].to, p(1250.0, -750.0));
+    near(r[1].to, p(2000.0, -1500.0));
     assert_eq!(r[1].bulge, -QUARTER);
     near(r[2].to, p(10000.0, -1500.0));
     assert_eq!(out.unreachable, None);
+}
+
+#[test]
+fn real_arc_beside_open_start_keeps_its_far_end_and_bulge() {
+    let poly =
+        Polyline2 { start: p(0.0, 0.0), segments: vec![seg(1000.0, 0.0, 0.0), seg(1500.0, 500.0, 0.3), seg(1500.0, 1500.0, 0.0)], closed: false };
+    let out = slide_segment_by_delta(&poly, 0, p(0.0, -100.0));
+    let r = resolved_segments(&out.poly);
+    near(r[0].from, p(0.0, -100.0));
+    near(r[0].to, p(900.0, -100.0));
+    near(r[1].to, p(1500.0, 500.0));
+    assert_eq!(r[1].bulge, 0.3);
+    near(r[2].from, p(1500.0, 500.0));
+    near(r[2].to, p(1500.0, 1500.0));
+    assert_eq!(out.unreachable, None);
+}
+
+#[test]
+fn semicircle_between_parallels_keeps_both_end_headings() {
+    let poly = Polyline2 { start: p(0.0, 0.0), segments: vec![seg(1000.0, 0.0, 0.0), seg(1000.0, 500.0, 1.0), seg(0.0, 500.0, 0.0)], closed: false };
+    let out = slide_segment_by_delta(&poly, 0, p(0.0, -100.0));
+    let r = resolved_segments(&out.poly);
+    near(r[0].to, p(1000.0, -100.0));
+    near(r[1].from, p(1000.0, -100.0));
+    near(r[1].to, p(1000.0, 500.0));
+    assert!((radius(&r[1]) - 300.0).abs() < 1e-6);
+    near(tangent_at_param(&r[1], 0.0), p(1.0, 0.0));
+    near(tangent_at_param(&r[1], 1.0), p(-1.0, 0.0));
+    near(r[2].to, p(0.0, 500.0));
 }
