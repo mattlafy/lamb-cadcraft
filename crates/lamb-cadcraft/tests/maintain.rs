@@ -1058,29 +1058,55 @@ fn an_oblique_wall_slid_along_itself_keeps_its_link() -> R {
     Ok(())
 }
 
-/// LAMB T541: a section partner whose crossing segment continues straight into its neighbour
-/// cannot absorb a move across them; the partial slide is applied and the unreachable length is
-/// reported and echoed.
+/// LAMB T573: a section partner whose crossing segment continues straight into its neighbour
+/// doubles the shared vertex — a perpendicular connector joins the unchanged neighbour to the moved
+/// segment, so the full move travels, nothing is unreachable or echoed, a second link further along
+/// the partner shifts up one segment and still holds, and one undo restores both.
 #[test]
-fn an_unreachable_travel_is_reported_and_echoed() -> R {
+fn a_collinear_neighbour_doubles_the_vertex_on_travel() -> R {
     register();
-    let d = wall_and_face([[5000.0, -5000.0], [5000.0, 5000.0]], &[[5000.0, 0.0], [5000.0, 1000.0], [5000.0, 3000.0], [6000.0, 3000.0]])?;
-    let (link, plan_e, plan_view) = wall_link(&d)?;
-    let mv = json!({"handles": [hex(plan_e)], "delta": [100, 0]});
-    let (_, report) = raw_report(&d, plan_view, "move", &mv, &[link.id])?;
-    assert_eq!(report.unreachable.len(), 1, "{report:?}");
-    let sec_e = if link.a.entity_id == plan_e { link.b.entity_id } else { link.a.entity_id };
-    assert_eq!(report.unreachable[0].0, sec_e);
-    assert!(close(report.unreachable[0].1, 100.0), "{report:?}");
+    // Face: seg 0 (5000,0)-(5000,1000) and seg 1 (5000,1000)-(5000,3000) are collinear; wall A
+    // crosses seg 1 at the 1200 cut (t = 0.1), wall B crosses seg 3 (8000,3000)-(8000,0) (t = 0.6).
+    let a: &[[f64; 2]] = &[[5000.0, -5000.0], [5000.0, 5000.0]];
+    let b: &[[f64; 2]] = &[[8000.0, -5000.0], [8000.0, 5000.0]];
+    let face: &[[f64; 2]] = &[[5000.0, 0.0], [5000.0, 1000.0], [5000.0, 3000.0], [8000.0, 3000.0], [8000.0, 0.0]];
+    let d = plans_and_faces(&[a, b], &[face], &[(0, 0, 0.5, 0, 1, 0.1), (1, 0, 0.5, 0, 3, 0.6)])?;
+    let original = read_document(&d)?.links;
+    let (la, lb) = (original[0].id, original[1].id);
+    let (ea, sec_e) = (original[0].a.entity_id, original[0].b.entity_id);
+    let plan_view = view_of(&d, ea)?;
+    {
+        let p = DrawingProject::new(&d)?;
+        assert!(original.iter().all(|l| link_still_coincides(&p, l).unwrap_or(false)), "the fixture's links hold");
+    }
+    let before_face = poly(&d, sec_e)?;
+    let mv = json!({"handles": [hex(ea)], "delta": [100, 0]});
+    let (_, report) = raw_report(&d, plan_view, "move", &mv, &[la])?;
+    assert!(report.unreachable.is_empty() && report.travelled == vec![sec_e], "{report:?}");
 
     let mut s = Session::new();
-    s.open_drawing(d, "t541", None);
+    s.open_drawing(d, "t573", None);
     install_link_maintenance(&mut s);
     s.execute("editview", &json!({"viewId": plan_view.0}))?;
-    s.set_travel(vec![link.id.0]);
+    s.set_travel(vec![la.0]);
     s.execute("move", &mv)?;
-    let line = format!("LAMB: 100 mm of the move could not travel to entity {} (its neighbours cannot absorb it)", hex(sec_e));
-    assert!(s.log.contains(&line), "{:?}", s.log);
+    assert!(!s.log.iter().any(|l| l.contains("could not travel")), "{:?}", s.log);
+    let segs = resolved_segments(&poly(s.doc()?, sec_e)?);
+    let pts: Vec<(f64, f64)> = std::iter::once(segs[0].from).chain(segs.iter().map(|g| g.to)).map(|q| (q.x, q.y)).collect();
+    let want = [(5000.0, 0.0), (5000.0, 1000.0), (5100.0, 1000.0), (5100.0, 3000.0), (8000.0, 3000.0), (8000.0, 0.0)];
+    assert_eq!(pts.len(), want.len(), "{pts:?}");
+    assert!(pts.iter().zip(&want).all(|(g, w)| close(g.0, w.0) && close(g.1, w.1)), "{pts:?}");
+    let now = links(&s)?;
+    assert_eq!((seg_on(&find_link(&now, la)?, sec_e), seg_on(&find_link(&now, lb)?, sec_e)), (2, 4), "{now:?}");
+    {
+        let p = DrawingProject::new(s.doc()?)?;
+        for id in [la, lb] {
+            assert!(link_still_coincides(&p, &find_link(&now, id)?)?, "link {id} holds");
+        }
+    }
+    s.undo()?;
+    assert_eq!(links(&s)?, original, "one undo restores both links");
+    assert_eq!(poly(s.doc()?, sec_e)?, before_face, "one undo restores the face");
     Ok(())
 }
 

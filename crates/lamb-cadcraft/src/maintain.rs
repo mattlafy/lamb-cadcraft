@@ -14,8 +14,10 @@
 //!    step 2, which drops it once its lines no longer cross (TS separation parity; LAMB T514)
 //!    (`selection-and-link-editing.md` §4b ray-sliding, lamb-core `travel_segment_move`), so a
 //!    travelled link stays live — §13 phase 3 "STRETCH a linked plan line → the section follows in
-//!    one undo step"; an unaccepted AI line never travels — the after-command sweep
-//!    ([`crate::sweeps`]) re-seats it on its slot instead;
+//!    one undo step"; a slide that doubles a vertex at a collinear neighbour (LAMB T573) inserts a
+//!    connector segment, and every link end on that partner past it shifts up one segment; an
+//!    unaccepted AI line never travels — the after-command sweep ([`crate::sweeps`]) re-seats it
+//!    on its slot instead;
 //! 0b. re-anchors: a link end whose entity the command replaced (TRIM, BREAK erase the original
 //!    handle and add a new one per piece) moves onto the new piece in the same view whose segment
 //!    is a sub-span of the old one and still holds the anchor point — same link id, origin and
@@ -212,9 +214,12 @@ fn similarity_delta(before: &Polyline2, after: &Polyline2, index: usize, param: 
 /// the entity's handle, layer and `ext`). Each partner travels at most once, first link in
 /// `doc.links` order; nothing cascades — the partner's other links are left to step 2's re-check.
 /// A partial slide (`unreachable`) is still applied, and returned with its unachieved length in mm;
-/// step 2 drops the link if the lines no longer cross.
+/// step 2 drops the link if the lines no longer cross. A slide that doubled a vertex (T573) inserted
+/// connector segments; every link end on that partner past one is shifted up to keep its segment.
 fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -> Result<(Vec<Id>, Vec<(Id, f64)>), SchemaError> {
     let mut unreachable: Vec<(Id, f64)> = Vec::new();
+    // T573: (partner, connector indices inserted into it), for the link-end shift below.
+    let mut shifts: Vec<(Id, Vec<usize>)> = Vec::new();
     let writes: Vec<(Id, Polyline2)> = {
         let p = DrawingProject::new(after)?;
         let after_entities = entity_map(&p);
@@ -246,6 +251,9 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -
                     }
                 }
                 if &t.geometry != op_after {
+                    if !t.inserted.is_empty() {
+                        shifts.push((t.entity_id, t.inserted.clone()));
+                    }
                     writes.push((t.entity_id, t.geometry));
                 }
             }
@@ -253,7 +261,38 @@ fn travel(before_entities: &EntityMap, after: &mut Drawing, travel_set: &[Id]) -
         writes
     };
     write_travelled(after, &writes)?;
+    shift_past_connectors(after, &shifts)?;
     Ok((writes.into_iter().map(|(id, _)| id).collect(), unreachable))
+}
+
+/// T573: moves each link end on a travelled partner up by one per connector inserted at or below
+/// its running index (ascending walk), param unchanged — the vertices moved too, so step 0d's
+/// subsequence detection cannot see the insertion. Writes the document once, only if needed.
+fn shift_past_connectors(after: &mut Drawing, shifts: &[(Id, Vec<usize>)]) -> Result<(), SchemaError> {
+    if shifts.is_empty() {
+        return Ok(());
+    }
+    let mut doc = read_document(after)?;
+    let mut changed = false;
+    for link in &mut doc.links {
+        for end in [&mut link.a, &mut link.b] {
+            let Some((_, inserted)) = shifts.iter().find(|(id, _)| *id == end.entity_id) else { continue };
+            let mut index = end.segment_index;
+            for &k in inserted {
+                if index >= k {
+                    index += 1;
+                }
+            }
+            if index != end.segment_index {
+                end.segment_index = index;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        write_document(after, &doc)?;
+    }
+    Ok(())
 }
 
 /// Writes each travelled partner's new geometry into `after`, keeping the entity's handle, layer

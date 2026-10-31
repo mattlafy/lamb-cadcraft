@@ -26,6 +26,10 @@ pub struct TravelResult {
     /// when the full delta was achieved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreachable: Option<Point2>,
+    /// LAMB T573: connector segments inserted into `geometry` at doubled vertices, ascending
+    /// (see `SegmentSlideResult::inserted`); link ends on the partner past them shift up.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inserted: Vec<usize>,
 }
 
 fn anchors_match(a: &LinkAnchor, b: &LinkAnchor) -> bool {
@@ -118,7 +122,7 @@ pub fn travel_segment_move(
     };
 
     let slid = slide_segment_by_delta(partner_poly, other.segment_index, partner_delta);
-    Ok(Some(TravelResult { entity_id: other.entity_id, geometry: slid.poly, unreachable: slid.unreachable }))
+    Ok(Some(TravelResult { entity_id: other.entity_id, geometry: slid.poly, unreachable: slid.unreachable, inserted: slid.inserted }))
 }
 
 #[cfg(test)]

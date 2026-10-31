@@ -313,38 +313,44 @@ fn intersect_rays(anchor_a: Point2, dir_a: Point2, anchor_b: Point2, dir_b: Poin
     Some(add2(anchor_a, scale2(dir_a, t)))
 }
 
+/// Where one end of the moved segment lands after a translate by `delta`.
+struct SlidEnd {
+    /// The moved segment's new end.
+    moved: Point2,
+    /// LAMB T573: a straight neighbour collinear with the moved segment cannot absorb the part of
+    /// the move across them, so the shared vertex is doubled: the neighbour's end lands here (on
+    /// its own line) and a perpendicular connector joins it to `moved`. `None` when the neighbour
+    /// simply ends at `moved`.
+    neighbor: Option<Point2>,
+}
+
 /// Slides one endpoint of the moved segment to reconnect with `neighbor` after a translate by
 /// `delta`, keeping `neighbor`'s own direction fixed. `shared_is_to` is true when `neighbor.to` is
-/// the shared vertex. A `None` neighbour is an open end, which translates freely. Returns the new
-/// point and the unreachable component, if any.
-fn slide_endpoint(
-    shared_original: Point2,
-    neighbor: Option<&ResolvedSegment>,
-    shared_is_to: bool,
-    moved_dir: Point2,
-    delta: Point2,
-) -> (Point2, Option<Point2>) {
-    let Some(neighbor) = neighbor else { return (add2(shared_original, delta), None) };
+/// the shared vertex. A `None` neighbour is an open end, which translates freely.
+fn slide_endpoint(shared_original: Point2, neighbor: Option<&ResolvedSegment>, shared_is_to: bool, moved_dir: Point2, delta: Point2) -> SlidEnd {
+    let target = add2(shared_original, delta);
+    let Some(neighbor) = neighbor else { return SlidEnd { moved: target, neighbor: None } };
 
     let far = if shared_is_to { neighbor.from } else { neighbor.to };
-    let target = add2(shared_original, delta);
 
     if is_arc(neighbor.bulge) {
         // A non-tangent arc neighbour (a tangent fillet is handled by `slide_fillet` before this
         // is reached) reconnects to the closest point on its CHORD's line.
         let shared = if shared_is_to { neighbor.to } else { neighbor.from };
         let chord_dir = normalize2(sub2(shared, far));
-        return (closest_point_on_infinite_line(far, chord_dir, target), None);
+        return SlidEnd { moved: closest_point_on_infinite_line(far, chord_dir, target), neighbor: None };
     }
 
     let neighbor_dir = normalize2(sub2(neighbor.to, neighbor.from));
     let parallel = cross2(moved_dir, neighbor_dir).abs() < RAY_PARALLEL_EPS;
     if parallel {
-        // The neighbour's ray can only absorb a slide ALONG the shared direction.
-        let along = scale2(moved_dir, dot2(delta, moved_dir));
-        let perp = sub2(delta, along);
-        let unreachable = if dist2(perp, Point2 { x: 0.0, y: 0.0 }) > 1e-9 { Some(perp) } else { None };
-        return (add2(shared_original, along), unreachable);
+        // The neighbour's ray can only absorb a slide ALONG the shared direction; the rest of the
+        // move becomes a connector perpendicular to the pair.
+        let along = add2(shared_original, scale2(moved_dir, dot2(delta, moved_dir)));
+        if dist2(along, target) <= TOLERANCE.coincidence_mm {
+            return SlidEnd { moved: along, neighbor: None };
+        }
+        return SlidEnd { moved: target, neighbor: Some(along) };
     }
 
     // Shift the moved segment's own infinite line by delta's perpendicular component, then
@@ -352,7 +358,7 @@ fn slide_endpoint(
     let perp = sub2(delta, scale2(moved_dir, dot2(delta, moved_dir)));
     let shifted_anchor = add2(shared_original, perp);
     let hit = intersect_rays(far, neighbor_dir, shifted_anchor, moved_dir);
-    (hit.unwrap_or(target), None)
+    SlidEnd { moved: hit.unwrap_or(target), neighbor: None }
 }
 
 /// §4b: a tangent fillet beside the moved segment keeps its radius. `fillet` is the arc neighbour,
@@ -402,17 +408,24 @@ pub struct SegmentSlideResult {
     /// was achieved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreachable: Option<Point2>,
+    /// LAMB T573: indices, in `poly`, of the connector segments inserted where a collinear
+    /// neighbour's shared vertex was doubled, ascending. An original segment moves up by one per
+    /// inserted index at or below its running index (walk them ascending).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inserted: Vec<usize>,
 }
 
 /// T108: translate `poly`'s segment `segment_index` by `delta`, stretching (never deforming) its
 /// neighbours to reconnect. An open end translates freely. A tangent fillet arc beside a straight
 /// moved segment translates with the corner it rounds, keeping its radius and tangencies (§4b); a
-/// non-tangent arc neighbour keeps the chord rule. `corner_at_to` tags are left untouched.
+/// non-tangent arc neighbour keeps the chord rule. A straight neighbour collinear with the moved
+/// segment keeps its line and gets a perpendicular connector at the doubled vertex (T573,
+/// [`SegmentSlideResult::inserted`]). `corner_at_to` tags are left untouched.
 pub fn slide_segment_by_delta(poly: &Polyline2, segment_index: usize, delta: Point2) -> SegmentSlideResult {
     let resolved = resolved_segments(poly);
     let n = resolved.len();
     let Some(seg) = resolved.get(segment_index).copied() else {
-        return SegmentSlideResult { poly: poly.clone(), unreachable: None };
+        return SegmentSlideResult { poly: poly.clone(), unreachable: None, inserted: Vec::new() };
     };
 
     let wrap = poly.closed && n >= 2;
@@ -461,24 +474,28 @@ pub fn slide_segment_by_delta(poly: &Polyline2, segment_index: usize, delta: Poi
 
     let prev_fillet =
         prev_seg.filter(|_| straight_moved).and_then(|f| slide_fillet(seg.from, f, beyond(f.index, true), true, moved_dir, delta).map(|r| (f, r)));
-    let (from_point, from_unreachable) = match prev_fillet {
+    let from = match prev_fillet {
         Some((f, (shared, far))) => {
             // The fillet's `from` is the end of the segment before it.
             fillet_vertices.push((if f.index > 0 { f.index - 1 } else { n - 1 }, far));
-            (shared, None)
+            SlidEnd { moved: shared, neighbor: None }
         }
         None => slide_endpoint(seg.from, prev_seg, true, moved_dir, delta),
     };
     let next_fillet =
         next_seg.filter(|_| straight_moved).and_then(|f| slide_fillet(seg.to, f, beyond(f.index, false), false, moved_dir, delta).map(|r| (f, r)));
-    let (to_point, to_unreachable) = match next_fillet {
+    let to = match next_fillet {
         Some((f, (shared, far))) => {
             fillet_vertices.push((f.index, far));
-            (shared, None)
+            SlidEnd { moved: shared, neighbor: None }
         }
         None => slide_endpoint(seg.to, next_seg, false, moved_dir, delta),
     };
-    let unreachable = from_unreachable.or(to_unreachable);
+    // The neighbours' new shared ends: the moved segment's own ends unless a vertex is doubled.
+    let from_point = from.moved;
+    let to_point = to.moved;
+    let from_neighbor = from.neighbor.unwrap_or(from_point);
+    let to_neighbor = to.neighbor.unwrap_or(to_point);
 
     let mut segments = poly.segments.clone();
     let mut start = poly.start;
@@ -494,10 +511,10 @@ pub fn slide_segment_by_delta(poly: &Polyline2, segment_index: usize, delta: Poi
     if segment_index == 0 {
         start = from_point;
         if wrap && let Some(s) = segments.get_mut(n - 1) {
-            s.to = from_point;
+            s.to = from_neighbor;
         }
     } else if let Some(s) = segments.get_mut(segment_index - 1) {
-        s.to = from_point;
+        s.to = from_neighbor;
     }
 
     if let Some(s) = segments.get_mut(segment_index) {
@@ -505,10 +522,41 @@ pub fn slide_segment_by_delta(poly: &Polyline2, segment_index: usize, delta: Poi
         s.bulge = seg.bulge;
     }
     if wrap && segment_index == n - 1 {
-        start = to_point;
+        start = to_neighbor;
     }
 
-    SegmentSlideResult { poly: Polyline2 { start, segments, closed: poly.closed }, unreachable }
+    // T573: insert the connectors at doubled vertices. One across a closed polyline's start vertex
+    // is appended, so no existing index shifts; the others go beside the moved segment.
+    let connector = |to: Point2| PolySegment { to, bulge: 0.0, corner_at_to: None };
+    let mut appended: Vec<Point2> = Vec::new();
+    // (insert before this ORIGINAL index, connector end), ascending by index.
+    let mut beside: Vec<(usize, Point2)> = Vec::new();
+    if from.neighbor.is_some() {
+        if segment_index == 0 {
+            appended.push(from_point);
+        } else {
+            beside.push((segment_index, from_point));
+        }
+    }
+    if to.neighbor.is_some() {
+        if segment_index == n - 1 {
+            appended.push(to_neighbor);
+        } else {
+            beside.push((segment_index + 1, to_neighbor));
+        }
+    }
+    let mut inserted: Vec<usize> = Vec::new();
+    for (shift, &(k, point)) in beside.iter().enumerate() {
+        // Each earlier connector pushed this original index up by one.
+        segments.insert(k + shift, connector(point));
+        inserted.push(k + shift);
+    }
+    for point in appended {
+        inserted.push(segments.len());
+        segments.push(connector(point));
+    }
+
+    SegmentSlideResult { poly: Polyline2 { start, segments, closed: poly.closed }, unreachable: None, inserted }
 }
 
 /// The bulge that makes an arc from `from` to `to` pass through `through`. Returns 0 (a straight
