@@ -324,13 +324,15 @@ pub fn lay_repeat(
 ///   circle instead of a line — the corner is the crossing nearest `j.point` — and its travel and
 ///   wall side come from the arc's tangent and radius at its junction end; the mapped lines stay
 ///   straight. Arms whose travels are parallel there (a tangent arc continuation) are an error.
-/// - **Three arms (T)**: exactly one gap within `TOLERANCE.angle_deg` of 180° and straight through
-///   arms of equal width ([`tee_butt`]; arc through arms, which [`tee_butt`] accepts since LAMB
-///   T583, are still an error here — their face has no straight frame). The through run's face opposite the branch carries the
+/// - **Three arms (T)**: exactly one gap within `TOLERANCE.angle_deg` of 180° and through arms of
+///   equal width, both straight or both arcs on one circle ([`tee_butt`]). The through run's face
+///   opposite the branch carries the
 ///   reference — it must be the `face` side (per the first through arm whose `sides` decide it),
 ///   else an error — its `to` end at the foot of the
 ///   branch's centreline on that face, the wall side toward the branch, the travel the along-face
-///   direction matching the detail's handedness.
+///   direction matching the detail's handedness. On arc through arms (LAMB T584) that face is the
+///   face circle: the corner point is its point radially from `j.point`, the travel the circle's
+///   tangent there; the mapped lines stay straight, as an L's arc arm.
 ///
 /// Any other junction is an error.
 ///
@@ -406,27 +408,42 @@ pub fn place_corner(
             (c, t, ni)
         }
         [_, _, _] => {
+            let any_arc = j.arms.iter().any(|a| matches!(runs.get(a.run).map(|r| &r.centreline), Some(RunCurve::Arc { .. })));
+            // An arc T's gaps are recomputed from node tangents by `tee_butt` (LAMB T583/T584).
             let one_straight = j.gaps_deg.len() == 3 && j.gaps_deg.iter().filter(|g| (*g - 180.0).abs() <= TOLERANCE.angle_deg).count() == 1;
-            if !one_straight {
+            if !any_arc && !one_straight {
                 return Err("only L and T corners are placed yet".into());
             }
             let (branch, toward, _) = tee_butt(j, runs).ok_or("the T's through arms are not straight runs of equal width")?;
-            // The first through arm whose sides decide the face (one may be shared by two spaces).
-            let frame_of = |k: usize| -> Result<(&WallRun, FaceFrame, f64), String> {
+            // The first through arm whose sides decide the face (one may be shared by two spaces):
+            // its corner point `c`, the face normal `n` out of the wall and the along-face `dir`.
+            let frame_of = |k: usize| -> Result<(Point2, Point2, Point2), String> {
                 let a = (branch + k) % 3;
                 let i = j.arms[a].run;
                 let run = runs.get(i).ok_or("junction arm names no run")?;
-                Ok((run, face_frame(run, sides.get(i).ok_or("junction arm has no sides")?, face)?, inset(a)))
+                let side = sides.get(i).ok_or("junction arm has no sides")?;
+                if let RunCurve::Arc { .. } = run.centreline {
+                    let (center, r, outward) = face_circle(run, side, face, inset(a))?;
+                    let (ux, uy) = (j.point.x - center.x, j.point.y - center.y);
+                    let len = ux.hypot(uy);
+                    if len <= TOLERANCE.coincidence_mm {
+                        return Err("the T's node is at its through arc's centre".into());
+                    }
+                    let u = Point2 { x: ux / len, y: uy / len };
+                    let c = Point2 { x: center.x + u.x * r, y: center.y + u.y * r };
+                    return Ok((c, Point2 { x: u.x * outward, y: u.y * outward }, Point2 { x: -u.y, y: u.x }));
+                }
+                let f = face_frame(run, side, face)?;
+                let h = run.width / 2.0 - inset(a);
+                Ok((Point2 { x: j.point.x + f.normal.x * h, y: j.point.y + f.normal.y * h }, f.normal, f.dir))
             };
-            let (run, f, ins) = frame_of(1).or_else(|e| frame_of(2).map_err(|_| e))?;
+            let (c, n, dir) = frame_of(1).or_else(|e| frame_of(2).map_err(|_| e))?;
             // `toward` is the through run's face on the branch side.
-            if (toward.x - j.point.x) * f.normal.x + (toward.y - j.point.y) * f.normal.y > 0.0 {
+            if (toward.x - j.point.x) * n.x + (toward.y - j.point.y) * n.y > 0.0 {
                 return Err("the detail's reference face is on the branch side".into());
             }
-            let h = run.width / 2.0 - ins;
-            let c = Point2 { x: j.point.x + f.normal.x * h, y: j.point.y + f.normal.y * h };
-            let ni = Point2 { x: -f.normal.x, y: -f.normal.y };
-            let t = if cross(f.dir, image(ni)).signum() == want { f.dir } else { Point2 { x: -f.dir.x, y: -f.dir.y } };
+            let ni = Point2 { x: -n.x, y: -n.y };
+            let t = if cross(dir, image(ni)).signum() == want { dir } else { Point2 { x: -dir.x, y: -dir.y } };
             (c, t, ni)
         }
         _ => return Err("only L and T corners are placed yet".into()),
@@ -1374,6 +1391,42 @@ mod tests {
     /// `CRN-B` band (−1000,200)–(0,200), wall side +y.
     fn crn() -> ((Point2, Point2), Vec<(Point2, Point2, String)>) {
         ((p(-1000.0, 0.0), p(0.0, 0.0)), vec![l((0.0, 0.0), (0.0, 1000.0), "CRN-A"), l((-1000.0, 200.0), (0.0, 200.0), "CRN-B")])
+    }
+
+    #[test]
+    fn a_t_corner_detail_on_an_arc_through_run_lands_on_its_face_circle() {
+        let (j, runs) = arc_t_junction();
+        // Outside toward the centre (left of the counter-clockwise arcs): the far face, radius
+        // 1900, is exterior; the branch rises outward from the node (0, 2000).
+        let arc = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
+        let both = RunSides { left: SideKind::Space(0), right: SideKind::Space(1), exterior: false, open_outside_left: None };
+        let sides = vec![arc.clone(), both, arc];
+        let (reference, lines) = crn();
+        let out = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap();
+        assert_eq!(rounded(&out), [(0.0, 1900.0, 0.0, 2900.0), (-1000.0, 2100.0, 0.0, 2100.0)]);
+        assert!(out.iter().all(|l| l.arc.is_none()));
+        // The mirrored detail runs the other way along the tangent at the same point.
+        let mirrored: Vec<_> = lines.iter().map(|(a, b, n)| (p(a.x, -a.y), p(b.x, -b.y), n.clone())).collect();
+        let m = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &mirrored, &[], false).unwrap();
+        assert_eq!(rounded(&m), [(0.0, 1900.0, 0.0, 2900.0), (1000.0, 2100.0, 0.0, 2100.0)]);
+        // Both travels are tangent to the face circle at the corner point.
+        for (placed, sign) in [(&out, 1.0), (&m, -1.0)] {
+            let c = placed[1].to;
+            let t = Point2 { x: (c.x - placed[1].from.x) / 1000.0, y: (c.y - placed[1].from.y) / 1000.0 };
+            assert!((t.x - sign).abs() < 1e-9 && (t.x * c.x + t.y * (c.y - 200.0)).abs() < 1e-6, "{t:?}");
+        }
+        // The outer face is the branch side.
+        assert_eq!(
+            place_corner(&j, &runs, &sides, FaceRef::Interior, reference, &lines, &[], false).unwrap_err(),
+            "the detail's reference face is on the branch side"
+        );
+        // A node off the centreline circle still lands on the face circle, radially; an inset on
+        // the through arm moves the corner into the wall.
+        let off = Junction { point: p(300.0, 2002.0 * (1.0f64 - (300.0f64 / 2002.0).powi(2)).sqrt()), ..j.clone() };
+        let c = place_corner(&off, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap()[0].from;
+        assert!((c.x.hypot(c.y) - 1900.0).abs() < 1e-6 && (c.x * off.point.y - c.y * off.point.x).abs() < 1e-6, "{c:?}");
+        let inset = place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[0.0, 0.0, 50.0], false).unwrap();
+        assert_eq!(rounded(&inset)[0], (0.0, 1950.0, 0.0, 2950.0));
     }
 
     #[test]

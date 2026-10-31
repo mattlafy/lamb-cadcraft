@@ -2972,6 +2972,101 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_t_corner_detail_on_an_arc_through_run_sits_on_its_far_face_circle() -> R {
+        let (mut s, plan, centre) = arc_t_plan()?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, plan);
+        let tees = tees(&graph);
+        assert_eq!(tees.len(), 2, "{:?}", graph.junctions);
+        let at_tee = |c: &CornerAssembly| tees.iter().any(|t| graph.junctions[c.junction].point == t.0);
+        // An exterior-face T detail: the annex (the branch side) is outside the arc's outer face.
+        let (mut s2, plan2, _) = arc_t_plan()?;
+        corner_detail(&mut s2, plan2, "exterior_face", false, (tees[0].0.x, tees[0].0.y))?;
+        let ext = corner_assembly(s2.doc()?, plan2)?;
+        assert!(ext.iter().any(at_tee), "{ext:?}");
+        assert!(
+            ext.iter().filter(|c| at_tee(c)).all(|c| c.skipped.as_deref() == Some("the detail's reference face is on the branch side")),
+            "{ext:?}"
+        );
+
+        // Both T's: the detail's tangent turns the same way about the centre at each, so it
+        // reaches into the banded (exterior) through arc at one T and the unbanded one at the other.
+        // A detail shorter than the through arcs (each ~500 mm), so their bands are clipped, not
+        // dropped: reference (−300, 0)→(0, 0), CRN-A up 300, CRN-B 300 long 200 into the wall.
+        let before = assembly_lines(s.doc()?, plan)?;
+        let cd = Id(s.execute("newdetail", &json!({ "name": "CD" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": cd.0 }))?;
+        let rl = line(&mut s, [-300.0, 0.0], [0.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": rl.hex(), "kind": "interior_face" }))?;
+        s.execute("layer.new", &json!({ "name": "CRN-A", "current": true }))?;
+        line(&mut s, [0.0, 0.0], [0.0, 300.0])?;
+        s.execute("layer.new", &json!({ "name": "CRN-B", "current": true }))?;
+        line(&mut s, [-300.0, 200.0], [0.0, 200.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.current", &json!({ "name": "TAGS" }))?;
+        for t in &tees {
+            let (x, y) = (t.0.x, t.0.y);
+            s.execute(
+                "detailtag",
+                &json!({ "detailViewId": cd.0, "corner": true, "tip": {"x": x, "y": y}, "bubble": {"x": x - 1000.0, "y": y + 1000.0} }),
+            )?;
+        }
+        let n = undo_len(&s)?;
+        let r = s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        let corners = corner_assembly(s.doc()?, plan)?;
+        let placed: Vec<_> = corners.iter().filter(|c| at_tee(c)).collect();
+        assert_eq!(placed.len(), 2, "{corners:?}");
+        let d = |p: Point2| (p.x - centre.x).hypot(p.y - centre.y);
+        for c in &placed {
+            assert!(c.skipped.is_none(), "{c:?}");
+            let node = graph.junctions[c.junction].point;
+            let u = Point2 { x: (node.x - centre.x) / d(node), y: (node.y - centre.y) / d(node) };
+            let crn_a = c.lines.iter().find(|l| l.layer == "CRN-A").ok_or("no CRN-A")?;
+            // From the inner face circle (radius 2000), radially from the node.
+            assert!((d(crn_a.from) - 2000.0).abs() < 1e-6, "{c:?}");
+            assert!(((crn_a.from.x - centre.x) * u.y - (crn_a.from.y - centre.y) * u.x).abs() < 1e-6, "{c:?}");
+            // The wall side is toward the branch: radially outward 300.
+            assert!((d(crn_a.to) - 2300.0).abs() < 1e-6, "{c:?}");
+            // CRN-B runs along the tangent there, 200 into the wall.
+            let crn_b = c.lines.iter().find(|l| l.layer == "CRN-B").ok_or("no CRN-B")?;
+            let (bx, by) = (crn_b.to.x - crn_b.from.x, crn_b.to.y - crn_b.from.y);
+            assert!((bx * u.x + by * u.y).abs() < 1e-6 && (bx.hypot(by) - 300.0).abs() < 1e-6, "{c:?}");
+            assert!((crn_b.to.x - crn_a.from.x - 200.0 * u.x).abs() < 1e-6 && (crn_b.to.y - crn_a.from.y - 200.0 * u.y).abs() < 1e-6, "{c:?}");
+        }
+        let skipped = r["skipped"].as_array().ok_or("no skipped")?;
+        assert!(skipped.iter().all(|x| !placed.iter().any(|c| x["junction"].as_u64() == Some(c.junction as u64))), "{r}");
+        // The through arcs' bands end at the corner's angular reach.
+        let runs = assembly_lines(s.doc()?, plan)?;
+        let mut reached = 0;
+        for c in &placed {
+            let j = &graph.junctions[c.junction];
+            for (i, reach) in corner_arc_reach(j, &graph.runs, &c.lines).into_iter().enumerate() {
+                let Some((ctr, end, toward)) = arc_end(&graph.runs[j.arms[i].run], j.arms[i].end) else { continue };
+                let a = &runs[j.arms[i].run];
+                // The arc between the two T's divides two spaces and lays no bands.
+                if reach <= 0.0 || a.skipped.is_some() {
+                    continue;
+                }
+                assert_eq!(before[j.arms[i].run].bands, a.bands, "arm {i}'s bands are clipped, not dropped");
+                reached += 1;
+                for l in &a.lines[..a.bands] {
+                    for q in [l.from, l.to] {
+                        assert!(arc_delta(ctr, end, toward, q) >= reach - TOLERANCE.angle_deg.to_radians(), "arm {i} reach {reach}: {l:?}");
+                    }
+                }
+                assert!(
+                    a.lines[..a.bands].iter().any(|l| [l.from, l.to].iter().any(|q| (arc_delta(ctr, end, toward, *q) - reach).abs() < 1e-9)),
+                    "no band of arm {i} ends at the reach"
+                );
+            }
+        }
+        assert_eq!(reached, 1, "one T's exterior through arc is trimmed");
+        s.undo()?;
+        assert!(s.doc()?.block(&assembly_block_name(plan)).is_none(), "undo removes the block");
+        Ok(())
+    }
+
+    #[test]
     fn mitre_butts_a_t_branch_s_bands_onto_an_arc_through_run_s_face_circle() -> R {
         let (mut s, plan, c) = arc_t_plan()?;
         let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, plan);
