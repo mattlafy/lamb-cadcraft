@@ -307,13 +307,16 @@ pub fn set_ghosts_hidden(hidden: bool) {
     GHOSTS_HIDDEN.store(hidden, Ordering::Relaxed);
 }
 
-/// Whether a mesh is ghosted: a surface, or massing still standing in for an undetailed wall.
+/// Whether a mesh is ghosted: a surface, massing still standing in for an undetailed wall, or a
+/// stateless `Defaulted` mesh (LAMB T569 — the same rule the 3D pane's fill follows).
 fn ghosted_mesh(m: &SceneMesh) -> bool {
-    m.kind == SceneMeshKind::Surface || m.construction == Some(ConstructionState::Massing)
+    m.kind == SceneMeshKind::Surface
+        || m.construction == Some(ConstructionState::Massing)
+        || (m.construction.is_none() && m.provenance == ProvenanceKind::Defaulted)
 }
 
-/// `scene` without its ghosted geometry: surfaces, massing meshes, and `Defaulted` / `NotThreeD`
-/// paths. The origin is unchanged.
+/// `scene` without its ghosted geometry: surfaces, massing meshes, stateless `Defaulted` meshes,
+/// and `Defaulted` / `NotThreeD` paths. The origin is unchanged.
 pub fn without_ghosts(scene: &Scene) -> Scene {
     Scene {
         origin: scene.origin,
@@ -408,5 +411,14 @@ mod tests {
         assert_eq!(kept, Scene { origin: [1.0, 2.0, 3.0], meshes: vec![layer], paths: Vec::new() });
         let authored = Scene { paths: vec![path(ProvenanceKind::Authored)], ..Scene::default() };
         assert_eq!(without_ghosts(&authored), authored);
+    }
+
+    #[test]
+    fn without_ghosts_drops_a_stateless_defaulted_mesh() {
+        let defaulted = |construction| SceneMesh { provenance: ProvenanceKind::Defaulted, ..mesh(SceneMeshKind::Solid, construction) };
+        let resolved = defaulted(Some(ConstructionState::Resolved));
+        let authored = mesh(SceneMeshKind::Solid, None);
+        let s = Scene { meshes: vec![defaulted(None), resolved.clone(), authored.clone()], ..Scene::default() };
+        assert_eq!(without_ghosts(&s).meshes, vec![resolved, authored]);
     }
 }

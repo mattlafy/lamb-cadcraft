@@ -4,7 +4,10 @@
 //! colour, a surface is ghosted grey, a conflicted mesh gets red edges. With an assembly plan
 //! (LAMB T493, `ghosting-and-visualization.md` "Construction states"), massing still standing in
 //! for an undetailed wall is ghosted in its own colour and a detail-conflicted mesh gets red edges.
-//! While GHOSTHIDE is in force (LAMB T498) the pane draws and picks `without_ghosts`.
+//! While GHOSTHIDE is in force (LAMB T498) the pane draws and picks `without_ghosts`. A stateless
+//! solid draws in its provenance's rendering state (LAMB T569, `3d-viewer.md` "Rendering states"):
+//! `Defaulted` ghosted in its own colour, `Ambiguous` part-ghosted with amber edges, `Proposed`
+//! (unaccepted AI) with teal glow edges.
 
 use cadcraft_engine::doc::color::{Color, Rgb};
 use cadcraft_engine::doc::{Drawing, Handle};
@@ -20,6 +23,12 @@ const SURFACE: (u32, f32) = (0x888888, 0.28);
 const MASSING_ALPHA: f32 = 0.28;
 /// A conflicted mesh's edges.
 const CONFLICT_EDGES: u32 = 0xe2543a;
+/// An `Ambiguous` mesh's alpha: partially ghosted between known points.
+const AMBIGUOUS_ALPHA: f32 = 0.55;
+/// An `Ambiguous` mesh's edges: the flag (the TS `PROVENANCE_MATERIAL` ambiguous hue).
+const AMBIGUOUS_EDGES: u32 = 0xb8860b;
+/// A `Proposed` (unaccepted AI) mesh's edges: the glow, distinct from the hover blue.
+const AI_GLOW_EDGES: u32 = 0x2ec4b6;
 
 /// Register LAMB's derived model as the 3D pane's scene.
 pub fn register() -> Result<(), &'static str> {
@@ -85,13 +94,29 @@ pub fn to_scene3(s: &Scene, d: &Drawing) -> Scene3 {
         .iter()
         .map(|m| {
             let (rgb, alpha) = match m.kind {
-                SceneMeshKind::Solid | SceneMeshKind::Layer => (layer_rgb(d, &m.layer).unwrap_or(SOLID_FALLBACK), 1.0),
+                SceneMeshKind::Solid | SceneMeshKind::Layer => {
+                    let alpha = match (m.construction, m.provenance) {
+                        (Some(ConstructionState::Massing), _) | (None, ProvenanceKind::Defaulted) => MASSING_ALPHA,
+                        (None, ProvenanceKind::Ambiguous) => AMBIGUOUS_ALPHA,
+                        _ => 1.0,
+                    };
+                    (layer_rgb(d, &m.layer).unwrap_or(SOLID_FALLBACK), alpha)
+                }
                 SceneMeshKind::Surface => SURFACE,
             };
             let alpha = if m.construction == Some(ConstructionState::Massing) { MASSING_ALPHA } else { alpha };
             let rgba = rgba(rgb, alpha);
             let conflicted = m.provenance == ProvenanceKind::Conflicted || m.construction == Some(ConstructionState::DetailConflicted);
-            let edges_rgba = conflicted.then(|| rgba_opaque(CONFLICT_EDGES));
+            let edges = if conflicted {
+                Some(CONFLICT_EDGES)
+            } else {
+                match m.provenance {
+                    ProvenanceKind::Ambiguous => Some(AMBIGUOUS_EDGES),
+                    ProvenanceKind::Proposed => Some(AI_GLOW_EDGES),
+                    _ => None,
+                }
+            };
+            let edges_rgba = edges.map(rgba_opaque);
             Mesh3 { positions: m.positions.clone(), indices: m.indices.clone(), rgba, edges_rgba, sources: m.sources.clone() }
         })
         .collect();
@@ -118,6 +143,7 @@ mod tests {
     use cadcraft_engine::doc::Drawing;
     use cadcraft_engine::doc::color::Color;
     use lamb_cadcraft::{ConstructionState, SceneMeshKind, project_to_drawing, scene};
+    use lamb_core::derivation::resolve::ProvenanceKind;
     use lamb_core::persistence::files_to_project;
 
     use super::{MASSING_ALPHA, build, built, pick, rgba, shown, to_scene3};
@@ -153,13 +179,14 @@ mod tests {
     #[test]
     fn surfaces_ghost_grey_and_solids_take_their_layer_colour() -> R {
         let mut d = with_room()?;
-        let s = scene(&d)?;
+        let mut s = scene(&d)?;
+        s.meshes.iter_mut().for_each(|m| m.provenance = ProvenanceKind::Authored);
         let solid = s.meshes.iter().position(|m| m.kind == SceneMeshKind::Solid).ok_or("no solid")?;
         let layer = s.meshes[solid].layer.clone();
         // A distinctive true colour, so the assertion cannot pass on the fallback.
         d.layer_mut(&layer).ok_or("solid's layer is missing")?.color = Color::True(cadcraft_engine::doc::color::Rgb(10, 200, 30));
 
-        let s3 = build(&d).ok_or("a LAMB drawing built no scene")?;
+        let s3 = built(&s, &d).ok_or("a LAMB drawing built no scene")?;
         assert_eq!(s3.origin, s.origin);
         assert_eq!(s3.meshes.len(), s.meshes.len());
         assert_eq!(s3.paths.len(), s.paths.len());
@@ -179,20 +206,63 @@ mod tests {
         Ok(())
     }
 
-    /// `with_room`'s scene converted with every mesh in `state`, beside the stateless conversion,
-    /// its solid's layer a distinctive true colour.
-    fn with_state(state: Option<ConstructionState>) -> Result<Vec<(SceneMeshKind, [u8; 4], Option<[u8; 4]>, [u8; 4])>, Box<dyn std::error::Error>> {
+    type Got = Vec<(SceneMeshKind, [u8; 4], Option<[u8; 4]>, [u8; 4])>;
+
+    /// `with_room`'s scene with every mesh `Authored` and stateless, converted after `set` restates
+    /// each mesh, beside the plain conversion; its solid's layer a distinctive true colour.
+    fn restated(set: impl Fn(&mut lamb_cadcraft::SceneMesh)) -> Result<Got, Box<dyn std::error::Error>> {
         let mut d = with_room()?;
         let mut s = scene(&d)?;
         assert!(s.meshes.iter().all(|m| m.construction.is_none()), "no assembly block, no state");
+        s.meshes.iter_mut().for_each(|m| m.provenance = ProvenanceKind::Authored);
         let solid = s.meshes.iter().find(|m| m.kind == SceneMeshKind::Solid).ok_or("no solid")?.layer.clone();
         d.layer_mut(&solid).ok_or("solid's layer is missing")?.color = Color::True(cadcraft_engine::doc::color::Rgb(10, 200, 30));
         let plain = to_scene3(&s, &d);
-        for m in &mut s.meshes {
-            m.construction = state;
-        }
+        s.meshes.iter_mut().for_each(&set);
         let stated = to_scene3(&s, &d);
         Ok(s.meshes.iter().zip(stated.meshes.iter().zip(&plain.meshes)).map(|(m, (a, b))| (m.kind, a.rgba, a.edges_rgba, b.rgba)).collect())
+    }
+
+    /// Every mesh in `state`.
+    fn with_state(state: Option<ConstructionState>) -> Result<Got, Box<dyn std::error::Error>> {
+        restated(|m| m.construction = state)
+    }
+
+    /// Every mesh of provenance `p`, with construction `state`; only the solids, as surfaces keep
+    /// their ghost grey whatever the provenance.
+    fn with_provenance(p: ProvenanceKind, state: Option<ConstructionState>) -> Result<Got, Box<dyn std::error::Error>> {
+        let got = restated(|m| {
+            m.provenance = p;
+            m.construction = state;
+        })?;
+        let solids: Got = got.into_iter().filter(|g| g.0 != SceneMeshKind::Surface).collect();
+        assert!(!solids.is_empty(), "the room derives a solid");
+        Ok(solids)
+    }
+
+    #[test]
+    fn stateless_solids_draw_in_their_provenance_state() -> R {
+        for (_, rgba, edges, plain) in with_provenance(ProvenanceKind::Defaulted, None)? {
+            assert_eq!(rgba, [plain[0], plain[1], plain[2], 71]);
+            assert_eq!(edges, None);
+        }
+        for (_, rgba, edges, plain) in with_provenance(ProvenanceKind::Ambiguous, None)? {
+            assert_eq!(rgba, [plain[0], plain[1], plain[2], 140]);
+            assert_eq!(edges, Some([0xb8, 0x86, 0x0b, 255]));
+        }
+        for (_, rgba, edges, plain) in with_provenance(ProvenanceKind::Proposed, None)? {
+            assert_eq!(rgba, plain);
+            assert_eq!(edges, Some([0x2e, 0xc4, 0xb6, 255]));
+        }
+        for (_, _, edges, _) in with_provenance(ProvenanceKind::Conflicted, None)? {
+            assert_eq!(edges, Some([0xe2, 0x54, 0x3a, 255]));
+        }
+        for (_, rgba, edges, plain) in with_provenance(ProvenanceKind::Defaulted, Some(ConstructionState::Resolved))? {
+            assert_eq!(rgba, plain);
+            assert_eq!(rgba[3], 255);
+            assert_eq!(edges, None);
+        }
+        Ok(())
     }
 
     #[test]
