@@ -39,3 +39,4 @@ mod toolsets_parametric;
 mod touch_canvas_menus;
 mod viewport_double_click_selection;
 mod workspace_focus;
+mod zoomed_far_in;

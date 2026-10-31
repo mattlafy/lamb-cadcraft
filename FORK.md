@@ -53,7 +53,7 @@ upstream rejects it.
 | PR | Branch | In `lamb` |
 |---|---|---|
 | [#1020](https://github.com/storytold/cadcraft/pull/1020) RENAME keeps extras | `pr/rename-keeps-extras` | merged |
-| [#1230](https://github.com/storytold/cadcraft/pull/1230) View twist / DVIEW | `pr/dview` | merged |
+| [#1230](https://github.com/storytold/cadcraft/pull/1230) View twist / DVIEW | `pr/dview` | merged; its twisted crossing window dashes through `canvas/draw.rs` `dashed_loop` (the general form of upstream's clipped `dashed_rect`, #2299) |
 | [#1292](https://github.com/storytold/cadcraft/pull/1292) Realtime PAN | `pr/realtime-pan` | merged; with #1230 its `realtime_pan` keeps the view's twist and turns the drag by it (`crates/engine/src/cmd/view.rs`), and the canvas click repair (patch 22) treats its drags like ZOOM Realtime's; the branch's `nav_drag` flag (a release of a drag that panned or zoomed places no point, also once Enter ended the command mid-drag) lives in patch 22's `handle_releases` here |
 | [#1293](https://github.com/storytold/cadcraft/pull/1293) Blocks window previews | `pr/block-previews` | merged |
 | [#1451](https://github.com/storytold/cadcraft/pull/1451) Copied hatch stays associative | `pr/hatch-copy-keeps-boundary` | merged |

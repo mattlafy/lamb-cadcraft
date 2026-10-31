@@ -28,7 +28,7 @@ pub(crate) use cycle::over_canvas_menu;
 use cycle::{CycleList, cycle_badge, cycle_click, cycle_list, shift_space_cycle};
 pub(crate) use draw::{Look, draw_highlight, draw_list};
 use draw::{Press, PressPick, Release, clip_infinite, track_press};
-use draw::{draw_drag_gpu, draw_highlight_gpu, draw_list_gpu, list_mesh_key, selection_area_fill};
+use draw::{dashed_loop, dashed_rect, draw_drag_gpu, draw_highlight_gpu, draw_list_gpu, list_mesh_key, selection_area_fill};
 use draw::{draw_pick_preview, pick_lists}; // LAMB (fork): T561
 use dyn_boxes::dynamic_input;
 pub(crate) use dyn_boxes::length_units;
@@ -1230,8 +1230,7 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
                 xf_paper.to_screen(Vec2::new(sh.printable.min.x, sh.printable.max.y)),
                 xf_paper.to_screen(Vec2::new(sh.printable.max.x, sh.printable.min.y)),
             );
-            let pts = [pa.left_top(), pa.right_top(), pa.right_bottom(), pa.left_bottom(), pa.left_top()];
-            painter.extend(Shape::dashed_line(&pts, Stroke::new(1.0, Color32::from_gray(150)), 4.0, 4.0));
+            painter.extend(dashed_rect(painter.clip_rect(), pa, Stroke::new(1.0, Color32::from_gray(150)), 4.0, 4.0));
             (Rgb(t.paper.r(), t.paper.g(), t.paper.b()), Some(paper))
         }
         None => {
@@ -1372,7 +1371,7 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
         let mut pts = corners.to_vec();
         pts.push(corners[0]);
         if crossing {
-            painter.extend(Shape::dashed_line(&pts, st, 5.0, 3.0));
+            painter.extend(dashed_loop(painter.clip_rect(), &corners, st, 5.0, 3.0));
         } else {
             painter.add(Shape::line(pts, st));
         }
