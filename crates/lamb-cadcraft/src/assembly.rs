@@ -34,7 +34,7 @@
 //! ([`crate::studgrid`], LAMB T464) shifts its run's nearest repeat copy along the run onto itself.
 //! A structural-centre detail (LAMB T476) is laid from the exterior face, its farthest band there;
 //! a grid detail (LAMB T477) from the exterior face too, its reference on the run's nearest parallel
-//! `datum` line within the wall ([`run_grid_offset`]).
+//! `datum` line within the wall ([`run_grid_offset`]) — on an arc run its concentric `datum` arc (LAMB T582).
 //! At each opening bridge an opening tag resolves to (LAMB T486), [`opening_assembly`] places the
 //! jamb detail at both jambs (lamb-core's [`place_opening`], mirrored at the second); each jamb's run
 //! is trimmed back to the detail's reach there ([`jamb_reach`]) as at a corner — on an arc run an
@@ -141,14 +141,22 @@ fn member_segments(d: &Drawing, detail: Id, members: &[cadcraft_doc::Handle]) ->
 /// (LAMB T477).
 const GRID_REACH_MM: f64 = 50.0;
 
-/// The signed distance `h` from straight `run`'s centreline, toward the side `outside_left` names,
-/// of the run's grid line (LAMB T477): the straight `datum`-role segment in `view` parallel to the
-/// run (within `TOLERANCE.angle_deg`), overlapping its along-extent and within `width/2 +`
-/// [`GRID_REACH_MM`] of the centreline, nearest it. Two at the same distance on opposite sides are
-/// ambiguous.
+/// The signed distance `h` from `run`'s centreline, toward the side `outside_left` names, of the
+/// run's grid line (LAMB T477): on a straight run, the straight `datum`-role segment in `view`
+/// parallel to the run (within `TOLERANCE.angle_deg`), overlapping its along-extent and within
+/// `width/2 +` [`GRID_REACH_MM`] of the centreline, nearest it. On an arc run (LAMB T582), the
+/// `datum` arc segment concentric with it (centre within `TOLERANCE.grouping_mm`), sharing more
+/// than `TOLERANCE.angle_deg` of its angular span and with radius within that reach of the
+/// centreline's, `h` the radius difference toward the outside. Straight datum segments never match
+/// an arc run, nor arcs a straight one. Two at the same distance on opposite sides are ambiguous.
 fn run_grid_offset(d: &Drawing, view: Id, run: &WallRun, outside_left: bool) -> Result<f64, String> {
     use lamb_core::derivation::read::ProjectRead;
-    let RunCurve::Line { from, to } = run.centreline else { return Err("grid reference on an arc run not laid yet".into()) };
+    let (from, to) = match run.centreline {
+        RunCurve::Line { from, to } => (from, to),
+        RunCurve::Arc { center, radius, start_angle, sweep } => {
+            return arc_grid_offset(d, view, run, outside_left, (center, radius, start_angle, sweep));
+        }
+    };
     let len = (to.x - from.x).hypot(to.y - from.y);
     if len <= TOLERANCE.coincidence_mm {
         return Err("no grid line on the run".into());
@@ -188,6 +196,11 @@ fn run_grid_offset(d: &Drawing, view: Id, run: &WallRun, outside_left: bool) -> 
             }
         }
     }
+    nearest_grid(found)
+}
+
+/// The nearest of the candidate grid offsets `found`, or why none is the run's grid line.
+fn nearest_grid(mut found: Vec<f64>) -> Result<f64, String> {
     found.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
     match found.as_slice() {
         [] => Err("no grid line on the run".into()),
@@ -198,12 +211,57 @@ fn run_grid_offset(d: &Drawing, view: Id, run: &WallRun, outside_left: bool) -> 
     }
 }
 
+/// [`run_grid_offset`] on an arc run whose centreline is `(center, radius, start_angle, sweep)`.
+fn arc_grid_offset(d: &Drawing, view: Id, run: &WallRun, outside_left: bool, arc: (Point2, f64, f64, f64)) -> Result<f64, String> {
+    use lamb_core::derivation::read::ProjectRead;
+    use std::f64::consts::TAU;
+    let (center, radius, start_angle, sweep) = arc;
+    let o = if outside_left == (sweep > 0.0) { -1.0 } else { 1.0 };
+    // The run's span as a counter-clockwise interval [lo, lo + span].
+    let (lo, span) = if sweep > 0.0 { (start_angle, sweep) } else { (start_angle + sweep, -sweep) };
+    let reach = run.width / 2.0 + GRID_REACH_MM;
+    let min_overlap = TOLERANCE.angle_deg.to_radians();
+    let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
+    let mut found: Vec<f64> = Vec::new();
+    for e in p.entities(view) {
+        if p.role_of(&e) != lamb_core::model::entities::LineRole::Datum {
+            continue;
+        }
+        let Some(poly) = e.polyline.as_deref() else { continue };
+        let mut at = poly.start;
+        for seg in &poly.segments {
+            let (a, b) = (at, seg.to);
+            at = seg.to;
+            let Some(g) = lamb_core::geometry::polyline::arc_from_bulge(a, b, seg.bulge) else { continue };
+            if (g.center.x - center.x).hypot(g.center.y - center.y) > TOLERANCE.grouping_mm {
+                continue;
+            }
+            let (g_lo, g_span) = if g.ccw {
+                (g.start_angle, (g.end_angle - g.start_angle).rem_euclid(TAU))
+            } else {
+                (g.end_angle, (g.start_angle - g.end_angle).rem_euclid(TAU))
+            };
+            let rel = (g_lo - lo).rem_euclid(TAU);
+            let shared = (span.min(rel + g_span) - rel).max(0.0) + span.min(rel + g_span - TAU).max(0.0);
+            if shared <= min_overlap {
+                continue;
+            }
+            let h = o * (g.radius - radius);
+            if h.abs() <= reach {
+                found.push(h);
+            }
+        }
+    }
+    nearest_grid(found)
+}
+
 /// The reference line and run face `run_lines` lays a detail from. A face reference is itself; a
 /// structural-centre reference (LAMB T476) is moved across onto the detail's farthest band, on
 /// [`detail_frame`]'s wall side, and laid from the exterior face — that band then sits on the face
 /// and the frame turns toward the interior. A tie is [`detail_frame`]'s ambiguity error. A grid
 /// reference (LAMB T477) is moved against the wall side by `s = width/2 − h` ([`run_grid_offset`])
-/// and laid from the exterior face, so the reference line lands on the run's grid line.
+/// and laid from the exterior face, so the reference line lands on the run's grid line — on an arc
+/// run (LAMB T582) its concentric datum arc, the shift being in the detail's own space.
 fn laid_reference(
     d: &Drawing,
     view: Id,
@@ -216,9 +274,6 @@ fn laid_reference(
         DetailRefKind::ExteriorFace => Ok(((r.from, r.to), FaceRef::Exterior)),
         DetailRefKind::InteriorFace => Ok(((r.from, r.to), FaceRef::Interior)),
         DetailRefKind::Grid => {
-            if matches!(run.centreline, RunCurve::Arc { .. }) {
-                return Err("grid reference on an arc run not laid yet".into());
-            }
             let outside_left = lamb_core::derivation::wall_spaces::outside_on_left(sides).ok_or("no single exterior side")?;
             let s = run.width / 2.0 - run_grid_offset(d, view, run, outside_left)?;
             let frame = detail_frame((r.from, r.to), lines)?;
@@ -502,7 +557,8 @@ pub struct CornerAssembly {
 /// structural-centre reference is laid from the exterior face with every inset the detail's
 /// farthest band offset, outward — that band then sits on each arm's exterior face. A grid
 /// reference is laid from the exterior face with each arm inset `width/2 − h`
-/// ([`run_grid_offset`]), so the reference lands on that arm's grid line.
+/// ([`run_grid_offset`]), so the reference lands on that arm's grid line — an arc arm's its
+/// concentric datum arc (LAMB T582).
 fn junction_placement(
     d: &Drawing,
     view: Id,
@@ -527,9 +583,6 @@ fn junction_placement(
                     continue;
                 };
                 let run = runs.get(i).ok_or("junction arm names no run")?;
-                if matches!(run.centreline, RunCurve::Arc { .. }) {
-                    return Err("grid reference on an arc run not laid yet".into());
-                }
                 let side = sides.get(i).ok_or("junction arm has no sides")?;
                 let outside_left = lamb_core::derivation::wall_spaces::outside_on_left(side).ok_or("no single exterior side")?;
                 insets.push(run.width / 2.0 - run_grid_offset(d, view, run, outside_left)?);
@@ -2984,6 +3037,105 @@ pub(crate) mod tests {
                 assert!((near - reach).abs() < 1e-9, "junction {} reach {reach}: {l:?} at {near}", c.junction);
             }
         }
+        Ok(())
+    }
+
+    /// [`angled_arc_room`] with a 200 mm grid-reference detail `GD` (reference y 0, `CLAD` −20, `GYP`
+    /// 50 and 180) tagged on its arc wall, and a `datum` arc for each `(centre offset in x, radius)`
+    /// in `datums`, spanning the arc wall's ±30°. Returns (session, plan, the arc's centre).
+    fn arc_grid_room(datums: &[(f64, f64)]) -> T<(Session, Id, Point2)> {
+        let (mut s, plan) = angled_arc_room()?;
+        let gd = Id(s.execute("newdetail", &json!({ "name": "GD" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": gd.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": r.hex(), "kind": "grid" }))?;
+        s.execute("layer.current", &json!({ "name": "CLAD" }))?;
+        line(&mut s, [0.0, -20.0], [1000.0, -20.0])?;
+        s.execute("layer.current", &json!({ "name": "GYP" }))?;
+        line(&mut s, [0.0, 50.0], [1000.0, 50.0])?;
+        line(&mut s, [0.0, 180.0], [1000.0, 180.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.current", &json!({ "name": "TAGS" }))?;
+        let c = Point2 { x: 3000.0 - (2200.0f64.powi(2) - 1100.0f64.powi(2)).sqrt(), y: 1100.0 };
+        let tip = [c.x + 2200.0, c.y];
+        s.execute("detailtag", &json!({ "detailViewId": gd.0, "tip": {"x": tip[0], "y": tip[1]}, "bubble": {"x": tip[0] + 1000.0, "y": tip[1]} }))?;
+        let a = 30.0f64.to_radians();
+        let b = (a / 2.0).tan();
+        for &(dx, rd) in datums {
+            let at = |t: f64| [c.x + dx + rd * t.cos(), c.y + rd * t.sin()];
+            let before = all_handles(&s)?;
+            s.execute("pline", &json!({ "vertices": [{ "p": at(-a), "bulge": b }, { "p": at(a), "bulge": 0.0 }] }))?;
+            let h = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no datum arc")?;
+            s.execute("setrole", &json!({ "handles": [h.hex()], "role": "datum" }))?;
+        }
+        Ok((s, plan, c))
+    }
+
+    /// The arc run's assembly in `plan`.
+    fn arc_run(s: &Session, plan: Id) -> T<RunAssembly> {
+        let d = s.doc()?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, plan);
+        let arc = graph.runs.iter().position(|r| matches!(r.centreline, RunCurve::Arc { .. })).ok_or("no arc run")?;
+        Ok(assembly_lines(d, plan)?.swap_remove(arc))
+    }
+
+    #[test]
+    fn a_grid_detail_on_an_arc_run_lays_its_reference_on_the_concentric_datum_arc() -> R {
+        // Centreline radius 2100; the datum arc 50 toward the outside: h = 50, s = 100 − 50 = 50.
+        let (s, plan, c) = arc_grid_room(&[(0.0, 2150.0)])?;
+        let ra = arc_run(&s, plan)?;
+        assert_eq!((ra.skipped.clone(), ra.bands), (None, 3), "{ra:?}");
+        let mut radii: Vec<(f64, String)> = Vec::new();
+        for l in &ra.lines[..ra.bands] {
+            let span = l.arc.ok_or("not an arc band")?;
+            assert!((span.center.x - c.x).abs() < 1e-6 && (span.center.y - c.y).abs() < 1e-6, "{l:?}");
+            let rad = |p: Point2| (p.x - c.x).hypot(p.y - c.y);
+            assert!((rad(l.from) - span.radius).abs() < 1e-6 && (rad(l.to) - span.radius).abs() < 1e-6, "{l:?}");
+            radii.push(((span.radius * 1e6).round() / 1e6, l.layer.clone()));
+        }
+        radii.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // Each band 50 further in than an exterior-face lay: CLAD 2200 − (−20 + 50), GYP 2200 − 100, 2200 − 230.
+        assert_eq!(radii, [(2170.0, "CLAD".to_string()), (2100.0, "GYP".to_string()), (1970.0, "GYP".to_string())]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_grid_detail_on_an_arc_run_without_one_concentric_datum_arc_in_reach_is_skipped() -> R {
+        let skip = |datums: &[(f64, f64)]| -> T<Option<String>> {
+            let (s, plan, _) = arc_grid_room(datums)?;
+            let ra = arc_run(&s, plan)?;
+            assert!(ra.lines.is_empty(), "{ra:?}");
+            Ok(ra.skipped)
+        };
+        assert_eq!(skip(&[(200.0, 2150.0)])?.as_deref(), Some("no grid line on the run"), "another centre");
+        assert_eq!(skip(&[(0.0, 2300.0)])?.as_deref(), Some("no grid line on the run"), "beyond reach");
+        assert_eq!(skip(&[(0.0, 2050.0), (0.0, 2150.0)])?.as_deref(), Some("ambiguous grid line"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_grid_corner_detail_at_an_arc_junction_takes_the_arc_arms_inset_from_its_datum_arc() -> R {
+        let (mut s, plan, c) = arc_grid_room(&[(0.0, 2150.0)])?;
+        // The bottom wall (faces y 0 and 200) gets its grid line at y 50.
+        let h = line(&mut s, [-500.0, 50.0], [3500.0, 50.0])?;
+        s.execute("setrole", &json!({ "handles": [h.hex()], "role": "datum" }))?;
+        corner_detail(&mut s, plan, "grid", false, (3000.0, 0.0))?;
+        let d = s.doc()?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, plan);
+        let corners = corner_assembly(d, plan)?;
+        let c0 = corners
+            .iter()
+            .find(|k| {
+                let p = graph.junctions[k.junction].point;
+                (p.x - 3000.0).abs() < 200.0 && p.y < 200.0
+            })
+            .ok_or("no bottom-right corner")?;
+        assert!(c0.skipped.is_none() && c0.lines.len() == 2, "{c0:?}");
+        // The reference tip lands where the two grid lines cross: y 50 on the radius-2150 circle.
+        let tip = Point2 { x: c.x + (2150.0f64.powi(2) - 1050.0f64.powi(2)).sqrt(), y: 50.0 };
+        let a = c0.lines.iter().find(|l| l.layer == "CRN-A").ok_or("no CRN-A")?;
+        let near = |p: Point2| (p.x - tip.x).hypot(p.y - tip.y) < 1e-6;
+        assert!(near(a.from) || near(a.to), "{tip:?}: {a:?}");
         Ok(())
     }
 
