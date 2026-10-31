@@ -441,16 +441,33 @@ pub fn place_corner(
 
 /// A jamb of an opening bridge (§9 item 3, LAMB T485): the run `end`'s `face` line end `c` — its
 /// centreline end offset `width / 2` toward the face — and the unit travel `t` toward the opening
-/// (along the centreline at `End`, against it at `Start`). Errors as `face_frame`: an arc run, an
-/// undecided face side.
+/// (along the centreline at `End`, against it at `Start`). On an arc run (LAMB T581) `c` is the face
+/// circle's point at the end's angle and `t` the arc's tangent there, out of the run. Errors: an
+/// undecided face side, a run with no length, a face radius not above `TOLERANCE.coincidence_mm`.
 pub fn jamb_point(run: &WallRun, sides: &RunSides, face: FaceRef, end: RunEnd) -> Result<(Point2, Point2), String> {
+    jamb_frame(run, sides, face, end).map(|(c, t, _)| (c, t))
+}
+
+/// [`jamb_point`] plus the unit normal at `c` toward the face side (away from the wall).
+fn jamb_frame(run: &WallRun, sides: &RunSides, face: FaceRef, end: RunEnd) -> Result<(Point2, Point2, Point2), String> {
+    if let RunCurve::Arc { start_angle, sweep, .. } = run.centreline {
+        let (center, r, outward) = face_circle(run, sides, face, 0.0)?;
+        let (a, s) = match end {
+            RunEnd::Start => (start_angle, -sweep.signum()),
+            RunEnd::End => (start_angle + sweep, sweep.signum()),
+        };
+        let radial = Point2 { x: a.cos(), y: a.sin() };
+        let c = Point2 { x: center.x + r * radial.x, y: center.y + r * radial.y };
+        let t = Point2 { x: -radial.y * s, y: radial.x * s };
+        return Ok((c, t, Point2 { x: radial.x * outward, y: radial.y * outward }));
+    }
     let f = face_frame(run, sides, face)?;
     let h = run.width / 2.0;
     let (e, s) = match end {
         RunEnd::Start => (f.from, -1.0),
         RunEnd::End => (f.to, 1.0),
     };
-    Ok((Point2 { x: e.x + f.normal.x * h, y: e.y + f.normal.y * h }, Point2 { x: f.dir.x * s, y: f.dir.y * s }))
+    Ok((Point2 { x: e.x + f.normal.x * h, y: e.y + f.normal.y * h }, Point2 { x: f.dir.x * s, y: f.dir.y * s }, f.normal))
 }
 
 /// An opening detail placed at both jambs of `bridge` (§9 item 3, LAMB T485), `[a's, b's]`. The
@@ -460,7 +477,7 @@ pub fn jamb_point(run: &WallRun, sides: &RunSides, face: FaceRef, end: RunEnd) -
 /// Each jamb uses its own travel, so the detail lands rigidly at the jamb whose handedness matches
 /// the detail's and **as its mirror image at the other** — intended: a jamb is drawn once, "typ.".
 /// `sides` is indexed like `runs`. Errors: the detail's frame ([`detail_frame`]), a missing run, an
-/// arc run, an undecided face side.
+/// undecided face side. On an arc run the mapped lines stay straight, as [`place_corner`]'s arc arms.
 ///
 /// `insets` (`[a's, b's]`; a missing entry is 0) move each jamb's point that far into the wall
 /// along `ni`, and `outward` maps the detail's `into` to `−ni` — as in [`place_corner`] (LAMB T490).
@@ -503,10 +520,9 @@ pub fn place_opening_end(
     let (i, end) = if at_b { bridge.b } else { bridge.a };
     let run = runs.get(i).ok_or("the opening bridge names no run")?;
     let side = sides.get(i).ok_or("the opening bridge's run has no sides")?;
-    let f = face_frame(run, side, face)?;
-    let (c, t) = jamb_point(run, side, face, end)?;
-    let c = Point2 { x: c.x - f.normal.x * inset, y: c.y - f.normal.y * inset };
-    let ni = Point2 { x: -f.normal.x * sgn, y: -f.normal.y * sgn };
+    let (c, t, n) = jamb_frame(run, side, face, end)?;
+    let c = Point2 { x: c.x - n.x * inset, y: c.y - n.y * inset };
+    let ni = Point2 { x: -n.x * sgn, y: -n.y * sgn };
     let map = |p: Point2| {
         let (dx, dy) = (p.x - r.x, p.y - r.y);
         let (u, v) = (dx * frame.along.x + dy * frame.along.y, dx * frame.into.x + dy * frame.into.y);
@@ -667,6 +683,14 @@ pub fn corner_arc_reach(j: &Junction, runs: &[WallRun], corner: &[AssemblyLine])
             corner.iter().flat_map(|l| [l.from, l.to]).map(|p| arc_delta(center, end, toward, p)).fold(0.0, f64::max)
         })
         .collect()
+}
+
+/// The angular counterpart of [`jamb_reach`] (LAMB T581): on an arc run, the largest angle
+/// (radians, floored at 0), about its centre, from its `end` back into the run, of any end of the
+/// jamb `lines`; 0 on a straight run.
+pub fn jamb_arc_reach(run: &WallRun, end: RunEnd, lines: &[AssemblyLine]) -> f64 {
+    let Some((center, a, toward)) = arc_end(run, end) else { return 0.0 };
+    lines.iter().flat_map(|l| [l.from, l.to]).map(|p| arc_delta(center, a, toward, p)).fold(0.0, f64::max)
 }
 
 /// An arc run's `(centre, angle of its end, toward)`: `toward` is ±1, the sense of increasing angle
@@ -1410,16 +1434,54 @@ mod tests {
     }
 
     #[test]
-    fn an_opening_detail_refuses_an_arc_run_and_an_undecided_side() {
+    fn an_opening_detail_refuses_an_undecided_side() {
         let (reference, lines) = jamb_detail();
-        let (bridge, mut runs, sides) = bridged(false);
+        let (bridge, runs, sides) = bridged(false);
         let neither = RunSides { left: SideKind::Space(0), right: SideKind::Space(1), exterior: false, open_outside_left: None };
         let undecided = vec![sides[0].clone(), neither];
         assert_eq!(
             place_opening(&bridge, &runs, &undecided, FaceRef::Exterior, reference, &lines, &[], false).unwrap_err(),
             "no single exterior side"
         );
-        runs[0].centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
-        assert_eq!(place_opening(&bridge, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap_err(), "arc runs are not laid yet");
+    }
+
+    #[test]
+    fn an_arc_jamb_places_the_detail_on_the_face_circle_along_the_tangent() {
+        let (reference, lines) = jamb_detail();
+        // A 200-wide arc wall, centreline radius 1000 CCW from 0 to 1 rad, exterior outside the
+        // circle (the right of a CCW travel); its End jamb opens on, bridged to a straight stub.
+        let outside_right = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
+        let mut arc = run(p(1000.0, 0.0), p(0.0, 0.0), 200.0);
+        arc.centreline = RunCurve::Arc { center: p(0.0, 0.0), radius: 1000.0, start_angle: 0.0, sweep: 1.0 };
+        let runs = vec![arc, run(p(0.0, 2000.0), p(0.0, 3000.0), 200.0)];
+        let sides = vec![outside_right.clone(), outside_right];
+        let bridge = OpeningBridge {
+            a: (0, RunEnd::End),
+            b: (1, RunEnd::Start),
+            from: p(1.0f64.cos() * 1000.0, 1.0f64.sin() * 1000.0),
+            to: p(0.0, 2000.0),
+            opening_entity_ids: vec![Id(9)],
+        };
+        let (c, t) = jamb_point(&runs[0], &sides[0], FaceRef::Exterior, RunEnd::End).unwrap();
+        let (radial, tangent) = (p(1.0f64.cos(), 1.0f64.sin()), p(-1.0f64.sin(), 1.0f64.cos()));
+        let near = |a: Point2, b: Point2| (a.x - b.x).hypot(a.y - b.y) < 1e-9;
+        assert!(near(c, p(radial.x * 1100.0, radial.y * 1100.0)), "{c:?}");
+        assert!(near(t, tangent), "{t:?}");
+        let a = place_opening_end(&bridge, false, &runs, &sides, FaceRef::Exterior, reference, &lines, 0.0, false).unwrap();
+        // The jamb line runs from the face circle's jamb point 200 radially into the wall.
+        assert!(near(a[0].from, c) && near(a[0].to, p(radial.x * 900.0, radial.y * 900.0)), "{a:?}");
+        // The band reaches 100 back along the tangent at radius 900.
+        let back = p(radial.x * 900.0 - tangent.x * 100.0, radial.y * 900.0 - tangent.y * 100.0);
+        assert!(near(a[1].from, back), "{a:?}");
+        assert!(a.iter().all(|l| l.arc.is_none()));
+        // An inset moves the jamb radially into the wall.
+        let inset = place_opening_end(&bridge, false, &runs, &sides, FaceRef::Exterior, reference, &lines, 50.0, false).unwrap();
+        assert!(near(inset[0].from, p(radial.x * 1050.0, radial.y * 1050.0)), "{inset:?}");
+        // The reach back into the run is the band end's angle; a straight run reaches 0.
+        assert!((jamb_arc_reach(&runs[0], RunEnd::End, &a) - (100.0f64 / 900.0).atan()).abs() < 1e-9);
+        assert_eq!(jamb_arc_reach(&runs[1], RunEnd::Start, &a), 0.0);
+        // The Start jamb's travel is against the sweep.
+        let (c0, t0) = jamb_point(&runs[0], &sides[0], FaceRef::Exterior, RunEnd::Start).unwrap();
+        assert!(near(c0, p(1100.0, 0.0)) && near(t0, p(0.0, -1.0)), "{c0:?} {t0:?}");
     }
 }

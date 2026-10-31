@@ -37,7 +37,8 @@
 //! `datum` line within the wall ([`run_grid_offset`]).
 //! At each opening bridge an opening tag resolves to (LAMB T486), [`opening_assembly`] places the
 //! jamb detail at both jambs (lamb-core's [`place_opening`], mirrored at the second); each jamb's run
-//! is trimmed back to the detail's reach there ([`jamb_reach`]) as at a corner. In a section each
+//! is trimmed back to the detail's reach there ([`jamb_reach`]) as at a corner — on an arc run an
+//! angle ([`jamb_arc_reach`], [`trim_arc_run`]; LAMB T581). In a section each
 //! end — head, sill — resolves and places on its own (LAMB T505, lamb-core's [`place_opening_end`]). The block holds the
 //! run lines, then the corners', then the openings'.
 //! Not the AI-line sweep in [`crate::sweeps`].
@@ -48,8 +49,9 @@ use cadcraft_doc::{Arc as ArcEntity, Block, Common, Drawing, Entity, EntityKind,
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
 use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
-    AssemblyLine, FaceRef, WidthConflict, arc_delta, arc_end, arm_direction, corner_arc_reach, corner_reach, detail_bands, detail_frame, jamb_reach,
-    junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner, place_opening, place_opening_end, tee_butt, trim_to_reach, width_conflict,
+    AssemblyLine, FaceRef, WidthConflict, arc_delta, arc_end, arm_direction, corner_arc_reach, corner_reach, detail_bands, detail_frame,
+    jamb_arc_reach, jamb_reach, junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner, place_opening, place_opening_end, tee_butt,
+    trim_to_reach, width_conflict,
 };
 use lamb_core::derivation::detail_tags::{EndLevel, RunDetail};
 use lamb_core::derivation::issues::{Issue, IssueKind};
@@ -391,6 +393,12 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             Some(true) => vec![(b.b, b.to, &o.lines[..])],
         };
         for ((i, end), point, lines) in ends {
+            if let Some((center, a, toward)) = graph.runs.get(i).and_then(|run| arc_end(run, end)) {
+                let reach = jamb_arc_reach(&graph.runs[i], end, lines);
+                let Some(r) = runs.get_mut(i).filter(|r| r.skipped.is_none() && reach > 0.0) else { continue };
+                trim_arc_run(r, center, a, toward, reach);
+                continue;
+            }
             let Some(RunCurve::Line { from, to }) = graph.runs.get(i).map(|r| r.centreline) else { continue };
             let len = (to.x - from.x).hypot(to.y - from.y);
             if len <= 0.0 {
@@ -2851,6 +2859,100 @@ pub(crate) mod tests {
         s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
         s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 1500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
         Ok((s, plan))
+    }
+
+    /// [`angled_arc_room`] with a 20° gap in the middle of its arc wall (±10° about the circle's
+    /// centre height), a straight `WINDOW` chord across it on the centreline circle and the jamb
+    /// detail `JD` of [`window_room`] tagged on it. Returns (session, plan, centre).
+    fn arc_window_room() -> T<(Session, Id, Point2)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let detail = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": r.hex(), "kind": "exterior_face" }))?;
+        s.execute("layer.new", &json!({ "name": "CLAD", "current": true }))?;
+        line(&mut s, [0.0, -20.0], [1000.0, -20.0])?;
+        s.execute("layer.new", &json!({ "name": "GYP", "current": true }))?;
+        line(&mut s, [0.0, 50.0], [1000.0, 50.0])?;
+        line(&mut s, [0.0, 200.0], [1000.0, 200.0])?;
+        let jd = Id(s.execute("newdetail", &json!({ "name": "JD" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": jd.0 }))?;
+        s.execute("layer.current", &json!({ "name": "0" }))?;
+        let r = line(&mut s, [-1000.0, 0.0], [0.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": r.hex(), "kind": "exterior_face" }))?;
+        s.execute("layer.new", &json!({ "name": "JAMB", "current": true }))?;
+        line(&mut s, [-50.0, 0.0], [-50.0, 200.0])?;
+        s.execute("layer.current", &json!({ "name": "GYP" }))?;
+        line(&mut s, [-50.0, 200.0], [0.0, 200.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        let c = Point2 { x: 3000.0 - (2200.0f64.powi(2) - 1100.0f64.powi(2)).sqrt(), y: 1100.0 };
+        let at = |r: f64, a: f64| [c.x + r * a.cos(), c.y + r * a.sin()];
+        let g = 10.0f64.to_radians();
+        let half_in = (900.0f64 / 2000.0).asin();
+        let v = |p: [f64; 2], bulge: f64| json!({ "p": p, "bulge": bulge });
+        for (r, half, corner) in [(2200.0, 30.0f64.to_radians(), 0.0), (2000.0, half_in, 200.0)] {
+            let b = ((half - g) / 4.0).tan();
+            let (top, bot) = (at(r, half), at(r, -half));
+            s.execute(
+                "pline",
+                &json!({ "vertices": [v(at(r, g), b), v(top, 0.0), v([corner, 2200.0 - corner], 0.0), v([corner, corner], 0.0), v(bot, b), v(at(r, -g), 0.0)] }),
+            )?;
+        }
+        s.execute("layer.new", &json!({ "name": "WINDOW", "current": true }))?;
+        line(&mut s, at(2100.0, -g), at(2100.0, g))?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 1500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
+        let tip = at(2100.0 * g.cos(), 0.0);
+        s.execute(
+            "detailtag",
+            &json!({ "detailViewId": jd.0, "corner": true, "tip": {"x": tip[0], "y": tip[1]}, "bubble": {"x": tip[0] + 500.0, "y": tip[1] - 500.0} }),
+        )?;
+        Ok((s, plan, c))
+    }
+
+    #[test]
+    fn an_opening_detail_across_a_gap_in_an_arc_wall_is_placed_at_both_arc_jambs_and_trims_the_arc_bands() -> R {
+        let (mut s, plan, center) = arc_window_room()?;
+        let r = s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!((r["openings"].as_u64(), r["skipped"].clone()), (Some(1), json!([])), "{r}");
+        let d = s.doc()?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, plan);
+        let openings = opening_assembly(d, plan)?;
+        let [o] = openings.as_slice() else { return Err(format!("{openings:?}").into()) };
+        assert!(o.skipped.is_none() && o.end.is_none() && o.lines.len() == 4, "{o:?}");
+        let b = &graph.bridges[o.bridge];
+        // Each JAMB line runs radially 200 into the wall from the outer face, 50 back from its jamb.
+        let ang = |p: Point2| (p.y - center.y).atan2(p.x - center.x);
+        let rad = |p: Point2| (p.x - center.x).hypot(p.y - center.y);
+        let g = 10.0f64.to_radians();
+        let mut signs = Vec::new();
+        for l in o.lines.iter().filter(|l| l.layer == "JAMB") {
+            assert!((rad(l.from) - 2200.0f64.hypot(50.0)).abs() < 1e-6 && (rad(l.to) - 2000.0f64.hypot(50.0)).abs() < 1e-6, "{l:?}");
+            assert!((ang(l.from).abs() - (g + (50.0f64 / 2200.0).atan())).abs() < 1e-9, "{l:?}");
+            signs.push(ang(l.from).signum());
+        }
+        signs.sort_by(f64::total_cmp);
+        assert_eq!(signs, [-1.0, 1.0], "{o:?}");
+        // Both arc pieces' bands stop at the jamb detail's reach.
+        let runs = assembly_lines(d, plan)?;
+        let half = o.lines.len() / 2;
+        for ((i, end), lines) in [(b.a, &o.lines[..half]), (b.b, &o.lines[half..])] {
+            let reach = jamb_arc_reach(&graph.runs[i], end, lines);
+            assert!((reach - (50.0f64 / 2000.0).atan()).abs() < 1e-9, "run {i}: {reach}");
+            let (c, a, toward) = arc_end(&graph.runs[i], end).ok_or("not an arc run")?;
+            let ra = &runs[i];
+            assert!(ra.skipped.is_none() && ra.bands == 3, "{ra:?}");
+            for l in &ra.lines[..ra.bands] {
+                assert!(l.arc.is_some());
+                let near = arc_delta(c, a, toward, l.from).min(arc_delta(c, a, toward, l.to));
+                assert!((near - reach).abs() < 1e-9, "run {i} reach {reach}: {l:?} at {near}");
+            }
+        }
+        Ok(())
     }
 
     #[test]

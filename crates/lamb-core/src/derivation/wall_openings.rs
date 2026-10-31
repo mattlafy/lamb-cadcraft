@@ -7,13 +7,15 @@
 //! and grouped into connected clusters, so a door drawn as a separate leaf line and swing arc is one
 //! opening. A cluster spans a gap when it comes within `TOLERANCE.grouping_mm` of both ends' caps.
 //!
-//! Only straight runs are bridged: a gap in an arc wall (and openings drawn as blocks) is a later
-//! slice.
+//! A gap is bridged between two straight free ends that face each other on one line, or between two
+//! free ends of different arc runs on one circle whose outward tangents turn toward each other
+//! around it (the short way, under half a turn). A straight end never pairs with an arc end.
+//! Openings drawn as blocks are a later slice.
 
 use std::cmp::Ordering;
 
 use super::read::ProjectRead;
-use super::wall_junctions::{RunEnd, run_ends};
+use super::wall_junctions::{EndInfo, RunEnd, run_ends};
 use super::walls::{RunCurve, WallRun, WallRunParams};
 use crate::geometry::Point2;
 use crate::geometry::intersect::intersect_segments;
@@ -102,10 +104,32 @@ fn cluster_cap_distance(c: &Cluster, cap: &ResolvedSegment) -> f64 {
     best
 }
 
+/// Two free arc ends face each other around one circle: centres and radii within `grouping_mm`,
+/// `a`'s outward tangent turning toward `b` by more than `coincidence_mm / radius` and under π, and
+/// `b`'s outward tangent turning the opposite way.
+fn arcs_face(a: &EndInfo, b: &EndInfo, ca: Point2, ra: f64, cb: Point2, rb: f64) -> bool {
+    if dist2(ca, cb) > TOLERANCE.grouping_mm || (ra - rb).abs() > TOLERANCE.grouping_mm || ra <= 0.0 {
+        return false;
+    }
+    let sense = |e: &EndInfo, c: Point2| cross2(sub2(e.point, c), e.outward).signum();
+    let (sa, sb) = (sense(a, ca), sense(b, ca));
+    if sa == 0.0 || sb != -sa {
+        return false;
+    }
+    let ang = |q: Point2| {
+        let v = sub2(q, ca);
+        v.y.atan2(v.x)
+    };
+    let two_pi = std::f64::consts::TAU;
+    let turn = ((ang(b.point) - ang(a.point)) * sa).rem_euclid(two_pi);
+    turn > TOLERANCE.coincidence_mm / ra && turn < std::f64::consts::PI
+}
+
 /// The opening bridges among `free_ends` (from [`super::wall_junctions::wall_junctions`] over
 /// `runs`), sorted by `(a, b)`. Candidates are free ends of different straight runs whose outward
 /// directions are antiparallel and which face each other on one line (lateral offset within
-/// `grouping_mm`); a pair is bridged when one opening cluster comes within `grouping_mm` of both
+/// `grouping_mm`), or free ends of different arc runs facing each other around one circle
+/// ([`arcs_face`]); a pair is bridged when one opening cluster comes within `grouping_mm` of both
 /// end caps. Shortest gaps win; each end bridges at most once.
 pub fn opening_bridges(
     p: &impl ProjectRead,
@@ -114,8 +138,7 @@ pub fn opening_bridges(
     runs: &[WallRun],
     free_ends: &[(usize, RunEnd)],
 ) -> Vec<OpeningBridge> {
-    let ends: Vec<_> =
-        run_ends(runs).into_iter().filter(|e| free_ends.contains(&e.key) && matches!(runs[e.key.0].centreline, RunCurve::Line { .. })).collect();
+    let ends: Vec<_> = run_ends(runs).into_iter().filter(|e| free_ends.contains(&e.key)).collect();
     if ends.len() < 2 {
         return Vec::new();
     }
@@ -123,7 +146,7 @@ pub fn opening_bridges(
     if clusters.is_empty() {
         return Vec::new();
     }
-    let cap = |e: &super::wall_junctions::EndInfo| {
+    let cap = |e: &EndInfo| {
         let n = Point2 { x: -e.outward.y, y: e.outward.x };
         let h = 0.5 * e.width;
         ResolvedSegment { index: 0, from: add2(e.point, scale2(n, -h)), to: add2(e.point, scale2(n, h)), bulge: 0.0 }
@@ -134,11 +157,21 @@ pub fn opening_bridges(
     let mut cands: Vec<(f64, usize, usize, usize)> = Vec::new(); // (gap, i, j, cluster)
     for (i, a) in ends.iter().enumerate() {
         for (j, b) in ends.iter().enumerate().skip(i + 1) {
-            if a.key.0 == b.key.0 || dot2(a.outward, b.outward) >= 0.0 || cross2(a.outward, b.outward).abs() > sin_tol {
+            if a.key.0 == b.key.0 {
                 continue;
             }
-            let d = sub2(b.point, a.point);
-            if dot2(a.outward, d) <= TOLERANCE.coincidence_mm || cross2(a.outward, d).abs() > TOLERANCE.grouping_mm {
+            let facing = match (&runs[a.key.0].centreline, &runs[b.key.0].centreline) {
+                (RunCurve::Line { .. }, RunCurve::Line { .. }) => {
+                    let d = sub2(b.point, a.point);
+                    dot2(a.outward, b.outward) < 0.0
+                        && cross2(a.outward, b.outward).abs() <= sin_tol
+                        && dot2(a.outward, d) > TOLERANCE.coincidence_mm
+                        && cross2(a.outward, d).abs() <= TOLERANCE.grouping_mm
+                }
+                (RunCurve::Arc { center: ca, radius: ra, .. }, RunCurve::Arc { center: cb, radius: rb, .. }) => arcs_face(a, b, *ca, *ra, *cb, *rb),
+                _ => false,
+            };
+            if !facing {
                 continue;
             }
             let spanning = clusters.iter().position(|c| {
