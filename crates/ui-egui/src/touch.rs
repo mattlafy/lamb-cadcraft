@@ -253,8 +253,9 @@ impl TouchMouse {
 
     fn begin(&mut self, id: TouchId, pos: Pos2, now: f64, canvas: Option<Rect>) {
         let placed = self.crosshair.is_none();
+        // The canvas may have shrunk since the crosshair was placed (an on-screen keyboard).
         let cross = match (self.crosshair, canvas) {
-            (Some(c), _) => c,
+            (Some(c), r) => clamp(c, r),
             (None, Some(r)) if r.is_positive() => r.center(),
             (None, _) => pos,
         };
@@ -440,6 +441,7 @@ mod tests {
         m: TouchMouse,
         gate: NativeGate,
         gated: bool,
+        canvas: Rect,
         t: f64,
         out: Vec<Event>,
         /// The backend's primary touch: its id and last position.
@@ -449,10 +451,19 @@ mod tests {
 
     impl Rig {
         fn new() -> Self {
-            Self { m: TouchMouse::default(), gate: NativeGate::default(), gated: true, t: 10.0, out: Vec::new(), primary: None, down: Vec::new() }
+            Self {
+                m: TouchMouse::default(),
+                gate: NativeGate::default(),
+                gated: true,
+                canvas: CANVAS,
+                t: 10.0,
+                out: Vec::new(),
+                primary: None,
+                down: Vec::new(),
+            }
         }
         fn frame(&mut self, mut events: Vec<Event>) {
-            self.m.filter(&mut events, self.t, Some(CANVAS), &on_canvas);
+            self.m.filter(&mut events, self.t, Some(self.canvas), &on_canvas);
             self.out.extend(events);
         }
         /// A browser event: when admitted, the backend's events for it.
@@ -671,6 +682,18 @@ mod tests {
         r.wait(0.4);
         assert_eq!(r.buttons(), vec![(true, CENTRE), (false, CENTRE)]);
         assert!(!r.m.busy());
+    }
+
+    #[test]
+    fn a_tap_after_the_canvas_shrinks_clicks_inside_it() {
+        let mut r = Rig::shown();
+        r.canvas = Rect { min: Pos2::new(0.0, 0.0), max: Pos2::new(800.0, 200.0) };
+        r.tap(100.0, 100.0);
+        r.wait(0.4);
+        let inside = Pos2::new(400.0, 200.0);
+        assert_eq!(r.m.crosshair(), Some(inside));
+        assert_eq!(r.buttons(), vec![(true, inside), (false, inside)]);
+        assert!(r.pointer_positions().iter().all(|p| r.canvas.contains(*p)), "{:?}", r.pointer_positions());
     }
 
     #[test]
