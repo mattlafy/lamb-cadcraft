@@ -1317,3 +1317,55 @@ fn rotate_and_scale_travel_the_partner() -> R {
     assert_eq!(s.doc()?.entity(Handle(sec_e.0)).cloned(), sec_ent, "and the section face");
     Ok(())
 }
+
+/// LAMB T576 (the user's cut-line rulings): a travelling plan wall moved clear of the cut line is a
+/// valid move — its section partner travels to the apparent crossing (the wall's extended line
+/// against the cut) and the link drops quietly, leaving no marker for the wall; a wall moved onto
+/// the cut gains a marker there; and a section move transmits only its along-cut (u) component.
+#[test]
+fn a_wall_leaving_or_entering_the_cut_loses_or_gains_its_crossing() -> R {
+    register();
+    let face = [[1000.0, 0.0], [5000.0, 0.0], [5000.0, 2400.0], [6000.0, 2400.0]];
+    let d = wall_and_face([[4000.0, -1000.0], [6000.0, 1000.0]], &face)?;
+    let (link, plan_e, plan_view) = wall_link(&d)?;
+    let (sec_e, _) = face_u(&d, &link, plan_e)?;
+    let sec_view = view_of(&d, sec_e)?;
+    assert!(link_still_coincides(&DrawingProject::new(&d)?, &link)?, "the fixture's link holds");
+
+    // (a) Off the cut: y = x − 3000 meets y = 0 at u = 3000.
+    let mv = json!({"handles": [hex(plan_e)], "delta": [0, 2000]});
+    let (after, report) = raw_report(&d, plan_view, "move", &mv, &[link.id])?;
+    assert!(report.separated.contains(&link.id) && report.unreachable.is_empty(), "{report:?}");
+    let (_, u) = face_u(&after, &link, plan_e)?;
+    assert!((u - 3000.0).abs() < 0.1, "the partner travels to the apparent crossing, at {u}");
+    assert!(markers_from(&after, sec_view, plan_e)?.is_empty(), "no marker for a wall clear of the cut");
+    let mut s = Session::new();
+    s.open_drawing(d.clone(), "t576", None);
+    install_link_maintenance(&mut s);
+    s.execute("editview", &json!({"viewId": plan_view.0}))?;
+    s.set_travel(vec![link.id.0]);
+    s.execute("move", &mv)?;
+    assert!(!s.log.iter().any(|l| l.contains("could not travel")), "no echo: {:?}", s.log);
+    assert!(find_link(&links(&s)?, link.id).is_err(), "the link is dropped");
+    let (_, u) = face_u(s.doc()?, &link, plan_e)?;
+    assert!((u - 3000.0).abs() < 0.1, "the observer travels the face to {u}");
+
+    // (b) Onto the cut, unlinked: a marker appears at u = 5000.
+    let nd = plans_and_faces(&[&[[4000.0, 1000.0], [6000.0, 3000.0]]], &[&face], &[])?;
+    let (np, ns) = plan_and_section(&nd)?;
+    let wall = block_handles(&nd, np).into_iter().next().ok_or("no wall")?;
+    let (after, _) = raw_report(&nd, np, "move", &json!({"handles": [wall.hex()], "delta": [0, -2000]}), &[])?;
+    let marks = markers_from(&after, ns, Id(wall.0))?;
+    assert!(marks.iter().any(|m| close(m.position.x, 5000.0)), "a marker at u = 5000: {marks:?}");
+
+    // (c) The face moved (100, 300) in the section: the plan wall moves (100, 0), the link holds.
+    let (after, report) = raw_report(&d, sec_view, "move", &json!({"handles": [hex(sec_e)], "delta": [100, 300]}), &[link.id])?;
+    assert!(report.travelled == vec![plan_e] && report.separated.is_empty(), "{report:?}");
+    let (was, now) = (resolved_segments(&poly(&d, plan_e)?), resolved_segments(&poly(&after, plan_e)?));
+    for (w, n) in [(was[0].from, now[0].from), (was[0].to, now[0].to)] {
+        assert!(close(n.x - w.x, 100.0) && close(n.y - w.y, 0.0), "wall moved {:?}", (n.x - w.x, n.y - w.y));
+    }
+    let kept = read_document(&after)?.links.into_iter().find(|l| l.id == link.id).ok_or("the link survives")?;
+    assert!(link_still_coincides(&DrawingProject::new(&after)?, &kept)?, "and holds");
+    Ok(())
+}
