@@ -13,6 +13,7 @@ use cadcraft_doc::{Drawing, Handle, Space};
 use cadcraft_engine::snap::{SnapHit, register_snap_provider};
 use cadcraft_geom::Vec2;
 use cadcraft_render::{DPrim, DisplayList, Kind, Options, register_overlay_provider};
+use lamb_core::derivation::datums::compute_datum_lines_for_view;
 use lamb_core::derivation::linking::find_link_for_marker;
 use lamb_core::derivation::markers::{Marker, MarkerShape, compute_cut_lines_for_view, compute_markers_for_view, compute_plan_cut_lines_for_view};
 use lamb_core::model::Id;
@@ -32,6 +33,8 @@ const MARKER_SEGMENTS: usize = 32;
 const MARKER_COLOR: Rgb = Rgb(0, 190, 255);
 const MARKER_ASSUMED_Z_COLOR: Rgb = Rgb(120, 140, 160);
 const CUT_LINE_COLOR: Rgb = Rgb(255, 170, 0);
+/// Datum planes from other views: the GRID layer's `#5090e0`.
+pub(crate) const DATUM_LINE_COLOR: Rgb = Rgb(0x50, 0x90, 0xe0);
 /// A picked view's cut lines (TS `SELECTED_OVERLAY_COLOR`, `#4da3ff`).
 const SELECTED_OVERLAY_COLOR: Rgb = Rgb(0x4d, 0xa3, 0xff);
 const SNAP_NAME: &str = "LAMB marker";
@@ -91,8 +94,8 @@ pub(crate) fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kin
 /// ([`halo`]: RESOLVE's attention, unaccepted AI lines' glow), a detail's reference line
 /// ([`crate::detailref`], magenta), a detail's repeat ghosts ([`crate::repeats::draw`], one pale copy
 /// of each repeat's members at its pitch), an assembly block's ghost ([`crate::asmview::draw`]),
-/// then its markers and cut lines, in
-/// its block's coordinates.
+/// then its markers, cut lines and the datum planes of other views that cross it, in its block's
+/// coordinates.
 pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let mut list = underlay::draw(d, space, opts);
     append_list(&mut list, halo::draw(d, space, opts));
@@ -103,6 +106,7 @@ pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let Ok(markers) = compute_markers_for_view(&dp, id) else { return list };
     let Ok(cuts) = compute_cut_lines_for_view(&dp, id) else { return list };
     let plan_cuts = compute_plan_cut_lines_for_view(&dp, id);
+    let datums = compute_datum_lines_for_view(&dp, id).unwrap_or_default();
 
     let picked = crate::viewpick::highlighted();
     let cut_color = |v: Id| if picked == Some(v) { SELECTED_OVERLAY_COLOR } else { CUT_LINE_COLOR };
@@ -148,6 +152,18 @@ pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
         let base = Vec2::new(0.0, c.local_y);
         list.bounds.add(base);
         push(&mut list, Handle(c.source_view_id.0), cut_color(c.source_view_id), Kind::Infinite { ray: false }, &[base, Vec2::new(1.0, 0.0)]);
+    }
+    for g in &datums {
+        let from = Vec2::new(g.from.x, g.from.y);
+        let to = Vec2::new(g.to.x, g.to.y);
+        list.bounds.add(from);
+        let handle = Handle(g.source_entity_id.0);
+        if g.infinite {
+            push(&mut list, handle, DATUM_LINE_COLOR, Kind::Infinite { ray: false }, &[from, to - from]);
+        } else {
+            list.bounds.add(to);
+            push(&mut list, handle, DATUM_LINE_COLOR, Kind::Polyline, &[from, to]);
+        }
     }
     list
 }

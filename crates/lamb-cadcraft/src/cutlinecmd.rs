@@ -233,6 +233,7 @@ mod tests {
     use super::*;
     use crate::commands::install_app;
     use crate::import::project_to_drawing;
+    use lamb_core::derivation::datums::{DatumLineOverlay, compute_datum_lines_for_view};
     use lamb_core::derivation::markers::compute_markers_for_view;
     use lamb_core::model::{LinkRecord, Placement, PlanView, Project};
     use lamb_core::persistence::files_to_project;
@@ -450,6 +451,80 @@ mod tests {
         s.input(Input::Point(Vec2::new(3000.0, 2000.0)))?;
         assert!(s.log.iter().any(|l| l == "No change."), "{:?}", s.log);
         assert_eq!(s.state()?.undo.len(), undo);
+        Ok(())
+    }
+
+    /// T578: a LINE drawn in the edited `view` with `role` set; its entity id.
+    fn datum_line(s: &mut Session, view: Id, a: [f64; 2], b: [f64; 2], role: &str) -> E<Id> {
+        let ids = |s: &Session| -> E<Vec<Id>> { Ok(DrawingProject::new(s.doc()?)?.entities(view).map(|e| e.id).collect()) };
+        let before = ids(s)?;
+        s.execute("line", &json!({ "points": [a, b] }))?;
+        let id = ids(s)?.into_iter().find(|i| !before.contains(i)).ok_or("line not drawn in the view")?;
+        s.execute("setrole", &json!({ "handles": [format!("{:X}", id.0)], "role": role }))?;
+        Ok(id)
+    }
+
+    fn datums_in(s: &Session, view: Id) -> E<Vec<DatumLineOverlay>> {
+        Ok(compute_datum_lines_for_view(&DrawingProject::new(s.doc()?)?, view)?)
+    }
+
+    fn near(a: Point2, b: Point2) -> bool {
+        (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9
+    }
+
+    /// T578: a plan datum crossing `Crossbar`'s cut (x = 5000, u = 0 at y = −1000) is a vertical
+    /// grid line there at the crossing's u, and follows a MOVE; short of the cut, or `seen`, or in
+    /// its own plan, nothing.
+    #[test]
+    fn a_plan_datum_shows_as_a_vertical_line_where_it_crosses_a_section() -> E<()> {
+        let (mut s, plan, crossbar) = editing_plan()?;
+        let legs = view_named(&s, "Legs")?;
+        let id = datum_line(&mut s, plan, [3000.0, 1000.0], [7000.0, 1000.0], "datum")?;
+        let g = datums_in(&s, crossbar)?;
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!((g[0].source_view_id, g[0].source_entity_id, g[0].infinite), (plan, id, true));
+        assert!(near(g[0].from, Point2 { x: 2000.0, y: 0.0 }) && near(g[0].to, Point2 { x: 2000.0, y: 1.0 }), "{g:?}");
+        assert!(datums_in(&s, plan)?.is_empty(), "never in its own view");
+        assert!(datums_in(&s, legs)?.is_empty(), "parallel to Legs' cut");
+
+        let list =
+            crate::overlays::lamb_overlay(s.doc()?, &cadcraft_doc::Space::Block(crate::schema::view_block_name(crossbar)), &Default::default());
+        let prims: Vec<_> = list.prims.iter().filter(|p| p.handle.0 == id.0).collect();
+        assert_eq!(prims.len(), 1);
+        assert!(matches!(prims[0].kind, cadcraft_render::Kind::Infinite { ray: false }) && prims[0].color == crate::overlays::DATUM_LINE_COLOR);
+
+        s.execute("move", &json!({ "handles": [format!("{:X}", id.0)], "delta": [0, 500] }))?;
+        let g = datums_in(&s, crossbar)?;
+        assert!(g.len() == 1 && near(g[0].from, Point2 { x: 2500.0, y: 0.0 }), "follows the move: {g:?}");
+
+        datum_line(&mut s, plan, [3000.0, 0.0], [4000.0, 0.0], "datum")?;
+        datum_line(&mut s, plan, [3000.0, 200.0], [7000.0, 200.0], "seen")?;
+        assert_eq!(datums_in(&s, crossbar)?.len(), 1, "short of the cut, or seen: nothing");
+        Ok(())
+    }
+
+    /// T578: in `Legs` (cut +X at y = 2500), a horizontal datum is a horizontal line at its z in
+    /// `Crossbar` and nothing in `P`; a vertical one is an infinite line in `P` through its mapped
+    /// point along Legs' gaze, and nothing in `Crossbar`, whose cut is parallel to it.
+    #[test]
+    fn section_datums_show_as_levels_in_sections_and_grid_lines_in_plans() -> E<()> {
+        let mut s = opened()?;
+        let (plan, crossbar, legs) = (view_named(&s, "P")?, view_named(&s, "Crossbar")?, view_named(&s, "Legs")?);
+        s.execute("editview", &json!({ "viewId": legs.0 }))?;
+        datum_line(&mut s, legs, [0.0, 2100.0], [4000.0, 2100.0], "datum")?;
+        let g = datums_in(&s, crossbar)?;
+        assert!(
+            g.len() == 1 && g[0].infinite && near(g[0].from, Point2 { x: 0.0, y: 2100.0 }) && near(g[0].to, Point2 { x: 1.0, y: 2100.0 }),
+            "{g:?}"
+        );
+        assert!(datums_in(&s, plan)?.is_empty(), "levels never show in plans");
+
+        let v = datum_line(&mut s, legs, [3000.0, 0.0], [3000.0, 2000.0], "datum")?;
+        let g = datums_in(&s, plan)?;
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert!(g[0].source_entity_id == v && g[0].infinite && near(g[0].from, Point2 { x: 3000.0, y: 2500.0 }), "{g:?}");
+        assert!((g[0].to.x - 3000.0).abs() < 1e-9 && (g[0].to.y - 2500.0).abs() > 0.999, "along the gaze: {g:?}");
+        assert_eq!(datums_in(&s, crossbar)?.len(), 1, "the vertical one is parallel to Crossbar's cut");
         Ok(())
     }
 }

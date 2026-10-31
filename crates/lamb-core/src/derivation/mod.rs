@@ -4,6 +4,7 @@
 
 pub mod alignment;
 pub mod assembly;
+pub mod datums;
 pub mod detail_tags;
 pub mod issues;
 pub mod linking;
