@@ -1230,8 +1230,27 @@ pub(crate) mod tests {
         if tagged {
             s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
             s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 2500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
+            without_assembly(&mut s)?;
         }
         Ok((s, plan))
+    }
+
+    /// Removes every assembly block and its model-space INSERT, outside any undo step: the state
+    /// of a tagged plan before its first ASSEMBLYPLAN, which a view's first DETAILTAG now skips
+    /// (LAMB T590 writes the block with that tag).
+    pub(crate) fn without_assembly(s: &mut Session) -> T<()> {
+        let d = s.doc_mut()?;
+        let names: Vec<String> = d.blocks.keys().filter(|k| k.starts_with("LAMB_ASSEMBLY_")).cloned().collect();
+        for n in &names {
+            d.blocks.remove(n);
+        }
+        let inserts: Vec<Handle> =
+            d.model.iter().filter(|e| matches!(&e.kind, EntityKind::Insert(i) if names.contains(&i.block))).map(|e| e.handle).collect();
+        for h in inserts {
+            d.model.remove(h);
+        }
+        d.layers.retain(|l| !names.contains(&l.name));
+        Ok(())
     }
 
     fn horizontal(a: &RunAssembly) -> Option<Vec<(f64, String)>> {
@@ -2118,6 +2137,7 @@ pub(crate) mod tests {
         for (detail, tip) in [(d1, (0.0, 0.0)), (d2, (5000.0, 0.0))] {
             s.execute("detailtag", &json!({ "detailViewId": detail.0, "corner": true, "tip": {"x": tip.0, "y": tip.1}, "bubble": {"x": tip.0 - 1000.0, "y": tip.1 - 1000.0} }))?;
         }
+        without_assembly(&mut s)?;
         let (_, corners) = resolve_view_details(s.doc()?, plan)?;
         assert_eq!(corners.iter().filter(|c| matches!(c, RunDetail::Tagged(_))).count(), 2, "{corners:?}");
         assert_eq!(corners.iter().filter(|c| matches!(c, RunDetail::Conflict | RunDetail::Untyped)).count(), 2, "{corners:?}");
@@ -2315,6 +2335,7 @@ pub(crate) mod tests {
             s.execute("outsidepoint", &json!({ "point": {"x": x, "y": y} }))?;
         }
         s.execute("detailtag", &json!({ "detailViewId": sd.0, "tip": {"x": tip_u, "y": 2000.0}, "bubble": {"x": -1000.0, "y": 2500.0} }))?;
+        without_assembly(&mut s)?;
         Ok((s, sec))
     }
 
@@ -2635,6 +2656,7 @@ pub(crate) mod tests {
             "detailtag",
             &json!({ "detailViewId": cd.0, "corner": true, "tip": {"x": tip.0, "y": tip.1}, "bubble": {"x": tip.0 - 1000.0, "y": tip.1 - 1000.0} }),
         )?;
+        without_assembly(s)?;
         Ok(cd)
     }
 
@@ -3010,6 +3032,7 @@ pub(crate) mod tests {
                 &json!({ "detailViewId": cd.0, "corner": true, "tip": {"x": x, "y": y}, "bubble": {"x": x - 1000.0, "y": y + 1000.0} }),
             )?;
         }
+        without_assembly(&mut s)?;
         let n = undo_len(&s)?;
         let r = s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
         assert_eq!(undo_len(&s)?, n + 1);

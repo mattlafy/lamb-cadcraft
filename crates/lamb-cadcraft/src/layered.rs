@@ -1394,6 +1394,7 @@ pub(crate) mod tests {
             p.views().find(|v| v.kind == lamb_core::derivation::read::ViewKind::Detail).ok_or("no detail")?.id
         };
         s.execute("detailtag", &json!({ "detailViewId": sd.0, "tip": {"x": 2000.0, "y": 1000.0}, "bubble": {"x": 2500.0, "y": 500.0} }))?;
+        crate::assembly::tests::without_assembly(&mut s)?;
         let plan = {
             let p = crate::project::DrawingProject::new(s.doc()?)?;
             p.views().find(|v| v.kind == lamb_core::derivation::read::ViewKind::Plan).ok_or("no plan")?.id

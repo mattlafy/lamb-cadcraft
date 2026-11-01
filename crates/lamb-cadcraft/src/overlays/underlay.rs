@@ -7,7 +7,10 @@
 //!
 //! Session UI state, never saved (ruling T350.1): each edited view's underlays ([`CHOSEN`], block
 //! name → set of block names; LAMB T522: any number at once). A choice that is no longer a
-//! candidate reads as off. UNDERLAY changes no
+//! candidate reads as off. LAMB T590: an edited plan or section with an assembly block
+//! ([`assembly_block_name`]) also draws that block's lines pale under it, on by default,
+//! `underlay {assembly: false}` turning it off ([`ASSEMBLY_OFF`], session state too). Display list
+//! only: plots are unchanged. UNDERLAY changes no
 //! drawing revision, so it bumps [`cadcraft_render::bump_overlays`] for the canvas's overlay cache.
 
 use std::cell::Cell;
@@ -29,7 +32,7 @@ use serde_json::{Value, json};
 use super::{view_id, view_of};
 use crate::commands::{edited_view, id_value, other};
 use crate::project::DrawingProject;
-use crate::schema::view_block_name;
+use crate::schema::{assembly_block_name, view_block_name};
 
 /// TS `rgba(210,210,210,0.35)`.
 const UNDERLAY_COLOR: Rgb = Rgb(210, 210, 210);
@@ -39,6 +42,30 @@ const UNDERLAY_SNAPS: u32 = mode::END | mode::MID | mode::CEN | mode::INT | mode
 
 /// Edited view's block name -> its underlays' block names.
 static CHOSEN: Mutex<BTreeMap<String, BTreeSet<String>>> = Mutex::new(BTreeMap::new());
+
+/// Block names of the views whose assembly underlay is turned off (LAMB T590; on by default).
+static ASSEMBLY_OFF: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+fn assembly_off() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
+    ASSEMBLY_OFF.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether `edit`'s assembly block is drawn pale under it.
+pub(crate) fn assembly_shown(edit: Id) -> bool {
+    !assembly_off().contains(&view_block_name(edit))
+}
+
+/// Turn `edit`'s assembly underlay on or off; returns its message.
+fn set_assembly(edit: Id, on: bool) -> String {
+    let key = view_block_name(edit);
+    if on {
+        assembly_off().remove(&key);
+    } else {
+        assembly_off().insert(key);
+    }
+    cadcraft_render::bump_overlays();
+    if on { "<Assembly underlay on>".to_owned() } else { "<Assembly underlay off>".to_owned() }
+}
 
 thread_local! {
     /// Set while [`snaps`] runs CADCraft's `osnap` in the underlay's space: that call asks the snap
@@ -110,10 +137,16 @@ fn set(d: &Drawing, edit: Id, toggle: Option<Id>) -> Value {
     json!({ "viewIds": on.iter().map(|u| u.0).collect::<Vec<_>>(), "message": message })
 }
 
-/// UNDERLAY `{viewId?}`: toggles an underlay candidate of the edited view in or out of its
+/// UNDERLAY `{viewId?, assembly?}`: toggles an underlay candidate of the edited view in or out of its
 /// underlays; no `viewId` (or `null`) clears them. Returns `{viewIds, message}`; not an undo step.
+/// `assembly: false|true` (LAMB T590) instead turns the edited view's assembly underlay off or on,
+/// leaving its view underlays as they are, and returns `{assembly, message}`.
 pub(crate) fn underlay(s: &mut Session, p: &Value) -> Result<Value> {
     let edit = edited_view(s).ok_or_else(|| other("Edit a plan or section first (EDITVIEW)."))?;
+    if let Some(a) = p.get("assembly").filter(|v| !v.is_null()) {
+        let on = a.as_bool().ok_or_else(|| other("assembly must be true or false"))?;
+        return Ok(json!({ "assembly": on, "message": set_assembly(edit, on) }));
+    }
     let d = s.doc()?;
     let Some(v) = p.get("viewId").filter(|v| !v.is_null()) else { return Ok(set(d, edit, None)) };
     let id = id_value(v).ok_or_else(|| other("No such view"))?;
@@ -123,8 +156,9 @@ pub(crate) fn underlay(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(set(d, edit, Some(id)))
 }
 
-/// UNDERLAY: `Enter underlay view name or [Off/?]:` — a candidate's name or id toggles it, `Off`
-/// clears them all, `?` lists the candidates, Enter leaves it as it is.
+/// UNDERLAY: `Enter underlay view name or [Assembly/Off/?]:` — a candidate's name or id toggles it,
+/// `Assembly` toggles the assembly underlay, `Off` clears the view underlays, `?` lists the
+/// candidates, Enter leaves it as it is.
 struct UnderlayMachine;
 
 impl Interactive for UnderlayMachine {
@@ -132,7 +166,7 @@ impl Interactive for UnderlayMachine {
         "underlay"
     }
     fn prompt(&self, _s: &Session) -> Prompt {
-        Prompt::new("Enter underlay view name", Accept::TEXT).kw(&["Off", "?"])
+        Prompt::new("Enter underlay view name", Accept::TEXT).kw(&["Assembly", "Off", "?"])
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         let text = match i {
@@ -144,6 +178,11 @@ impl Interactive for UnderlayMachine {
             return Ok(Step::Done);
         }
         let edit = edited_view(s).ok_or_else(|| other("Edit a plan or section first (EDITVIEW)."))?;
+        if text.eq_ignore_ascii_case("assembly") || text.eq_ignore_ascii_case("a") {
+            let m = set_assembly(edit, !assembly_shown(edit));
+            s.echo(m);
+            return Ok(Step::Done);
+        }
         let d = s.doc()?;
         if text.eq_ignore_ascii_case("off") {
             let r = set(d, edit, None);
@@ -186,28 +225,33 @@ fn pairs<'a>(d: &'a Drawing, space: &Space) -> Option<(DrawingProject<'a>, Id, V
     (!us.is_empty()).then_some((dp, edit, us))
 }
 
-/// Every underlay's linework for `space`, mapped into the edited view's local coordinates, pale,
-/// one pass per underlay in candidate order. Infinite lines and wipeout masks are left out. Empty
-/// without an underlay.
+/// The edited view's assembly block (LAMB T590, unless turned off) and then every underlay's
+/// linework for `space`, mapped into the edited view's local coordinates, pale, one pass per
+/// underlay in candidate order. Infinite lines and wipeout masks are left out. Empty without either.
 pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let mut out = DisplayList { bounds: Bounds2::EMPTY, ..DisplayList::default() };
-    let Some((dp, edit, us)) = pairs(d, space) else { return out };
+    let Some((dp, edit)) = view_of(d, space) else { return out };
     let opts = Options { view: None, ..opts.clone() };
-    for u in us {
+    if assembly_shown(edit)
+        && let Some(block) = d.block(&assembly_block_name(edit))
+    {
+        // Assembly lines are in the view's own local coordinates: no map.
+        push_pale(&cadcraft_render::build_entities(d, block.entities.iter().map(|e| &**e), &opts), Some, &mut out);
+    }
+    for u in current(d, edit) {
         draw_one(d, &dp, edit, u, &opts, &mut out);
     }
     out
 }
 
-/// Append underlay `u`'s mapped, pale linework to `out`.
-fn draw_one(d: &Drawing, dp: &DrawingProject<'_>, edit: Id, u: Id, opts: &Options, out: &mut DisplayList) {
-    let Some(block) = d.block(&view_block_name(u)) else { return };
-    let src = cadcraft_render::build_entities(d, block.entities.iter().map(|e| &**e), opts);
+/// Append `src`'s primitives to `out`, each point through `map`, pale; infinite lines and masks
+/// are left out, and so is any primitive with a point that does not map.
+fn push_pale(src: &DisplayList, map: impl Fn(Vec2) -> Option<Vec2>, out: &mut DisplayList) {
     for prim in &src.prims {
         if matches!(prim.kind, Kind::Infinite { .. } | Kind::Mask) {
             continue;
         }
-        let Some(pts) = src.points(prim).iter().map(|p| map(dp, u, edit, *p)).collect::<Option<Vec<Vec2>>>() else { continue };
+        let Some(pts) = src.points(prim).iter().map(|p| map(*p)).collect::<Option<Vec<Vec2>>>() else { continue };
         let buf = if prim.kind == Kind::Tris { &mut out.tris } else { &mut out.verts };
         let start = buf.len() as u32;
         buf.extend_from_slice(&pts);
@@ -216,6 +260,13 @@ fn draw_one(d: &Drawing, dp: &DrawingProject<'_>, edit: Id, u: Id, opts: &Option
         }
         out.prims.push(DPrim { color: UNDERLAY_COLOR, aci7: false, transparency: UNDERLAY_TRANSPARENCY, start, len: pts.len() as u32, ..*prim });
     }
+}
+
+/// Append underlay `u`'s mapped, pale linework to `out`.
+fn draw_one(d: &Drawing, dp: &DrawingProject<'_>, edit: Id, u: Id, opts: &Options, out: &mut DisplayList) {
+    let Some(block) = d.block(&view_block_name(u)) else { return };
+    let src = cadcraft_render::build_entities(d, block.entities.iter().map(|e| &**e), opts);
+    push_pale(&src, |p| map(dp, u, edit, p), out);
 }
 
 /// The bounds of every underlay's mapped linework in `space` (EMPTY without one): ZOOM Extents
@@ -261,6 +312,7 @@ fn snap_one(d: &Drawing, dp: &DrawingProject<'_>, edit: Id, u: Id, cursor: Vec2,
 #[cfg(test)]
 pub(crate) fn reset() {
     chosen().clear();
+    assembly_off().clear();
 }
 
 #[cfg(test)]
@@ -466,7 +518,7 @@ pub(crate) mod tests {
         let (mut s, _plan, a, b) = sections()?;
         s.execute("editview", &json!({ "viewId": a.0 }))?;
         s.start("underlay")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter underlay view name or [Off/?]:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter underlay view name or [Assembly/Off/?]:"));
         s.input(Input::Keyword("?".into()))?;
         assert!(s.log.iter().any(|l| l == &format!("{}  B-B (mirrored)", b.0)), "{:?}", s.log);
         s.input(Input::Text("b-b".into()))?;
@@ -475,6 +527,35 @@ pub(crate) mod tests {
         s.start("underlay")?;
         s.input(Input::Keyword("Off".into()))?;
         assert!(current(s.doc()?, a).is_empty());
+        Ok(())
+    }
+
+    /// LAMB T590: the tagged room's assembly lines draw pale under the edited plan, in its own
+    /// coordinates, until `underlay {assembly: false}`.
+    #[test]
+    fn the_edited_plans_assembly_block_draws_pale_under_it_until_turned_off() -> R {
+        let _g = lock();
+        let (mut s, plan) = crate::assembly::tests::room("exterior_face", true)?;
+        assert!(draw(s.doc()?, &block(plan), &Options::default()).prims.is_empty(), "no assembly block, nothing drawn");
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let asm = s.doc()?.block(&assembly_block_name(plan)).ok_or("no assembly block")?.clone();
+        assert_eq!(asm.entities.len(), 12);
+        let list = draw(s.doc()?, &block(plan), &Options::default());
+        let lines = polylines(&list);
+        assert_eq!(lines.len(), 12, "one pale line per assembly line");
+        assert!(lines.iter().all(|(p, _)| (p.color, p.transparency, p.aci7) == (UNDERLAY_COLOR, UNDERLAY_TRANSPARENCY, false)));
+        // The bottom run's CLAD band at y = -20, unmapped.
+        assert!(lines.iter().any(|(_, pts)| pts.iter().all(|p| (p.y + 20.0).abs() < 1e-6)), "{lines:?}");
+        let full = lamb_overlay(s.doc()?, &block(plan), &Options::default());
+        assert_eq!(full.prims[..12], list.prims[..], "drawn first, under the markers");
+
+        let r = s.execute("underlay", &json!({ "assembly": false }))?;
+        assert_eq!(r, json!({ "assembly": false, "message": "<Assembly underlay off>" }));
+        assert!(draw(s.doc()?, &block(plan), &Options::default()).prims.is_empty());
+        s.start("underlay")?;
+        s.input(Input::Keyword("Assembly".into()))?;
+        assert!(s.log.iter().any(|l| l == "<Assembly underlay on>"), "{:?}", s.log);
+        assert_eq!(polylines(&draw(s.doc()?, &block(plan), &Options::default())).len(), 12);
         Ok(())
     }
 

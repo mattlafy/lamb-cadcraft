@@ -6,15 +6,21 @@
 //! it tags a junction (corner) or a run (edge). DXF/DWG see a plain leader.
 //!
 //! - `detailtag {detailViewId, corner?, tip:{x,y}, bubble:{x,y}}` (`dtag`): one tag, on the current
-//!   layer, in the edited plan or section view; one undo step; the detail's cut direction must match. Returns `{"handle": <hex>}`. Interactive:
-//!   `Enter detail name or [Corner/?]:` → `Specify tag point:` → `Specify bubble point:`.
+//!   layer, in the edited plan or section view; one undo step; the detail's cut direction must match.
+//!   A tip that would attach to nothing is refused (LAMB T590), as is an edge tag on a face-corner
+//!   vertex; a placed tag echoes `Tagged run 2 of "Ground" with "D1"` and the view's report line,
+//!   and a view's first tag writes its assembly block ([`crate::assembly::write_assembly_block`])
+//!   in the same undo step. Returns `{"handle": <hex>, "attached": {"run"|"junction"|"opening": n}}`.
+//!   Interactive: `Enter detail name or [Corner/?]:` → `Specify tag point:` (asked again after a
+//!   refused point) → `Specify bubble point:`.
 //! - `detailtags {viewId?}`: the resolution report for a plan or section view (default: the edited one) —
 //!   `<12 runs: 3 tagged, 7 spread, 2 untyped; 4 junctions: 4 spread>`, echoed and returned.
 //!
 //! Reading tags back ([`view_detail_tags`]): an edge tag's tip attaches to the run whose centreline
 //! is nearest, if within `width / 2 + TOLERANCE.grouping_mm`; a corner tag's tip to the nearest
-//! junction within `max arm width / 2 + TOLERANCE.grouping_mm`. Anything else — a tip in open
-//! space, a detail view that no longer exists or is drawn in the other direction — is `unattached`. [`resolve_view_details`] then runs
+//! junction within its corner reach (`max over gaps of (max arm width / 2) / sin(gap / 2)`, so
+//! every face-corner vertex) `+ TOLERANCE.grouping_mm`. Anything else — a tip left in open space
+//! by a later edit, a detail view that no longer exists or is drawn in the other direction — is `unattached`. [`resolve_view_details`] then runs
 //! lamb-core's greedy resolution (edges and corners). Computed on demand, never stored.
 
 use cadcraft_doc::{Drawing, EntityKind, Handle, Leader, Line};
@@ -25,7 +31,7 @@ use lamb_core::derivation::detail_tags::{
     resolve_opening_end_details,
 };
 use lamb_core::derivation::read::ProjectRead;
-use lamb_core::derivation::wall_junctions::{WallGraph, wall_graph};
+use lamb_core::derivation::wall_junctions::{Junction, WallGraph, wall_graph};
 use lamb_core::derivation::wall_spaces::{SideParams, WallSides, wall_sides};
 use lamb_core::derivation::walls::{RunCurve, WallRunParams};
 use lamb_core::geometry::Point2;
@@ -35,7 +41,7 @@ use serde_json::{Value, json};
 
 use crate::commands::{bad, edited_view, id_value, other, point_param};
 use crate::project::DrawingProject;
-use crate::schema::{EntityData, read_document, read_entity_data, set_entity_data, view_block_name};
+use crate::schema::{EntityData, assembly_block_name, read_document, read_entity_data, set_entity_data, view_block_name};
 
 pub use crate::schema::DetailTag;
 
@@ -90,19 +96,115 @@ pub(crate) fn attach_run(graph: &WallGraph, tip: Point2) -> Option<usize> {
     (d <= graph.runs[i].width / 2.0 + TOLERANCE.grouping_mm).then_some(i)
 }
 
-/// The junction a corner tag at `tip` attaches to: the nearest one whose reach covers it.
+/// How far junction `j`'s face-corner vertices sit from its point (LAMB T590): the largest
+/// `(max arm width / 2) / sin(gap / 2)` over its gaps — 1.41 × w/2 at an L. `sin` is floored at
+/// 0.2 so a sliver gap stays bounded, and a dead end's 360° gap counts as w/2.
+fn corner_reach(graph: &WallGraph, j: &Junction) -> f64 {
+    let half = j.arms.iter().filter_map(|a| graph.runs.get(a.run)).map(|r| r.width).fold(0.0, f64::max) / 2.0;
+    j.gaps_deg
+        .iter()
+        .map(|g| {
+            let s = (g / 2.0).to_radians().sin().abs();
+            if s < 1e-9 { half } else { half / s.max(0.2) }
+        })
+        .fold(half, f64::max)
+}
+
+/// The junction a corner tag at `tip` attaches to: the nearest one within
+/// [`corner_reach`]` + TOLERANCE.grouping_mm` of it.
 pub(crate) fn attach_junction(graph: &WallGraph, tip: Point2) -> Option<usize> {
     graph
         .junctions
         .iter()
         .enumerate()
         .filter_map(|(i, j)| {
-            let w = j.arms.iter().filter_map(|a| graph.runs.get(a.run)).map(|r| r.width).fold(0.0, f64::max);
             let d = dist(j.point, tip);
-            (d <= w / 2.0 + TOLERANCE.grouping_mm).then_some((i, d))
+            (d <= corner_reach(graph, j) + TOLERANCE.grouping_mm).then_some((i, d))
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(i, _)| i)
+}
+
+/// Distance from `p` to the nearer of a run's two face lines — its centreline offset by
+/// `width / 2` either way, extended past the run's ends (a face circle for an arc run).
+fn face_line_distance(c: &RunCurve, width: f64, p: Point2) -> f64 {
+    let off = match *c {
+        RunCurve::Line { from, to } => {
+            let len = dist(from, to);
+            if len <= 0.0 {
+                return f64::INFINITY;
+            }
+            ((p.x - from.x) * (to.y - from.y) - (p.y - from.y) * (to.x - from.x)).abs() / len
+        }
+        RunCurve::Arc { center, radius, .. } => (dist(p, center) - radius).abs(),
+    };
+    (off - width / 2.0).abs()
+}
+
+/// `true` when `tip` is a face-corner vertex: within a junction's corner reach and within
+/// `TOLERANCE.grouping_mm` of the face lines of two of its arms' runs.
+fn on_face_corner(graph: &WallGraph, tip: Point2) -> bool {
+    graph.junctions.iter().any(|j| {
+        if dist(j.point, tip) > corner_reach(graph, j) + TOLERANCE.grouping_mm {
+            return false;
+        }
+        let mut runs: Vec<usize> = j.arms.iter().map(|a| a.run).collect();
+        runs.sort_unstable();
+        runs.dedup();
+        runs.iter().filter_map(|&r| graph.runs.get(r)).filter(|r| face_line_distance(&r.centreline, r.width, tip) <= TOLERANCE.grouping_mm).count()
+            >= 2
+    })
+}
+
+/// What a new tag at its tip attaches to (LAMB T590).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Target {
+    Run(usize),
+    Junction(usize),
+    Opening(usize),
+}
+
+impl Target {
+    fn json(self) -> Value {
+        match self {
+            Target::Run(i) => json!({ "run": i }),
+            Target::Junction(i) => json!({ "junction": i }),
+            Target::Opening(i) => json!({ "opening": i }),
+        }
+    }
+    fn words(self) -> String {
+        match self {
+            Target::Run(i) => format!("run {i}"),
+            Target::Junction(i) => format!("junction {i}"),
+            Target::Opening(i) => format!("opening {i}"),
+        }
+    }
+}
+
+/// Where a new edge (or `corner`) tag at `tip` attaches in `graph`, or the refusal.
+pub(crate) fn place_target(graph: &WallGraph, corner: bool, tip: Point2) -> std::result::Result<Target, String> {
+    if graph.runs.is_empty() {
+        return Err("No walls here: wall faces are pairs of parallel lines on a WALL* layer (50–800 mm apart)".into());
+    }
+    if corner {
+        if let Some(j) = attach_junction(graph, tip) {
+            return Ok(Target::Junction(j));
+        }
+        return attach_bridge(graph, tip)
+            .map(Target::Opening)
+            .ok_or_else(|| "Not at a wall corner: put the tag point on the corner of two walls".into());
+    }
+    if on_face_corner(graph, tip) {
+        return Err("That point is the corner of two walls: pick a point along one face, or Corner for a corner detail".into());
+    }
+    attach_run(graph, tip).map(Target::Run).ok_or_else(|| "Not on a wall face: put the tag point on a wall line".into())
+}
+
+/// [`place_target`] in `view`.
+fn view_target(s: &Session, view: Id, corner: bool, tip: Point2) -> std::result::Result<Target, String> {
+    let p = DrawingProject::new(s.doc().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let graph = wall_graph(&p, view, &wall_params(&p, view));
+    place_target(&graph, corner, tip)
 }
 
 /// The opening bridge a corner-shaped tag at `tip` attaches to when no junction does (LAMB T486):
@@ -386,6 +488,7 @@ pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
         (CutDirection::Plan, CutDirection::Vertical) => return Err(other("That detail is drawn in plan; tag it in a plan view")),
         _ => {}
     }
+    let target = view_target(s, view, corner, Point2 { x: tip.x, y: tip.y }).map_err(other)?;
     let mut common = s.current_common();
     set_entity_data(&mut common, &EntityData { detail_tag: Some(DetailTag { detail_view_id: detail, corner }), ..EntityData::default() })
         .map_err(other)?;
@@ -393,8 +496,27 @@ pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
     let space = s.space();
     let leader =
         Leader { vertices: vec![Vec2::new(tip.x, tip.y).to3(0.0), Vec2::new(bubble.x, bubble.y).to3(0.0)], arrow: true, spline: false, style };
-    let h = s.doc_mut()?.add(&space, common, EntityKind::Leader(leader))?;
-    Ok(json!({ "handle": format!("{:X}", h.0) }))
+    // The tag and, for a view's first, its assembly plan land together: one undo step.
+    let mut after = s.doc()?.clone();
+    let h = after.add(&space, common, EntityKind::Leader(leader))?;
+    let mut notes = Vec::new();
+    if after.block(&assembly_block_name(view)).is_none()
+        && let Err(e) = crate::assembly::write_assembly_block(&mut after, view)
+    {
+        notes.push(format!("LAMB assembly: {e}"));
+    }
+    *s.doc_mut()? = after;
+    let doc = read_document(s.doc()?).map_err(other)?;
+    let name = |id: Id| doc.views.iter().find(|v| v.id() == id).map(|v| v.name().to_owned()).unwrap_or_else(|| id.0.to_string());
+    let tagged = format!("Tagged {} of \"{}\" with \"{}\"", target.words(), name(view), name(detail));
+    s.echo(tagged);
+    if let Ok((runs, junctions, tags)) = resolve_with_tags(s.doc()?, view) {
+        s.echo(report(&runs, &junctions, tags.unattached.len()));
+    }
+    for n in notes {
+        s.echo(n);
+    }
+    Ok(json!({ "handle": format!("{:X}", h.0), "attached": target.json() }))
 }
 
 /// The detail the prompt offers by default: the most recently placed tag's detail (highest handle,
@@ -499,7 +621,12 @@ impl Interactive for DetailTagM {
             return Ok(if i == Input::Enter { Step::Cancel } else { Step::Continue });
         };
         let Some(tip) = self.tip else {
-            self.tip = Some(p);
+            // A point that attaches to nothing is refused here and the tag point asked again.
+            let view = edited_wall_view(s).map_err(other)?;
+            match view_target(s, view, self.corner, Point2 { x: p.x, y: p.y }) {
+                Ok(_) => self.tip = Some(p),
+                Err(e) => s.echo(e),
+            }
             return Ok(Step::Continue);
         };
         let params = json!({
@@ -612,13 +739,14 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_in_open_space_and_one_naming_a_deleted_detail_are_unattached() -> R {
+    fn a_tag_in_open_space_is_refused_and_one_naming_a_deleted_detail_is_unattached() -> R {
         let (mut s, plan, detail) = room()?;
-        let open = tag(&mut s, detail, false, (2500.0, 2000.0))?["handle"].as_str().ok_or("no handle")?.to_owned();
-        let far_corner = tag(&mut s, detail, true, (2500.0, -500.0))?["handle"].as_str().ok_or("no handle")?.to_owned();
-        let t = view_detail_tags(s.doc()?, plan)?;
-        assert!(t.edges.is_empty() && t.corners.is_empty());
-        assert_eq!(t.unattached.iter().map(|h| format!("{:X}", h.0)).collect::<Vec<_>>(), [open, far_corner]);
+        let n = leaders(&s, plan)?.len();
+        let e = tag(&mut s, detail, false, (2500.0, 2000.0)).err().ok_or("open space accepted")?;
+        assert_eq!(e.to_string(), "Not on a wall face: put the tag point on a wall line");
+        let e = tag(&mut s, detail, true, (2500.0, -500.0)).err().ok_or("far corner accepted")?;
+        assert_eq!(e.to_string(), "Not at a wall corner: put the tag point on the corner of two walls");
+        assert_eq!(leaders(&s, plan)?.len(), n, "a refusal records nothing");
 
         tag(&mut s, detail, false, (2500.0, 100.0))?;
         assert_eq!(view_detail_tags(s.doc()?, plan)?.edges.len(), 1);
@@ -628,9 +756,95 @@ mod tests {
         crate::schema::write_document(d, &doc)?;
         let t = view_detail_tags(s.doc()?, plan)?;
         assert!(t.edges.is_empty());
-        assert_eq!(t.unattached.len(), 3);
+        assert_eq!(t.unattached.len(), 1);
         let r = s.execute("detailtags", &json!({ "viewId": plan.0 }))?;
-        assert_eq!(r["message"], "<4 runs: 4 untyped; 4 junctions: 4 untyped; 3 unattached>");
+        assert_eq!(r["message"], "<4 runs: 4 untyped; 4 junctions: 4 untyped; 1 unattached>");
+        Ok(())
+    }
+
+    /// [`room`]'s 5000 × 4000 outline with `width` mm walls on `layer`: outer face corner (0, 0),
+    /// inner face corner (width, width), bottom outer face midpoint (2500, 0).
+    fn walled(width: f64, layer: &str) -> T<(Session, Id, Id)> {
+        let mut s = session()?;
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let detail = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        if layer != "0" {
+            s.execute("layer.new", &json!({ "name": layer, "current": true }))?;
+        }
+        let (a, b, c) = (width, 5000.0 - width, 4000.0 - width);
+        s.execute("pline", &json!({ "vertices": [[0, 0], [5000, 0], [5000, 4000], [0, 4000]], "closed": true }))?;
+        s.execute("pline", &json!({ "vertices": [[a, a], [b, a], [b, c], [a, c]], "closed": true }))?;
+        Ok((s, plan, detail))
+    }
+
+    /// LAMB T590's reproduction: a face midpoint takes an edge tag; a face-corner vertex, outer or
+    /// inner, takes a corner tag and refuses an edge tag — for 150 and 300 mm walls alike.
+    #[test]
+    fn face_midpoints_and_face_corner_vertices_attach_or_refuse_as_their_kind_fits() -> R {
+        for w in [150.0, 300.0] {
+            let (mut s, plan, detail) = walled(w, "WALL-EXT")?;
+            tag(&mut s, detail, false, (2500.0, 0.0))?;
+            let e = tag(&mut s, detail, true, (2500.0, 0.0)).err().ok_or("corner tag at a face midpoint accepted")?;
+            assert!(e.to_string().starts_with("Not at a wall corner"), "{e}");
+            for v in [(0.0, 0.0), (w, w)] {
+                let e = tag(&mut s, detail, false, v).err().ok_or(format!("edge tag at the corner vertex {v:?} accepted ({w} mm)"))?;
+                assert_eq!(e.to_string(), "That point is the corner of two walls: pick a point along one face, or Corner for a corner detail");
+                tag(&mut s, detail, true, v).map_err(|e| format!("corner tag at {v:?} ({w} mm): {e}"))?;
+            }
+            let t = view_detail_tags(s.doc()?, plan)?;
+            assert_eq!((t.edges.len(), t.corners.len(), t.unattached.len()), (1, 2, 0), "{w} mm");
+            assert_eq!(t.corners[0].junction, t.corners[1].junction, "both vertices are the same corner");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn walls_on_layer_0_are_no_walls_and_every_tag_is_refused() -> R {
+        let (mut s, plan, detail) = walled(200.0, "0")?;
+        for (corner, tip) in [(false, (2500.0, 0.0)), (true, (0.0, 0.0))] {
+            let e = tag(&mut s, detail, corner, tip).err().ok_or("tag on layer 0 walls accepted")?;
+            assert_eq!(e.to_string(), "No walls here: wall faces are pairs of parallel lines on a WALL* layer (50–800 mm apart)");
+        }
+        assert!(leaders(&s, plan)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_placed_tag_names_its_target_and_the_first_one_makes_the_assembly_plan_in_its_own_undo_step() -> R {
+        let (mut s, plan, detail) = room()?;
+        let name = crate::schema::assembly_block_name(plan);
+        assert!(s.doc()?.block(&name).is_none());
+        let n = s.state()?.undo.len();
+        let r = tag(&mut s, detail, false, (2500.0, 0.0))?;
+        assert_eq!(s.state()?.undo.len(), n + 1, "one undo step");
+        assert!(s.doc()?.block(&name).is_some(), "the first tag makes the assembly block");
+        let run = r["attached"]["run"].as_u64().ok_or("no run")?;
+        assert!(s.log.iter().any(|l| l == &format!("Tagged run {run} of \"Ground\" with \"D1\"")), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l == "<4 runs: 1 tagged, 3 spread; 4 junctions: 4 untyped>"), "{:?}", s.log);
+
+        let r = tag(&mut s, detail, true, (0.0, 0.0))?;
+        let j = r["attached"]["junction"].as_u64().ok_or("no junction")?;
+        assert!(s.log.iter().any(|l| l == &format!("Tagged junction {j} of \"Ground\" with \"D1\"")), "{:?}", s.log);
+        s.undo()?;
+        assert!(s.doc()?.block(&name).is_some(), "a later tag leaves the block alone");
+        s.undo()?;
+        assert!(leaders(&s, plan)?.is_empty() && s.doc()?.block(&name).is_none(), "one undo removes the first tag and the block together");
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_form_refuses_a_bad_tag_point_and_asks_again() -> R {
+        let (mut s, plan, _detail) = room()?;
+        s.start("dtag")?;
+        s.input(Input::Enter)?;
+        s.input(Input::Point(Vec2::new(2500.0, 2000.0)))?;
+        assert!(s.log.iter().any(|l| l == "Not on a wall face: put the tag point on a wall line"), "{:?}", s.log);
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point"));
+        s.input(Input::Point(Vec2::new(2500.0, 0.0)))?;
+        s.input(Input::Point(Vec2::new(1500.0, -1000.0)))?;
+        assert!(s.running.is_none());
+        assert_eq!(view_detail_tags(s.doc()?, plan)?.edges.len(), 1);
         Ok(())
     }
 
