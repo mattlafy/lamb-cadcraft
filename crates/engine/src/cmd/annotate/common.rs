@@ -25,17 +25,26 @@ pub(super) fn dim(s: &Session, kind: DimKind, defpt: Vec2, p13: Vec2, p14: Vec2,
     })
 }
 
-/// Horizontal (0) or vertical (90°) from where the dimension line is placed (AutoCAD's rule).
-fn auto_rotation(p1: Vec2, p2: Vec2, at: Vec2) -> f64 {
+/// Horizontal or vertical from where the dimension line is placed (AutoCAD's rule), measured in
+/// `frame` (radians): the result is `frame` or `frame + 90°`. `frame` is 0 without a rotated tile.
+pub(super) fn auto_rotation(p1: Vec2, p2: Vec2, at: Vec2, frame: f64) -> f64 {
+    let (p1, p2, at) = if frame == 0.0 {
+        (p1, p2, at)
+    } else {
+        let (sn, cs) = (-frame).sin_cos();
+        let r = |p: Vec2| Vec2::new(p.x * cs - p.y * sn, p.x * sn + p.y * cs);
+        (r(p1), r(p2), r(at))
+    };
     let (x0, x1) = (p1.x.min(p2.x), p1.x.max(p2.x));
     let (y0, y1) = (p1.y.min(p2.y), p1.y.max(p2.y));
     let outside_y = at.y < y0 || at.y > y1;
     let outside_x = at.x < x0 || at.x > x1;
-    if outside_x && !outside_y { std::f64::consts::FRAC_PI_2 } else { 0.0 }
+    if outside_x && !outside_y { frame + std::f64::consts::FRAC_PI_2 } else { frame }
 }
 
-pub(super) fn linear_kind(p1: Vec2, p2: Vec2, at: Vec2, rotation: Option<f64>, aligned: bool) -> DimKind {
-    if aligned { DimKind::Aligned } else { DimKind::Linear { rotation: rotation.unwrap_or_else(|| auto_rotation(p1, p2, at)) } }
+/// An explicit `rotation` is a world angle; without one the dimension auto-chooses in `frame`.
+pub(super) fn linear_kind(p1: Vec2, p2: Vec2, at: Vec2, rotation: Option<f64>, aligned: bool, frame: f64) -> DimKind {
+    if aligned { DimKind::Aligned } else { DimKind::Linear { rotation: rotation.unwrap_or_else(|| auto_rotation(p1, p2, at, frame)) } }
 }
 
 /// Add a dimension. With DIMASSOC on, definition points that sit on object endpoints,

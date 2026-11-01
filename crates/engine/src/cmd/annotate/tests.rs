@@ -575,3 +575,21 @@ fn linetype_rename_updates_references() {
     assert!(s.execute("rename", &json!({ "table": "linetype", "from": "ByLayer", "to": "X" })).is_err());
     assert_eq!(s.doc().unwrap().entity(by_layer).unwrap().common.linetype, "ByLayer");
 }
+
+#[test]
+fn auto_rotation_measures_in_the_frame() {
+    use super::common::auto_rotation;
+    use std::f64::consts::FRAC_PI_2;
+    let f = 30f64.to_radians();
+    let (d, n) = (Vec2::from_angle(f), Vec2::from_angle(f + FRAC_PI_2));
+    let (p1, p2) = (d * 2.0, d * 12.0 + n * 3.0);
+    // Offset perpendicular to the 30° direction: measured along the frame.
+    assert!((auto_rotation(p1, p2, d * 7.0 + n * 5.0, f) - f).abs() < 1e-12);
+    // Beyond the ends along it, within their spread across it: the frame's vertical.
+    assert!((auto_rotation(p1, p2, d * 20.0 + n * 1.0, f) - (f + FRAC_PI_2)).abs() < 1e-12);
+    // Frame 0 is the world rule.
+    let (a, b) = (Vec2::new(0.0, 0.0), Vec2::new(10.0, 3.0));
+    assert_eq!(auto_rotation(a, b, Vec2::new(5.0, 8.0), 0.0), 0.0);
+    assert_eq!(auto_rotation(a, b, Vec2::new(15.0, 1.0), 0.0), FRAC_PI_2);
+    assert_eq!(auto_rotation(a, b, Vec2::new(15.0, 8.0), 0.0), 0.0);
+}

@@ -275,6 +275,61 @@ fn ortho_follows_the_rotated_plan_tile_and_ucsalign_turns_it_off() -> R {
     Ok(())
 }
 
+/// The linear rotation of the dimension a DIMLINEAR call just added.
+fn last_linear_rotation(s: &Session) -> f64 {
+    let h = s.last_dim.expect("a dimension");
+    match &s.doc().unwrap().entity(h).unwrap().kind {
+        cadcraft_doc::EntityKind::Dimension(d) => match d.kind {
+            cadcraft_doc::DimKind::Linear { rotation } => rotation,
+            ref other => panic!("not linear: {other:?}"),
+        },
+        other => panic!("not a dimension: {other:?}"),
+    }
+}
+
+#[test]
+fn dimlinear_measures_in_the_rotated_plan_tile() -> R {
+    use cadcraft_engine::Input;
+    let mut f = open("t76-rotated-section", 2)?;
+    let (sec, a, b) = f.secs[0];
+    show(&mut f.s, 1, sec)?;
+    show(&mut f.s, 0, f.plan)?;
+    let want = (b.y - a.y).atan2(b.x - a.x);
+    let (pa, pb) = (Vec2::new(a.x, a.y), Vec2::new(b.x, b.y));
+    let mid = (pa + pb) * 0.5 + Vec2::from_angle(want + std::f64::consts::FRAC_PI_2) * 500.0;
+    // Interactive, automatic choice: along the cut.
+    f.s.start("dimlinear")?;
+    for p in [pa, pb, mid] {
+        f.s.input(Input::Point(p))?;
+    }
+    assert!((last_linear_rotation(&f.s) - want).abs() < EPS, "{} vs {want}", last_linear_rotation(&f.s));
+    // The parameter form with no rotation chooses the same way.
+    f.s.execute("dimlinear", &json!({"p1": [pa.x, pa.y], "p2": [pb.x, pb.y], "at": [mid.x, mid.y]}))?;
+    assert!((last_linear_rotation(&f.s) - want).abs() < EPS);
+    // Horizontal / Vertical keywords follow the tile.
+    f.s.start("dimlinear")?;
+    f.s.input(Input::Point(pa))?;
+    f.s.input(Input::Point(pb))?;
+    f.s.input(Input::Keyword("Horizontal".into()))?;
+    f.s.input(Input::Point(mid))?;
+    assert!((last_linear_rotation(&f.s) - want).abs() < EPS);
+    f.s.start("dimlinear")?;
+    f.s.input(Input::Point(pa))?;
+    f.s.input(Input::Point(pb))?;
+    f.s.input(Input::Keyword("Vertical".into()))?;
+    f.s.input(Input::Point(mid))?;
+    assert!((last_linear_rotation(&f.s) - (want + std::f64::consts::FRAC_PI_2)).abs() < EPS);
+    // UCSALIGN off: world X/Y.
+    f.s.execute("ucsalign", &json!({"on": false}))?;
+    f.s.start("dimlinear")?;
+    f.s.input(Input::Point(pa))?;
+    f.s.input(Input::Point(pb))?;
+    f.s.input(Input::Keyword("Horizontal".into()))?;
+    f.s.input(Input::Point(mid))?;
+    assert_eq!(last_linear_rotation(&f.s), 0.0);
+    Ok(())
+}
+
 #[test]
 fn ortho_without_tiles_is_world() -> R {
     register();
