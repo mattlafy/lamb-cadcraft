@@ -150,8 +150,9 @@ pub struct EntityData {
     /// skipped there.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub corners: Vec<CornerEntry>,
-    /// On a `Leader` in a plan view's block: a detail tag (`cadcraft-integration.md` §9), its tip
-    /// `vertices[0]` ([`crate::detailtags`]).
+    /// On a `Leader` in a plan or section view's block: a detail tag (`cadcraft-integration.md` §9),
+    /// its tip `vertices[0]`; on a closed `LwPolyline` there, a callout-box tag, its tip
+    /// [`DetailTag::anchor`] ([`crate::detailtags`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail_tag: Option<DetailTag>,
     /// On a straight line in a detail view's block: that detail's reference line and its kind
@@ -226,12 +227,16 @@ pub enum DetailRefKind {
 
 /// A detail tag's assignment: the detail view it names, and whether it tags a junction (a corner
 /// detail) rather than a run (an edge detail).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetailTag {
     pub detail_view_id: Id,
     #[serde(default)]
     pub corner: bool,
+    /// On a callout-box tag (a closed `LwPolyline` encircling the area, LAMB T594): its tag point.
+    /// `None` on a leader tag, whose tip is `vertices[0]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<[f64; 2]>,
 }
 
 impl Default for EntityData {

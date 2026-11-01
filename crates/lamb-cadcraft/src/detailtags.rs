@@ -14,7 +14,13 @@
 //!   Interactive (LAMB T591): `Select detail [D1/Corner_Detail/Corner]:` — one keyword per detail
 //!   drawn in the edited view's direction (name with `/[]` and spaces as `_`; a typed name or id
 //!   also selects; none ends the command) → `Specify tag point on a wall face:` (`at a wall
-//!   corner` in Corner mode; asked again after a refused point) → `Specify bubble point:`.
+//!   corner` in Corner mode; asked again after a refused point) → `Specify bubble point or [Box]:`.
+//! - A callout-box tag (LAMB T594): `detailtag {…, tip, box: {a:{x,y}, b:{x,y}}}` in place of
+//!   `bubble` (both or neither is a bad-params error) makes one closed 4-vertex `LwPolyline`,
+//!   linetype `DASHED` (loaded when missing), encircling the area, with no leader; its tag point is
+//!   [`DetailTag::anchor`]. The box must enclose the tag point and be wider and taller than
+//!   `TOLERANCE.coincidence_mm`. Interactive: `Box` → `Specify first corner of the callout box:` →
+//!   `Specify opposite corner:` (a refused box asks for the first corner again).
 //! - `detailtags {viewId?}`: the resolution report for a plan or section view (default: the edited one) —
 //!   `<12 runs: 3 tagged, 7 spread, 2 untyped; 4 junctions: 4 spread>`, echoed and returned.
 //!
@@ -25,9 +31,9 @@
 //! by a later edit, a detail view that no longer exists or is drawn in the other direction — is `unattached`. [`resolve_view_details`] then runs
 //! lamb-core's greedy resolution (edges and corners). Computed on demand, never stored.
 
-use cadcraft_doc::{Drawing, EntityKind, Handle, Leader, Line};
+use cadcraft_doc::{Drawing, EntityKind, Handle, Leader, Line, LwPolyline};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
-use cadcraft_geom::Vec2;
+use cadcraft_geom::{PolyVertex, Vec2};
 use lamb_core::derivation::detail_tags::{
     CornerTag, EdgeTag, OpeningEndTag, OpeningTag, RunDetail, resolve_corner_details, resolve_edge_details, resolve_opening_details,
     resolve_opening_end_details,
@@ -256,17 +262,51 @@ pub(crate) fn view_direction(d: &Drawing, view: Id) -> CutDirection {
     if vertical { CutDirection::Vertical } else { CutDirection::Plan }
 }
 
-/// Every tagged leader in `view`'s block: (handle, tip, tag).
+/// Every detail tag in `view`'s block: (handle, tip, tag). A leader's tip is `vertices[0]`; a
+/// callout box's (a tagged `LwPolyline`) its `anchor` — one without an anchor is skipped.
 pub(crate) fn tags_in(d: &Drawing, view: Id) -> std::result::Result<Vec<(Handle, Point2, DetailTag)>, String> {
     let Some(block) = d.block(&view_block_name(view)) else { return Ok(Vec::new()) };
     let mut out = Vec::new();
     for e in block.entities.iter() {
-        let EntityKind::Leader(l) = &e.kind else { continue };
+        if !matches!(e.kind, EntityKind::Leader(_) | EntityKind::LwPolyline(_)) {
+            continue;
+        }
         let Some(tag) = read_entity_data(&e.common).map_err(|e| e.to_string())?.detail_tag else { continue };
-        let Some(tip) = l.vertices.first() else { continue };
-        out.push((e.handle, Point2 { x: tip.x, y: tip.y }, tag));
+        let tip = match (&e.kind, tag.anchor) {
+            (EntityKind::Leader(l), _) => l.vertices.first().map(|v| Point2 { x: v.x, y: v.y }),
+            (EntityKind::LwPolyline(_), Some([x, y])) => Some(Point2 { x, y }),
+            _ => None,
+        };
+        let Some(tip) = tip else { continue };
+        out.push((e.handle, tip, tag));
     }
     Ok(out)
+}
+
+/// A callout box's four corners from two opposite ones, counter-clockwise from the lower left.
+pub(crate) fn box_vertices(a: Point2, b: Point2) -> Vec<PolyVertex> {
+    let (x0, x1, y0, y1) = (a.x.min(b.x), a.x.max(b.x), a.y.min(b.y), a.y.max(b.y));
+    [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        .iter()
+        .map(|&(x, y)| PolyVertex { p: Vec2::new(x, y), bulge: 0.0, start_width: 0.0, end_width: 0.0 })
+        .collect()
+}
+
+/// The refusal for a callout box from `a` to `b` around `tip`, if any.
+fn box_refusal(tip: Point2, a: Point2, b: Point2) -> Option<&'static str> {
+    let t = TOLERANCE.coincidence_mm;
+    let (x0, x1, y0, y1) = (a.x.min(b.x), a.x.max(b.x), a.y.min(b.y), a.y.max(b.y));
+    if x1 - x0 <= t || y1 - y0 <= t {
+        return Some("The box needs two opposite corners apart in both directions");
+    }
+    (tip.x < x0 - t || tip.x > x1 + t || tip.y < y0 - t || tip.y > y1 + t).then_some("The box must enclose the tag point")
+}
+
+/// What a new tag draws besides its tip: a leader to a bubble point, or a callout box.
+#[derive(Clone, Copy)]
+enum Shape {
+    Bubble(Point2),
+    Box(Point2, Point2),
 }
 
 fn graph_tags(d: &Drawing, view: Id, graph: &WallGraph) -> std::result::Result<ViewTags, String> {
@@ -484,12 +524,19 @@ fn detail_direction(s: &Session, id: Id) -> Option<CutDirection> {
     })
 }
 
-/// DETAILTAG's JSON form: a two-vertex leader from `tip` to `bubble` in the edited plan or section view.
+/// DETAILTAG's JSON form: a two-vertex leader from `tip` to `bubble`, or a dashed callout `box`
+/// around `tip`, in the edited plan or section view.
 pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
     let detail = p.get("detailViewId").and_then(id_value).ok_or_else(|| bad("detailtag", "`detailViewId` is required"))?;
     let corner = p.get("corner").and_then(Value::as_bool).unwrap_or(false);
     let tip = point_param("detailtag", p, "tip")?;
-    let bubble = point_param("detailtag", p, "bubble")?;
+    let given = |k: &str| p.get(k).filter(|v| !v.is_null());
+    let shape = match (given("bubble"), given("box")) {
+        (Some(_), None) => Shape::Bubble(point_param("detailtag", p, "bubble")?),
+        (None, Some(b)) => Shape::Box(point_param("detailtag", b, "a")?, point_param("detailtag", b, "b")?),
+        (Some(_), Some(_)) => return Err(bad("detailtag", "give `bubble` or `box`, not both")),
+        (None, None) => return Err(bad("detailtag", "`bubble` or `box` is required")),
+    };
     // Every refusal before `doc_mut`, so a refusal records nothing.
     let view = edited_wall_view(s).map_err(other)?;
     let Some(dir) = detail_direction(s, detail) else { return Err(other("No such detail view")) };
@@ -499,16 +546,39 @@ pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
         _ => {}
     }
     let target = view_target(s, view, corner, Point2 { x: tip.x, y: tip.y }).map_err(other)?;
+    if let Shape::Box(a, b) = shape
+        && let Some(e) = box_refusal(tip, a, b)
+    {
+        return Err(other(e));
+    }
     let mut common = s.current_common();
-    set_entity_data(&mut common, &EntityData { detail_tag: Some(DetailTag { detail_view_id: detail, corner }), ..EntityData::default() })
+    let anchor = matches!(shape, Shape::Box(..)).then_some([tip.x, tip.y]);
+    set_entity_data(&mut common, &EntityData { detail_tag: Some(DetailTag { detail_view_id: detail, corner, anchor }), ..EntityData::default() })
         .map_err(other)?;
-    let style = s.doc()?.header.str("DIMSTYLE", "Standard");
     let space = s.space();
-    let leader =
-        Leader { vertices: vec![Vec2::new(tip.x, tip.y).to3(0.0), Vec2::new(bubble.x, bubble.y).to3(0.0)], arrow: true, spline: false, style };
     // The tag and, for a view's first, its assembly plan land together: one undo step.
     let mut after = s.doc()?.clone();
-    let h = after.add(&space, common, EntityKind::Leader(leader))?;
+    let kind = match shape {
+        Shape::Bubble(bubble) => {
+            let style = after.header.str("DIMSTYLE", "Standard");
+            EntityKind::Leader(Leader {
+                vertices: vec![Vec2::new(tip.x, tip.y).to3(0.0), Vec2::new(bubble.x, bubble.y).to3(0.0)],
+                arrow: true,
+                spline: false,
+                style,
+            })
+        }
+        Shape::Box(a, b) => {
+            if after.linetype("DASHED").is_none()
+                && let Some(lt) = cadcraft_doc::library::standard_linetypes_for(&after).into_iter().find(|l| l.name == "DASHED")
+            {
+                after.linetypes.push(lt);
+            }
+            common.linetype = "DASHED".into();
+            EntityKind::LwPolyline(LwPolyline { vertices: box_vertices(a, b), closed: true, const_width: 0.0, elevation: 0.0, plinegen: false })
+        }
+    };
+    let h = after.add(&space, common, kind)?;
     let mut notes = Vec::new();
     if after.block(&assembly_block_name(view)).is_none()
         && let Err(e) = crate::assembly::write_assembly_block(&mut after, view)
@@ -566,6 +636,9 @@ struct DetailTagM {
     corner: bool,
     tip: Option<Vec2>,
     offered: Vec<Offered>,
+    /// `Box` was chosen at the bubble prompt (this tag only), and the box's first corner.
+    boxing: bool,
+    box_a: Option<Vec2>,
 }
 
 impl DetailTagM {
@@ -594,7 +667,11 @@ impl Interactive for DetailTagM {
                 let msg = if self.corner { "Specify tag point at a wall corner" } else { "Specify tag point on a wall face" };
                 Prompt::new(msg, Accept::POINT)
             }
-            (Some(_), Some(tip)) => Prompt::new("Specify bubble point", Accept::POINT).base(tip),
+            (Some(_), Some(tip)) => match (self.boxing, self.box_a) {
+                (false, _) => Prompt::new("Specify bubble point", Accept::POINT).base(tip).kw(&["Box"]),
+                (true, None) => Prompt::new("Specify first corner of the callout box", Accept::POINT),
+                (true, Some(a)) => Prompt::new("Specify opposite corner", Accept::POINT).corner(a),
+            },
         }
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
@@ -669,6 +746,14 @@ impl Interactive for DetailTagM {
                 None => "No such detail view",
             }));
         };
+        if self.tip.is_some()
+            && !self.boxing
+            && let Input::Text(t) | Input::Keyword(t) = &i
+            && (t.trim().eq_ignore_ascii_case("box") || t.trim().eq_ignore_ascii_case("b"))
+        {
+            self.boxing = true;
+            return Ok(Step::Continue);
+        }
         let Input::Point(p) = i else {
             return Ok(if i == Input::Enter { Step::Cancel } else { Step::Continue });
         };
@@ -681,27 +766,47 @@ impl Interactive for DetailTagM {
             }
             return Ok(Step::Continue);
         };
-        let params = json!({
+        let mut params = json!({
             "detailViewId": detail.0,
             "corner": self.corner,
             "tip": {"x": tip.x, "y": tip.y},
-            "bubble": {"x": p.x, "y": p.y},
         });
+        if self.boxing {
+            let Some(a) = self.box_a else {
+                self.box_a = Some(p);
+                return Ok(Step::Continue);
+            };
+            params["box"] = json!({ "a": {"x": a.x, "y": a.y}, "b": {"x": p.x, "y": p.y} });
+        } else {
+            params["bubble"] = json!({"x": p.x, "y": p.y});
+        }
         if let Err(e) = detailtag(s, &params) {
             s.echo(e.to_string());
+            if self.boxing {
+                // A refused box asks for its first corner again.
+                self.box_a = None;
+                return Ok(Step::Continue);
+            }
         }
         Ok(Step::Done)
     }
     fn preview(&self, _s: &Session, cursor: Vec2) -> Vec<EntityKind> {
-        match (self.detail, self.tip) {
-            (Some(_), Some(a)) => vec![EntityKind::Line(Line { a: a.to3(0.0), b: cursor.to3(0.0) })],
+        match (self.detail, self.tip, self.boxing, self.box_a) {
+            (Some(_), Some(_), true, Some(a)) => vec![EntityKind::LwPolyline(LwPolyline {
+                vertices: box_vertices(Point2 { x: a.x, y: a.y }, Point2 { x: cursor.x, y: cursor.y }),
+                closed: true,
+                const_width: 0.0,
+                elevation: 0.0,
+                plinegen: false,
+            })],
+            (Some(_), Some(a), false, _) => vec![EntityKind::Line(Line { a: a.to3(0.0), b: cursor.to3(0.0) })],
             _ => Vec::new(),
         }
     }
 }
 
 pub(crate) fn detailtag_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(DetailTagM { default: None, detail: None, corner: false, tip: None, offered: Vec::new() }))
+    Ok(Box::new(DetailTagM { default: None, detail: None, corner: false, tip: None, offered: Vec::new(), boxing: false, box_a: None }))
 }
 
 #[cfg(test)]
@@ -1090,6 +1195,124 @@ mod tests {
         s.execute("editview", &json!({ "viewId": r["viewId"].as_u64().ok_or("no id")? }))?;
         s.start("dtag")?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [S1/Corner] <S1>:"));
+        Ok(())
+    }
+
+    fn box_tag(s: &mut Session, detail: Id, corner: bool, tip: (f64, f64), a: (f64, f64), b: (f64, f64)) -> Result<Value> {
+        s.execute(
+            "detailtag",
+            &json!({ "detailViewId": detail.0, "corner": corner, "tip": {"x": tip.0, "y": tip.1},
+                     "box": {"a": {"x": a.0, "y": a.1}, "b": {"x": b.0, "y": b.1}} }),
+        )
+    }
+
+    /// The view block's callout-box tags.
+    fn boxes(s: &Session, plan: Id) -> T<Vec<cadcraft_doc::Entity>> {
+        let b = s.doc()?.block(&view_block_name(plan)).ok_or("no block")?.clone();
+        Ok(b.entities
+            .iter()
+            .filter(|e| matches!(e.kind, EntityKind::LwPolyline(_)) && read_entity_data(&e.common).is_ok_and(|d| d.detail_tag.is_some()))
+            .map(|e| (**e).clone())
+            .collect())
+    }
+
+    #[test]
+    fn a_box_tag_resolves_as_a_leader_tag_at_the_same_anchor_and_is_a_closed_dashed_rectangle() -> R {
+        let (mut s, plan, detail) = room()?;
+        let r = box_tag(&mut s, detail, false, (2500.0, 0.0), (2000.0, -300.0), (3000.0, 300.0))?;
+        box_tag(&mut s, detail, true, (0.0, 0.0), (300.0, 300.0), (-300.0, -300.0))?;
+        let (mut l, lplan, ldetail) = room()?;
+        tag(&mut l, ldetail, false, (2500.0, 0.0))?;
+        tag(&mut l, ldetail, true, (0.0, 0.0))?;
+        assert_eq!((plan, detail), (lplan, ldetail));
+        let (rb, rl) = (s.execute("detailtags", &json!({}))?, l.execute("detailtags", &json!({}))?);
+        assert_eq!(rb, rl);
+        assert_eq!(rb["message"], "<4 runs: 1 tagged, 3 spread; 4 junctions: 1 tagged, 3 spread>");
+
+        assert!(leaders(&s, plan)?.is_empty(), "a box tag makes no leader");
+        let b = boxes(&s, plan)?;
+        assert_eq!(b.len(), 2);
+        assert_eq!(r["handle"], format!("{:X}", b[0].handle.0));
+        let EntityKind::LwPolyline(pl) = &b[0].kind else { return Err("not a polyline".into()) };
+        let corners: Vec<(f64, f64)> = pl.vertices.iter().map(|v| (v.p.x, v.p.y)).collect();
+        assert_eq!((pl.closed, corners), (true, vec![(2000.0, -300.0), (3000.0, -300.0), (3000.0, 300.0), (2000.0, 300.0)]));
+        assert_eq!((b[0].common.linetype.as_str(), b[0].common.layer.as_str()), ("DASHED", "TAGS"));
+        assert!(s.doc()?.linetype("DASHED").is_some(), "DASHED is loaded");
+        let tag = read_entity_data(&b[0].common)?.detail_tag.ok_or("no tag")?;
+        assert_eq!(tag, DetailTag { detail_view_id: detail, corner: false, anchor: Some([2500.0, 0.0]) });
+        Ok(())
+    }
+
+    #[test]
+    fn a_box_that_misses_the_tag_point_or_has_no_area_is_refused_and_records_nothing() -> R {
+        let (mut s, plan, detail) = room()?;
+        let n = (s.doc()?.block(&view_block_name(plan)).ok_or("no block")?.entities.len(), s.state()?.undo.len());
+        let e = box_tag(&mut s, detail, false, (2500.0, 0.0), (3000.0, -300.0), (4000.0, 300.0)).err().ok_or("box missing the point accepted")?;
+        assert_eq!(e.to_string(), "The box must enclose the tag point");
+        let e = box_tag(&mut s, detail, false, (2500.0, 0.0), (2000.0, 0.0), (3000.0, 0.0)).err().ok_or("flat box accepted")?;
+        assert_eq!(e.to_string(), "The box needs two opposite corners apart in both directions");
+        let e = box_tag(&mut s, detail, false, (2500.0, 2000.0), (2000.0, 1500.0), (3000.0, 2500.0)).err().ok_or("open space accepted")?;
+        assert_eq!(e.to_string(), "Not on a wall face: put the tag point on a wall line");
+        let both = json!({ "detailViewId": detail.0, "tip": {"x": 2500, "y": 0}, "bubble": {"x": 0, "y": -1000},
+                           "box": {"a": {"x": 2000, "y": -300}, "b": {"x": 3000, "y": 300}} });
+        assert!(s.execute("detailtag", &both).is_err_and(|e| e.to_string().contains("give `bubble` or `box`, not both")));
+        let neither = json!({ "detailViewId": detail.0, "tip": {"x": 2500, "y": 0} });
+        assert!(s.execute("detailtag", &neither).is_err_and(|e| e.to_string().contains("`bubble` or `box` is required")));
+        assert_eq!((s.doc()?.block(&view_block_name(plan)).ok_or("no block")?.entities.len(), s.state()?.undo.len()), n);
+        assert!(s.doc()?.linetype("DASHED").is_none(), "a refusal loads nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_box_makes_the_same_entity_as_the_parameter_form() -> R {
+        let (mut s, plan, detail) = room()?;
+        s.start("dtag")?;
+        s.input(Input::Enter)?;
+        s.input(Input::Point(Vec2::new(2500.0, 0.0)))?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify bubble point or [Box]:"));
+        s.input(Input::Keyword("Box".into()))?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify first corner of the callout box"));
+        // A box that misses the tag point is refused and its first corner asked again.
+        s.input(Input::Point(Vec2::new(3000.0, 300.0)))?;
+        assert_eq!(s.current_prompt().map(|p| (p.message, p.base)), Some(("Specify opposite corner".to_owned(), Some(Vec2::new(3000.0, 300.0)))));
+        s.input(Input::Point(Vec2::new(2800.0, -300.0)))?;
+        assert_eq!(s.log.last().map(String::as_str), Some("The box must enclose the tag point"));
+        assert!(boxes(&s, plan)?.is_empty());
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify first corner of the callout box"));
+        s.input(Input::Point(Vec2::new(3000.0, 300.0)))?;
+        s.input(Input::Point(Vec2::new(2000.0, -300.0)))?;
+        assert!(s.running.is_none());
+
+        box_tag(&mut s, detail, false, (2500.0, 0.0), (3000.0, 300.0), (2000.0, -300.0))?;
+        let b = boxes(&s, plan)?;
+        assert_eq!(b.len(), 2);
+        assert_eq!(
+            (&b[0].kind, &b[0].common.layer, &b[0].common.linetype, &b[0].common.ext),
+            (&b[1].kind, &b[1].common.layer, &b[1].common.linetype, &b[1].common.ext)
+        );
+
+        // `Box` was for that tag only: the next one asks for a bubble point again.
+        s.start("dtag")?;
+        s.input(Input::Enter)?;
+        s.input(Input::Point(Vec2::new(2500.0, 0.0)))?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify bubble point"));
+        Ok(())
+    }
+
+    #[test]
+    fn box_tags_survive_undo_redo_and_a_dxf_round_trip() -> R {
+        let (mut s, plan, detail) = room()?;
+        box_tag(&mut s, detail, false, (2500.0, 0.0), (2000.0, -300.0), (3000.0, 300.0))?;
+        s.undo()?;
+        assert!(boxes(&s, plan)?.is_empty(), "one undo step removes the box");
+        s.redo()?;
+        assert_eq!(view_detail_tags(s.doc()?, plan)?.edges.len(), 1);
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(view_detail_tags(&back, plan)?, view_detail_tags(s.doc()?, plan)?);
+        let block = back.block(&view_block_name(plan)).ok_or("no block")?;
+        let e = block.entities.iter().find(|e| read_entity_data(&e.common).is_ok_and(|d| d.detail_tag.is_some())).ok_or("box lost")?;
+        assert_eq!(e.common.linetype.to_ascii_uppercase(), "DASHED");
+        assert!(matches!(&e.kind, EntityKind::LwPolyline(pl) if pl.closed && pl.vertices.len() == 4));
         Ok(())
     }
 

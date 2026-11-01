@@ -19,14 +19,19 @@
 //! re-found anchor when that is more than `TOLERANCE.coincidence_mm` away, in the command's own
 //! undo step. An error is echoed, never raised.
 //!
+//! A callout-box tag (LAMB T594) is followed the same way through its `anchor`: the whole box and
+//! its anchor shift by (new tip − old tip). A box the command itself moved or copied whole (its
+//! polyline shifted, its tag otherwise the same) has its anchor shifted with it.
+//!
 //! Out of scope: TRIM/BREAK replacing a face entity with new ones — the tip stays, and a tag that
 //! then falls off shows as unattached in RESOLVE / DETAILTAGS.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use cadcraft_doc::{Drawing, EntityKind, Handle, Space};
+use cadcraft_doc::{Drawing, Entity, EntityKind, Handle, Space};
 use cadcraft_engine::Session;
+use cadcraft_geom::{PolyVertex, Vec2};
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::derivation::wall_junctions::{WallGraph, wall_graph};
 use lamb_core::geometry::Point2;
@@ -36,7 +41,7 @@ use lamb_core::model::{AnyView, Id};
 
 use crate::detailtags::{attach_bridge, attach_junction, attach_run, tags_in, wall_params};
 use crate::project::DrawingProject;
-use crate::schema::{read_document, view_block_name};
+use crate::schema::{DetailTag, read_document, read_entity_data, set_entity_data, view_block_name};
 
 /// Where a tag's tip was, relative to what it tagged.
 enum Anchor {
@@ -173,25 +178,103 @@ fn follow(before: &Drawing, after: &Drawing) -> Result<Vec<(Id, Handle, Point2)>
     Ok(out)
 }
 
+/// A callout-box tag's polyline vertices and anchor, if `e` is one.
+fn box_of(e: &Entity) -> Option<(&[PolyVertex], DetailTag, Point2)> {
+    let EntityKind::LwPolyline(pl) = &e.kind else { return None };
+    let tag = read_entity_data(&e.common).ok()?.detail_tag?;
+    let [x, y] = tag.anchor?;
+    Some((&pl.vertices, tag, Point2 { x, y }))
+}
+
+/// `after` as `before` moved by one shift, with its bulges unchanged: that shift.
+fn translation(before: &[PolyVertex], after: &[PolyVertex]) -> Option<Vec2> {
+    let d = after.first()?.p - before.first()?.p;
+    let same =
+        before.len() == after.len() && before.iter().zip(after).all(|(b, a)| (a.p - b.p - d).len() <= TOLERANCE.coincidence_mm && a.bulge == b.bulge);
+    same.then_some(d)
+}
+
+/// Every callout box the command moved or copied whole, whose anchor it left behind (LAMB T594):
+/// (view, box, new anchor). A copy is a new box with the same tag as one before, a shifted copy
+/// of its polyline.
+fn box_follow(before: &Drawing, after: &Drawing) -> Vec<(Id, Handle, Point2)> {
+    let Ok(doc) = read_document(after) else { return Vec::new() };
+    let mut out = Vec::new();
+    for view in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_) | AnyView::Vertical(_))).map(AnyView::id) {
+        let name = view_block_name(view);
+        let (Some(bb), Some(ab)) = (before.block(&name), after.block(&name)) else { continue };
+        if Arc::ptr_eq(bb, ab) || **bb == **ab {
+            continue;
+        }
+        for e in ab.entities.iter() {
+            let Some((av, atag, anchor)) = box_of(e) else { continue };
+            let shift = match bb.entities.get(e.handle) {
+                Some(was) if Arc::ptr_eq(was, e) || **was == **e => continue,
+                Some(was) => box_of(was).filter(|(_, t, _)| *t == atag).and_then(|(bv, _, _)| translation(bv, av)),
+                None => bb.entities.iter().filter_map(|b| box_of(b)).filter(|(_, t, _)| *t == atag).find_map(|(bv, _, _)| translation(bv, av)),
+            };
+            if let Some(d) = shift.filter(|d| d.len() > TOLERANCE.coincidence_mm) {
+                out.push((view, e.handle, Point2 { x: anchor.x + d.x, y: anchor.y + d.y }));
+            }
+        }
+    }
+    out
+}
+
+/// Moves each tag's tip: a leader's `vertices[0]`, a callout box's whole polyline with its anchor.
 fn apply(d: &mut Drawing, moves: &[(Id, Handle, Point2)]) -> Result<(), String> {
     for (view, h, to) in moves {
         let store = d.space_mut(&Space::Block(view_block_name(*view))).ok_or("view block gone")?;
         let Some(e) = store.get(*h) else { continue };
         let mut e = (**e).clone();
-        let EntityKind::Leader(l) = &mut e.kind else { continue };
-        let Some(v) = l.vertices.first_mut() else { continue };
-        (v.x, v.y) = (to.x, to.y);
+        match &mut e.kind {
+            EntityKind::Leader(l) => {
+                let Some(v) = l.vertices.first_mut() else { continue };
+                (v.x, v.y) = (to.x, to.y);
+            }
+            EntityKind::LwPolyline(_) => {
+                let Some((_, _, from)) = box_of(&e) else { continue };
+                let d = Vec2::new(to.x - from.x, to.y - from.y);
+                if let EntityKind::LwPolyline(pl) = &mut e.kind {
+                    for v in &mut pl.vertices {
+                        v.p += d;
+                    }
+                }
+                set_anchor(&mut e, *to)?;
+            }
+            _ => continue,
+        }
         store.replace(e);
     }
     Ok(())
+}
+
+/// Sets a callout box's anchor alone (after [`box_follow`]).
+fn apply_anchors(d: &mut Drawing, moves: &[(Id, Handle, Point2)]) -> Result<(), String> {
+    for (view, h, to) in moves {
+        let store = d.space_mut(&Space::Block(view_block_name(*view))).ok_or("view block gone")?;
+        let Some(e) = store.get(*h) else { continue };
+        let mut e = (**e).clone();
+        set_anchor(&mut e, *to)?;
+        store.replace(e);
+    }
+    Ok(())
+}
+
+fn set_anchor(e: &mut Entity, to: Point2) -> Result<(), String> {
+    let mut data = read_entity_data(&e.common).map_err(|e| e.to_string())?;
+    let Some(tag) = data.detail_tag.as_mut() else { return Ok(()) };
+    tag.anchor = Some([to.x, to.y]);
+    set_entity_data(&mut e.common, &data).map_err(|e| e.to_string())
 }
 
 /// The after-command observer: moves the tip of every tag whose wall, junction or opening the
 /// command moved (module doc). Writes back only when a tip moved.
 pub fn tag_follow_observer(s: &mut Session, before: &Arc<Drawing>) {
     let Ok(current) = s.doc() else { return };
+    let boxes = box_follow(before, current);
     let moves = match follow(before, current) {
-        Ok(m) if m.is_empty() => return,
+        Ok(m) if m.is_empty() && boxes.is_empty() => return,
         Ok(m) => m,
         Err(e) => {
             s.echo(format!("LAMB tag follow: {e}"));
@@ -199,7 +282,7 @@ pub fn tag_follow_observer(s: &mut Session, before: &Arc<Drawing>) {
         }
     };
     let mut after = current.clone();
-    if let Err(e) = apply(&mut after, &moves) {
+    if let Err(e) = apply_anchors(&mut after, &boxes).and_then(|()| apply(&mut after, &moves)) {
         s.echo(format!("LAMB tag follow: {e}"));
         return;
     }
@@ -340,6 +423,56 @@ mod tests {
         assert_eq!(tip(&s, plan, &opening)?, (3200.0, -300.0));
         let t = view_detail_tags(s.doc()?, plan)?;
         assert_eq!((t.openings.len(), t.unattached.len()), (1, 0), "{t:?}");
+        Ok(())
+    }
+
+    /// A callout-box edge tag at `tip`, 500 × 400 around it. Returns its handle.
+    fn box_tag(s: &mut Session, detail: Id, tip: (f64, f64)) -> T<String> {
+        let r = s.execute(
+            "detailtag",
+            &json!({ "detailViewId": detail.0, "tip": {"x": tip.0, "y": tip.1},
+                     "box": {"a": {"x": tip.0 - 250.0, "y": tip.1 - 200.0}, "b": {"x": tip.0 + 250.0, "y": tip.1 + 200.0}} }),
+        )?;
+        Ok(r["handle"].as_str().ok_or("no handle")?.to_owned())
+    }
+
+    /// A box tag's anchor and first vertex, rounded to 1e-6.
+    fn box_at(s: &Session, view: Id, h: &str) -> T<((f64, f64), (f64, f64))> {
+        let b = s.doc()?.block(&view_block_name(view)).ok_or("no block")?;
+        let e = b.entities.iter().find(|e| format!("{:X}", e.handle.0) == h).ok_or("no box")?;
+        let EntityKind::LwPolyline(pl) = &e.kind else { return Err("not a polyline".into()) };
+        let [x, y] = crate::schema::read_entity_data(&e.common)?.detail_tag.and_then(|t| t.anchor).ok_or("no anchor")?;
+        let v = pl.vertices.first().ok_or("no vertices")?.p;
+        let r = |a: f64| (a * 1e6).round() / 1e6;
+        Ok(((r(x), r(y)), (r(v.x), r(v.y))))
+    }
+
+    #[test]
+    fn a_box_tag_follows_a_move_of_its_wall_box_and_anchor_together() -> R {
+        let (mut s, plan, detail) = room()?;
+        let walls = geometry(&s, plan)?;
+        let b = box_tag(&mut s, detail, (2500.0, 100.0))?;
+        s.execute("move", &json!({ "handles": walls, "delta": [1000, 500] }))?;
+        assert_eq!(box_at(&s, plan, &b)?, ((3500.0, 600.0), (3250.0, 400.0)));
+        let t = view_detail_tags(s.doc()?, plan)?;
+        assert_eq!((t.edges.len(), t.unattached.len()), (1, 0), "{t:?}");
+        s.undo()?;
+        assert_eq!(box_at(&s, plan, &b)?, ((2500.0, 100.0), (2250.0, -100.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn moving_or_copying_a_box_tag_takes_its_anchor_along() -> R {
+        let (mut s, plan, detail) = room()?;
+        let b = box_tag(&mut s, detail, (2500.0, 100.0))?;
+        s.execute("move", &json!({ "handles": [b.clone()], "delta": [300, 0] }))?;
+        assert_eq!(box_at(&s, plan, &b)?, ((2800.0, 100.0), (2550.0, -100.0)));
+        // Onto the top wall's centreline.
+        s.execute("copy", &json!({ "handles": [b.clone()], "delta": [0, 3800] }))?;
+        let t = view_detail_tags(s.doc()?, plan)?;
+        assert_eq!((t.edges.len(), t.unattached.len()), (2, 0), "{t:?}");
+        assert_ne!(t.edges[0].run, t.edges[1].run, "the copy tags the top wall");
+        assert_eq!(box_at(&s, plan, &b)?, ((2800.0, 100.0), (2550.0, -100.0)), "the original stays");
         Ok(())
     }
 }
