@@ -40,6 +40,7 @@ pub mod convert;
 pub mod corners;
 mod cutlinecmd;
 pub mod detailref;
+pub mod detailsheets;
 pub mod detailtags;
 mod dxfimport;
 mod entitycmds;

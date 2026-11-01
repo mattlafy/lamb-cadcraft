@@ -182,6 +182,16 @@ const NEW_SHEET: IconDef = &[
     a(Loop(&[(4.5, 7.5), (14.5, 7.5), (14.5, 16.5), (4.5, 16.5)])),
 ];
 
+/// A sheet whose drawing area holds a 2 × 2 grid of detail frames.
+const DETAIL_SHEETS: IconDef = &[
+    b(Loop(&[(2.0, 5.0), (22.0, 5.0), (22.0, 19.0), (2.0, 19.0)])),
+    b(Line(&[(17.0, 5.0), (17.0, 19.0)])),
+    a(Loop(&[(4.0, 7.0), (9.0, 7.0), (9.0, 11.0), (4.0, 11.0)])),
+    a(Loop(&[(10.5, 7.0), (15.0, 7.0), (15.0, 11.0), (10.5, 11.0)])),
+    a(Loop(&[(4.0, 13.0), (9.0, 13.0), (9.0, 17.0), (4.0, 17.0)])),
+    a(Loop(&[(10.5, 13.0), (15.0, 13.0), (15.0, 17.0), (10.5, 17.0)])),
+];
+
 /// The LAMB tab: everything a user would start from View ▸ LAMB, grouped by what it works on.
 pub const LAMB_TAB: ExtTab = ExtTab {
     name: "LAMB",
@@ -250,7 +260,11 @@ pub const LAMB_TAB: ExtTab = ExtTab {
         ExtGroup {
             name: "Project",
             large: &[tool(START_PROJECT, "lambproject", "Start Project")],
-            small: &[tool(DXF_IMPORT, "dxfimport", "Import DXF as View"), tool(NEW_SHEET, "newsheet", "New Sheet")],
+            small: &[
+                tool(DXF_IMPORT, "dxfimport", "Import DXF as View"),
+                tool(NEW_SHEET, "newsheet", "New Sheet"),
+                tool(DETAIL_SHEETS, "detailsheets", "Detail Sheets"),
+            ],
         },
     ],
 };

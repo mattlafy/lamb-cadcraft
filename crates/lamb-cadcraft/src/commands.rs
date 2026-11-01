@@ -12,6 +12,8 @@
 //!   its assembly plan; each freezes every other view's layer and every other assembly layer;
 //!   returns `{layout, viewports: [hex handles]}`. Typed only: a sheet is an ordinary layout (`+`,
 //!   MVIEW) whose viewports each pick their view with VPVIEW.
+//! - `detailsheets {prefix?, perSheet?}` (`dsh`): every detail assigned to a wall and on no sheet yet,
+//!   laid out on new numbered sheets `A501`, `A502`, … — see [`crate::detailsheets`].
 //! - `vpview {handle, viewId | null}`: binds a layout viewport to a view — its `view_id`, every other
 //!   view's layer frozen in it, zoomed to the view; `null` unbinds it. One undo step; the
 //!   Properties palette's View row runs it ([`crate::props`]).
@@ -837,6 +839,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .menu(MENU_NEW_VIEW)
             .interactive(crate::viewlife::duplicateview_machine),
         CommandSpec::new("newsheet", "New Sheet", newsheet).alias(&["nsh"]).params("{name, viewIds?, assemblyIds?}").interactive(newsheet_machine),
+        CommandSpec::new("detailsheets", "Detail Sheets", crate::detailsheets::detailsheets)
+            .alias(&["dsh"])
+            .params("{prefix?, perSheet?}")
+            .interactive(crate::detailsheets::detailsheets_machine),
         CommandSpec::new("vpview", "Viewport View", vpview).params("{handle, viewId | null} → {handle, viewId}"),
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU_VIEW_SETUP).interactive(editview_machine),
         CommandSpec::new("viewprops", "View Properties", crate::viewprops::viewprops)
