@@ -910,7 +910,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{handle?, kind?: exterior_face|interior_face|structural_centre|grid}")
             .menu(MENU_DETAILS)
             .interactive(crate::detailref::detailref_machine),
-        CommandSpec::new("repeat", "Repeat", crate::repeats::repeat).params("{dimension?, handles?: [handle], copies?: [handle]}").menu(MENU_DETAILS),
+        CommandSpec::new("repeat", "Repeat", crate::repeats::repeat).params("{dimension?, handles?: [handle], copies?: [handle]}").menu(MENU_DETAILS).interactive(crate::repeats::repeat_machine),
         CommandSpec::new("outsidepoint", "Outside Point", crate::outside::outsidepoint)
             .params("{point:{x,y}}")
             .menu(MENU_DETAILS)
@@ -1076,7 +1076,7 @@ mod tests {
             assert!(c.interactive.is_some(), "{id}");
         }
         // One-shot commands with no prompts; everything else on the menu prompts.
-        let one_shot = ["lambproject", "panelock", "ucsalign", "ghosthide", "ghostshow", "detailtags", "repeat"];
+        let one_shot = ["lambproject", "panelock", "ucsalign", "ghosthide", "ghostshow", "detailtags"];
         for (sub, ids) in groups {
             for id in ids.iter().filter(|id| !one_shot.contains(id)) {
                 let c = command_specs().iter().find(|c| c.id == *id).ok_or(*id)?;

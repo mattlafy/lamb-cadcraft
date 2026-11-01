@@ -5,7 +5,10 @@
 //! CADCraft edits and DXF; DXF/DWG see a plain dimension.
 //!
 //! - `repeat {}` (LAMB ▸ Details ▸ Repeat): only while editing a detail view; returns
-//!   `{"repeats": [...]}`. `repeat {dimension}` returns that one or `null`.
+//!   `{"repeats": [...]}`. `repeat {dimension}` returns that one or `null`. Interactively (LAMB
+//!   T592): select the geometry (or `List`), then the pitch as two points or `Grid` (start point
+//!   and direction, at the project stud grid's pitch); the aligned pitch dimension is drawn and
+//!   tagged in one undo step.
 //!   `repeat {dimension, handles: [...]}` tags (replacing that dimension's members);
 //!   `handles: []` untags. One undo step; every refusal changes nothing.
 //! - `repeat {dimension, handles, copies: [...]}` converts two drawn copies (LAMB T386): the copies
@@ -33,9 +36,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cadcraft_color::Rgb;
-use cadcraft_doc::{DimKind, Drawing, Entity, EntityKind, Handle, Space};
-use cadcraft_engine::{Result, Session};
-use cadcraft_geom::{Bounds2, Vec2};
+use cadcraft_doc::{DimKind, Dimension, Drawing, Entity, EntityKind, Handle, Space};
+use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
+use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use cadcraft_render::{DPrim, DisplayList, Kind, Options};
 use lamb_core::geometry::Point2;
 use lamb_core::geometry::tolerance::{TOLERANCE, deg_to_rad};
@@ -345,6 +348,164 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
         m.insert("erased".into(), json!(copies.iter().map(|h| h.hex()).collect::<Vec<_>>()));
     }
     Ok(out)
+}
+
+/// What [`RepeatM`] is asking for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    Select,
+    Start,
+    End(Vec2),
+    GridStart,
+    GridDirection(Vec2),
+}
+
+/// Interactive REPEAT (LAMB T592): the geometry, then the pitch as two points or `Grid` (a start
+/// point and a direction, the pitch being the project stud grid's). The pitch dimension is drawn
+/// and tagged in the command's one undo step.
+struct RepeatM {
+    phase: Phase,
+    members: Vec<Handle>,
+}
+
+/// The repeat pitch's dimension line sits this far to the left of the pitch.
+const PITCH_DIM_OFFSET: f64 = 300.0;
+/// The pitch when the project has no stud grid (16" centres).
+const DEFAULT_GRID_PITCH: f64 = 406.4;
+
+const OUTSIDE_A_DETAIL: &str =
+    "REPEAT marks repeating geometry in a detail (a stud, a joist): EDITVIEW a detail first, then run REPEAT and select it.";
+
+impl RepeatM {
+    /// Draws the aligned pitch dimension start → start + pitch and tags it with the members; a
+    /// refusal restores the drawing, so nothing is recorded.
+    fn finish(&self, s: &mut Session, start: Vec2, pitch: Vec2, on_grid: bool) -> Result<Step> {
+        let len = pitch.x.hypot(pitch.y);
+        if len <= TOLERANCE.coincidence_mm {
+            s.echo("The pitch has no length");
+            return Ok(Step::Continue);
+        }
+        let before = s.state()?.doc.clone();
+        let end = start + pitch;
+        let defpt = Vec2::new(end.x - pitch.y / len * PITCH_DIM_OFFSET, end.y + pitch.x / len * PITCH_DIM_OFFSET);
+        let style = s.doc()?.header.str("DIMSTYLE", "Standard");
+        let kind = EntityKind::Dimension(Dimension {
+            kind: DimKind::Aligned,
+            defpt: Vec3::new(defpt.x, defpt.y, 0.0),
+            text_mid: Vec3::ZERO,
+            p13: Vec3::new(start.x, start.y, 0.0),
+            p14: Vec3::new(end.x, end.y, 0.0),
+            p15: Vec3::ZERO,
+            p16: Vec3::ZERO,
+            text: String::new(),
+            style,
+            measurement: len,
+            text_rotation: 0.0,
+            user_text_pos: false,
+            block: None,
+            overrides: Default::default(),
+            assoc: Vec::new(),
+            marks: Default::default(),
+        });
+        let dim = s.add_entity(kind)?;
+        let handles: Vec<String> = self.members.iter().map(|h| h.hex()).collect();
+        match repeat(s, &json!({ "dimension": dim.hex(), "handles": handles })) {
+            Ok(_) => {
+                let grid = if on_grid { ", on the stud grid" } else { "" };
+                s.echo(format!("Repeat: {} objects every {} mm{grid}", self.members.len(), cadcraft_constraints::format_value(len)));
+            }
+            Err(e) => {
+                s.state_mut()?.doc = before;
+                s.echo(e.to_string());
+            }
+        }
+        Ok(Step::Done)
+    }
+}
+
+impl Interactive for RepeatM {
+    fn name(&self) -> &'static str {
+        "repeat"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        match self.phase {
+            Phase::Select => Prompt::new("Select the geometry that repeats", Accept::SELECT).kw(&["List"]),
+            Phase::Start => Prompt::new("Specify the pitch start point", Accept::POINT).kw(&["Grid"]),
+            Phase::End(a) => Prompt::new("Specify the pitch end point", Accept::POINT).base(a),
+            Phase::GridStart => Prompt::new("Specify the start point", Accept::POINT),
+            Phase::GridDirection(a) => Prompt::new("Specify the repeat direction", Accept::POINT).base(a),
+        }
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        if edited_detail(s).is_err() {
+            s.echo(OUTSIDE_A_DETAIL);
+            return Ok(Step::Done);
+        }
+        Ok(Step::Continue)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        match (self.phase, i) {
+            (Phase::Select, Input::Keyword(k)) if k.eq_ignore_ascii_case("list") => {
+                let detail = edited_detail(s).map_err(other)?;
+                let all = detail_repeats(s.doc()?, detail).map_err(other)?;
+                if all.is_empty() {
+                    s.echo("No repeats in this detail");
+                }
+                for r in &all {
+                    s.echo(format!("{} objects @ {} mm", r.members.len(), cadcraft_constraints::format_value(length(r.pitch))));
+                }
+                Ok(Step::Done)
+            }
+            (Phase::Select, Input::Pick(hs)) => {
+                for h in hs {
+                    if !self.members.contains(&h) {
+                        self.members.push(h);
+                    }
+                }
+                Ok(Step::Continue)
+            }
+            (Phase::Select, Input::Enter) => {
+                if self.members.is_empty() {
+                    s.echo("Nothing selected");
+                    return Ok(Step::Done);
+                }
+                self.phase = Phase::Start;
+                Ok(Step::Continue)
+            }
+            (Phase::Start, Input::Keyword(k)) if k.eq_ignore_ascii_case("grid") => {
+                self.phase = Phase::GridStart;
+                Ok(Step::Continue)
+            }
+            (Phase::Start, Input::Point(p)) => {
+                self.phase = Phase::End(p);
+                Ok(Step::Continue)
+            }
+            (Phase::End(a), Input::Point(b)) => self.finish(s, a, b - a, false),
+            (Phase::GridStart, Input::Point(p)) => {
+                self.phase = Phase::GridDirection(p);
+                Ok(Step::Continue)
+            }
+            (Phase::GridDirection(a), Input::Point(b)) => {
+                let w = b - a;
+                let lw = w.x.hypot(w.y);
+                if lw <= TOLERANCE.coincidence_mm {
+                    s.echo("The direction has no length");
+                    return Ok(Step::Continue);
+                }
+                let grid = crate::studgrid::project_grid(s.doc()?);
+                let pitch = grid.map_or(DEFAULT_GRID_PITCH, |g| g.1);
+                self.finish(s, a, Vec2::new(w.x / lw * pitch, w.y / lw * pitch), grid.is_some())
+            }
+            _ => Ok(Step::Continue),
+        }
+    }
+}
+
+pub(crate) fn repeat_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(RepeatM { phase: Phase::Select, members: Vec::new() }))
 }
 
 /// Whether `n` is `[A-Za-z_][A-Za-z0-9_]*`.
@@ -872,6 +1033,93 @@ mod tests {
         let (by_hand, converted) = (laid(false)?, laid(true)?);
         assert!(by_hand.iter().any(|r| r.lines.len() > r.bands), "the repeat lays copies");
         assert_eq!(converted, by_hand);
+        Ok(())
+    }
+
+    fn display(s: &Session) -> Option<String> {
+        s.current_prompt().map(|p| p.display())
+    }
+
+    #[test]
+    fn interactive_repeat_picks_then_two_points_and_draws_the_tagged_pitch_in_one_undo_step() -> R {
+        let Fixture { mut s, detail, stud, edge, pitch, .. } = fixture()?;
+        let m = undo_len(&s)?;
+        let before = all_handles(&s)?;
+        s.start("repeat")?;
+        assert_eq!(display(&s).as_deref(), Some("Select the geometry that repeats or [List]:"));
+        s.input(Input::Pick(vec![stud]))?;
+        s.input(Input::Pick(vec![edge, stud]))?;
+        s.input(Input::Enter)?;
+        assert_eq!(display(&s).as_deref(), Some("Specify the pitch start point or [Grid]:"));
+        s.input(Input::Point(Vec2::new(0.0, 0.0)))?;
+        let p = s.current_prompt().ok_or("no prompt")?;
+        assert_eq!((p.message.as_str(), p.base), ("Specify the pitch end point", Some(Vec2::new(0.0, 0.0))));
+        s.input(Input::Point(Vec2::new(406.4, 0.0)))?;
+        assert!(s.running.is_none());
+        assert_eq!(undo_len(&s)?, m + 1, "one undo step");
+        let added: Vec<Handle> = all_handles(&s)?.into_iter().filter(|h| !before.contains(h)).collect();
+        assert_eq!(added.len(), 1, "one dimension");
+        let EntityKind::Dimension(dm) = &s.doc()?.entity(added[0]).ok_or("gone")?.kind else { return Err("not a dimension".into()) };
+        assert_eq!(dm.kind, DimKind::Aligned);
+        assert_eq!((dm.defpt.x, dm.defpt.y), (406.4, 300.0), "300 mm to the left of the pitch");
+        let all = detail_repeats(s.doc()?, detail)?;
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].dimension, all[0].members.clone(), all[0].pitch), (added[0], vec![stud, edge], Point2 { x: 406.4, y: 0.0 }));
+        assert!(s.log.iter().any(|l| l == "Repeat: 2 objects every 406.4 mm"), "{:?}", s.log);
+        assert_ne!(added[0], pitch);
+        s.undo()?;
+        assert!(detail_repeats(s.doc()?, detail)?.is_empty());
+        assert_eq!(all_handles(&s)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_repeat_on_the_grid_takes_the_project_grid_pitch_along_the_direction() -> R {
+        let Fixture { mut s, plan, detail, stud, .. } = fixture()?;
+        crate::studgrid::tests::place(&mut s, plan, lamb_core::geometry::IDENTITY_TRANSFORM)?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 0.0, "y": 0.0}, "pitch": 600.0 }))?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.start("repeat")?;
+        s.input(Input::Pick(vec![stud]))?;
+        s.input(Input::Enter)?;
+        s.input(Input::Keyword("Grid".into()))?;
+        assert_eq!(display(&s).as_deref(), Some("Specify the start point:"));
+        s.input(Input::Point(Vec2::new(0.0, 0.0)))?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify the repeat direction"));
+        s.input(Input::Point(Vec2::new(0.0, 50.0)))?;
+        let all = detail_repeats(s.doc()?, detail)?;
+        assert_eq!(all.len(), 1);
+        assert!((all[0].pitch.x).abs() < 1e-9 && (all[0].pitch.y - 600.0).abs() < 1e-9, "{:?}", all[0].pitch);
+        assert!(s.log.iter().any(|l| l == "Repeat: 1 objects every 600 mm, on the stud grid"), "{:?}", s.log);
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_repeat_ends_outside_a_detail_lists_and_refuses_without_recording() -> R {
+        let Fixture { mut s, plan, detail, stud, edge, pitch, .. } = fixture()?;
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [stud.hex(), edge.hex()] }))?;
+        s.start("repeat")?;
+        s.input(Input::Keyword("List".into()))?;
+        assert!(s.running.is_none());
+        assert!(s.log.iter().any(|l| l == "2 objects @ 406.4 mm"), "{:?}", s.log);
+
+        // Members already in a repeat: the dimension goes too, nothing is recorded.
+        let (m, before) = (undo_len(&s)?, all_handles(&s)?);
+        s.start("repeat")?;
+        s.input(Input::Pick(vec![stud]))?;
+        s.input(Input::Enter)?;
+        s.input(Input::Point(Vec2::new(0.0, 0.0)))?;
+        s.input(Input::Point(Vec2::new(406.4, 0.0)))?;
+        assert!(s.running.is_none());
+        assert!(s.log.iter().any(|l| l.contains("Already in a repeat")), "{:?}", s.log);
+        assert_eq!((undo_len(&s)?, all_handles(&s)?), (m, before));
+        assert_eq!(detail_repeats(s.doc()?, detail)?.len(), 1);
+
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.start("repeat")?;
+        assert!(s.running.is_none());
+        assert!(s.log.iter().any(|l| l.starts_with("REPEAT marks repeating geometry in a detail")), "{:?}", s.log);
         Ok(())
     }
 }
