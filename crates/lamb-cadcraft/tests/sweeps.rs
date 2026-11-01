@@ -536,3 +536,179 @@ fn properties_say_whether_an_ai_line_is_pending() -> R {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// T597: linking plan segments to the automatic section lines; ghosted AI lines; drawn-over erase
+// ---------------------------------------------------------------------------------------------
+
+/// A placed plan with a closed 4000x3000 WALL-EXT rectangle and one placed section across it at
+/// y = 1500, so the solid-cut sweep materialises the section's wall cut lines. Returns the session,
+/// the plan, the section and the rectangle.
+fn rectangle_session(as_lines: bool) -> Result<(Session, Id, Id, Vec<Id>), Box<dyn std::error::Error>> {
+    commands::install_app().map_err(|e| e.to_string())?;
+    let mut s = Session::new();
+    install(&mut s);
+    s.new_drawing(true);
+    s.execute("lambproject", &json!({}))?;
+    let level = s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].clone();
+    let plan = s.execute("newplan", &json!({ "name": "P" }))?["viewId"].clone();
+    s.execute(
+        "placeview",
+        &json!({ "viewId": plan, "kind": "plan", "levelId": level, "cutElevation": 1200, "transform": { "originX": 0, "originY": 0, "rotation": 0 } }),
+    )?;
+    s.execute("editview", &json!({ "viewId": plan }))?;
+    s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+    let plan = Id(plan.as_u64().ok_or("plan id")?);
+    let corners = [[0, 0], [4000, 0], [4000, 3000], [0, 3000]];
+    let before: Vec<Id> = DrawingProject::new(s.doc()?)?.entities(plan).map(|e| e.id).collect();
+    if as_lines {
+        for i in 0..4 {
+            s.execute("line", &json!({ "points": [corners[i], corners[(i + 1) % 4]] }))?;
+        }
+    } else {
+        s.execute("pline", &json!({ "vertices": corners, "closed": true }))?;
+    }
+    let rect: Vec<Id> = DrawingProject::new(s.doc()?)?.entities(plan).map(|e| e.id).filter(|id| !before.contains(id)).collect();
+    let section = s.execute(
+        "newsectionline",
+        &json!({ "name": "A", "hostViewId": plan.0, "cutFrom": { "x": -1000, "y": 1500 }, "cutTo": { "x": 5000, "y": 1500 } }),
+    )?["viewId"]
+        .as_u64()
+        .ok_or("section id")?;
+    Ok((s, plan, Id(section), rect))
+}
+
+/// (id, proposal id or "", accepted, polyline key) of every entity in `view`, sorted by id.
+fn snapshot(d: &Drawing, view: Id) -> Result<Vec<(Id, String, bool, String)>, Box<dyn std::error::Error>> {
+    let p = DrawingProject::new(d)?;
+    let mut out: Vec<_> = p
+        .entities(view)
+        .map(|e| {
+            let (key_, acc) = e.ai_origin.map_or((String::new(), false), |o| (o.proposal_id.clone(), o.accepted));
+            (e.id, key_, acc, e.polyline.map_or_else(String::new, |q| key(&q)))
+        })
+        .collect();
+    out.sort_by_key(|x| x.0);
+    Ok(out)
+}
+
+/// Links every hollow marker of `rect` in `section` to the section line through it, one
+/// `link.apply` each (in `order`), and checks after every link that no non-AI entity of either
+/// view was erased or moved and no slot is held twice. Returns how many links were made.
+fn link_every_marker(s: &mut Session, plan: Id, section: Id, rect: &[Id], reverse: bool) -> Result<usize, Box<dyn std::error::Error>> {
+    use lamb_core::derivation::markers::compute_markers_for_view;
+    use lamb_core::geometry::polyline::{closest_point_on_segment, resolved_segments};
+    s.execute("editview", &json!({ "viewId": section.0 }))?;
+    let mut made = 0;
+    let mut markers: Vec<_> = compute_markers_for_view(&DrawingProject::new(s.doc()?)?, section)?
+        .into_iter()
+        .filter(|m| rect.contains(&m.source_entity_id))
+        .map(|m| (m.source_entity_id, m.source_segment_index))
+        .collect();
+    assert!(markers.len() >= 2, "the rectangle crosses the cut twice: {markers:?}");
+    if reverse {
+        markers.reverse();
+    }
+    for (source, seg) in markers {
+        let m = compute_markers_for_view(&DrawingProject::new(s.doc()?)?, section)?
+            .into_iter()
+            .find(|m| m.source_entity_id == source && m.source_segment_index == seg)
+            .ok_or("marker vanished")?;
+        if m.filled {
+            continue;
+        }
+        let near = {
+            let p = DrawingProject::new(s.doc()?)?;
+            p.entities(section)
+                .filter_map(|e| {
+                    let poly = e.polyline?;
+                    resolved_segments(&poly)
+                        .iter()
+                        .map(|g| (e.id, g.index, closest_point_on_segment(g, m.position)))
+                        .min_by(|a, b| a.2.distance.total_cmp(&b.2.distance))
+                })
+                .filter(|x| x.2.distance <= 2.0)
+                .map(|x| (x.0, x.1, x.2.t))
+                .next()
+        };
+        let Some((line, index, t)) = near else { continue };
+        let (plan_before, sec_before) = (snapshot(s.doc()?, plan)?, snapshot(s.doc()?, section)?);
+        s.execute(
+            "link.apply",
+            &json!({ "a": { "entityId": line.0, "segmentIndex": index, "segmentParam": t },
+                     "b": { "entityId": source.0, "segmentIndex": seg, "segmentParam": m.source_segment_param } }),
+        )?;
+        made += 1;
+        let (plan_after, sec_after) = (snapshot(s.doc()?, plan)?, snapshot(s.doc()?, section)?);
+        for (before, after, name) in [(&plan_before, &plan_after, "plan"), (&sec_before, &sec_after, "section")] {
+            for e in before.iter().filter(|e| e.1.is_empty() || e.2) {
+                assert!(after.contains(e), "{name}: linking {source}:{seg} erased or moved user line {e:?}\nbefore {before:?}\nafter {after:?}");
+            }
+            let mut keys: Vec<&String> = after.iter().map(|e| &e.1).filter(|k| !k.is_empty()).collect();
+            let n = keys.len();
+            keys.sort();
+            keys.dedup();
+            assert_eq!(keys.len(), n, "{name}: a slot is held twice after linking {source}:{seg}: {after:?}");
+        }
+        let linked = read_document(s.doc()?)?.links.iter().any(|l| l.a.entity_id == line && l.b.entity_id == source);
+        assert!(linked, "the link linking {source}:{seg} made survives its own sweep\nbefore {sec_before:?}\nafter {sec_after:?}");
+    }
+    Ok(made)
+}
+
+#[test]
+fn linking_rectangle_segments_to_section_lines_erases_and_adds_nothing() -> R {
+    for (as_lines, reverse) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (mut s, plan, section, rect) = rectangle_session(as_lines)?;
+        // Four separate LINEs synthesise no solid, so the section has no automatic line to link.
+        if solid_cuts(s.doc()?)?.is_empty() {
+            assert!(as_lines, "a closed rectangle pline shows its wall cut in the section");
+            continue;
+        }
+        let made = link_every_marker(&mut s, plan, section, &rect, reverse)?;
+        assert!(made >= 1, "at least one link made (lines {as_lines}, reverse {reverse})");
+    }
+    Ok(())
+}
+
+fn transparency(d: &Drawing, id: Id) -> Result<cadcraft_doc::Transparency, Box<dyn std::error::Error>> {
+    Ok(d.entity(Handle(id.0)).ok_or("no entity")?.common.transparency)
+}
+
+#[test]
+fn unaccepted_ai_lines_are_ghosted_and_accept_or_copy_clears_it() -> R {
+    use cadcraft_doc::Transparency;
+    let (mut s, _, section, _) = rectangle_session(false)?;
+    let (ai, ..) = solid_cuts(s.doc()?)?.into_iter().find(|l| l.1 == section).ok_or("no solid cut")?;
+    assert_eq!(transparency(s.doc()?, ai)?, Transparency::Percent(70), "a proposal draws faint");
+    s.execute("editview", &json!({ "viewId": section.0 }))?;
+    let before: Vec<Id> = DrawingProject::new(s.doc()?)?.entities(section).map(|e| e.id).collect();
+    s.execute("copy", &json!({ "handles": [Handle(ai.0).hex()], "delta": [100000, 100000] }))?;
+    let copy = DrawingProject::new(s.doc()?)?.entities(section).map(|e| e.id).find(|id| !before.contains(id)).ok_or("no copy")?;
+    assert_eq!(transparency(s.doc()?, copy)?, Transparency::ByLayer, "a copy is the user's line, not a ghost");
+    s.execute("accept", &json!({ "handles": [Handle(ai.0).hex()] }))?;
+    assert_eq!(transparency(s.doc()?, ai)?, Transparency::ByLayer, "accepted: drawn like any line");
+    Ok(())
+}
+
+#[test]
+fn a_line_drawn_over_an_ai_polyline_erases_it_whole_and_undo_restores_it() -> R {
+    let (mut s, _, section, _) = rectangle_session(false)?;
+    let (ai, _, origin, poly) = solid_cuts(s.doc()?)?.into_iter().find(|l| l.1 == section).ok_or("no solid cut")?;
+    s.execute("editview", &json!({ "viewId": section.0 }))?;
+    // Along the first segment of the loop, a little inside both ends.
+    let seg = poly.segments.first().ok_or("no segment")?;
+    let (a, b) = (poly.start, seg.to);
+    let lerp = |t: f64| [a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t];
+    s.execute("line", &json!({ "points": [lerp(0.2), lerp(0.8)] }))?;
+    assert!(s.doc()?.entity(Handle(ai.0)).is_none(), "the whole AI polyline is erased");
+    assert!(read_document(s.doc()?)?.suppressed_proposals.contains(&origin.proposal_id), "and its slot suppressed");
+    assert_eq!(holders(s.doc()?, &origin.proposal_id)?, (0, 0), "not re-proposed");
+    s.undo()?;
+    assert!(s.doc()?.entity(Handle(ai.0)).is_some(), "one undo restores it");
+    assert!(!read_document(s.doc()?)?.suppressed_proposals.contains(&origin.proposal_id));
+    // A line crossing it, not along it, leaves it alone.
+    s.execute("line", &json!({ "points": [[lerp(0.5)[0] - 300.0, lerp(0.5)[1] - 300.0], [lerp(0.5)[0] + 300.0, lerp(0.5)[1] + 300.0]] }))?;
+    assert!(s.doc()?.entity(Handle(ai.0)).is_some(), "a crossing line erases nothing");
+    Ok(())
+}

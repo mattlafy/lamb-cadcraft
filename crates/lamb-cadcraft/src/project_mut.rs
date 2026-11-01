@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use cadcraft_doc::{Common, Drawing, Entity, EntityKind, Handle, Space};
+use cadcraft_doc::{Common, Drawing, Entity, EntityKind, Handle, Space, Transparency};
 use lamb_core::derivation::read::{EntityRef, ProjectRead, ViewRef, view_ref};
 use lamb_core::derivation::write::{ProjectWrite, RemovedEntity};
 use lamb_core::geometry::polyline::virtual_corner_entries;
@@ -89,6 +89,21 @@ impl<'a> DrawingProjectMut<'a> {
         }
     }
 
+    /// Sets entity `h`'s transparency, leaving it untouched when it already matches.
+    pub fn set_transparency(&mut self, h: Handle, t: Transparency) {
+        if self.drawing.entity(h).is_some_and(|e| e.common.transparency == t) {
+            return;
+        }
+        if let Err(e) = self.drawing.modify_entity(h, |e| e.common.transparency = t) {
+            self.fail(e.to_string());
+        }
+    }
+
+    /// Entity `h`'s transparency, if it exists.
+    pub fn transparency(&self, h: Handle) -> Option<Transparency> {
+        self.drawing.entity(h).map(|e| e.common.transparency)
+    }
+
     /// A block entity read back as a lamb-core `DrawingEntity` (an unconvertible one as an empty
     /// polyline at the origin; only AI lines the sweeps wrote are ever removed).
     fn drawing_entity(&self, view: Id, e: &Entity) -> DrawingEntity {
@@ -114,6 +129,15 @@ impl<'a> DrawingProjectMut<'a> {
             ai_origin: data.and_then(|d| d.ai_origin.clone()),
         }
     }
+}
+
+/// How faint an unaccepted AI line draws (LAMB T597): proposals read as ghosts until accepted.
+pub const AI_GHOST: Transparency = Transparency::Percent(70);
+
+/// The transparency an entity with `origin` carries: [`AI_GHOST`] while it is an unaccepted
+/// proposal, else `ByLayer`.
+pub fn ai_transparency(origin: Option<&AiOrigin>) -> Transparency {
+    if origin.is_some_and(|o| !o.accepted) { AI_GHOST } else { Transparency::ByLayer }
 }
 
 /// The corner tags that go with `kind` written from `p` (only an `LwPolyline` has vertices).
@@ -173,7 +197,7 @@ impl ProjectWrite for DrawingProjectMut<'_> {
         let (kind, _) = from_polyline(geometry);
         let data =
             EntityData { role: entity.role, ai_origin: entity.ai_origin.clone(), corners: corners_for(&kind, geometry), ..EntityData::default() };
-        let mut common = Common { layer: entity.layer_id.clone(), ..Common::default() };
+        let mut common = Common { layer: entity.layer_id.clone(), transparency: ai_transparency(entity.ai_origin.as_ref()), ..Common::default() };
         set_entity_data(&mut common, &data).map_err(|e| e.to_string())?;
         let h = Handle(entity.id.0);
         self.drawing.ensure_layer(&entity.layer_id);
@@ -248,8 +272,10 @@ impl ProjectWrite for DrawingProjectMut<'_> {
             return;
         }
         let mut data = self.entity_data.get(&h).cloned().unwrap_or_default();
+        let transparency = ai_transparency(origin.as_ref());
         data.ai_origin = origin;
         self.write_data(h, data);
+        self.set_transparency(h, transparency);
     }
 
     fn set_suppressed_proposals(&mut self, keys: Vec<String>) {
