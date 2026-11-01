@@ -43,6 +43,11 @@ pub struct DocState {
     /// Ids an adapter attached to the current selection (LAMB fork patch 19, [`travel`]). Session
     /// state, never saved, not in undo snapshots; dies with the selection at the quiet points.
     pub travel: Vec<u64>,
+    /// What the last erase removed, for OOPS.
+    pub(crate) erased: crate::cmd::Erased,
+    /// The fonts missing on Windows that a save last named: the next save names them again only
+    /// when they change.
+    pub(crate) fonts_noted: String,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -101,12 +106,23 @@ impl DocState {
             panes: Default::default(),
             picked: None,
             travel: Vec::new(),
+            erased: Default::default(),
+            fonts_noted: String::new(),
         }
     }
     /// The drawing has changes not saved to its file, or the Block Editor has changes not yet
     /// saved into its block.
     pub fn is_dirty(&self) -> bool {
         !Arc::ptr_eq(self.drawing(), &self.saved) || self.block_unsaved()
+    }
+    /// Show the drawing an undo or redo step holds, with nothing selected; returns the drawing as
+    /// it was, as the step back.
+    pub(crate) fn swap_in(&mut self, snap: Snapshot) -> Snapshot {
+        let cur = Snapshot { label: snap.label, doc: std::mem::replace(&mut self.doc, snap.doc), selection: std::mem::take(&mut self.selection) };
+        self.follow_layout(&cur.doc);
+        self.reconcile_untiled_twist();
+        self.revision += 1;
+        cur
     }
     /// After undo/redo replaced the drawing (`before` is the one shown until then): if the current
     /// layout no longer exists, follow it to its other name when it was renamed (same tab order,

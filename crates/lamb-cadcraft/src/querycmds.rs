@@ -356,6 +356,7 @@ fn entity_kind(dp: &DrawingProject<'_>, e: &EntityRef<'_>) -> &'static str {
         EntityKind::Solid(_) => "solid",
         EntityKind::Trace(_) => "trace",
         EntityKind::Face3d(_) => "face3d",
+        EntityKind::PolyfaceMesh(_) => "polyfacemesh",
         EntityKind::Region(_) => "region",
         EntityKind::Viewport(_) => "viewport",
         EntityKind::Image(_) => "image",

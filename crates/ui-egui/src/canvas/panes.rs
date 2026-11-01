@@ -106,6 +106,7 @@ pub(super) fn prepare(app: &mut CadApp, tiles: &[(Rect, ModelTile)], rots: &[f64
             tolerance: 2f64.powi(band) * 0.5,
             min_dash: 2f64.powi(band) * 2.0,
             text: true,
+            linetypes: true,
             fill: true,
             lineweights: lwdisplay,
             view_height: tile.view.height,
