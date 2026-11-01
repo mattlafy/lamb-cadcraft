@@ -11,8 +11,10 @@
 //!   vertex; a placed tag echoes `Tagged run 2 of "Ground" with "D1"` and the view's report line,
 //!   and a view's first tag writes its assembly block ([`crate::assembly::write_assembly_block`])
 //!   in the same undo step. Returns `{"handle": <hex>, "attached": {"run"|"junction"|"opening": n}}`.
-//!   Interactive: `Enter detail name or [Corner/?]:` → `Specify tag point:` (asked again after a
-//!   refused point) → `Specify bubble point:`.
+//!   Interactive (LAMB T591): `Select detail [D1/Corner_Detail/Corner]:` — one keyword per detail
+//!   drawn in the edited view's direction (name with `/[]` and spaces as `_`; a typed name or id
+//!   also selects; none ends the command) → `Specify tag point on a wall face:` (`at a wall
+//!   corner` in Corner mode; asked again after a refused point) → `Specify bubble point:`.
 //! - `detailtags {viewId?}`: the resolution report for a plan or section view (default: the edited one) —
 //!   `<12 runs: 3 tagged, 7 spread, 2 untyped; 4 junctions: 4 spread>`, echoed and returned.
 //!
@@ -536,19 +538,32 @@ fn default_detail(s: &Session) -> Option<Id> {
     last.map(|(_, id)| id).filter(|id| details.iter().any(|v| v.id() == *id)).or_else(|| (details.len() == 1).then(|| details[0].id()))
 }
 
-/// DETAILTAG: detail (name or id, `Corner` toggles corner mode, `?` lists), tag point, bubble point.
+/// A detail's name as one command-line keyword: `/`, `[`, `]` and spaces become `_`.
+fn detail_keyword(name: &str) -> String {
+    name.chars().map(|c| if matches!(c, '/' | '[' | ']') || c.is_whitespace() { '_' } else { c }).collect()
+}
+
+/// A detail DETAILTAG offers: its id, keyword and name.
+struct Offered {
+    id: Id,
+    keyword: String,
+    name: String,
+}
+
+/// DETAILTAG: detail (one keyword per detail drawn in the edited view's direction, `Corner`
+/// toggles corner mode; a typed name or id also selects), tag point, bubble point.
 struct DetailTagM {
     default: Option<Id>,
     detail: Option<Id>,
     corner: bool,
     tip: Option<Vec2>,
+    offered: Vec<Offered>,
 }
 
 impl DetailTagM {
-    fn default_name(&self, s: &Session) -> Option<String> {
+    fn default_name(&self) -> Option<String> {
         let id = self.default?;
-        let doc = read_document(s.doc().ok()?).ok()?;
-        doc.views.iter().find(|v| v.id() == id).map(|v| v.name().to_owned())
+        self.offered.iter().find(|o| o.id == id).map(|o| o.name.clone())
     }
 }
 
@@ -556,25 +571,50 @@ impl Interactive for DetailTagM {
     fn name(&self) -> &'static str {
         "detailtag"
     }
-    fn prompt(&self, s: &Session) -> Prompt {
+    fn prompt(&self, _s: &Session) -> Prompt {
         match (self.detail, self.tip) {
             (None, _) => {
-                let msg = if self.corner { "Enter corner detail name" } else { "Enter detail name" };
-                let p = Prompt::new(msg, Accept::TEXT).kw(&["Corner", "?"]);
-                match self.default_name(s) {
+                let msg = if self.corner { "Select corner detail" } else { "Select detail" };
+                let kws: Vec<&str> = self.offered.iter().map(|o| o.keyword.as_str()).chain(["Corner"]).collect();
+                let p = Prompt::new(msg, Accept::TEXT).kw(&kws).options_only();
+                match self.default_name() {
                     Some(n) => p.default(n),
                     None => p,
                 }
             }
-            (Some(_), None) => Prompt::new("Specify tag point", Accept::POINT),
+            (Some(_), None) => {
+                let msg = if self.corner { "Specify tag point at a wall corner" } else { "Specify tag point on a wall face" };
+                Prompt::new(msg, Accept::POINT)
+            }
             (Some(_), Some(tip)) => Prompt::new("Specify bubble point", Accept::POINT).base(tip),
         }
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        if let Err(e) = edited_wall_view(s) {
-            s.echo(e);
+        let view = match edited_wall_view(s) {
+            Ok(v) => v,
+            Err(e) => {
+                s.echo(e);
+                return Ok(Step::Done);
+            }
+        };
+        let dir = view_direction(s.doc()?, view);
+        let doc = read_document(s.doc()?).map_err(other)?;
+        self.offered = doc
+            .views
+            .iter()
+            .filter_map(|v| match v {
+                AnyView::Detail(d) if d.cut_direction == dir => Some(Offered { id: d.id, keyword: detail_keyword(&d.name), name: d.name.clone() }),
+                _ => None,
+            })
+            .collect();
+        if self.offered.is_empty() {
+            let kind = if dir == CutDirection::Vertical { "section" } else { "plan" };
+            s.echo(format!("No {kind} details in this drawing — make one with NEWDETAIL, draw it, then tag a wall with it"));
             return Ok(Step::Done);
         }
+        // The last detail used, if drawn this way; else the only one offered.
+        self.default =
+            default_detail(s).filter(|id| self.offered.iter().any(|o| o.id == *id)).or_else(|| (self.offered.len() == 1).then(|| self.offered[0].id));
         Ok(Step::Continue)
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
@@ -597,25 +637,29 @@ impl Interactive for DetailTagM {
                 self.corner = !self.corner;
                 return Ok(Step::Continue);
             }
-            let doc = read_document(s.doc()?).map_err(other)?;
-            let details = || doc.views.iter().filter(|v| matches!(v, AnyView::Detail(_)));
-            if text == "?" {
-                let lines: Vec<String> = details().map(|v| format!("{}  {}", v.id().0, v.name())).collect();
-                if lines.is_empty() {
-                    s.echo("No detail views (NEWDETAIL).");
-                }
-                for l in lines {
-                    s.echo(l);
-                }
+            let by_name = self.offered.iter().find(|o| o.keyword.eq_ignore_ascii_case(&text) || o.name.eq_ignore_ascii_case(&text));
+            let by_id = || text.parse::<u64>().ok().and_then(|n| self.offered.iter().find(|o| o.id == Id(n)));
+            if let Some(o) = by_name.or_else(by_id) {
+                self.detail = Some(o.id);
                 return Ok(Step::Continue);
             }
-            let by_name = details().find(|v| v.name().eq_ignore_ascii_case(&text));
-            let by_id = || text.parse::<u64>().ok().and_then(|n| details().find(|v| v.id() == Id(n)));
-            match by_name.or_else(by_id).map(AnyView::id) {
-                Some(id) => self.detail = Some(id),
-                None => return Err(other("No such detail view")),
-            }
-            return Ok(Step::Continue);
+            // A detail drawn the other way gets the reason it is not offered.
+            let doc = read_document(s.doc()?).map_err(other)?;
+            let other_way = doc.views.iter().find_map(|v| match v {
+                AnyView::Detail(d)
+                    if detail_keyword(&d.name).eq_ignore_ascii_case(&text)
+                        || d.name.eq_ignore_ascii_case(&text)
+                        || text.parse::<u64>().is_ok_and(|n| d.id == Id(n)) =>
+                {
+                    Some(d.cut_direction)
+                }
+                _ => None,
+            });
+            return Err(other(match other_way {
+                Some(CutDirection::Vertical) => "That detail is drawn in section; tag it in a section view",
+                Some(_) => "That detail is drawn in plan; tag it in a plan view",
+                None => "No such detail view",
+            }));
         };
         let Input::Point(p) = i else {
             return Ok(if i == Input::Enter { Step::Cancel } else { Step::Continue });
@@ -648,8 +692,8 @@ impl Interactive for DetailTagM {
     }
 }
 
-pub(crate) fn detailtag_machine(s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(DetailTagM { default: default_detail(s), detail: None, corner: false, tip: None }))
+pub(crate) fn detailtag_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(DetailTagM { default: None, detail: None, corner: false, tip: None, offered: Vec::new() }))
 }
 
 #[cfg(test)]
@@ -840,7 +884,7 @@ mod tests {
         s.input(Input::Enter)?;
         s.input(Input::Point(Vec2::new(2500.0, 2000.0)))?;
         assert!(s.log.iter().any(|l| l == "Not on a wall face: put the tag point on a wall line"), "{:?}", s.log);
-        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point"));
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point on a wall face"));
         s.input(Input::Point(Vec2::new(2500.0, 0.0)))?;
         s.input(Input::Point(Vec2::new(1500.0, -1000.0)))?;
         assert!(s.running.is_none());
@@ -892,13 +936,11 @@ mod tests {
     fn the_interactive_form_places_the_same_tag_as_the_parameter_form() -> R {
         let (mut s, plan, detail) = room()?;
         s.start("dtag")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter detail name or [Corner/?] <D1>:"));
-        s.input(Input::Keyword("?".into()))?;
-        assert!(s.log.iter().any(|l| l == &format!("{}  D1", detail.0)), "{:?}", s.log);
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [D1/Corner] <D1>:"));
         s.input(Input::Keyword("Corner".into()))?;
-        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Enter corner detail name"));
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Select corner detail"));
         s.input(Input::Text("d1".into()))?;
-        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point"));
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point at a wall corner"));
         s.input(Input::Point(Vec2::new(0.0, 0.0)))?;
         assert_eq!(s.current_prompt().and_then(|p| p.base), Some(Vec2::new(0.0, 0.0)));
         s.input(Input::Point(Vec2::new(-1000.0, -1000.0)))?;
@@ -1005,6 +1047,59 @@ mod tests {
         );
         s.start("newplan")?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("New plan or [Height/Floating] <Height>:"));
+        Ok(())
+    }
+
+    #[test]
+    fn dtag_offers_this_drawing_s_details_drawn_the_edited_view_s_way_as_keywords() -> R {
+        let (mut s, plan, _d1) = room()?;
+        let cd = Id(s.execute("newdetail", &json!({ "name": "Corner Detail" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("newdetail", &json!({ "name": "S1", "cutDirection": "vertical" }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.start("dtag")?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [D1/Corner_Detail/Corner]:"));
+        s.input(Input::Keyword("Corner_Detail".into()))?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point on a wall face"));
+        s.input(Input::Point(Vec2::new(2500.0, 0.0)))?;
+        s.input(Input::Point(Vec2::new(1500.0, -1000.0)))?;
+        assert!(s.running.is_none());
+        let t = view_detail_tags(s.doc()?, plan)?;
+        assert_eq!(t.edges.len(), 1);
+        assert_eq!(t.edges[0].detail, cd.0.to_string());
+        assert!(s.log.iter().any(|l| l.starts_with("Tagged run ") && l.ends_with("with \"Corner Detail\"")), "{:?}", s.log);
+
+        // The section detail is not offered in a plan, and typing it says why.
+        s.start("dtag")?;
+        s.input(Input::Text("s1".into()))?;
+        assert_eq!(s.log.last().map(String::as_str), Some("That detail is drawn in section; tag it in a section view"));
+        s.input(Input::Cancel)?;
+
+        // In a section only S1 is offered, and as the only one it is the default.
+        let r = s.execute(
+            "newsectionline",
+            &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": -500}, "cutTo": {"x": 5000, "y": -500} }),
+        )?;
+        s.execute("editview", &json!({ "viewId": r["viewId"].as_u64().ok_or("no id")? }))?;
+        s.start("dtag")?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [S1/Corner] <S1>:"));
+        Ok(())
+    }
+
+    #[test]
+    fn dtag_with_no_details_drawn_the_edited_view_s_way_ends_and_records_nothing() -> R {
+        let mut s = session()?;
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("newdetail", &json!({ "name": "S1", "cutDirection": "vertical" }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let before = cadcraft_io::write_dxf(s.doc()?);
+        s.start("dtag")?;
+        assert!(s.running.is_none(), "ends at once");
+        assert!(
+            s.log.iter().any(|l| l == "No plan details in this drawing — make one with NEWDETAIL, draw it, then tag a wall with it"),
+            "{:?}",
+            s.log
+        );
+        assert_eq!(cadcraft_io::write_dxf(s.doc()?), before);
         Ok(())
     }
 }
