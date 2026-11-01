@@ -2289,7 +2289,7 @@ pub(crate) mod tests {
     /// reference (0,0)–(1000,0), a `GYP` band at y = 50 and a `STUD` repeat (38 × 150 at x 100, pitch
     /// 400), edge-tagged on the wall. Returns (session, section).
     pub(crate) fn section_wall(inner: f64) -> T<(Session, Id)> {
-        section_fixture(inner / 2.0, Some((-2000.0, 2000.0)), |s| {
+        section_fixture(inner / 2.0, None, |s| {
             s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
             s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
             s.execute(

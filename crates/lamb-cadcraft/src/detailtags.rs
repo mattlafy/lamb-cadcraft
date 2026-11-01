@@ -230,9 +230,17 @@ pub(crate) fn attach_bridge(graph: &WallGraph, tip: Point2) -> Option<usize> {
 /// points ([`crate::outside::outside_points`]) marking their regions outside.
 pub(crate) fn graph_and_sides(p: &DrawingProject<'_>, view: Id) -> (WallGraph, WallSides) {
     let graph = wall_graph(p, view, &wall_params(p, view));
-    let exterior_layer_ids = p.layers().iter().filter(|l| starts_with_ci(&l.name, "WALL-EXT")).map(|l| l.id.clone()).collect();
-    let sides = wall_sides(p, &graph, &SideParams { outside_points: crate::outside::outside_points(p.drawing(), view), exterior_layer_ids });
+    let sides = wall_sides(
+        p,
+        &graph,
+        &SideParams { outside_points: crate::outside::outside_points(p.drawing(), view), exterior_layer_ids: exterior_layer_ids(p) },
+    );
     (graph, sides)
+}
+
+/// The ids of the layers whose faces make a run exterior: names starting `WALL-EXT`.
+pub(crate) fn exterior_layer_ids(p: &DrawingProject<'_>) -> Vec<String> {
+    p.layers().iter().filter(|l| starts_with_ci(&l.name, "WALL-EXT")).map(|l| l.id.clone()).collect()
 }
 
 /// What counts as a wall face in `view`: [`WallRunParams::for_vertical`] in a vertical view, else

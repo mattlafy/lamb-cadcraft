@@ -93,7 +93,7 @@ pub(crate) fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kin
 /// The overlay provider: the edited view's underlay ([`underlay`], drawn first, pale), its halos
 /// ([`halo`]: RESOLVE's attention, unaccepted AI lines' glow), a detail's reference line
 /// ([`crate::detailref`], magenta), a detail's repeat ghosts ([`crate::repeats::draw`], one pale copy
-/// of each repeat's members at its pitch), an assembly block's ghost ([`crate::asmview::draw`]),
+/// of each repeat's members at its pitch), its outside points ([`crate::outside::draw`]), an assembly block's ghost ([`crate::asmview::draw`]),
 /// then its markers, cut lines and the datum planes of other views that cross it, in its block's
 /// coordinates.
 pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
@@ -101,6 +101,7 @@ pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     append_list(&mut list, halo::draw(d, space, opts));
     append_list(&mut list, crate::detailref::draw(d, space, opts));
     append_list(&mut list, crate::repeats::draw(d, space, opts));
+    append_list(&mut list, crate::outside::draw(d, space, opts));
     append_list(&mut list, crate::asmview::draw(d, space, opts));
     let Some((dp, id)) = view_of(d, space) else { return list };
     let Ok(markers) = compute_markers_for_view(&dp, id) else { return list };
