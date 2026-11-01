@@ -6,7 +6,7 @@
 //!   faces:[{entityId, segmentIndex}]×2, detail:{state, detailViewId?, name?}, skipped?,
 //!   conflict?}`. `state` is `tagged|spread|gap|conflict|untyped`. Refuses a view that is not a plan
 //!   or section and a point on no run (`No wall run there`).
-//! - Interactive, on the edited plan or section: `Select a wall:` repeats; each pick echoes
+//! - Interactive, on the edited plan or section: `Select a wall to inspect:` repeats; each pick echoes
 //!   `Run <i>: <state> <name>, <width>mm wide` and haloes the run's two face entities until the
 //!   command ends.
 
@@ -146,19 +146,12 @@ impl Interactive for WallRunM {
         "wallrun"
     }
     fn prompt(&self, _s: &Session) -> Prompt {
-        Prompt::new("Select a wall", Accept::POINT)
+        Prompt::new("Select a wall to inspect", Accept::POINT)
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        match edited_wall_view(s) {
-            Ok(plan) => {
-                self.plan = Some(plan);
-                Ok(Step::Continue)
-            }
-            Err(e) => {
-                s.echo(e);
-                Ok(Step::Done)
-            }
-        }
+        s.echo("WALLRUN: click a wall to see which detail it gets, its width, and any mismatch between the drawn width and the detail.");
+        self.plan = wall_view_or_refuse(s, "WALLRUN");
+        Ok(if self.plan.is_some() { Step::Continue } else { Step::Done })
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         let Some(plan) = self.plan else { return Ok(Step::Done) };
@@ -180,6 +173,22 @@ impl Interactive for WallRunM {
             Input::Enter => Ok(Step::Done),
             Input::Cancel => Ok(Step::Cancel),
             _ => Ok(Step::Continue),
+        }
+    }
+}
+
+/// The Walls & Framing commands' refusal when the edited space is not a plan or section.
+pub(crate) fn needs_wall_view(name: &str) -> String {
+    format!("{name} needs a plan or section: open one from the Views palette or with EDITVIEW.")
+}
+
+/// The edited plan or section, or `None` after echoing [`needs_wall_view`] for command `name`.
+pub(crate) fn wall_view_or_refuse(s: &mut Session, name: &str) -> Option<Id> {
+    match edited_wall_view(s) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            s.echo(needs_wall_view(name));
+            None
         }
     }
 }
@@ -242,13 +251,117 @@ mod tests {
         Ok(())
     }
 
+    /// Starts `cmd` on the edited plan of a conflicted room: its begin echo is `intro` and its first
+    /// prompt `prompt` (`None`: it finishes at once). Then, with no view edited, it echoes `refusal`
+    /// right after `intro` and ends.
+    fn says_what_it_does(cmd: &str, intro: &str, prompt: Option<&str>, refusal: &str) -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, _) = room_with("exterior_face", true, 210.0)?;
+        let n = s.log.len();
+        s.start(cmd)?;
+        assert_eq!(s.log.get(n + 1).map(String::as_str), Some(intro), "{cmd}: {:?}", &s.log[n..]);
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), prompt, "{cmd}");
+        if s.running.is_some() {
+            s.input(Input::Cancel)?;
+        }
+        s.execute("editview", &json!({}))?;
+        let n = s.log.len();
+        s.start(cmd)?;
+        assert!(s.running.is_none(), "{cmd} ends outside a plan or section");
+        assert_eq!(&s.log[n + 1..], [intro, refusal], "{cmd}");
+        Ok(())
+    }
+
+    #[test]
+    fn wallrun_says_what_it_does() -> R {
+        says_what_it_does(
+            "wallrun",
+            "WALLRUN: click a wall to see which detail it gets, its width, and any mismatch between the drawn width and the detail.",
+            Some("Select a wall to inspect:"),
+            &needs_wall_view("WALLRUN"),
+        )
+    }
+
+    #[test]
+    fn wallfit_says_what_it_does() -> R {
+        says_what_it_does(
+            "wallfit",
+            "WALLFIT: makes each wall as thick as its detail by moving one face. Choose which side stays put.",
+            Some("Keep which side in place [Reference/Exterior/Interior/Centre/Grid] <Reference>:"),
+            &needs_wall_view("WALLFIT"),
+        )
+    }
+
+    #[test]
+    fn assemblyplan_says_what_it_does() -> R {
+        says_what_it_does(
+            "assemblyplan",
+            "ASSEMBLYPLAN: lays each wall's detail along it (studs, sheathing, layers) as a derived plan you can view with ASSEMBLYVIEW.",
+            Some("Mitre corners that have no corner detail? [Yes/No] <No>:"),
+            &needs_wall_view("ASSEMBLYPLAN"),
+        )
+    }
+
+    #[test]
+    fn assemblyview_says_what_it_does() -> R {
+        says_what_it_does(
+            "assemblyview",
+            "ASSEMBLYVIEW: opens the derived assembly plan of this view (read-only; edit the plan or the details instead).",
+            None,
+            &needs_wall_view("ASSEMBLYVIEW"),
+        )
+    }
+
+    #[test]
+    fn wallconflicts_says_what_it_does() -> R {
+        says_what_it_does(
+            "wallconflicts",
+            "WALLCONFLICTS: lists walls whose drawn width differs from their detail.",
+            None,
+            &needs_wall_view("WALLCONFLICTS"),
+        )
+    }
+
+    #[test]
+    fn studgrid_says_what_it_does() -> R {
+        says_what_it_does(
+            "studgrid",
+            "STUDGRID: sets the grid every stud and joist lines up on, across all views.",
+            Some("Specify stud grid origin (a stud centre) or [Pitch/Wall] <406.4>:"),
+            "STUDGRID needs a plan: open one from the Views palette or with EDITVIEW.",
+        )
+    }
+
+    #[test]
+    fn studmove_says_what_it_does() -> R {
+        says_what_it_does(
+            "studmove",
+            "STUDMOVE: moves the nearest stud of a wall onto a point; the rest stay on the grid.",
+            Some("Specify the stud's new centre on a wall:"),
+            &needs_wall_view("STUDMOVE"),
+        )
+    }
+
+    #[test]
+    fn resolve_says_what_it_does() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, _) = room_with("exterior_face", true, 210.0)?;
+        let n = s.log.len();
+        s.start("resolve")?;
+        assert_eq!(
+            s.log.get(n + 1).map(String::as_str),
+            Some("Review Issues: steps through conflicts in the drawing; Next/Previous to move, Enter to finish.")
+        );
+        Ok(())
+    }
+
     #[test]
     fn the_interactive_form_echoes_haloes_and_clears() -> R {
         let _g = crate::overlays::underlay::tests::lock();
         set_attention(None);
         let (mut s, plan) = room_with("exterior_face", true, 210.0)?;
         s.start("wallrun")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select a wall:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select a wall to inspect:"));
         s.input(Input::Point(Vec2::new(2500.0, 105.0)))?;
         assert!(s.running.is_some());
         let echoed = s.log.iter().find(|l| l.starts_with("Run ")).ok_or("no echo")?;
@@ -268,7 +381,9 @@ mod tests {
         let undo = s.state()?.undo.len();
         s.start("wallrun")?;
         assert!(s.running.is_none());
-        assert!(s.log.iter().any(|l| l == "Edit a plan or section view first (EDITVIEW)"), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l.starts_with("WALLRUN: click a wall to see which detail")), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| *l == needs_wall_view("WALLRUN")), "{:?}", s.log);
+        assert_eq!(needs_wall_view("WALLRUN"), "WALLRUN needs a plan or section: open one from the Views palette or with EDITVIEW.");
         assert_eq!(s.state()?.undo.len(), undo);
         Ok(())
     }

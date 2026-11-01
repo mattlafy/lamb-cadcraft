@@ -15,7 +15,7 @@
 //! - `studgrid {point:{x,y}, pitch?}` (LAMB ▸ Walls & Framing ▸ Stud Grid): the project's grid origin, at a
 //!   point of the edited plan, pitch default 406.4 mm; erases every grid point in every view and
 //!   adds the new one, one undo step; refused in a plan with no placement. Returns
-//!   `{"handle": <hex>, "pitch": P}`. Interactive: `Specify stud grid origin or [Pitch] <406.4>:`,
+//!   `{"handle": <hex>, "pitch": P}`. Interactive: `Specify stud grid origin (a stud centre) or [Pitch/Wall] <406.4>:`,
 //!   `Pitch` asking `Specify stud grid pitch <406.4>:` and then the origin again.
 //! - `studgrid {point, pitch?, wall: true, off?}` (the `Wall` option, T460): a wall-scoped grid point
 //!   ([`EntityData::stud_grid_wall`]) inside exactly one run's band of the edited plan overrules the
@@ -230,7 +230,7 @@ impl Interactive for StudGridM {
             Prompt::new("Specify stud grid pitch", Accept::NUMBER).default(fmt_mm(self.pitch))
         } else {
             match self.wall {
-                None => Prompt::new("Specify stud grid origin", Accept::POINT).kw(&["Pitch", "Wall"]).default(fmt_mm(self.pitch)),
+                None => Prompt::new("Specify stud grid origin (a stud centre)", Accept::POINT).kw(&["Pitch", "Wall"]).default(fmt_mm(self.pitch)),
                 Some(WallGrid::Phase) => {
                     Prompt::new("Specify stud grid origin on the wall", Accept::POINT).kw(&["Pitch", "Off"]).default(fmt_mm(self.pitch))
                 }
@@ -239,18 +239,16 @@ impl Interactive for StudGridM {
         }
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        match edited_plan(s) {
-            Ok(_) => {
-                if let Some((_, pitch)) = project_grid(s.doc()?) {
-                    self.pitch = pitch;
-                }
-                Ok(Step::Continue)
-            }
-            Err(e) => {
-                s.echo(e);
-                Ok(Step::Done)
-            }
+        s.echo("STUDGRID: sets the grid every stud and joist lines up on, across all views.");
+        if edited_plan(s).is_err() {
+            // The origin is a plan point: a section is refused too, so the refusal names a plan.
+            s.echo("STUDGRID needs a plan: open one from the Views palette or with EDITVIEW.");
+            return Ok(Step::Done);
         }
+        if let Some((_, pitch)) = project_grid(s.doc()?) {
+            self.pitch = pitch;
+        }
+        Ok(Step::Continue)
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         if self.asking_pitch {
@@ -330,16 +328,11 @@ impl Interactive for StudMoveM {
         "studmove"
     }
     fn prompt(&self, _s: &Session) -> Prompt {
-        Prompt::new("Specify the stud's new centre", Accept::POINT)
+        Prompt::new("Specify the stud's new centre on a wall", Accept::POINT)
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
-        match edited_wall_view(s) {
-            Ok(_) => Ok(Step::Continue),
-            Err(e) => {
-                s.echo(e);
-                Ok(Step::Done)
-            }
-        }
+        s.echo("STUDMOVE: moves the nearest stud of a wall onto a point; the rest stay on the grid.");
+        Ok(if crate::wallrun::wall_view_or_refuse(s, "STUDMOVE").is_some() { Step::Continue } else { Step::Done })
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         match i {
@@ -521,11 +514,11 @@ pub(crate) mod tests {
     fn the_interactive_form_takes_a_pitch_then_the_origin() -> R {
         let (mut s, plan) = stud_room(406.4)?;
         s.start("studgrid")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid origin or [Pitch/Wall] <406.4>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid origin (a stud centre) or [Pitch/Wall] <406.4>:"));
         s.input(Input::Text("P".into()))?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid pitch <406.4>:"));
         s.input(Input::Text("600".into()))?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid origin or [Pitch/Wall] <600>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid origin (a stud centre) or [Pitch/Wall] <600>:"));
         s.input(Input::Point(Vec2::new(13.0, 7.0)))?;
         assert!(s.running.is_none());
         let g = stud_grid(s.doc()?, plan).ok_or("no grid")?;
@@ -827,7 +820,7 @@ pub(crate) mod tests {
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
         let north = stud_xs(s.doc()?, plan, 3900.0)?;
         s.start("smv")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify the stud's new centre:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify the stud's new centre on a wall:"));
         s.input(Input::Point(Vec2::new(north[2] + 40.0, 3900.0)))?;
         assert!(s.running.is_none());
         assert_eq!(stud_xs(s.doc()?, plan, 3900.0)?, with_moved(&north, &[north[2]], &[round6(north[2] + 40.0)]));

@@ -203,7 +203,7 @@ pub fn assemblyview(s: &mut Session, p: &Value) -> EngineResult<Value> {
     let name = assembly_block_name(view);
     let label = view_name(d, view);
     if d.block(&name).is_none() {
-        return Err(other(format!("No assembly plan for \"{label}\" — run ASSEMBLYPLAN")));
+        return Err(other("No assembly plan yet: tag a wall with DTAG (or run ASSEMBLYPLAN)."));
     }
     enter_space(s, Space::Block(name.clone()))?;
     s.echo(format!("Assembly plan of \"{label}\" (read-only). EDITVIEW to return."));
@@ -313,6 +313,10 @@ impl Interactive for AssemblyViewM {
         Prompt::new("Assembly view", Accept::TEXT)
     }
     fn begin(&mut self, s: &mut Session) -> EngineResult<Step> {
+        s.echo("ASSEMBLYVIEW: opens the derived assembly plan of this view (read-only; edit the plan or the details instead).");
+        if crate::wallrun::wall_view_or_refuse(s, "ASSEMBLYVIEW").is_none() {
+            return Ok(Step::Done);
+        }
         if let Err(e) = assemblyview(s, &json!({})) {
             s.echo(e.to_string());
         }
@@ -347,7 +351,7 @@ mod tests {
         let (mut s, plan) = room("exterior_face", true)?;
         let plan_space = s.space();
         let e = s.execute("assemblyview", &json!({})).err().ok_or("no block accepted")?;
-        assert!(e.to_string().contains("No assembly plan for \"Ground\" — run ASSEMBLYPLAN"), "{e}");
+        assert!(e.to_string().contains("No assembly plan yet: tag a wall with DTAG (or run ASSEMBLYPLAN)."), "{e}");
         assert_eq!(s.space(), plan_space);
         let detail = detail_id(&s)?;
         let e = s.execute("assemblyview", &json!({ "viewId": detail.0 })).err().ok_or("detail accepted")?;

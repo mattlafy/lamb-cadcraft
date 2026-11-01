@@ -1093,14 +1093,13 @@ impl Interactive for AssemblyPlanM {
     }
     fn prompt(&self, s: &Session) -> Prompt {
         let current = edited_wall_view(s).is_ok_and(|plan| mitred(s, plan));
-        Prompt::new("Mitre missing corner details", Accept::TEXT).kw(&["Yes", "No"]).default(if current { "Yes" } else { "No" }.to_owned())
+        Prompt::new("Mitre corners that have no corner detail?", Accept::TEXT)
+            .kw(&["Yes", "No"])
+            .default(if current { "Yes" } else { "No" }.to_owned())
     }
     fn begin(&mut self, s: &mut Session) -> EngineResult<Step> {
-        if let Err(e) = edited_wall_view(s) {
-            s.echo(e);
-            return Ok(Step::Done);
-        }
-        Ok(Step::Continue)
+        s.echo("ASSEMBLYPLAN: lays each wall's detail along it (studs, sheathing, layers) as a derived plan you can view with ASSEMBLYVIEW.");
+        Ok(if crate::wallrun::wall_view_or_refuse(s, "ASSEMBLYPLAN").is_some() { Step::Continue } else { Step::Done })
     }
     fn input(&mut self, s: &mut Session, i: Input) -> EngineResult<Step> {
         let mitre = match i {
@@ -1148,18 +1147,13 @@ impl Interactive for WallConflictsM {
         Prompt::new("Wall conflicts", Accept::TEXT)
     }
     fn begin(&mut self, s: &mut Session) -> EngineResult<Step> {
-        let plan = match edited_wall_view(s) {
-            Ok(plan) => plan,
-            Err(e) => {
-                s.echo(e);
-                return Ok(Step::Done);
-            }
-        };
+        s.echo("WALLCONFLICTS: lists walls whose drawn width differs from their detail.");
+        let Some(plan) = crate::wallrun::wall_view_or_refuse(s, "WALLCONFLICTS") else { return Ok(Step::Done) };
         match wallconflicts(s, &json!({ "viewId": plan.0 })) {
             Ok(r) => {
                 let list = r["conflicts"].as_array().cloned().unwrap_or_default();
                 if list.is_empty() {
-                    s.echo("No width conflicts");
+                    s.echo("No width conflicts: every detailed wall matches its detail.");
                 }
                 for c in list {
                     s.echo(format!("Run {}: {}", c["run"], c["text"].as_str().unwrap_or_default()));
@@ -2211,7 +2205,7 @@ pub(crate) mod tests {
         let n = undo_len(&s)?;
         s.start("assemblyplan")?;
         let p = s.current_prompt().ok_or("no prompt")?;
-        assert_eq!(p.display(), "Mitre missing corner details or [Yes/No] <No>:");
+        assert_eq!(p.display(), "Mitre corners that have no corner detail? [Yes/No] <No>:");
         s.input(Input::Enter)?;
         assert!(s.running.is_none());
         assert_eq!(undo_len(&s)?, n + 1);
@@ -2255,7 +2249,7 @@ pub(crate) mod tests {
 
         let (mut s, _plan) = room_with("exterior_face", true, 200.0)?;
         s.start("wallconflicts")?;
-        assert!(s.log.iter().any(|l| l == "No width conflicts"), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l == "No width conflicts: every detailed wall matches its detail."), "{:?}", s.log);
         Ok(())
     }
 
@@ -2270,7 +2264,8 @@ pub(crate) mod tests {
                 assert_eq!(edited_wall_view(&s), Err("Edit a plan or section view first (EDITVIEW)".to_owned()));
             }
             for cmd in ["assemblyplan", "wallconflicts", "wallfit"] {
-                let why = edited_wall_view(&s).err().ok_or("a plan is edited")?;
+                edited_wall_view(&s).err().ok_or("a plan is edited")?;
+                let why = crate::wallrun::needs_wall_view(&cmd.to_ascii_uppercase());
                 let before = s.doc()?.clone();
                 let n = undo_len(&s)?;
                 s.log.clear();

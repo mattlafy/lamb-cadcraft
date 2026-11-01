@@ -34,6 +34,7 @@ use crate::detailref::{DetailRefKind, detail_reference};
 use crate::detailtags::{edited_wall_view, graph_and_sides};
 use crate::maintain::write_travelled;
 use crate::project::DrawingProject;
+use crate::wallrun::wall_view_or_refuse;
 
 /// Which face of a fitted run stays put.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,7 +419,7 @@ pub fn wallfit(s: &mut Session, p: &Value) -> EngineResult<Value> {
     // Validate before `doc_mut`: touching the drawing on a refusal would still record an undo step.
     let planned = plan_moves(s.doc()?, plan, only.as_deref(), hold).map_err(other)?;
     if planned.moves.is_empty() {
-        s.echo("No width conflicts".to_string());
+        s.echo("No width conflicts: every detailed wall matches its detail.".to_string());
         return Ok(json!({ "fitted": [], "hold": hold.name(), "travelled": [] }));
     }
     let (fitted, travelled) = wall_fit_travelling(s.doc_mut()?, plan, only.as_deref(), hold).map_err(other)?;
@@ -450,14 +451,11 @@ impl Interactive for WallFitM {
         "wallfit"
     }
     fn prompt(&self, _s: &Session) -> Prompt {
-        Prompt::new("Hold", Accept::TEXT).kw(&HOLD_WORDS).default("Reference".to_owned())
+        Prompt::new("Keep which side in place", Accept::TEXT).kw(&HOLD_WORDS).options_only().default("Reference".to_owned())
     }
     fn begin(&mut self, s: &mut Session) -> EngineResult<Step> {
-        if let Err(e) = edited_wall_view(s) {
-            s.echo(e);
-            return Ok(Step::Done);
-        }
-        Ok(Step::Continue)
+        s.echo("WALLFIT: makes each wall as thick as its detail by moving one face. Choose which side stays put.");
+        Ok(if wall_view_or_refuse(s, "WALLFIT").is_some() { Step::Continue } else { Step::Done })
     }
     fn input(&mut self, s: &mut Session, i: Input) -> EngineResult<Step> {
         let hold = match i {
@@ -729,7 +727,10 @@ mod tests {
         let (mut s, plan) = room_with("exterior_face", true, 210.0)?;
         let n = undo_len(&s)?;
         s.start("wallfit")?;
-        assert_eq!(s.current_prompt().ok_or("no prompt")?.display(), "Hold or [Reference/Exterior/Interior/Centre/Grid] <Reference>:");
+        assert_eq!(
+            s.current_prompt().ok_or("no prompt")?.display(),
+            "Keep which side in place [Reference/Exterior/Interior/Centre/Grid] <Reference>:"
+        );
         s.input(Input::Text("bogus".into()))?;
         assert!(s.running.is_some(), "re-asks");
         assert!(s.log.iter().any(|l| l == "Reference, Exterior, Interior, Centre or Grid"), "{:?}", s.log);
@@ -1006,7 +1007,7 @@ mod tests {
         s.log.clear();
         s.start("wallfit")?;
         assert!(s.running.is_none());
-        assert!(s.log.iter().any(|l| l.contains("plan and section views")), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| *l == crate::wallrun::needs_wall_view("WALLFIT")), "{:?}", s.log);
         assert_eq!(undo_len(&s)?, n);
         Ok(())
     }

@@ -97,6 +97,7 @@ impl Interactive for Resolve {
         Prompt::new(self.line(), Accept::TEXT).kw(&["Next", "Previous"])
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        s.echo("Review Issues: steps through conflicts in the drawing; Next/Previous to move, Enter to finish.");
         if self.issues.is_empty() {
             s.echo("No issues found");
             return Ok(Step::Done);
