@@ -175,6 +175,12 @@ pub struct EntityData {
     /// run whose band holds it ([`crate::studgrid`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stud_grid_wall: Option<WallGrid>,
+    /// With `stud_grid`: the point is heading-scoped — its origin and pitch are the grid of every
+    /// straight run whose project-global direction is within `TOLERANCE.angle_deg` of this heading
+    /// (degrees from +X, in `[0, 180)`), building-wide ([`crate::studgrid`]). Exclusive with
+    /// `stud_grid_wall`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stud_grid_heading: Option<f64>,
     /// On a `Point` in a plan or vertical view's block: a stud-move point — the nearest repeat copy
     /// of the run whose band holds it is laid centred on it ([`crate::studgrid`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -252,6 +258,7 @@ impl Default for EntityData {
             outside: false,
             stud_grid: None,
             stud_grid_wall: None,
+            stud_grid_heading: None,
             stud_move: false,
             hole: None,
         }

@@ -327,7 +327,7 @@ mod tests {
         says_what_it_does(
             "studgrid",
             "STUDGRID: sets the grid every stud and joist lines up on, across all views.",
-            Some("Specify stud grid origin (a stud centre) or [Pitch/Wall] <406.4>:"),
+            Some("Specify stud grid origin (a stud centre) or [Pitch/Wall/Heading] <406.4>:"),
             "STUDGRID needs a plan: open one from the Views palette or with EDITVIEW.",
         )
     }

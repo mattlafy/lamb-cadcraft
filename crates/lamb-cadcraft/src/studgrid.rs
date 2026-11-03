@@ -15,7 +15,7 @@
 //! - `studgrid {point:{x,y}, pitch?}` (LAMB ▸ Walls & Framing ▸ Stud Grid): the project's grid origin, at a
 //!   point of the edited plan, pitch default 406.4 mm; erases every grid point in every view and
 //!   adds the new one, one undo step; refused in a plan with no placement. Returns
-//!   `{"handle": <hex>, "pitch": P}`. Interactive: `Specify stud grid origin (a stud centre) or [Pitch/Wall] <406.4>:`,
+//!   `{"handle": <hex>, "pitch": P}`. Interactive: `Specify stud grid origin (a stud centre) or [Pitch/Wall/Heading] <406.4>:`,
 //!   `Pitch` asking `Specify stud grid pitch <406.4>:` and then the origin again.
 //! - `studgrid {point, pitch?, wall: true, off?}` (the `Wall` option, T460): a wall-scoped grid point
 //!   ([`EntityData::stud_grid_wall`]) inside exactly one run's band of the edited plan overrules the
@@ -24,6 +24,15 @@
 //!   project STUDGRID leaves wall points alone. Interactive: `Wall` →
 //!   `Specify stud grid origin on the wall or [Pitch/Off] <406.4>:`, `Off` →
 //!   `Specify a point on the wall:`.
+//! - `studgrid {point, pitch?, heading: true | <deg>}` (the `Heading` option, T621): a heading-scoped
+//!   grid point ([`EntityData::stud_grid_heading`], project-global degrees in `[0, 180)`) — the
+//!   origin and pitch of every straight run whose global direction is within `TOLERANCE.angle_deg`
+//!   of it, mod 180°, in every placed plan and (for joists) section, building-wide. `true` takes the
+//!   heading of the one straight run whose band holds `point`; a number is explicit. Exclusive with
+//!   `wall`; refused in an unplaced plan; replaces any heading point on the same heading in every
+//!   view; a project STUDGRID leaves heading points alone and [`project_grid`] never returns one.
+//!   Precedence per run ([`run_grid`]): wall point → heading point → project point. Interactive:
+//!   `Heading` → `Specify stud grid origin on a wall of that heading or [Pitch] <406.4>:`.
 
 use cadcraft_doc::{Drawing, EntityKind, Handle, Point};
 use cadcraft_engine::units::parse_distance;
@@ -48,9 +57,26 @@ pub(crate) const DEFAULT_PITCH_MM: f64 = 406.4;
 /// How far a repeat's pitch may be from the grid's and still take the grid ("+/- a few mm").
 pub(crate) const PITCH_TOLERANCE_MM: f64 = 5.0;
 
-/// Every stud-grid point in `view`'s block, as (handle, origin, pitch, wall scope); malformed data
-/// skipped.
-fn grid_points(d: &Drawing, view: Id) -> Vec<(Handle, Point2, f64, Option<WallGrid>)> {
+/// One stud-grid point of a view's block: its handle, local origin, pitch and scope — a wall
+/// scope ([`EntityData::stud_grid_wall`]) or a heading in project-global degrees
+/// ([`EntityData::stud_grid_heading`]); neither is the project point.
+#[derive(Clone, Copy, Debug)]
+struct GridPoint {
+    handle: Handle,
+    at: Point2,
+    pitch: f64,
+    wall: Option<WallGrid>,
+    heading: Option<f64>,
+}
+
+impl GridPoint {
+    fn is_project(&self) -> bool {
+        self.wall.is_none() && self.heading.is_none()
+    }
+}
+
+/// Every stud-grid point in `view`'s block; malformed data skipped.
+fn grid_points(d: &Drawing, view: Id) -> Vec<GridPoint> {
     let Some(block) = d.block(&view_block_name(view)) else { return Vec::new() };
     block
         .entities
@@ -59,9 +85,40 @@ fn grid_points(d: &Drawing, view: Id) -> Vec<(Handle, Point2, f64, Option<WallGr
             let EntityKind::Point(pt) = &e.kind else { return None };
             let data = read_entity_data(&e.common).ok()?;
             let pitch = data.stud_grid?;
-            (pitch.is_finite() && pitch > 0.0).then_some((e.handle, Point2 { x: pt.p.x, y: pt.p.y }, pitch, data.stud_grid_wall))
+            let heading = data.stud_grid_heading.filter(|h| h.is_finite()).map(norm_heading);
+            (pitch.is_finite() && pitch > 0.0).then_some(GridPoint {
+                handle: e.handle,
+                at: Point2 { x: pt.p.x, y: pt.p.y },
+                pitch,
+                wall: data.stud_grid_wall,
+                heading,
+            })
         })
         .collect()
+}
+
+/// `deg` folded into `[0, 180)`: a heading and its reverse are one heading.
+fn norm_heading(deg: f64) -> f64 {
+    let h = deg.rem_euclid(180.0);
+    if h >= 180.0 { 0.0 } else { h }
+}
+
+/// Whether headings `a` and `b` (degrees) are one heading, mod 180°, within `TOLERANCE.angle_deg`.
+fn same_heading(a: f64, b: f64) -> bool {
+    let d = (a - b).rem_euclid(180.0);
+    d.min(180.0 - d) <= TOLERANCE.angle_deg
+}
+
+/// The heading (degrees, `[0, 180)`) of the direction `from → to`.
+fn heading_of(from: Point2, to: Point2) -> f64 {
+    norm_heading((to.y - from.y).atan2(to.x - from.x).to_degrees())
+}
+
+/// Straight `run`'s project-global heading in plan `v` (its centreline through the placement);
+/// `None` for an arc run or an unplaced plan.
+fn plan_run_heading(v: &ViewRef<'_>, run: &WallRun) -> Option<f64> {
+    let RunCurve::Line { from, to } = run.centreline else { return None };
+    Some(heading_of(plan_local_to_global_xy(v, from).ok()?, plan_local_to_global_xy(v, to).ok()?))
 }
 
 /// Whether `q` lies inside straight `run`'s band: along its centreline within its length, and no
@@ -96,28 +153,54 @@ fn find_view(doc: &LambDocument, id: Id) -> Option<ViewRef<'_>> {
     doc.views.iter().map(view_ref).find(|v| v.id == id)
 }
 
-/// The project's stud grid as (global origin, pitch): the first grid point of the first placed
-/// plan, in document order, that has one.
+/// Whether `q` lies inside arc `run`'s band (radially within half its width, inside its sweep);
+/// straight runs answer `false`. Only STUDGRID's curved-wall refusal asks.
+fn in_arc_band(run: &WallRun, q: Point2) -> bool {
+    let RunCurve::Arc { center, radius, start_angle, sweep } = run.centreline else { return false };
+    let r = (q.x - center.x).hypot(q.y - center.y);
+    let a = (q.y - center.y).atan2(q.x - center.x);
+    let t = if sweep >= 0.0 { (a - start_angle).rem_euclid(std::f64::consts::TAU) } else { (start_angle - a).rem_euclid(std::f64::consts::TAU) };
+    (r - radius).abs() <= run.width / 2.0 + TOLERANCE.coincidence_mm && t <= sweep.abs()
+}
+
+/// The project's stud grid as (global origin, pitch): the first unscoped grid point (neither wall
+/// nor heading) of the first placed plan, in document order, that has one.
 pub(crate) fn project_grid(d: &Drawing) -> Option<(Point2, f64)> {
     project_grid_of(d, &read_document(d).ok()?)
 }
 
+fn placed_plans(doc: &LambDocument) -> impl Iterator<Item = ViewRef<'_>> {
+    doc.views.iter().map(view_ref).filter(|v| v.kind == ViewKind::Plan && v.transform().is_some())
+}
+
 fn project_grid_of(d: &Drawing, doc: &LambDocument) -> Option<(Point2, f64)> {
-    doc.views.iter().map(view_ref).filter(|v| v.kind == ViewKind::Plan && v.transform().is_some()).find_map(|v| {
-        let &(_, local, pitch, _) = grid_points(d, v.id).iter().find(|g| g.3.is_none())?;
-        Some((plan_local_to_global_xy(&v, local).ok()?, pitch))
+    placed_plans(doc).find_map(|v| {
+        let g = grid_points(d, v.id).into_iter().find(GridPoint::is_project)?;
+        Some((plan_local_to_global_xy(&v, g.at).ok()?, g.pitch))
+    })
+}
+
+/// The heading grid for global `heading` as (global origin, pitch): the first heading point on
+/// that heading (within `TOLERANCE.angle_deg`, mod 180°) of the first placed plan holding one.
+fn heading_grid_of(d: &Drawing, doc: &LambDocument, heading: f64) -> Option<(Point2, f64)> {
+    placed_plans(doc).find_map(|v| {
+        let g = grid_points(d, v.id).into_iter().find(|g| g.wall.is_none() && g.heading.is_some_and(|h| same_heading(h, heading)))?;
+        Some((plan_local_to_global_xy(&v, g.at).ok()?, g.pitch))
     })
 }
 
 /// The project's stud grid in `view`'s local space: a placed plan, or a placed vertical view whose
 /// host resolves; `None` for anything else, or with no grid.
+#[cfg(test)]
 pub(crate) fn stud_grid(d: &Drawing, view: Id) -> Option<RepeatGrid> {
     let doc = read_document(d).ok()?;
-    grid_in(d, &doc, &find_view(&doc, view)?)
+    let (g, pitch) = project_grid_of(d, &doc)?;
+    grid_in(&doc, &find_view(&doc, view)?, g, pitch)
 }
 
-fn grid_in(d: &Drawing, doc: &LambDocument, v: &ViewRef<'_>) -> Option<RepeatGrid> {
-    let (g, pitch) = project_grid_of(d, doc)?;
+/// The grid with global origin `g` and `pitch` in `v`'s local space — a plan through its
+/// placement, a vertical view through its cut line (u of `g`'s projection, z 0).
+fn grid_in(doc: &LambDocument, v: &ViewRef<'_>, g: Point2, pitch: f64) -> Option<RepeatGrid> {
     let origin = match v.kind {
         ViewKind::Plan => plan_global_to_local_xy(v, g).ok()?,
         ViewKind::Vertical => {
@@ -131,29 +214,46 @@ fn grid_in(d: &Drawing, doc: &LambDocument, v: &ViewRef<'_>) -> Option<RepeatGri
 }
 
 /// The grid `run`'s repeats in `view` lay on: every run of a plan; in a vertical view only a
-/// straight run parallel to the cut line's u axis (joists), never a wall cut in section.
+/// straight run parallel to the cut line's u axis (joists), never a wall cut in section. A wall
+/// point in the run's band (plans) wins, then a heading point on the run's global heading (a plan
+/// run's centreline through the placement; a joist run's cut line, `c_hat`), then the project's.
 pub(crate) fn run_grid(d: &Drawing, view: Id, run: &WallRun) -> Option<RepeatGrid> {
     let doc = read_document(d).ok()?;
     let v = find_view(&doc, view)?;
     if v.kind == ViewKind::Plan
-        && let Some(&(_, origin, pitch, wall)) = grid_points(d, view).iter().find(|g| g.3.is_some() && in_band(run, g.1))
+        && let Some(g) = grid_points(d, view).into_iter().find(|g| g.wall.is_some() && in_band(run, g.at))
     {
-        return (wall == Some(WallGrid::Phase)).then_some(RepeatGrid { origin, pitch, pitch_tolerance_mm: PITCH_TOLERANCE_MM });
+        return (g.wall == Some(WallGrid::Phase)).then_some(RepeatGrid { origin: g.at, pitch: g.pitch, pitch_tolerance_mm: PITCH_TOLERANCE_MM });
     }
-    if v.kind == ViewKind::Vertical {
-        let RunCurve::Line { from, to } = run.centreline else { return None };
-        let (a, b) = (vertical_uz_to_local(&v, Uz { u: 0.0, z: 0.0 }), vertical_uz_to_local(&v, Uz { u: 1.0, z: 0.0 }));
-        let (ux, uy, rx, ry) = (b.x - a.x, b.y - a.y, to.x - from.x, to.y - from.y);
-        let angle = (ux * ry - uy * rx).abs().atan2((ux * rx + uy * ry).abs()).to_degrees();
-        if angle > TOLERANCE.angle_deg {
-            return None;
+    let heading = match v.kind {
+        ViewKind::Plan => plan_run_heading(&v, run),
+        ViewKind::Vertical => {
+            let RunCurve::Line { from, to } = run.centreline else { return None };
+            let (a, b) = (vertical_uz_to_local(&v, Uz { u: 0.0, z: 0.0 }), vertical_uz_to_local(&v, Uz { u: 1.0, z: 0.0 }));
+            let (ux, uy, rx, ry) = (b.x - a.x, b.y - a.y, to.x - from.x, to.y - from.y);
+            let angle = (ux * ry - uy * rx).abs().atan2((ux * rx + uy * ry).abs()).to_degrees();
+            if angle > TOLERANCE.angle_deg {
+                return None;
+            }
+            let host = find_view(&doc, v.host_view_id()?)?;
+            vertical_basis(&v, &host).ok().map(|b| heading_of(Point2 { x: 0.0, y: 0.0 }, b.c_hat))
         }
-    }
-    stud_grid(d, view)
+        ViewKind::Detail => return None,
+    };
+    let (g, pitch) = heading.and_then(|h| heading_grid_of(d, &doc, h)).or_else(|| project_grid_of(d, &doc))?;
+    grid_in(&doc, &v, g, pitch)
+}
+
+/// STUDGRID's `heading` argument: absent (or false), from the wall at the point, or explicit
+/// global degrees.
+enum HeadingArg {
+    None,
+    FromWall,
+    Deg(f64),
 }
 
 /// STUDGRID's JSON form: the project's one grid point at `point` in the edited plan, pitch `pitch`
-/// (406.4).
+/// (406.4); `wall` scopes it to one run, `heading` to every straight run on one global heading.
 pub(crate) fn studgrid(s: &mut Session, p: &Value) -> Result<Value> {
     let at = point_param("studgrid", p, "point")?;
     let pitch = match p.get("pitch") {
@@ -173,10 +273,21 @@ pub(crate) fn studgrid(s: &mut Session, p: &Value) -> Result<Value> {
     if off && !wall {
         return Err(bad("studgrid", "`off` needs `wall`"));
     }
+    let heading_arg = match p.get("heading") {
+        None | Some(Value::Null | Value::Bool(false)) => HeadingArg::None,
+        Some(Value::Bool(true)) => HeadingArg::FromWall,
+        Some(v) => HeadingArg::Deg(
+            v.as_f64().filter(|v| v.is_finite()).ok_or_else(|| bad("studgrid", "`heading` must be true or a finite number of degrees"))?,
+        ),
+    };
+    if wall && !matches!(heading_arg, HeadingArg::None) {
+        return Err(bad("studgrid", "`heading` and `wall` are exclusive"));
+    }
     // Every refusal before `doc_mut`, so a refusal records nothing.
     let view = edited_plan(s).map_err(other)?;
     let doc = read_document(s.doc()?).map_err(other)?;
     let scope = if wall { Some(if off { WallGrid::Off } else { WallGrid::Phase }) } else { None };
+    let mut heading = None;
     let old: Vec<Handle> = if wall {
         let d = s.doc()?;
         let (graph, _) = graph_and_sides(&DrawingProject::new(d).map_err(other)?, view);
@@ -186,16 +297,38 @@ pub(crate) fn studgrid(s: &mut Session, p: &Value) -> Result<Value> {
             (Some(_), Some(_)) => return Err(other("That point is inside more than one wall; pick away from the corner")),
             (Some(r), None) => r,
         };
-        grid_points(d, view).into_iter().filter(|g| g.3.is_some() && in_band(run, g.1)).map(|g| g.0).collect()
+        grid_points(d, view).into_iter().filter(|g| g.wall.is_some() && in_band(run, g.at)).map(|g| g.handle).collect()
     } else {
-        if find_view(&doc, view).and_then(|v| v.transform()).is_none() {
+        let Some(v) = find_view(&doc, view).filter(|v| v.transform().is_some()) else {
             return Err(other("This plan has no placement"));
-        }
+        };
         let d = s.doc()?;
-        doc.views.iter().flat_map(|v| grid_points(d, v.id())).filter(|g| g.3.is_none()).map(|g| g.0).collect()
+        heading = match heading_arg {
+            HeadingArg::None => None,
+            HeadingArg::Deg(h) => Some(norm_heading(h)),
+            HeadingArg::FromWall => {
+                let (graph, _) = graph_and_sides(&DrawingProject::new(d).map_err(other)?, view);
+                let mut holding = graph.runs.iter().filter(|r| in_band(r, at));
+                let run = match (holding.next(), holding.next()) {
+                    (None, _) if graph.runs.iter().any(|r| in_arc_band(r, at)) => {
+                        return Err(other("That wall is curved; a heading needs a straight wall"));
+                    }
+                    (None, _) => return Err(other("No wall there")),
+                    (Some(_), Some(_)) => return Err(other("That point is inside more than one wall; pick away from the corner")),
+                    (Some(r), None) => r,
+                };
+                Some(plan_run_heading(&v, run).ok_or_else(|| other("This plan has no placement"))?)
+            }
+        };
+        let all = doc.views.iter().flat_map(|v| grid_points(d, v.id()));
+        match heading {
+            None => all.filter(GridPoint::is_project).map(|g| g.handle).collect(),
+            Some(h) => all.filter(|g| g.wall.is_none() && g.heading.is_some_and(|gh| same_heading(gh, h))).map(|g| g.handle).collect(),
+        }
     };
     let mut common = s.current_common();
-    set_entity_data(&mut common, &EntityData { stud_grid: Some(pitch), stud_grid_wall: scope, ..EntityData::default() }).map_err(other)?;
+    let data = EntityData { stud_grid: Some(pitch), stud_grid_wall: scope, stud_grid_heading: heading, ..EntityData::default() };
+    set_entity_data(&mut common, &data).map_err(other)?;
     let space = s.space();
     let d = s.doc_mut()?;
     for h in old {
@@ -206,15 +339,19 @@ pub(crate) fn studgrid(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(w) = scope {
         out["wall"] = json!(if w == WallGrid::Off { "off" } else { "phase" });
     }
+    if let Some(h) = heading {
+        out["heading"] = json!(h);
+    }
     Ok(out)
 }
 
-/// STUDGRID: an origin prompt with `Pitch` and `Wall` options; `Wall` (and then `Off`) scope the
-/// point to the wall it lands in.
+/// STUDGRID: an origin prompt with `Pitch`, `Wall` and `Heading` options; `Wall` (and then `Off`)
+/// scope the point to the wall it lands in, `Heading` to every wall on that wall's heading.
 struct StudGridM {
     pitch: f64,
     asking_pitch: bool,
     wall: Option<WallGrid>,
+    heading: bool,
 }
 
 fn fmt_mm(v: f64) -> String {
@@ -230,7 +367,12 @@ impl Interactive for StudGridM {
             Prompt::new("Specify stud grid pitch", Accept::NUMBER).default(fmt_mm(self.pitch))
         } else {
             match self.wall {
-                None => Prompt::new("Specify stud grid origin (a stud centre)", Accept::POINT).kw(&["Pitch", "Wall"]).default(fmt_mm(self.pitch)),
+                None if self.heading => {
+                    Prompt::new("Specify stud grid origin on a wall of that heading", Accept::POINT).kw(&["Pitch"]).default(fmt_mm(self.pitch))
+                }
+                None => Prompt::new("Specify stud grid origin (a stud centre)", Accept::POINT)
+                    .kw(&["Pitch", "Wall", "Heading"])
+                    .default(fmt_mm(self.pitch)),
                 Some(WallGrid::Phase) => {
                     Prompt::new("Specify stud grid origin on the wall", Accept::POINT).kw(&["Pitch", "Off"]).default(fmt_mm(self.pitch))
                 }
@@ -273,6 +415,9 @@ impl Interactive for StudGridM {
                     args["wall"] = json!(true);
                     args["off"] = json!(w == WallGrid::Off);
                 }
+                if self.heading {
+                    args["heading"] = json!(true);
+                }
                 if let Err(e) = studgrid(s, &args) {
                     s.echo(e.to_string());
                 }
@@ -282,7 +427,8 @@ impl Interactive for StudGridM {
                 match (self.wall, t.trim().to_ascii_lowercase().as_str()) {
                     (Some(WallGrid::Off), _) => {}
                     (_, "p" | "pitch") => self.asking_pitch = true,
-                    (None, "w" | "wall") => self.wall = Some(WallGrid::Phase),
+                    (None, "w" | "wall") if !self.heading => self.wall = Some(WallGrid::Phase),
+                    (None, "h" | "heading") => self.heading = true,
                     (Some(WallGrid::Phase), "o" | "off") => self.wall = Some(WallGrid::Off),
                     _ => {}
                 }
@@ -295,7 +441,7 @@ impl Interactive for StudGridM {
 }
 
 pub(crate) fn studgrid_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(StudGridM { pitch: DEFAULT_PITCH_MM, asking_pitch: false, wall: None }))
+    Ok(Box::new(StudGridM { pitch: DEFAULT_PITCH_MM, asking_pitch: false, wall: None, heading: false }))
 }
 
 /// STUDMOVE's JSON form: a stud-move point at `point` in the edited plan or section, inside exactly
@@ -524,11 +670,17 @@ pub(crate) mod tests {
     fn the_interactive_form_takes_a_pitch_then_the_origin() -> R {
         let (mut s, plan) = stud_room(406.4)?;
         s.start("studgrid")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid origin (a stud centre) or [Pitch/Wall] <406.4>:"));
+        assert_eq!(
+            s.current_prompt().map(|p| p.display()).as_deref(),
+            Some("Specify stud grid origin (a stud centre) or [Pitch/Wall/Heading] <406.4>:")
+        );
         s.input(Input::Text("P".into()))?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid pitch <406.4>:"));
         s.input(Input::Text("600".into()))?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify stud grid origin (a stud centre) or [Pitch/Wall] <600>:"));
+        assert_eq!(
+            s.current_prompt().map(|p| p.display()).as_deref(),
+            Some("Specify stud grid origin (a stud centre) or [Pitch/Wall/Heading] <600>:")
+        );
         s.input(Input::Point(Vec2::new(13.0, 7.0)))?;
         assert!(s.running.is_none());
         let g = stud_grid(s.doc()?, plan).ok_or("no grid")?;
@@ -659,7 +811,7 @@ pub(crate) mod tests {
         assert_eq!(stud_xs(s.doc()?, plan, 100.0)?, south, "the south wall keeps the project grid");
         let r = s.execute("studgrid", &json!({ "point": {"x": 2500.0, "y": 3900.0}, "wall": true, "off": true }))?;
         assert_eq!(r["wall"], "off");
-        assert_eq!(grid_points(s.doc()?, plan).iter().filter(|g| g.3.is_some()).count(), 1, "the Off point replaced the Phase one");
+        assert_eq!(grid_points(s.doc()?, plan).iter().filter(|g| g.wall.is_some()).count(), 1, "the Off point replaced the Phase one");
         assert_eq!(stud_xs(s.doc()?, plan, 3900.0)?, free_north, "Off lays the run as with no grid");
         assert_eq!(stud_xs(s.doc()?, plan, 100.0)?, south);
         Ok(())
@@ -708,7 +860,7 @@ pub(crate) mod tests {
         s.execute("studgrid", &json!({ "point": {"x": 1000, "y": 3900}, "wall": true }))?;
         s.execute("studgrid", &json!({ "point": {"x": 3000, "y": 3900}, "wall": true }))?;
         s.execute("studgrid", &json!({ "point": {"x": 3000, "y": 100}, "wall": true }))?;
-        let walls = |s: &Session| -> T<usize> { Ok(grid_points(s.doc()?, plan).iter().filter(|g| g.3.is_some()).count()) };
+        let walls = |s: &Session| -> T<usize> { Ok(grid_points(s.doc()?, plan).iter().filter(|g| g.wall.is_some()).count()) };
         assert_eq!(walls(&s)?, 2, "one per wall");
         s.execute("studgrid", &json!({ "point": {"x": 13, "y": 7} }))?;
         s.execute("studgrid", &json!({ "point": {"x": 20, "y": 7} }))?;
@@ -727,7 +879,7 @@ pub(crate) mod tests {
         assert_eq!(prompt(&s).as_deref(), Some("Specify stud grid origin on the wall or [Pitch/Off] <406.4>:"));
         s.input(Input::Point(Vec2::new(2500.0, 3900.0)))?;
         assert!(s.running.is_none());
-        let wall = |s: &Session| -> T<Vec<Option<WallGrid>>> { Ok(grid_points(s.doc()?, plan).iter().map(|g| g.3).collect()) };
+        let wall = |s: &Session| -> T<Vec<Option<WallGrid>>> { Ok(grid_points(s.doc()?, plan).iter().map(|g| g.wall).collect()) };
         assert_eq!(wall(&s)?, vec![Some(WallGrid::Phase)]);
         s.start("studgrid")?;
         s.input(Input::Text("W".into()))?;
@@ -745,7 +897,7 @@ pub(crate) mod tests {
         s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
         s.execute("studgrid", &json!({ "point": {"x": 2145.0, "y": 3900.0}, "pitch": 400, "wall": true }))?;
         let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
-        let strip = |d: &Drawing| grid_points(d, plan).into_iter().map(|g| (g.1, g.2, g.3)).collect::<Vec<_>>();
+        let strip = |d: &Drawing| grid_points(d, plan).into_iter().map(|g| (g.at, g.pitch, g.wall, g.heading)).collect::<Vec<_>>();
         assert_eq!(strip(&back), strip(s.doc()?));
         assert_eq!(stud_xs(&back, plan, 3900.0)?, stud_xs(s.doc()?, plan, 3900.0)?);
         Ok(())
@@ -988,6 +1140,195 @@ pub(crate) mod tests {
                 assert!(!inside, "grid at {x}: run {i}'s copy {c:?} reaches into the jambs {lo}..{hi}");
             }
         }
+        Ok(())
+    }
+
+    // T621: the grid per heading.
+
+    /// The stud copies' along-centres (y) on the vertical run nearest `x`, sorted.
+    fn stud_ys(d: &Drawing, plan: Id, x: f64) -> T<Vec<f64>> {
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, plan);
+        let runs = assembly_lines(d, plan)?;
+        let r = runs
+            .iter()
+            .find(
+                |r| matches!(graph.runs[r.run].centreline, RunCurve::Line { from, to } if (from.x - to.x).abs() < 1e-9 && (from.x - x).abs() < 500.0),
+            )
+            .ok_or("no such run")?;
+        let mut ys: Vec<f64> = r.lines[r.bands..]
+            .chunks(4)
+            .map(|c| {
+                let ys = c.iter().flat_map(|l| [l.from.y, l.to.y]);
+                let (lo, hi) = (ys.clone().fold(f64::INFINITY, f64::min), ys.fold(f64::NEG_INFINITY, f64::max));
+                ((lo + hi) / 2.0 * 1e6).round() / 1e6
+            })
+            .collect();
+        ys.sort_by(f64::total_cmp);
+        Ok(ys)
+    }
+
+    /// `view`'s stud centres on the horizontal run nearest local `y`, in global XY.
+    fn global_studs_at(d: &Drawing, view: Id, y: f64) -> T<Vec<Point2>> {
+        let doc = read_document(d)?;
+        let v = find_view(&doc, view).ok_or("no view")?;
+        let wall_y = if y < 2000.0 { 100.0 } else { 3900.0 };
+        stud_xs(d, view, y)?.into_iter().map(|x| Ok(plan_local_to_global_xy(&v, Point2 { x, y: wall_y })?)).collect()
+    }
+
+    fn headings(d: &Drawing, view: Id) -> Vec<f64> {
+        grid_points(d, view).iter().filter_map(|g| g.heading).collect()
+    }
+
+    #[test]
+    fn a_heading_point_phases_every_wall_on_its_heading_and_nothing_else() -> R {
+        let (mut s, plan, second) = two_plans()?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        let first_before = assembly_lines(s.doc()?, plan)?;
+        let (east_before, west_before) = (stud_ys(s.doc()?, second, 4900.0)?, stud_ys(s.doc()?, second, 100.0)?);
+        assert!(!east_before.is_empty() && !west_before.is_empty());
+        s.execute("editview", &json!({ "viewId": second.0 }))?;
+        let n = undo_len(&s)?;
+        let south_before = global_studs_at(s.doc()?, second, 100.0)?;
+        let r = s.execute("studgrid", &json!({ "point": {"x": 2500.0, "y": 100.0}, "heading": true }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_ne!(global_studs_at(s.doc()?, second, 100.0)?, south_before, "the south wall rephased");
+        let deg = r["heading"].as_f64().ok_or("no heading")?;
+        assert!((deg - MOVED.rotation.to_degrees()).abs() < 1e-9, "{deg}");
+        assert_eq!(project_grid(s.doc()?), Some((Point2 { x: 13.0, y: 7.0 }, 406.4)), "project_grid never returns a heading point");
+        let g = Point2 {
+            x: 1000.0 + 2500.0 * MOVED.rotation.cos() - 100.0 * MOVED.rotation.sin(),
+            y: 500.0 + 2500.0 * MOVED.rotation.sin() + 100.0 * MOVED.rotation.cos(),
+        };
+        let dir = Point2 { x: MOVED.rotation.cos(), y: MOVED.rotation.sin() };
+        for y in [100.0, 3900.0] {
+            let studs = global_studs_at(s.doc()?, second, y)?;
+            assert!(!studs.is_empty());
+            assert!(studs.iter().all(|&p| on_grid(p, g, dir, 406.4)), "y {y}: {studs:?}");
+        }
+        assert_eq!(
+            (stud_ys(s.doc()?, second, 4900.0)?, stud_ys(s.doc()?, second, 100.0)?),
+            (east_before, west_before),
+            "east/west keep the project grid"
+        );
+        assert_eq!(assembly_lines(s.doc()?, plan)?, first_before, "the first plan's headings have no point of their own");
+        s.undo()?;
+        assert!(headings(s.doc()?, second).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn heading_points_replace_per_heading_and_a_project_studgrid_keeps_them() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        let (south, north) = (stud_xs(s.doc()?, plan, 100.0)?, stud_xs(s.doc()?, plan, 3900.0)?);
+        let (east, west) = (stud_ys(s.doc()?, plan, 4900.0)?, stud_ys(s.doc()?, plan, 100.0)?);
+        assert!(on_pitch(&east, 7.0, 406.4) && on_pitch(&west, 7.0, 406.4));
+        let n = undo_len(&s)?;
+        s.execute("studgrid", &json!({ "point": {"x": 100.0, "y": 57.0}, "heading": 90, "pitch": 600 }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert_ne!(stud_ys(s.doc()?, plan, 4900.0)?, east, "600 does not take the 406.4 repeat: east lays as with no grid");
+        assert_eq!((stud_xs(s.doc()?, plan, 100.0)?, stud_xs(s.doc()?, plan, 3900.0)?), (south.clone(), north.clone()));
+        s.execute("studgrid", &json!({ "point": {"x": 4900.0, "y": 57.0}, "heading": 270 }))?;
+        assert_eq!(undo_len(&s)?, n + 2);
+        assert_eq!(headings(s.doc()?, plan), vec![90.0], "the second heading-90 point replaced the first");
+        let (e, w) = (stud_ys(s.doc()?, plan, 4900.0)?, stud_ys(s.doc()?, plan, 100.0)?);
+        assert!(!e.is_empty() && on_pitch(&e, 57.0, 406.4) && on_pitch(&w, 57.0, 406.4), "{e:?} {w:?}");
+        s.execute("studgrid", &json!({ "point": {"x": 50.0, "y": 100.0}, "heading": 180.0 }))?;
+        assert_eq!(headings(s.doc()?, plan), vec![90.0, 0.0]);
+        assert!(on_pitch(&stud_xs(s.doc()?, plan, 3900.0)?, 50.0, 406.4));
+        s.execute("studgrid", &json!({ "point": {"x": 20.0, "y": 7.0} }))?;
+        assert_eq!(undo_len(&s)?, n + 4);
+        assert_eq!(headings(s.doc()?, plan), vec![90.0, 0.0], "a project STUDGRID keeps heading points");
+        assert_eq!(grid_points(s.doc()?, plan).iter().filter(|g| g.is_project()).count(), 1);
+        assert_eq!(project_grid(s.doc()?), Some((Point2 { x: 20.0, y: 7.0 }, 406.4)));
+        s.undo()?;
+        assert_eq!(project_grid(s.doc()?), Some((Point2 { x: 13.0, y: 7.0 }, 406.4)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_wall_point_overrules_a_heading_point_for_its_run() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 50.0, "y": 100.0}, "heading": 0 }))?;
+        assert!(on_pitch(&stud_xs(s.doc()?, plan, 3900.0)?, 50.0, 406.4));
+        s.execute("studgrid", &json!({ "point": {"x": 113.0 + 406.4 * 5.0, "y": 3900.0}, "wall": true }))?;
+        let north = stud_xs(s.doc()?, plan, 3900.0)?;
+        assert!(!north.is_empty() && on_pitch(&north, 113.0, 406.4), "{north:?}");
+        assert!(on_pitch(&stud_xs(s.doc()?, plan, 100.0)?, 50.0, 406.4), "the south wall keeps the heading grid");
+        Ok(())
+    }
+
+    #[test]
+    fn heading_refusals_record_nothing() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        let n = undo_len(&s)?;
+        let refuse = |s: &mut Session, p: Value, msg: &str| {
+            assert!(s.execute("studgrid", &p).is_err_and(|e| e.to_string().contains(msg)), "{p} should say {msg}");
+        };
+        refuse(&mut s, json!({ "point": {"x": 2500, "y": 2000}, "heading": true }), "No wall there");
+        refuse(&mut s, json!({ "point": {"x": 200, "y": 200}, "heading": true }), "inside more than one wall");
+        refuse(&mut s, json!({ "point": {"x": 2500, "y": 3900}, "heading": true, "wall": true }), "`heading` and `wall` are exclusive");
+        refuse(&mut s, json!({ "point": {"x": 2500, "y": 3900}, "heading": "east" }), "`heading` must be true or a finite number");
+        // JSON has no non-finite number: serde turns one into null, which is no heading at all.
+        assert_eq!(json!({ "heading": f64::NAN })["heading"], Value::Null);
+        assert_eq!(undo_len(&s)?, n, "refusals record nothing");
+        let floating = Id(s.execute("newplan", &json!({ "name": "Loose" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": floating.0 }))?;
+        let m = undo_len(&s)?;
+        refuse(&mut s, json!({ "point": {"x": 0, "y": 0}, "heading": 0 }), "This plan has no placement");
+        assert_eq!(undo_len(&s)?, m);
+        assert!(grid_points(s.doc()?, plan).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_heading_point_on_the_cut_line_s_heading_lays_the_section_s_joists() -> R {
+        let (mut s, sec, plan) = crate::assembly::tests::joist_section()?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        let doc = read_document(s.doc()?)?;
+        let (v, host) = (find_view(&doc, sec).ok_or("no section")?, find_view(&doc, plan).ok_or("no plan")?);
+        let basis = vertical_basis(&v, &host)?;
+        let deg = heading_of(Point2 { x: 0.0, y: 0.0 }, basis.c_hat);
+        s.execute("studgrid", &json!({ "point": {"x": 113.0, "y": 57.0}, "pitch": 400, "heading": deg }))?;
+        let d = s.doc()?;
+        let g = plan_local_to_global_xy(&host, Point2 { x: 113.0, y: 57.0 })?;
+        let u0 = project_to_u(&basis, g);
+        let floor = crate::assembly::tests::floor_run(d, sec)?;
+        let copies: Vec<&[AssemblyLine]> = floor.lines[floor.bands..].chunks(4).collect();
+        assert!(!copies.is_empty());
+        for c in copies {
+            let xs = c.iter().flat_map(|l| [l.from.x, l.to.x]);
+            let (lo, hi) = (xs.clone().fold(f64::INFINITY, f64::min), xs.fold(f64::NEG_INFINITY, f64::max));
+            let u = lamb_core::derivation::projection::vertical_local_to_uz(&v, Point2 { x: (lo + hi) / 2.0, y: 1125.0 }).u;
+            let m = (u - u0).rem_euclid(400.0);
+            assert!(m < 1e-6 || 400.0 - m < 1e-6, "joist at u {u} off the heading grid through u {u0}");
+        }
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, sec);
+        let cut: Vec<&WallRun> =
+            graph.runs.iter().filter(|r| matches!(r.centreline, RunCurve::Line { from, to } if (from.x - to.x).abs() < 1e-9)).collect();
+        assert!(!cut.is_empty());
+        assert!(cut.iter().all(|r| run_grid(d, sec, r).is_none()), "the section's cut walls take no grid");
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_heading_option_places_a_heading_point_that_survives_dxf() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        s.start("studgrid")?;
+        s.input(Input::Text("H".into()))?;
+        assert_eq!(
+            s.current_prompt().map(|p| p.display()).as_deref(),
+            Some("Specify stud grid origin on a wall of that heading or [Pitch] <406.4>:")
+        );
+        s.input(Input::Point(Vec2::new(4900.0, 2000.0)))?;
+        assert!(s.running.is_none());
+        assert_eq!(headings(s.doc()?, plan), vec![90.0]);
+        assert!(on_pitch(&stud_ys(s.doc()?, plan, 4900.0)?, 2000.0, 406.4));
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(headings(&back, plan), vec![90.0]);
+        assert_eq!(stud_ys(&back, plan, 4900.0)?, stud_ys(s.doc()?, plan, 4900.0)?);
         Ok(())
     }
 }

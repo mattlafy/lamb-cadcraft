@@ -398,6 +398,7 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
             outside: false,
             stud_grid: None,
             stud_grid_wall: None,
+            stud_grid_heading: None,
             stud_move: false,
             hole: None,
         };
