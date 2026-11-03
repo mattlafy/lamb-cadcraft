@@ -2,11 +2,12 @@
 //! per floor level, written as a `Table` on a sheet layout.
 //!
 //! Computed on demand, never stored: for every placed plan and every section or elevation view,
-//! [`assembly_lines`], [`corner_assembly`] and [`opening_assembly`] (a call that errs adds nothing
+//! [`assembly_lines`], [`corner_assembly`], [`opening_assembly`] and [`end_assembly`] (a call that errs adds nothing
 //! for that view). Each repeat copy of a run (`lines[bands..]` chunked by `copies`) is one of the
 //! item named by its first line's layer (`STUD`, `JOIST`); a placed corner detail is one
 //! `"<detail> (corner)"`; a placed opening detail is `"<detail> (jamb)"`, two when it is laid at
-//! both jambs (a plan), one for a single end (a section's head or sill).
+//! both jambs (a plan), one for a single end (a section's head or sill); a placed termination at a
+//! wall's free end is one `"<detail> (end)"` (LAMB T617).
 //!
 //! A plan's level is its placement's level; a floating plan is skipped. In a vertical view a run
 //! belongs to the level with the greatest floor elevation at or below its centreline's mid-point
@@ -35,7 +36,7 @@ use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id, Level, Placement};
 use serde_json::{Value, json};
 
-use crate::assembly::{assembly_lines, corner_assembly, opening_assembly};
+use crate::assembly::{assembly_lines, corner_assembly, end_assembly, opening_assembly};
 use crate::commands::{bad, name_input, other, point_param};
 use crate::detailtags::graph_and_sides;
 use crate::project::DrawingProject;
@@ -137,6 +138,11 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
             for o in openings.iter().filter(|o| o.detail.is_some() && o.skipped.is_none() && !o.lines.is_empty()) {
                 let n = if o.end.is_none() { 2 } else { 1 };
                 bump(level_of(lines_mid(&o.lines)), format!("{} (jamb)", detail_name(o.detail)), vi, n);
+            }
+        }
+        if let Ok(ends) = end_assembly(d, id) {
+            for e in ends.iter().filter(|e| e.detail.is_some() && e.skipped.is_none() && !e.lines.is_empty()) {
+                bump(level_of(lines_mid(&e.lines)), format!("{} (end)", detail_name(e.detail)), vi, 1);
             }
         }
     }
@@ -254,7 +260,7 @@ pub(crate) fn bomtable_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembly::tests::{corner_detail, room_with, undo_len, window_room};
+    use crate::assembly::tests::{corner_detail, gap_room, room_with, undo_len, window_room};
     use crate::schema::{read_document, write_document};
     use lamb_core::geometry::IDENTITY_TRANSFORM;
     use lamb_core::model::{Actor, authored_field};
@@ -327,6 +333,18 @@ mod tests {
         assert!(n > 10, "studs laid round the room: {n}");
         let rows = bom_rows(d);
         assert_eq!(rows, [BomRow { level: "Level 1".into(), item: "STUD".into(), count: n, view: "Ground".into() }]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_placed_termination_is_one_end_row_per_free_end() -> R {
+        let (mut s, plan, jd) = gap_room()?;
+        let l1 = add_level(&mut s, "Level 1", 0.0)?;
+        place(&mut s, plan, l1)?;
+        s.execute("detailtag", &json!({ "detailViewId": jd.0, "corner": true, "tip": {"x": 2000, "y": 100}, "bubble": {"x": 1500, "y": -400} }))?;
+        let rows = bom_rows(s.doc()?);
+        assert!(rows.contains(&BomRow { level: "Level 1".into(), item: "JD (end)".into(), count: 2, view: "Ground".into() }), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.item.ends_with("(jamb)")), "{rows:?}");
         Ok(())
     }
 

@@ -289,6 +289,23 @@ pub fn resolve_opening_end_details(graph: &WallGraph, sides: &WallSides, tags: &
     flat.chunks(2).map(|c| [c[0].clone(), c[1].clone()]).collect()
 }
 
+/// A termination-detail tag placed on one wall end: `end` indexes [`WallGraph::free_ends`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndTag {
+    pub detail: String,
+    pub end: usize,
+}
+
+/// One [`RunDetail`] per free end of `graph` (LAMB T617): rules 1 and 2 of the module docs over
+/// each end's run's [`RunClass`], with no neighbours — a termination tag spreads to every free end
+/// of its class, never by gaps. Tags naming an end that is not in the graph are ignored.
+pub fn resolve_end_details(graph: &WallGraph, sides: &WallSides, tags: &[EndTag]) -> Vec<RunDetail> {
+    let rc = run_classes(graph, sides);
+    let classes: Vec<Option<RunClass>> = graph.free_ends.iter().map(|(r, _)| rc.get(*r).copied()).collect();
+    let tags: Vec<(usize, &str)> = tags.iter().map(|t| (t.end, t.detail.as_str())).collect();
+    resolve_greedy(&classes, &vec![BTreeSet::new(); classes.len()], &tags)
+}
+
 /// The greedy algorithm shared by edges, corners and openings: `classes[i]` and `neighbours[i]` describe item
 /// i (a run or a junction), `tags` are `(item, detail)`; items out of range are ignored.
 fn resolve_greedy<K: Ord + Clone>(classes: &[K], neighbours: &[BTreeSet<usize>], tags: &[(usize, &str)]) -> Vec<RunDetail> {
@@ -452,5 +469,22 @@ mod tests {
     fn an_opening_in_another_width_is_not_spread_to() {
         let (g, s) = bridged(&[200.0, 200.0, 90.0, 90.0, 200.0, 90.0]);
         assert_eq!(resolve_opening_details(&g, &s, &[tag("J1", 0)]), [RunDetail::Tagged("J1".into()), RunDetail::Untyped, RunDetail::Untyped]);
+    }
+
+    /// Exterior runs of the given widths, each with a free end at its `End`.
+    fn ended(widths: &[f64]) -> (WallGraph, WallSides) {
+        let (mut g, s) = bridged(widths);
+        g.bridges.clear();
+        g.free_ends = (0..widths.len()).map(|r| (r, RunEnd::End)).collect();
+        (g, s)
+    }
+
+    #[test]
+    fn an_end_tag_spreads_to_free_ends_of_its_class_only() {
+        let (g, s) = ended(&[200.0, 200.0, 90.0]);
+        let t = |d: &str, end| EndTag { detail: d.into(), end };
+        assert_eq!(resolve_end_details(&g, &s, &[t("E1", 0)]), [RunDetail::Tagged("E1".into()), RunDetail::Spread("E1".into()), RunDetail::Untyped]);
+        assert_eq!(resolve_end_details(&g, &s, &[t("E1", 0), t("E2", 0)])[0], RunDetail::Conflict);
+        assert_eq!(resolve_end_details(&g, &s, &[t("E1", 9)]), [RunDetail::Untyped, RunDetail::Untyped, RunDetail::Untyped]);
     }
 }

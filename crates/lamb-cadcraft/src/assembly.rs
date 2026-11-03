@@ -40,8 +40,10 @@
 //! jamb detail at both jambs (lamb-core's [`place_opening`], mirrored at the second); each jamb's run
 //! is trimmed back to the detail's reach there ([`jamb_reach`]) as at a corner — on an arc run an
 //! angle ([`jamb_arc_reach`], [`trim_arc_run`]; LAMB T581). In a section each
-//! end — head, sill — resolves and places on its own (LAMB T505, lamb-core's [`place_opening_end`]). The block holds the
-//! run lines, then the corners', then the openings'.
+//! end — head, sill — resolves and places on its own (LAMB T505, lamb-core's [`place_opening_end`]).
+//! In a plan, a wall's free end whose termination tag resolves (LAMB T617) takes its detail as one
+//! jamb ([`end_assembly`], lamb-core's [`place_run_end`]) and trims its run the same way. The block
+//! holds the run lines, then the corners', then the openings', then the free ends'.
 //! Not the AI-line sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
@@ -52,7 +54,7 @@ use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
     AssemblyLine, FaceRef, WidthConflict, arc_delta, arc_end, arm_direction, corner_arc_reach, corner_reach, detail_bands, detail_frame,
     end_on_circle, jamb_arc_reach, jamb_reach, junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner, place_opening, place_opening_end,
-    tee_butt, tee_face_circle, trim_to_reach, width_conflict,
+    place_run_end, tee_butt, tee_face_circle, trim_to_reach, width_conflict,
 };
 use lamb_core::derivation::detail_tags::{EndLevel, RunDetail};
 use lamb_core::derivation::issues::{Issue, IssueKind};
@@ -69,8 +71,8 @@ use crate::commands::{id_value, other};
 use crate::convert::to_polyline;
 use crate::detailref::{DetailRefKind, detail_reference};
 use crate::detailtags::{
-    bridge_upper, edited_wall_view, graph_and_sides, resolve_view_details, resolve_view_opening_ends, resolve_view_openings, view_detail_tags,
-    view_direction,
+    bridge_upper, edited_wall_view, graph_and_sides, resolve_view_details, resolve_view_ends, resolve_view_opening_ends, resolve_view_openings,
+    run_end_point, view_detail_tags, view_direction,
 };
 use crate::project::DrawingProject;
 use crate::repeats::{detail_repeats, repeat_members};
@@ -452,26 +454,39 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             Some(false) => vec![(b.a, b.from, &o.lines[..])],
             Some(true) => vec![(b.b, b.to, &o.lines[..])],
         };
-        for ((i, end), point, lines) in ends {
-            if let Some((center, a, toward)) = graph.runs.get(i).and_then(|run| arc_end(run, end)) {
-                let reach = jamb_arc_reach(&graph.runs[i], end, lines);
-                let Some(r) = runs.get_mut(i).filter(|r| r.skipped.is_none() && reach > 0.0) else { continue };
-                trim_arc_run(r, center, a, toward, reach);
-                continue;
-            }
-            let Some(RunCurve::Line { from, to }) = graph.runs.get(i).map(|r| r.centreline) else { continue };
-            let len = (to.x - from.x).hypot(to.y - from.y);
-            if len <= 0.0 {
-                continue;
-            }
-            let s = if end == RunEnd::End { 1.0 } else { -1.0 };
-            let t = Point2 { x: s * (to.x - from.x) / len, y: s * (to.y - from.y) / len };
-            let reach = jamb_reach(point, t, lines);
-            let Some(r) = runs.get_mut(i).filter(|r| r.skipped.is_none() && reach > 0.0) else { continue };
-            trim_run(r, point, Point2 { x: -t.x, y: -t.y }, reach);
+        for (key, point, lines) in ends {
+            trim_jamb(&mut runs, &graph.runs, key, point, lines);
         }
     }
+    for e in end_assembly(d, plan)?.iter().filter(|e| e.skipped.is_none()) {
+        let Some(&(i, end)) = graph.free_ends.get(e.end) else { continue };
+        let Some(run) = graph.runs.get(i) else { continue };
+        trim_jamb(&mut runs, &graph.runs, (i, end), run_end_point(&run.centreline, end), &e.lines);
+    }
     Ok(runs)
+}
+
+/// Trims run `key.0`'s laid lines back to a jamb-placed detail's reach at its `key.1` end, `point`
+/// being that end's centreline point — an opening jamb's or a free end's (LAMB T617).
+fn trim_jamb(runs: &mut [RunAssembly], graph_runs: &[WallRun], (i, end): (usize, RunEnd), point: Point2, lines: &[AssemblyLine]) {
+    if let Some((center, a, toward)) = graph_runs.get(i).and_then(|run| arc_end(run, end)) {
+        let reach = jamb_arc_reach(&graph_runs[i], end, lines);
+        if let Some(r) = runs.get_mut(i).filter(|r| r.skipped.is_none() && reach > 0.0) {
+            trim_arc_run(r, center, a, toward, reach);
+        }
+        return;
+    }
+    let Some(RunCurve::Line { from, to }) = graph_runs.get(i).map(|r| r.centreline) else { return };
+    let len = (to.x - from.x).hypot(to.y - from.y);
+    if len <= 0.0 {
+        return;
+    }
+    let s = if end == RunEnd::End { 1.0 } else { -1.0 };
+    let t = Point2 { x: s * (to.x - from.x) / len, y: s * (to.y - from.y) / len };
+    let reach = jamb_reach(point, t, lines);
+    if let Some(r) = runs.get_mut(i).filter(|r| r.skipped.is_none() && reach > 0.0) {
+        trim_run(r, point, Point2 { x: -t.x, y: -t.y }, reach);
+    }
 }
 
 /// Clips `r`'s band lines to `reach` along `u` from `node` ([`trim_to_reach`], dropping those wholly
@@ -716,14 +731,77 @@ pub fn opening_assembly(d: &Drawing, view: Id) -> Result<Vec<OpeningAssembly>, S
     Ok(out)
 }
 
+/// One free end's placed termination detail, or why it was not placed (LAMB T617).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EndAssembly {
+    /// Index into the view's wall-graph free ends.
+    pub end: usize,
+    pub detail: Option<Id>,
+    pub lines: Vec<AssemblyLine>,
+    pub skipped: Option<String>,
+}
+
+/// One termination detail's lines placed at free end `(i, end)` as one jamb ([`place_run_end`]).
+fn end_lines(
+    d: &Drawing,
+    view: Id,
+    detail: Id,
+    (i, end): (usize, RunEnd),
+    runs: &[WallRun],
+    sides: &[lamb_core::derivation::wall_spaces::RunSides],
+) -> Result<Vec<AssemblyLine>, String> {
+    let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
+    let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
+    let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| *h != r.handle).collect();
+    let lines = member_segments(d, detail, &others);
+    let (face, insets, outward) = junction_placement(d, view, &r, &lines, &[Some(i)], runs, sides)?;
+    let run = runs.get(i).ok_or("the free end names no run")?;
+    let side = sides.get(i).ok_or("the free end's run has no sides")?;
+    place_run_end(run, side, end, face, (r.from, r.to), &lines, insets.first().copied().unwrap_or(0.0), outward)
+}
+
+/// Every free end of a plan `view`'s wall graph whose termination detail resolves
+/// ([`resolve_view_ends`]), in free-end order, with that detail placed there as one jamb; a failure
+/// is the entry's `skipped` reason, never an error of the view. A vertical view has none.
+pub fn end_assembly(d: &Drawing, view: Id) -> Result<Vec<EndAssembly>, String> {
+    if view_direction(d, view) == lamb_core::model::CutDirection::Vertical {
+        return Ok(Vec::new());
+    }
+    let resolved = resolve_view_ends(d, view)?;
+    let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
+    let (graph, sides) = graph_and_sides(&p, view);
+    let mut out = Vec::new();
+    for (i, (key, x)) in graph.free_ends.iter().zip(&resolved).enumerate() {
+        let id = match x {
+            RunDetail::Tagged(id) | RunDetail::Spread(id) | RunDetail::Gap(id) => id,
+            RunDetail::Conflict | RunDetail::Untyped => continue,
+        };
+        let skip = |why: String, detail: Option<Id>| EndAssembly { end: i, detail, lines: Vec::new(), skipped: Some(why) };
+        let Ok(detail) = id.parse::<u64>().map(Id) else {
+            out.push(skip("detail id is not a number".into(), None));
+            continue;
+        };
+        out.push(match end_lines(d, view, detail, *key, &graph.runs, &sides.runs) {
+            Ok(lines) => EndAssembly { end: i, detail: Some(detail), lines, skipped: None },
+            Err(e) => skip(e, Some(detail)),
+        });
+    }
+    Ok(out)
+}
+
 /// Every line written to a view's assembly block, in write order: the runs' lines, then the
-/// corners', then the openings'.
+/// corners', then the openings', then the free ends'.
 fn block_lines_of<'a>(
     runs: &'a [RunAssembly],
     corners: &'a [CornerAssembly],
     openings: &'a [OpeningAssembly],
+    ends: &'a [EndAssembly],
 ) -> impl Iterator<Item = &'a AssemblyLine> {
-    runs.iter().flat_map(|r| &r.lines).chain(corners.iter().flat_map(|c| &c.lines)).chain(openings.iter().flat_map(|o| &o.lines))
+    runs.iter()
+        .flat_map(|r| &r.lines)
+        .chain(corners.iter().flat_map(|c| &c.lines))
+        .chain(openings.iter().flat_map(|o| &o.lines))
+        .chain(ends.iter().flat_map(|e| &e.lines))
 }
 
 /// The midpoint of a run's centreline: a line's mean of ends, an arc's point at half its sweep.
@@ -888,12 +966,19 @@ fn line_entity(l: &AssemblyLine) -> EntityKind {
 }
 
 /// Replaces the block [`assembly_block_name`]`(plan)` with one LINE or ARC ([`line_entity`]) per
-/// line of `runs`, then of `corners`, then of `openings`.
-fn replace_block(d: &mut Drawing, plan: Id, runs: &[RunAssembly], corners: &[CornerAssembly], openings: &[OpeningAssembly]) -> Result<(), String> {
+/// line of `runs`, then of `corners`, then of `openings`, then of `ends`.
+fn replace_block(
+    d: &mut Drawing,
+    plan: Id,
+    runs: &[RunAssembly],
+    corners: &[CornerAssembly],
+    openings: &[OpeningAssembly],
+    ends: &[EndAssembly],
+) -> Result<(), String> {
     let name = assembly_block_name(plan);
     d.blocks.insert(name.clone(), Arc::new(Block::new(&name)));
     let space = Space::Block(name);
-    for l in block_lines_of(runs, corners, openings) {
+    for l in block_lines_of(runs, corners, openings, ends) {
         let common = Common { layer: l.layer.clone(), ..Common::default() };
         d.add(&space, common, line_entity(l)).map_err(|e| e.to_string())?;
     }
@@ -928,28 +1013,33 @@ fn ensure_assembly_insert(d: &mut Drawing, plan: Id) {
 /// placed corner and opening line (an empty block when nothing is laid), and gives it its model-space INSERT on
 /// its own layer when it has none. `plan` must be a plan or section view; nothing is touched on
 /// error.
-pub fn write_assembly_block(d: &mut Drawing, plan: Id) -> Result<(Vec<RunAssembly>, Vec<CornerAssembly>, Vec<OpeningAssembly>), String> {
+#[allow(clippy::type_complexity)]
+pub fn write_assembly_block(
+    d: &mut Drawing,
+    plan: Id,
+) -> Result<(Vec<RunAssembly>, Vec<CornerAssembly>, Vec<OpeningAssembly>, Vec<EndAssembly>), String> {
     check_wall_view(d, plan)?;
     let runs = assembly_lines(d, plan)?;
     let corners = corner_assembly(d, plan)?;
     let openings = opening_assembly(d, plan)?;
-    replace_block(d, plan, &runs, &corners, &openings)?;
+    let ends = end_assembly(d, plan)?;
+    replace_block(d, plan, &runs, &corners, &openings, &ends)?;
     ensure_assembly_insert(d, plan);
-    Ok((runs, corners, openings))
+    Ok((runs, corners, openings, ends))
 }
 
-/// `true` when `block` holds exactly the lines of `runs`, `corners` then `openings`, in write order: same count, each pair on
+/// `true` when `block` holds exactly the lines of `runs`, `corners`, `openings` then `ends`, in write order: same count, each pair on
 /// the same layer and of the same kind ([`line_entity`]) — a LINE's ends within
 /// [`TOLERANCE`]`.coincidence_mm`; an ARC's centre and radius within that, its start and end angles
 /// within `TOLERANCE.angle_deg`.
-fn block_matches(block: &Block, runs: &[RunAssembly], corners: &[CornerAssembly], openings: &[OpeningAssembly]) -> bool {
+fn block_matches(block: &Block, runs: &[RunAssembly], corners: &[CornerAssembly], openings: &[OpeningAssembly], ends: &[EndAssembly]) -> bool {
     let tol = TOLERANCE.coincidence_mm;
     let near = |p: cadcraft_geom::Vec3, q: cadcraft_geom::Vec3| (p.x - q.x).hypot(p.y - q.y) <= tol;
     let same_angle = |a: f64, b: f64| {
         let d = (a - b).rem_euclid(std::f64::consts::TAU);
         d.min(std::f64::consts::TAU - d) <= TOLERANCE.angle_deg.to_radians()
     };
-    let mut want = block_lines_of(runs, corners, openings);
+    let mut want = block_lines_of(runs, corners, openings, ends);
     for e in block.entities.iter() {
         let Some(l) = want.next() else { return false };
         if e.common.layer != l.layer {
@@ -974,8 +1064,8 @@ fn block_matches(block: &Block, runs: &[RunAssembly], corners: &[CornerAssembly]
 /// not derive.
 pub(crate) fn block_matches_view(d: &Drawing, view: Id) -> bool {
     let Some(block) = d.block(&assembly_block_name(view)) else { return false };
-    match (assembly_lines(d, view), corner_assembly(d, view), opening_assembly(d, view)) {
-        (Ok(runs), Ok(corners), Ok(openings)) => block_matches(block, &runs, &corners, &openings),
+    match (assembly_lines(d, view), corner_assembly(d, view), opening_assembly(d, view), end_assembly(d, view)) {
+        (Ok(runs), Ok(corners), Ok(openings), Ok(ends)) => block_matches(block, &runs, &corners, &openings, &ends),
         _ => false,
     }
 }
@@ -992,8 +1082,10 @@ pub fn assembly_observer(s: &mut Session, _before: &Arc<Drawing>) {
         for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_) | AnyView::Vertical(_))) {
             let plan = v.id();
             let Some(block) = d.block(&assembly_block_name(plan)) else { continue };
-            match assembly_lines(d, plan).and_then(|runs| Ok((runs, corner_assembly(d, plan)?, opening_assembly(d, plan)?))) {
-                Ok((runs, corners, openings)) if !block_matches(block, &runs, &corners, &openings) => rewrite.push((plan, runs, corners, openings)),
+            match assembly_lines(d, plan).and_then(|runs| Ok((runs, corner_assembly(d, plan)?, opening_assembly(d, plan)?, end_assembly(d, plan)?))) {
+                Ok((runs, corners, openings, ends)) if !block_matches(block, &runs, &corners, &openings, &ends) => {
+                    rewrite.push((plan, runs, corners, openings, ends))
+                }
                 Ok(_) => {}
                 Err(e) => errors.push(e),
             }
@@ -1007,8 +1099,8 @@ pub fn assembly_observer(s: &mut Session, _before: &Arc<Drawing>) {
     }
     let Ok(current) = s.doc() else { return };
     let mut after = current.clone();
-    for (plan, runs, corners, openings) in &rewrite {
-        if let Err(e) = replace_block(&mut after, *plan, runs, corners, openings) {
+    for (plan, runs, corners, openings, ends) in &rewrite {
+        if let Err(e) = replace_block(&mut after, *plan, runs, corners, openings, ends) {
             s.echo(format!("LAMB assembly: {e}"));
             return;
         }
@@ -1049,12 +1141,13 @@ pub fn assemblyplan(s: &mut Session, p: &Value) -> EngineResult<Value> {
     if flag_changes {
         write_document(d, &doc).map_err(|e| other(e.to_string()))?;
     }
-    let (runs, corners, openings) = write_assembly_block(d, plan).map_err(other)?;
-    let lines = block_lines_of(&runs, &corners, &openings).count();
+    let (runs, corners, openings, ends) = write_assembly_block(d, plan).map_err(other)?;
+    let lines = block_lines_of(&runs, &corners, &openings, &ends).count();
     let mut skipped: Vec<Value> = runs.iter().filter_map(|r| r.skipped.as_ref().map(|why| json!({ "run": r.run, "reason": why }))).collect();
     let run_skips = skipped.len();
     skipped.extend(corners.iter().filter_map(|c| c.skipped.as_ref().map(|why| json!({ "junction": c.junction, "reason": why }))));
     skipped.extend(openings.iter().filter_map(|o| o.skipped.as_ref().map(|why| json!({ "bridge": o.bridge, "reason": why }))));
+    skipped.extend(ends.iter().filter_map(|e| e.skipped.as_ref().map(|why| json!({ "end": e.end, "reason": why }))));
     let placed = corners.iter().filter(|c| c.skipped.is_none()).count();
     let opened = openings.iter().filter(|o| o.skipped.is_none()).count();
     s.echo(format!("{lines} assembly lines, {run_skips} runs skipped, {placed} corners placed"));
@@ -1880,10 +1973,10 @@ pub(crate) mod tests {
         assert_eq!(got_arcs, [half(900.0, "GYP"), half(1050.0, "GYP"), half(1120.0, "CLAD")]);
 
         // A second ASSEMBLYPLAN and an unrelated edit leave the block as it is.
-        assert!(block_matches(&b, &assembly_lines(s.doc()?, plan)?, &[], &[]));
+        assert!(block_matches(&b, &assembly_lines(s.doc()?, plan)?, &[], &[], &[]));
         s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
         let b = s.doc()?.block(&name).ok_or("no block")?.clone();
-        assert!(block_matches(&b, &assembly_lines(s.doc()?, plan)?, &[], &[]));
+        assert!(block_matches(&b, &assembly_lines(s.doc()?, plan)?, &[], &[], &[]));
         s.execute("editview", &json!({ "viewId": null }))?;
         s.execute("layer.new", &json!({ "name": "NOTES", "current": true }))?;
         line(&mut s, [90_000.0, 90_000.0], [91_000.0, 90_000.0])?;
@@ -1931,10 +2024,10 @@ pub(crate) mod tests {
         assert_eq!(b.entities.len(), total);
         let arcs = b.entities.iter().filter(|e| matches!(e.kind, EntityKind::Arc(_))).count();
         assert_eq!(arcs, 3, "only the bands are ARCs; the chords are LINEs");
-        assert!(block_matches(&b, &assembly_lines(s.doc()?, plan)?, &[], &[]));
+        assert!(block_matches(&b, &assembly_lines(s.doc()?, plan)?, &[], &[], &[]));
         s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
         let b2 = s.doc()?.block(&name).ok_or("no block")?.clone();
-        assert!(block_matches(&b2, &assembly_lines(s.doc()?, plan)?, &[], &[]));
+        assert!(block_matches(&b2, &assembly_lines(s.doc()?, plan)?, &[], &[], &[]));
         assert_eq!(b2.entities.len(), total);
         Ok(())
     }
@@ -1965,11 +2058,11 @@ pub(crate) mod tests {
             common: Common { layer: "A".into(), ..Common::default() },
             kind: line_entity(&cw),
         });
-        assert!(block_matches(&block, &[run(cw.clone())], &[], &[]));
+        assert!(block_matches(&block, &[run(cw.clone())], &[], &[], &[]));
         let straight = AssemblyLine { arc: None, ..cw.clone() };
-        assert!(!block_matches(&block, &[run(straight)], &[], &[]), "a LINE where an ARC is");
+        assert!(!block_matches(&block, &[run(straight)], &[], &[], &[]), "a LINE where an ARC is");
         let bigger = AssemblyLine { arc: Some(lamb_core::derivation::assembly::ArcSpan { radius: 1001.0, ..cw.arc.unwrap() }), ..cw };
-        assert!(!block_matches(&block, &[run(bigger)], &[], &[]));
+        assert!(!block_matches(&block, &[run(bigger)], &[], &[], &[]));
     }
 
     #[test]
@@ -2540,7 +2633,7 @@ pub(crate) mod tests {
         let d = s.doc()?;
         let block = d.block(&name).ok_or("no block")?;
         assert!(!Arc::ptr_eq(&before, block), "rewritten");
-        assert!(block_matches(block, &assembly_lines(d, sec)?, &corner_assembly(d, sec)?, &opening_assembly(d, sec)?));
+        assert!(block_matches(block, &assembly_lines(d, sec)?, &corner_assembly(d, sec)?, &opening_assembly(d, sec)?, &end_assembly(d, sec)?));
         s.undo()?;
         assert_eq!(**s.doc()?.block(&name).ok_or("no block")?, *before, "undo restores the section's block");
         Ok(())
@@ -2579,7 +2672,7 @@ pub(crate) mod tests {
         let d = s.doc()?;
         let block = d.block(&name).ok_or("no block")?;
         assert!(!Arc::ptr_eq(&before, block), "rewritten");
-        assert!(block_matches(block, &assembly_lines(d, sec)?, &corner_assembly(d, sec)?, &opening_assembly(d, sec)?));
+        assert!(block_matches(block, &assembly_lines(d, sec)?, &corner_assembly(d, sec)?, &opening_assembly(d, sec)?, &end_assembly(d, sec)?));
         // The exterior face moved to u = −20: the GYP bands sit at u 30 and 280.
         let mut us: Vec<f64> = block
             .entities
@@ -2727,7 +2820,8 @@ pub(crate) mod tests {
             s.doc()?.block(&assembly_block_name(plan)).ok_or("no block")?,
             &assembly_lines(s.doc()?, plan)?,
             &corner_assembly(s.doc()?, plan)?,
-            &opening_assembly(s.doc()?, plan)?
+            &opening_assembly(s.doc()?, plan)?,
+            &end_assembly(s.doc()?, plan)?
         ));
         s.undo()?;
         assert!(Arc::ptr_eq(&before, s.doc()?.block(&assembly_block_name(plan)).ok_or("no block")?), "undo restores the block");
@@ -2869,7 +2963,8 @@ pub(crate) mod tests {
             d.block(&assembly_block_name(sec)).ok_or("no block")?,
             &assembly_lines(d, sec)?,
             &corner_assembly(d, sec)?,
-            &opening_assembly(d, sec)?
+            &opening_assembly(d, sec)?,
+            &end_assembly(d, sec)?
         ));
         assert_trimmed(d, sec)?;
         Ok(())
@@ -3549,7 +3644,7 @@ pub(crate) mod tests {
         assert_eq!(jambs, [(1950.0, -20.0, 1950.0, 180.0, "JAMB".into()), (3050.0, -20.0, 3050.0, 180.0, "JAMB".into())], "{block:?}");
         let d = s.doc()?;
         let b = d.block(&assembly_block_name(plan)).ok_or("no block")?;
-        assert!(block_matches(b, &assembly_lines(d, plan)?, &corner_assembly(d, plan)?, &opening_assembly(d, plan)?));
+        assert!(block_matches(b, &assembly_lines(d, plan)?, &corner_assembly(d, plan)?, &opening_assembly(d, plan)?, &end_assembly(d, plan)?));
         s.undo()?;
         assert!(Arc::ptr_eq(&before, s.doc()?.block(&assembly_block_name(plan)).ok_or("no block")?), "undo restores the block");
         Ok(())
@@ -3692,7 +3787,13 @@ pub(crate) mod tests {
         let lower = runs.iter().find(|r| run_midpoint(&graph.runs[r.run]).y < 1500.0).ok_or("no lower run")?;
         let upper = runs.iter().find(|r| run_midpoint(&graph.runs[r.run]).y > 1500.0).ok_or("no upper run")?;
         assert_eq!((z_span(lower).1, z_span(upper).0), (850.0, 2150.0), "{runs:?}");
-        assert!(block_matches(d.block(&assembly_block_name(sec)).ok_or("no block")?, &runs, &corner_assembly(d, sec)?, &opening_assembly(d, sec)?));
+        assert!(block_matches(
+            d.block(&assembly_block_name(sec)).ok_or("no block")?,
+            &runs,
+            &corner_assembly(d, sec)?,
+            &opening_assembly(d, sec)?,
+            &end_assembly(d, sec)?
+        ));
 
         let r = s.execute("detailtags", &json!({ "viewId": sec.0 }))?;
         assert_eq!(
@@ -3720,6 +3821,85 @@ pub(crate) mod tests {
         assert_eq!(opens[0].id, format!("undetailed_opening:{sec}:0:{end}"));
         assert_eq!(opens[0].location, point);
         assert_eq!(opens[0].note, format!("Opening sill at ({:.0}, {:.0}) has no opening detail", point.x, point.y));
+        Ok(())
+    }
+
+    /// [`window_room`] with its WINDOW line erased: the 1000 mm gap in the bottom wall leaves two
+    /// free ends, (2000, 100) and (3000, 100), both 200 mm exterior. Returns (session, plan, JD).
+    pub(crate) fn gap_room() -> T<(Session, Id, Id)> {
+        let (mut s, plan) = window_room(false, false)?;
+        let block = s.doc()?.block(&view_block_name(plan)).ok_or("no plan block")?;
+        let win: Vec<String> = block.entities.iter().filter(|e| e.common.layer == "WINDOW").map(|e| e.handle.hex()).collect();
+        s.execute("erase", &json!({ "handles": win }))?;
+        let doc = read_document(s.doc()?)?;
+        let jd = doc.views.iter().find(|v| v.name() == "JD").ok_or("no JD")?.id();
+        Ok((s, plan, jd))
+    }
+
+    fn line_set(lines: &[AssemblyLine]) -> Vec<(f64, f64, f64, f64, String)> {
+        let mut v: Vec<_> = lines.iter().map(|l| (r6(l.from.x), r6(l.from.y), r6(l.to.x), r6(l.to.y), l.layer.clone())).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
+
+    #[test]
+    fn a_termination_at_a_free_end_is_laid_as_the_jamb_of_an_equivalent_bridge_and_spreads() -> R {
+        let (mut s, plan, jd) = gap_room()?;
+        crate::maintain::install(&mut s);
+        let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, plan);
+        assert_eq!((graph.bridges.len(), graph.free_ends.len()), (0, 2), "{:?}", graph.free_ends);
+        let n = undo_len(&s)?;
+        let before = s.doc()?.block(&assembly_block_name(plan)).ok_or("no block")?.clone();
+        let r =
+            s.execute("detailtag", &json!({ "detailViewId": jd.0, "corner": true, "tip": {"x": 2000, "y": 100}, "bubble": {"x": 1500, "y": -400} }))?;
+        assert_eq!(r["attached"], json!({ "end": 0 }), "{r}");
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let ends = resolve_view_ends(s.doc()?, plan)?;
+        assert_eq!(ends, [RunDetail::Tagged(jd.0.to_string()), RunDetail::Spread(jd.0.to_string())]);
+        let placed = end_assembly(s.doc()?, plan)?;
+        assert!(placed.len() == 2 && placed.iter().all(|e| e.skipped.is_none() && e.detail == Some(jd)), "{placed:?}");
+        let laid: Vec<AssemblyLine> = placed.iter().flat_map(|e| e.lines.clone()).collect();
+
+        // The same detail on the same gap closed by a window: identical lines at the two jambs.
+        let (w, wplan) = window_room(false, true)?;
+        let jambs: Vec<AssemblyLine> = opening_assembly(w.doc()?, wplan)?.into_iter().flat_map(|o| o.lines).collect();
+        assert_eq!(line_set(&laid), line_set(&jambs));
+        assert!(line_set(&laid).contains(&(1950.0, 0.0, 1950.0, 200.0, "JAMB".into())), "{laid:?}");
+
+        // The block holds them, last, and each run's bands stop at the detail's reach as at a jamb.
+        let d = s.doc()?;
+        let b = d.block(&assembly_block_name(plan)).ok_or("no block")?;
+        assert!(block_matches(b, &assembly_lines(d, plan)?, &corner_assembly(d, plan)?, &opening_assembly(d, plan)?, &placed));
+        let block = block_xy(&s, &assembly_block_name(plan))?;
+        assert_eq!(block[block.len() - 4..].iter().map(|l| l.4.as_str()).collect::<Vec<_>>(), ["JAMB", "GYP", "JAMB", "GYP"]);
+        let mut ext = bottom_band_extents(&assembly_lines(s.doc()?, plan)?);
+        ext.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!((ext.len(), ext[0].1, ext[1].0), (2, 1950.0, 3050.0), "{ext:?}");
+
+        // Undo of the tag removes them in one step.
+        s.undo()?;
+        assert_eq!(**s.doc()?.block(&assembly_block_name(plan)).ok_or("no block")?, *before);
+        assert!(end_assembly(s.doc()?, plan)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_termination_does_not_spread_to_a_free_end_of_another_width() -> R {
+        let (mut s, plan, jd) = gap_room()?;
+        // A free-standing 90 mm partition stub: two more free ends, of another class.
+        s.execute("layer.new", &json!({ "name": "WALL-INT", "current": true }))?;
+        line(&mut s, [2000.0, 1500.0], [2000.0, 2500.0])?;
+        line(&mut s, [2090.0, 1500.0], [2090.0, 2500.0])?;
+        s.execute("layer.current", &json!({ "name": "TAGS" }))?;
+        s.execute("detailtag", &json!({ "detailViewId": jd.0, "corner": true, "tip": {"x": 3000, "y": 100}, "bubble": {"x": 3500, "y": -400} }))?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, plan);
+        let ends = resolve_view_ends(s.doc()?, plan)?;
+        assert_eq!(ends.len(), 4, "{:?}", graph.free_ends);
+        let of_width = |w: i64| -> Vec<&RunDetail> {
+            graph.free_ends.iter().zip(&ends).filter(|((r, _), _)| graph.runs[*r].width.round() as i64 == w).map(|(_, x)| x).collect()
+        };
+        assert!(of_width(200).iter().all(|x| matches!(x, RunDetail::Tagged(_) | RunDetail::Spread(_))), "{ends:?}");
+        assert!(of_width(90).len() == 2 && of_width(90).iter().all(|x| **x == RunDetail::Untyped), "{ends:?}");
         Ok(())
     }
 }

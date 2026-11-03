@@ -533,12 +533,28 @@ pub fn place_opening_end(
     inset: f64,
     outward: bool,
 ) -> Result<Vec<AssemblyLine>, String> {
-    let frame = detail_frame(reference, lines)?;
-    let r = reference.1;
-    let sgn = if outward { -1.0 } else { 1.0 };
     let (i, end) = if at_b { bridge.b } else { bridge.a };
     let run = runs.get(i).ok_or("the opening bridge names no run")?;
     let side = sides.get(i).ok_or("the opening bridge's run has no sides")?;
+    place_run_end(run, side, end, face, reference, lines, inset, outward)
+}
+
+/// A detail placed at `end` of `run` as one jamb (LAMB T617): exactly how [`place_opening_end`]
+/// places it at a bridge end on that run. A wall's free end takes its termination detail this way.
+#[allow(clippy::too_many_arguments)]
+pub fn place_run_end(
+    run: &WallRun,
+    side: &RunSides,
+    end: RunEnd,
+    face: FaceRef,
+    reference: (Point2, Point2),
+    lines: &[(Point2, Point2, String)],
+    inset: f64,
+    outward: bool,
+) -> Result<Vec<AssemblyLine>, String> {
+    let frame = detail_frame(reference, lines)?;
+    let r = reference.1;
+    let sgn = if outward { -1.0 } else { 1.0 };
     let (c, t, n) = jamb_frame(run, side, face, end)?;
     let c = Point2 { x: c.x - n.x * inset, y: c.y - n.y * inset };
     let ni = Point2 { x: -n.x * sgn, y: -n.y * sgn };
@@ -1726,5 +1742,21 @@ mod tests {
         // The Start jamb's travel is against the sweep.
         let (c0, t0) = jamb_point(&runs[0], &sides[0], FaceRef::Exterior, RunEnd::Start).unwrap();
         assert!(near(c0, p(1100.0, 0.0)) && near(t0, p(0.0, -1.0)), "{c0:?} {t0:?}");
+    }
+
+    #[test]
+    fn a_run_end_lays_a_detail_as_the_bridge_end_on_that_run_does() {
+        let (reference, lines) = jamb_detail();
+        let side = RunSides { left: SideKind::Space(0), right: SideKind::Outside, exterior: true, open_outside_left: None };
+        let runs = vec![run(p(0.0, 0.0), p(3000.0, 0.0), 200.0), run(p(4000.0, 0.0), p(6000.0, 0.0), 200.0)];
+        let sides = vec![side.clone(), side.clone()];
+        let bridge =
+            OpeningBridge { a: (0, RunEnd::End), b: (1, RunEnd::Start), from: p(3000.0, 0.0), to: p(4000.0, 0.0), opening_entity_ids: vec![Id(9)] };
+        for (at_b, i, end) in [(false, 0, RunEnd::End), (true, 1, RunEnd::Start)] {
+            let via_bridge = place_opening_end(&bridge, at_b, &runs, &sides, FaceRef::Exterior, reference, &lines, 30.0, false).unwrap();
+            let via_run = place_run_end(&runs[i], &side, end, FaceRef::Exterior, reference, &lines, 30.0, false).unwrap();
+            assert_eq!(via_bridge, via_run);
+            assert!(!via_run.is_empty());
+        }
     }
 }
