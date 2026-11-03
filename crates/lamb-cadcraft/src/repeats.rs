@@ -403,6 +403,7 @@ impl RepeatM {
             text_rotation: 0.0,
             user_text_pos: false,
             block: None,
+            insertion_point: Vec3::ZERO,
             overrides: Default::default(),
             assoc: Vec::new(),
             marks: Default::default(),
