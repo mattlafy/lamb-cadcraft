@@ -1,8 +1,12 @@
 //! A canvas hover observer (fork-only, LAMB T550): one registered function told the rollover
 //! entity (`CanvasState::hover`) whenever it changes, with the open drawing. Unregistered, or no
 //! drawing open, nothing happens. LAMB haloes the hovered entity's linked lines in its other views.
+//!
+//! A selection observer beside it (LAMB T616): one registered function told the session's
+//! selection whenever it differs from the last one seen, checked in the same per-frame call. LAMB
+//! highlights a selected detail tag's walls and placed detail.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use cadcraft_doc::{Drawing, Handle};
 
@@ -18,9 +22,38 @@ pub fn register_hover_observer(f: HoverObserver) -> Result<(), &'static str> {
     OBSERVER.set(f).map_err(|_| "hover observer already registered")
 }
 
-/// Call the observer with `app.canvas.hover` when it differs from `before`.
+/// Told the open drawing and the new selection (empty: nothing selected).
+pub type SelectionObserver = fn(&Drawing, &[Handle]);
+
+static SELECTION_OBSERVER: OnceLock<SelectionObserver> = OnceLock::new();
+
+/// The selection the selection observer was last checked against.
+static LAST_SELECTION: Mutex<Vec<Handle>> = Mutex::new(Vec::new());
+
+/// Register the selection observer. Once per process; a second call is an error.
+pub fn register_selection_observer(f: SelectionObserver) -> Result<(), &'static str> {
+    SELECTION_OBSERVER.set(f).map_err(|_| "selection observer already registered")
+}
+
+/// Call the hover observer with `app.canvas.hover` when it differs from `before`, and the
+/// selection observer with the session's selection when it differs from the last one seen.
 pub(super) fn notify(app: &CadApp, before: Option<Handle>) {
     notify_with(OBSERVER.get().copied(), app, before);
+    notify_selection_with(SELECTION_OBSERVER.get().copied(), app, &LAST_SELECTION);
+}
+
+fn notify_selection_with(f: Option<SelectionObserver>, app: &CadApp, last: &Mutex<Vec<Handle>>) {
+    let Some(f) = f else { return };
+    let now = app.session.selection();
+    let mut seen = last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *seen == now {
+        return;
+    }
+    seen.clone_from(&now);
+    drop(seen);
+    if let Ok(d) = app.session.doc() {
+        f(d, &now);
+    }
 }
 
 fn notify_with(f: Option<HoverObserver>, app: &CadApp, before: Option<Handle>) {
@@ -65,5 +98,38 @@ mod tests {
         assert_eq!(seen(), vec![Some(Handle(0x2A)), None]);
         notify_with(None, &app, Some(Handle(1)));
         assert_eq!(seen().len(), 2, "unregistered: nothing");
+    }
+
+    static SELECTIONS: Mutex<Vec<Vec<Handle>>> = Mutex::new(Vec::new());
+
+    fn record_selection(_: &Drawing, sel: &[Handle]) {
+        SELECTIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(sel.to_vec());
+    }
+
+    fn selections() -> Vec<Vec<Handle>> {
+        SELECTIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    #[test]
+    fn selection_observer_fires_once_per_change() -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = CadApp::new(cadcraft_engine::Session::new(), crate::Services::default());
+        app.session.new_drawing(true);
+        app.session.execute("line", &serde_json::json!({ "points": [[0, 0], [1000, 0]] }))?;
+        let h = app.session.doc()?.model.iter().map(|e| e.handle).next().ok_or("no line")?;
+        let last = Mutex::new(Vec::new());
+        let f: Option<SelectionObserver> = Some(record_selection);
+        notify_selection_with(f, &app, &last);
+        assert!(selections().is_empty(), "unchanged: no call");
+        app.session.set_selection(vec![h]);
+        notify_selection_with(f, &app, &last);
+        notify_selection_with(f, &app, &last);
+        assert_eq!(selections(), vec![vec![h]], "once per change");
+        app.session.set_selection(Vec::new());
+        notify_selection_with(None, &app, &last);
+        assert_eq!(selections().len(), 1, "unregistered: nothing");
+        let last = Mutex::new(vec![h]);
+        notify_selection_with(f, &app, &last);
+        assert_eq!(selections(), vec![vec![h], Vec::new()]);
+        Ok(())
     }
 }

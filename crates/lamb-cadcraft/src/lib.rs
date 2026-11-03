@@ -83,6 +83,7 @@ pub mod solids_cli;
 mod studgrid;
 pub mod sweeps;
 pub mod tagfollow;
+mod taghighlight;
 mod viewlife;
 pub mod viewpick;
 mod viewprops;
@@ -115,4 +116,5 @@ pub use schema::{
 };
 pub use sheets::{SheetError, create_sheet};
 pub use sweeps::{run_sweeps, sweep_observer};
+pub use taghighlight::selection_changed;
 pub use views::{ViewError, create_view};

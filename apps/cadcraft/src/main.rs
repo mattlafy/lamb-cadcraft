@@ -296,8 +296,16 @@ fn install_lamb() {
     if let Err(e) = cadcraft_ui_egui::canvas::scalebar::register_scale_bar(lamb_cadcraft::commands::scale_bar_wanted) {
         log::warn!("LAMB scale bar not installed: {e}");
     }
+    install_canvas_observers();
+}
+
+/// LAMB's canvas hover and selection observers (fork patch 30; LAMB T550, T616).
+fn install_canvas_observers() {
     if let Err(e) = cadcraft_ui_egui::canvas::hoverext::register_hover_observer(lamb_cadcraft::hover_links) {
         log::warn!("LAMB hover halo not installed: {e}");
+    }
+    if let Err(e) = cadcraft_ui_egui::canvas::hoverext::register_selection_observer(lamb_cadcraft::selection_changed) {
+        log::warn!("LAMB detail tag highlight not installed: {e}");
     }
 }
 
