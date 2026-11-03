@@ -355,11 +355,12 @@ pub(crate) fn studmove_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::assembly::assembly_lines;
-    use crate::assembly::tests::{room_with, undo_len};
+    use crate::assembly::tests::{line, room_with, t_plan, tees, undo_len, window_room};
+    use crate::assembly::{assembly_lines, opening_assembly};
     use crate::detailtags::graph_and_sides;
     use crate::project::DrawingProject;
     use crate::schema::{assembly_block_name, write_document};
+    use lamb_core::derivation::assembly::AssemblyLine;
     use lamb_core::geometry::{IDENTITY_TRANSFORM, Transform2D};
     use lamb_core::model::{AnyView, Placement};
     use std::collections::HashSet;
@@ -401,14 +402,23 @@ pub(crate) mod tests {
         let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
         place(&mut s, plan, IDENTITY_TRANSFORM)?;
         let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
-        s.execute("editview", &json!({ "viewId": detail.0 }))?;
-        s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
-        let stud = new_handle(&mut s, "pline", json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?;
-        let dim = new_handle(&mut s, "dimaligned", json!({ "p1": [100, 0], "p2": [100.0 + pitch, 0], "at": [300, -300] }))?;
-        s.execute("repeat", &json!({ "dimension": dim.hex(), "handles": [stud.hex()] }))?;
-        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        add_studs(&mut s, detail, pitch, plan)?;
         s.execute("layer.new", &json!({ "name": "MARKS", "current": true }))?;
         Ok((s, plan))
+    }
+
+    /// Draws a 38-wide stud (detail x 100..138, y 50..200) on `STUD` in `detail`, repeated at
+    /// `pitch`, then edits `back` again.
+    fn add_studs(s: &mut Session, detail: Id, pitch: f64, back: Id) -> R {
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        if s.execute("layer.new", &json!({ "name": "STUD", "current": true })).is_err() {
+            s.execute("layer.current", &json!({ "name": "STUD" }))?;
+        }
+        let stud = new_handle(s, "pline", json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?;
+        let dim = new_handle(s, "dimaligned", json!({ "p1": [100, 0], "p2": [100.0 + pitch, 0], "at": [300, -300] }))?;
+        s.execute("repeat", &json!({ "dimension": dim.hex(), "handles": [stud.hex()] }))?;
+        s.execute("editview", &json!({ "viewId": back.0 }))?;
+        Ok(())
     }
 
     /// The stud copies' along-centres (x) on the horizontal run nearest `y`, sorted.
@@ -836,6 +846,148 @@ pub(crate) mod tests {
         let moved = stud_xs(s.doc()?, plan, 3900.0)?;
         assert_ne!(moved, north);
         assert_eq!(stud_xs(&back, plan, 3900.0)?, moved);
+        Ok(())
+    }
+
+    // T596: the grid across details — three invariants, each with a project grid placed.
+
+    /// Every repeat copy of every laid run, as (run index, its lines): `lines[bands..]` split by
+    /// `copies`.
+    fn copy_chunks(runs: &[crate::assembly::RunAssembly]) -> Vec<(usize, &[AssemblyLine])> {
+        let mut out = Vec::new();
+        for r in runs {
+            let mut at = r.bands;
+            for &n in &r.copies {
+                out.push((r.run, &r.lines[at..at + n]));
+                at += n;
+            }
+        }
+        out
+    }
+
+    /// Whether `copy`'s along-centre on straight `run` sits on a grid line through `g + k·pitch`.
+    fn centred_on_grid(copy: &[AssemblyLine], run: &WallRun, g: Point2, pitch: f64) -> bool {
+        let RunCurve::Line { from, to } = run.centreline else { return true };
+        let len = (to.x - from.x).hypot(to.y - from.y);
+        let u = Point2 { x: (to.x - from.x) / len, y: (to.y - from.y) / len };
+        let ts = copy.iter().flat_map(|l| [l.from, l.to]).map(|p| (p.x - g.x) * u.x + (p.y - g.y) * u.y);
+        let mid = (ts.clone().fold(f64::INFINITY, f64::min) + ts.fold(f64::NEG_INFINITY, f64::max)) / 2.0;
+        let m = mid.rem_euclid(pitch);
+        m < 1e-6 || pitch - m < 1e-6
+    }
+
+    #[test]
+    fn two_edge_details_with_near_pitches_lay_every_copy_on_one_grid() -> R {
+        let (mut s, plan) = stud_room(406.4)?;
+        let d2 = Id(s.execute("newdetail", &json!({ "name": "D2" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": d2.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": r.hex(), "kind": "exterior_face" }))?;
+        s.execute("layer.current", &json!({ "name": "GYP" }))?;
+        line(&mut s, [0.0, 200.0], [1000.0, 200.0])?;
+        add_studs(&mut s, d2, 403.0, plan)?;
+        s.execute("layer.current", &json!({ "name": "TAGS" }))?;
+        s.execute("detailtag", &json!({ "detailViewId": d2.0, "tip": {"x": 2500.0, "y": 4000.0}, "bubble": {"x": 2500.0, "y": 5000.0} }))?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 7.0} }))?;
+        let (g, pitch) = project_grid(s.doc()?).ok_or("no project grid")?;
+        let d = s.doc()?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, plan);
+        let runs = assembly_lines(d, plan)?;
+        let chunks = copy_chunks(&runs);
+        let details: HashSet<Id> = chunks.iter().filter_map(|(i, _)| runs.iter().find(|r| r.run == *i)?.detail).collect();
+        assert_eq!(details.len(), 2, "copies from both details: {runs:?}");
+        for (i, c) in &chunks {
+            assert!(centred_on_grid(c, &graph.runs[*i], g, pitch), "run {i}: {c:?} off the grid");
+        }
+        Ok(())
+    }
+
+    /// Asserts no two copies of `runs` coincide: every line of one matching a line of the other,
+    /// ends within `TOLERANCE.coincidence_mm` in either order.
+    fn assert_no_doubled_copies(runs: &[crate::assembly::RunAssembly]) {
+        let near = |a: Point2, b: Point2| (a.x - b.x).hypot(a.y - b.y) <= TOLERANCE.coincidence_mm;
+        let same = |a: &AssemblyLine, b: &AssemblyLine| (near(a.from, b.from) && near(a.to, b.to)) || (near(a.from, b.to) && near(a.to, b.from));
+        let chunks = copy_chunks(runs);
+        for (i, (ri, a)) in chunks.iter().enumerate() {
+            for (rj, b) in &chunks[i + 1..] {
+                let doubled = a.len() == b.len() && a.iter().all(|l| b.iter().any(|m| same(l, m)));
+                assert!(!doubled, "runs {ri} and {rj} both lay {a:?}");
+            }
+        }
+    }
+
+    /// The assembly room with its walls redrawn so the bottom wall is two collinear pieces meeting
+    /// at x 2500 (outer and inner face each split), placed, studs at 406.4. Returns (session, plan).
+    fn split_room() -> T<(Session, Id)> {
+        let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        let d = s.doc()?;
+        let walls: Vec<String> = d
+            .model
+            .iter()
+            .chain(d.blocks.values().flat_map(|b| b.entities.iter()))
+            .filter(|e| e.common.layer == "WALL-EXT")
+            .map(|e| e.handle.hex())
+            .collect();
+        assert_eq!(walls.len(), 2, "the room's two face plines");
+        s.execute("erase", &json!({ "handles": walls }))?;
+        s.execute("layer.current", &json!({ "name": "WALL-EXT" }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [2500, 0]] }))?;
+        s.execute("pline", &json!({ "vertices": [[2500, 0], [5000, 0], [5000, 4000], [0, 4000], [0, 0]] }))?;
+        s.execute("pline", &json!({ "vertices": [[200, 200], [2500, 200]] }))?;
+        s.execute("pline", &json!({ "vertices": [[2500, 200], [4800, 200], [4800, 3800], [200, 3800], [200, 200]] }))?;
+        place(&mut s, plan, IDENTITY_TRANSFORM)?;
+        add_studs(&mut s, detail, 406.4, plan)?;
+        Ok((s, plan))
+    }
+
+    #[test]
+    fn no_copy_is_doubled_where_two_runs_meet() -> R {
+        let (mut s, plan) = split_room()?;
+        // A grid line on the split point x 2500, where both pieces would lay a stud if either did.
+        s.execute("studgrid", &json!({ "point": {"x": 2500.0, "y": 7.0} }))?;
+        let runs = assembly_lines(s.doc()?, plan)?;
+        let bottom: HashSet<usize> = copy_chunks(&runs).into_iter().filter(|(_, c)| c.iter().all(|l| l.from.y < 300.0)).map(|(i, _)| i).collect();
+        assert_eq!(bottom.len(), 2, "the bottom wall is two runs, each laying studs: {runs:?}");
+        assert_no_doubled_copies(&runs);
+
+        let (mut s, plan) = t_plan()?;
+        place(&mut s, plan, IDENTITY_TRANSFORM)?;
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        add_studs(&mut s, detail, 406.4, plan)?;
+        s.execute("studgrid", &json!({ "point": {"x": 13.0, "y": 1000.0} }))?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, plan);
+        assert!(!tees(&graph).is_empty(), "the plan has a T");
+        let runs = assembly_lines(s.doc()?, plan)?;
+        let laying: HashSet<usize> = copy_chunks(&runs).into_iter().map(|(i, _)| i).collect();
+        assert!(laying.len() > 2, "studs on several runs: {laying:?}");
+        assert_no_doubled_copies(&runs);
+        Ok(())
+    }
+
+    #[test]
+    fn jambs_drop_grid_copies_as_corners_do() -> R {
+        let (mut s, plan) = window_room(false, true)?;
+        place(&mut s, plan, IDENTITY_TRANSFORM)?;
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        add_studs(&mut s, detail, 406.4, plan)?;
+        let jambs = opening_assembly(s.doc()?, plan)?;
+        let ends: Vec<f64> = jambs.iter().filter(|o| o.skipped.is_none()).flat_map(|o| o.lines.iter().flat_map(|l| [l.from.x, l.to.x])).collect();
+        assert!(!ends.is_empty(), "the window's jambs lay: {jambs:?}");
+        let (lo, hi) = (ends.iter().copied().fold(f64::INFINITY, f64::min), ends.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+        let tol = TOLERANCE.coincidence_mm;
+        // Grid phases across one pitch, so some phase puts a grid line inside each jamb.
+        for k in 0..=16 {
+            let x = 1950.0 + 406.4 * f64::from(k) / 16.0;
+            s.execute("studgrid", &json!({ "point": {"x": x, "y": 7.0} }))?;
+            let runs = assembly_lines(s.doc()?, plan)?;
+            let bottom: Vec<_> = copy_chunks(&runs).into_iter().filter(|(_, c)| c.iter().all(|l| l.from.y < 300.0 && l.to.y < 300.0)).collect();
+            assert!(!bottom.is_empty(), "grid at {x}: no bottom copies");
+            for (i, c) in bottom {
+                let inside = c.iter().flat_map(|l| [l.from.x, l.to.x]).any(|e| e > lo + tol && e < hi - tol);
+                assert!(!inside, "grid at {x}: run {i}'s copy {c:?} reaches into the jambs {lo}..{hi}");
+            }
+        }
         Ok(())
     }
 }

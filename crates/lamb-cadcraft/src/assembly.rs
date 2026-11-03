@@ -2020,7 +2020,7 @@ pub(crate) mod tests {
     /// bottom one skewed, so its unmitred bands end on a cut square to the branch, not on the face.
     /// (A partition inside the room is no fixture for this: a run with a space on both sides lays no
     /// face detail, and a square branch's run already ends on the through run's face.)
-    fn t_plan() -> T<(Session, Id)> {
+    pub(crate) fn t_plan() -> T<(Session, Id)> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);
@@ -2058,7 +2058,9 @@ pub(crate) mod tests {
     }
 
     /// The T junctions of `graph` with their branch run and branch end.
-    fn tees(graph: &lamb_core::derivation::wall_junctions::WallGraph) -> Vec<(Point2, usize, lamb_core::derivation::wall_junctions::RunEnd)> {
+    pub(crate) fn tees(
+        graph: &lamb_core::derivation::wall_junctions::WallGraph,
+    ) -> Vec<(Point2, usize, lamb_core::derivation::wall_junctions::RunEnd)> {
         graph.junctions.iter().filter_map(|j| tee_butt(j, &graph.runs).map(|(b, _, _)| (j.point, j.arms[b].run, j.arms[b].end))).collect()
     }
 
