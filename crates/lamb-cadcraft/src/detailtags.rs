@@ -21,6 +21,11 @@
 //!   [`DetailTag::anchor`]. The box must enclose the tag point and be wider and taller than
 //!   `TOLERANCE.coincidence_mm`. Interactive: `Box` → `Specify first corner of the callout box:` →
 //!   `Specify opposite corner:` (a refused box asks for the first corner again).
+//! - A tag's flip (LAMB T615): `detailtag {…, flip?: bool}` sets [`DetailTag::flip`]; interactively
+//!   `Flip` at the edge tag point prompt (`Specify tag point on a wall face or [Flip]:`) toggles it
+//!   for the tag being placed. `detailflip {handle}` toggles an existing tag's flip in the edited
+//!   view, one undo step, returning `{"handle", "flip"}`; interactive `Select detail tag to flip:`.
+//!   What the flip does to a wall chain's outside: [`crate::outside`].
 //! - `detailtags {viewId?}`: the resolution report for a plan or section view (default: the edited one) —
 //!   `<12 runs: 3 tagged, 7 spread, 2 untyped; 4 junctions: 4 spread>`, echoed and returned.
 //!
@@ -232,15 +237,17 @@ pub(crate) fn attach_bridge(graph: &WallGraph, tip: Point2) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// The view's wall graph and sides, with `WALL-EXT*` layers exterior and the view's outside pick
-/// points ([`crate::outside::outside_points`]) marking their regions outside.
+/// The view's wall graph and sides, with `WALL-EXT*` layers exterior, the view's outside pick
+/// points ([`crate::outside::outside_points`]) marking their regions outside, and then each edge
+/// tag's side carried along its wall chain ([`crate::outside::apply_tag_sides`], LAMB T615).
 pub(crate) fn graph_and_sides(p: &DrawingProject<'_>, view: Id) -> (WallGraph, WallSides) {
     let graph = wall_graph(p, view, &wall_params(p, view));
-    let sides = wall_sides(
+    let mut sides = wall_sides(
         p,
         &graph,
         &SideParams { outside_points: crate::outside::outside_points(p.drawing(), view), exterior_layer_ids: exterior_layer_ids(p) },
     );
+    crate::outside::apply_tag_sides(p.drawing(), view, &graph, &mut sides);
     (graph, sides)
 }
 
@@ -529,6 +536,7 @@ fn detail_direction(s: &Session, id: Id) -> Option<CutDirection> {
 pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
     let detail = p.get("detailViewId").and_then(id_value).ok_or_else(|| bad("detailtag", "`detailViewId` is required"))?;
     let corner = p.get("corner").and_then(Value::as_bool).unwrap_or(false);
+    let flip = p.get("flip").and_then(Value::as_bool).unwrap_or(false);
     let tip = point_param("detailtag", p, "tip")?;
     let given = |k: &str| p.get(k).filter(|v| !v.is_null());
     let shape = match (given("bubble"), given("box")) {
@@ -553,8 +561,11 @@ pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut common = s.current_common();
     let anchor = matches!(shape, Shape::Box(..)).then_some([tip.x, tip.y]);
-    set_entity_data(&mut common, &EntityData { detail_tag: Some(DetailTag { detail_view_id: detail, corner, anchor }), ..EntityData::default() })
-        .map_err(other)?;
+    set_entity_data(
+        &mut common,
+        &EntityData { detail_tag: Some(DetailTag { detail_view_id: detail, corner, anchor, flip }), ..EntityData::default() },
+    )
+    .map_err(other)?;
     let space = s.space();
     // The tag and, for a view's first, its assembly plan land together: one undo step.
     let mut after = s.doc()?.clone();
@@ -599,6 +610,73 @@ pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "handle": format!("{:X}", h.0), "attached": target.json() }))
 }
 
+fn parse_handle(v: &Value) -> Option<Handle> {
+    v.as_str().and_then(Handle::parse_hex).or_else(|| v.as_u64().map(Handle))
+}
+
+/// DETAILFLIP's JSON form: toggles the flip of detail tag `handle` in the edited plan or section
+/// view, one undo step. Returns `{"handle", "flip"}`.
+pub(crate) fn detailflip(s: &mut Session, p: &Value) -> Result<Value> {
+    let h = p.get("handle").and_then(parse_handle).ok_or_else(|| bad("detailflip", "`handle` is required"))?;
+    // Every refusal before `doc_mut`, so a refusal records nothing.
+    let view = edited_wall_view(s).map_err(other)?;
+    let Some((_, _, tag)) = tags_in(s.doc()?, view).map_err(other)?.into_iter().find(|(th, _, _)| *th == h) else {
+        return Err(other("That is not a detail tag in this view"));
+    };
+    let flip = !tag.flip;
+    let mut res = Ok(());
+    s.doc_mut()?
+        .modify_entity(h, |e| {
+            res = read_entity_data(&e.common).and_then(|mut data| {
+                if let Some(t) = data.detail_tag.as_mut() {
+                    t.flip = flip;
+                }
+                set_entity_data(&mut e.common, &data)
+            });
+        })
+        .map_err(other)?;
+    res.map_err(other)?;
+    s.echo(if flip { "Detail tag flipped: its wall chain's outside is the other side" } else { "Detail tag unflipped" }.to_owned());
+    Ok(json!({ "handle": format!("{:X}", h.0), "flip": flip }))
+}
+
+/// DETAILFLIP: one pick.
+struct DetailFlipM;
+
+impl Interactive for DetailFlipM {
+    fn name(&self) -> &'static str {
+        "detailflip"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Select detail tag to flip", Accept::SELECT)
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        if let Err(e) = edited_wall_view(s) {
+            s.echo(e);
+            return Ok(Step::Done);
+        }
+        Ok(Step::Continue)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        match i {
+            Input::Pick(hs) => {
+                let Some(h) = hs.first().copied() else { return Ok(Step::Continue) };
+                if let Err(e) = detailflip(s, &json!({ "handle": format!("{:X}", h.0) })) {
+                    s.echo(e.to_string());
+                    return Ok(Step::Continue);
+                }
+                Ok(Step::Done)
+            }
+            Input::Cancel | Input::Enter => Ok(Step::Cancel),
+            _ => Ok(Step::Continue),
+        }
+    }
+}
+
+pub(crate) fn detailflip_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(DetailFlipM))
+}
+
 /// The detail the prompt offers by default: the most recently placed tag's detail (highest handle,
 /// any view) if that view still exists, else the drawing's only detail view.
 fn default_detail(s: &Session) -> Option<Id> {
@@ -634,6 +712,8 @@ struct DetailTagM {
     default: Option<Id>,
     detail: Option<Id>,
     corner: bool,
+    /// `Flip` was toggled at the tag point prompt (this tag only).
+    flip: bool,
     tip: Option<Vec2>,
     offered: Vec<Offered>,
     /// `Box` was chosen at the bubble prompt (this tag only), and the box's first corner.
@@ -664,8 +744,12 @@ impl Interactive for DetailTagM {
                 }
             }
             (Some(_), None) => {
-                let msg = if self.corner { "Specify tag point at a wall corner" } else { "Specify tag point on a wall face" };
-                Prompt::new(msg, Accept::POINT)
+                if self.corner {
+                    Prompt::new("Specify tag point at a wall corner", Accept::POINT)
+                } else {
+                    let msg = if self.flip { "Specify tag point on a wall face (flipped)" } else { "Specify tag point on a wall face" };
+                    Prompt::new(msg, Accept::POINT).kw(&["Flip"])
+                }
             }
             (Some(_), Some(tip)) => match (self.boxing, self.box_a) {
                 (false, _) => Prompt::new("Specify bubble point", Accept::POINT).base(tip).kw(&["Box"]),
@@ -746,6 +830,14 @@ impl Interactive for DetailTagM {
                 None => "No such detail view",
             }));
         };
+        if self.tip.is_none()
+            && !self.corner
+            && let Input::Text(t) | Input::Keyword(t) = &i
+            && (t.trim().eq_ignore_ascii_case("flip") || t.trim().eq_ignore_ascii_case("f"))
+        {
+            self.flip = !self.flip;
+            return Ok(Step::Continue);
+        }
         if self.tip.is_some()
             && !self.boxing
             && let Input::Text(t) | Input::Keyword(t) = &i
@@ -769,6 +861,7 @@ impl Interactive for DetailTagM {
         let mut params = json!({
             "detailViewId": detail.0,
             "corner": self.corner,
+            "flip": self.flip,
             "tip": {"x": tip.x, "y": tip.y},
         });
         if self.boxing {
@@ -806,7 +899,7 @@ impl Interactive for DetailTagM {
 }
 
 pub(crate) fn detailtag_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(DetailTagM { default: None, detail: None, corner: false, tip: None, offered: Vec::new(), boxing: false, box_a: None }))
+    Ok(Box::new(DetailTagM { default: None, detail: None, corner: false, flip: false, tip: None, offered: Vec::new(), boxing: false, box_a: None }))
 }
 
 #[cfg(test)]
@@ -1239,7 +1332,7 @@ mod tests {
         assert_eq!((b[0].common.linetype.as_str(), b[0].common.layer.as_str()), ("DASHED", "TAGS"));
         assert!(s.doc()?.linetype("DASHED").is_some(), "DASHED is loaded");
         let tag = read_entity_data(&b[0].common)?.detail_tag.ok_or("no tag")?;
-        assert_eq!(tag, DetailTag { detail_view_id: detail, corner: false, anchor: Some([2500.0, 0.0]) });
+        assert_eq!(tag, DetailTag { detail_view_id: detail, corner: false, anchor: Some([2500.0, 0.0]), flip: false });
         Ok(())
     }
 

@@ -60,15 +60,15 @@
 //!
 //! - `newdetail {name, cutDirection?}` (LAMB ▸ New View ▸ New Detail): a floating detail view drawn in
 //!   `plan` (default) or `vertical` (section), entered; interactively `Enter detail name or
-//!   [Plan/Section] <Detail N>:`. `detailtag` (`dtag`) / `detailtags`: detail tags in a plan or
-//!   section view and their resolution report — see
+//!   [Plan/Section] <Detail N>:`. `detailtag` (`dtag`) / `detailtags` / `detailflip {handle}` (LAMB ▸ Details ▸ Detail Flip):
+//!   detail tags in a plan or section view, their resolution report, and a tag's outside flip — see
 //!   [`crate::detailtags`]. `dxfimport {path | data, fileName?, name?, unitScale?}` (LAMB ▸ Project ▸
 //!   Import DXF as View): a DXF/DWG file's line work as a new unplaced plan view — see
 //!   [`crate::dxfimport`]. `lambopen {path}` (typed only, Import TS-app Project): TS-app interchange, not the save format
 //!   (LAMB's data lives in the DWG/DXF and ordinary Save/Open carry it) — a TS-app `.lamb`
 //!   project (directory or its JSON file form) opened as a new document tab — see
 //!   [`crate::lambopen`]. `lambsave {path}` (typed only, Export TS-app Project): the open drawing
-//!   written as a `.lamb` project directory — see [`crate::lambopen`]. `outsidepoint {point:{x,y}}` (LAMB ▸ Details ▸ Outside Point): a tagged
+//!   written as a `.lamb` project directory — see [`crate::lambopen`]. `outsidepoint {point:{x,y}}` (typed only; detail tags' flips set a wall chain's outside): a tagged
 //!   POINT in the edited plan view marking its region outside — see [`crate::outside`]. `studgrid {point:{x,y}, pitch?}` (LAMB ▸ Walls & Framing ▸ Stud Grid): the edited
 //!   the project's stud grid origin (pitch 406.4), at a point of the edited plan, that every view's repeats line up on; with `wall: true` (and `off?`) a point inside one plan wall's band overrules it for that run only; `studmove {point:{x,y}}` (LAMB ▸ Walls & Framing ▸ Move Stud) a point in one plan or section run's band that its nearest stud or joist is laid centred on — see [`crate::studgrid`]. `assemblyplan {viewId, mitre?}` (LAMB ▸ Walls & Framing ▸ Assembly Plan): the plan's or section's laid
 //!   detail bands, then each two-arm corner's placed corner detail, written into its block
@@ -914,7 +914,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .interactive(crate::querycmds::showlinks_machine),
         CommandSpec::new("detailtag", "Detail Tag", crate::detailtags::detailtag)
             .alias(&["dtag"])
-            .params("{detailViewId, corner?: bool, tip:{x,y}, bubble:{x,y}}")
+            .params("{detailViewId, corner?: bool, flip?: bool, tip:{x,y}, bubble:{x,y}}")
             .menu(MENU_DETAILS)
             .interactive(crate::detailtags::detailtag_machine),
         CommandSpec::new("detailtags", "Detail Tags Report", crate::detailtags::detailtags).params("{viewId?}").noundo().menu(MENU_DETAILS),
@@ -923,9 +923,12 @@ pub fn commands() -> Vec<CommandSpec> {
             .menu(MENU_DETAILS)
             .interactive(crate::detailref::detailref_machine),
         CommandSpec::new("repeat", "Repeat", crate::repeats::repeat).params("{dimension?, handles?: [handle], copies?: [handle]}").menu(MENU_DETAILS).interactive(crate::repeats::repeat_machine),
+        CommandSpec::new("detailflip", "Detail Flip", crate::detailtags::detailflip)
+            .params("{handle} → {handle, flip}")
+            .menu(MENU_DETAILS)
+            .interactive(crate::detailtags::detailflip_machine),
         CommandSpec::new("outsidepoint", "Outside Point", crate::outside::outsidepoint)
             .params("{point:{x,y}}")
-            .menu(MENU_DETAILS)
             .interactive(crate::outside::outsidepoint_machine),
         CommandSpec::new("assemblyplan", "Assembly Plan", crate::assembly::assemblyplan)
             .params("{viewId, mitre?: bool}")
@@ -1066,7 +1069,7 @@ mod tests {
             ("Levels & Cuts", &["level", "levelline", "cutline", "viewhole"]),
             ("Display", &["refpane", "underlay", "panelock", "ucsalign", "ghosthide", "ghostshow"]),
             ("Links", &["link", "unlink", "showlinks"]),
-            ("Details", &["detailtag", "detailtags", "detailref", "repeat", "outsidepoint"]),
+            ("Details", &["detailtag", "detailtags", "detailref", "repeat", "detailflip"]),
             ("Walls & Framing", &["assemblyplan", "assemblyview", "wallrun", "wallfit", "wallconflicts", "studgrid", "studmove", "resolve"]),
             ("Line Roles", &["setrole", "layerrole", "accept"]),
         ];

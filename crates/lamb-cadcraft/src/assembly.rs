@@ -2351,13 +2351,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_open_section_takes_its_exterior_side_from_the_outside_point() -> R {
-        // Without a point the wall run has no exterior side and is skipped, as before.
+    fn an_open_section_takes_its_exterior_side_from_the_tag_s_bubble_or_an_outside_point() -> R {
+        // Without a point the tag's bubble (u -1000) gives the wall run the same side (LAMB T615).
         let (s, sec) = open_section(None)?;
         let tagged = section_left_run(&s, sec)?;
-        let runs = assembly_lines(s.doc()?, sec)?;
-        let r = runs.iter().find(|r| r.run == tagged).ok_or("no tagged run")?;
-        assert_eq!(r.skipped.as_deref(), Some("no single exterior side"), "{r:?}");
+        let bare = assembly_lines(s.doc()?, sec)?;
+        let r = bare.iter().find(|r| r.run == tagged).ok_or("no tagged run")?;
+        assert_eq!((r.skipped.as_deref(), r.conflict), (None, None), "{r:?}");
+        let bare = r.clone();
 
         // With the point at u -1000: the bands are measured from the wall's u 0 face.
         let (mut s, sec) = open_section(Some((-1000.0, 1500.0)))?;
@@ -2368,6 +2369,7 @@ pub(crate) mod tests {
         let runs = assembly_lines(d, sec)?;
         let r = runs.iter().find(|r| r.run == tagged).ok_or("no tagged run")?;
         assert_eq!((r.skipped.as_deref(), r.conflict), (None, None), "{r:?}");
+        assert_eq!(r.lines, bare.lines);
         let RunCurve::Line { from, to } = graph.runs[tagged].centreline else { return Err("arc run".into()) };
         let len = (to.x - from.x).hypot(to.y - from.y);
         let copies = ((len - 138.0) / 400.0).floor() as usize + 1;

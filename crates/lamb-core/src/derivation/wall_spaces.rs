@@ -45,16 +45,22 @@ pub struct RunSides {
     pub exterior: bool,
     /// For a straight or arc run with both sides `Outside`: whether the nearest outside pick point
     /// beside it lies to the left. `None` when no point resolves it, and for every other run.
+    /// A caller may also set it on any run to give that run an explicit side (the LAMB fork's
+    /// detail-tag sides); [`outside_on_left`] reads it first.
     pub open_outside_left: Option<bool>,
 }
 
-/// Whether the run's exterior side is the left of its centreline's travel: the single `Outside`
-/// side, or for an open structure [`RunSides::open_outside_left`]. `None` when undecided.
+/// Whether the run's exterior side is the left of its centreline's travel: an explicit side in
+/// [`RunSides::open_outside_left`] first — the nearest outside point on an open run, or the side of
+/// the detail tag governing the run (set by the caller after [`wall_sides`]) — else the single
+/// `Outside` side. `None` when undecided.
 pub fn outside_on_left(sides: &RunSides) -> Option<bool> {
+    if let Some(left) = sides.open_outside_left {
+        return Some(left);
+    }
     match (sides.left, sides.right) {
         (SideKind::Outside, SideKind::Space(_)) => Some(true),
         (SideKind::Space(_), SideKind::Outside) => Some(false),
-        (SideKind::Outside, SideKind::Outside) => sides.open_outside_left,
         _ => None,
     }
 }

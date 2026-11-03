@@ -243,6 +243,10 @@ pub struct DetailTag {
     /// `None` on a leader tag, whose tip is `vertices[0]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<[f64; 2]>,
+    /// The tag's outside side is inverted (LAMB T615, [`crate::outside`]): an edge tag's run takes
+    /// the side opposite its automatic one (or its bubble's), and so does the wall chain it governs.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub flip: bool,
 }
 
 impl Default for EntityData {

@@ -14,19 +14,31 @@
 //!   an open wall):`.
 //! - [`draw`]: each outside point of the edited view as a faint circle with a centre dot (overlay
 //!   only; the point itself never plots).
+//!
+//! Detail-tag sides (LAMB T615) override outside points: [`apply_tag_sides`], called from
+//! [`crate::detailtags::graph_and_sides`] after `wall_sides`, gives every edge tag's run the tag's
+//! side — the run's automatic side where its structure closes, else the side its bubble sits on (a leader's last
+//! vertex, a callout box's centre), inverted by [`DetailTag::flip`](crate::schema::DetailTag) — and
+//! carries it run to run through every two-arm junction and opening bridge (stopping at T/X
+//! junctions and free ends), each run taking the nearest tag by hops (ties: the earlier tag). The
+//! result is written into `RunSides::open_outside_left`, which `outside_on_left` reads first.
+//! OUTSIDEPOINT stays typed-only for courtyards and saved projects; it is off the Details menu.
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::{Drawing, EntityKind, Handle, Point, Space};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::{Bounds2, Vec2};
 use cadcraft_render::{DisplayList, Kind, Options};
-use lamb_core::derivation::wall_spaces::{SideKind, SideParams, WallSides, wall_sides};
+use lamb_core::derivation::wall_junctions::{RunEnd, WallGraph};
+use lamb_core::derivation::wall_spaces::{RunSides, SideKind, SideParams, WallSides, outside_on_left, wall_sides};
+use lamb_core::derivation::walls::RunCurve;
 use lamb_core::geometry::Point2;
+use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::Id;
 use serde_json::{Value, json};
 
 use crate::commands::{other, point_param};
-use crate::detailtags::{edited_wall_view, exterior_layer_ids, graph_and_sides};
+use crate::detailtags::{attach_run, edited_wall_view, exterior_layer_ids, graph_and_sides, tags_in};
 use crate::overlays::{push, view_id};
 use crate::project::DrawingProject;
 use crate::schema::{EntityData, read_entity_data, set_entity_data, view_block_name};
@@ -68,10 +80,12 @@ pub(crate) fn outside_points(d: &Drawing, view: Id) -> Vec<Point2> {
 /// run's sides, `Err(reason)` when it changes nothing.
 fn placement_effect(d: &Drawing, view: Id, at: Point2) -> std::result::Result<String, String> {
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
-    let (graph, without) = graph_and_sides(&p, view);
+    // Plain `wall_sides` both ways: tag sides would mask what the point itself changes.
+    let graph = graph_and_sides(&p, view).0;
     let ext = exterior_layer_ids(&p);
     let sides = |pts: Vec<Point2>| wall_sides(&p, &graph, &SideParams { outside_points: pts, exterior_layer_ids: ext.clone() });
     let mut pts = outside_points(d, view);
+    let without = sides(pts.clone());
     pts.push(at);
     let with = sides(pts);
     if with.runs != without.runs {
@@ -122,6 +136,116 @@ pub(crate) fn outsidepoint(s: &mut Session, p: &Value) -> Result<Value> {
     let h = d.add(&space, common, EntityKind::Point(Point { p: Vec2::new(at.x, at.y).to3(0.0), angle: 0.0 }))?;
     s.echo(message.clone());
     Ok(json!({ "handle": format!("{:X}", h.0), "message": message }))
+}
+
+/// The side of run curve `c` (left of its travel = `true`) holding `p`; `None` within the wall band
+/// (`width / 2` of the centreline).
+fn point_side(c: &RunCurve, width: f64, p: Point2) -> Option<bool> {
+    match *c {
+        RunCurve::Line { from, to } => {
+            let len = (to.x - from.x).hypot(to.y - from.y);
+            if len <= TOLERANCE.coincidence_mm {
+                return None;
+            }
+            let off = ((to.x - from.x) * (p.y - from.y) - (to.y - from.y) * (p.x - from.x)) / len;
+            (off.abs() > width / 2.0).then_some(off > 0.0)
+        }
+        RunCurve::Arc { center, radius, sweep, .. } => {
+            let r = (p.x - center.x).hypot(p.y - center.y);
+            // Travelling counter-clockwise, the centre is on the left.
+            ((r - radius).abs() > width / 2.0).then_some((r < radius) == (sweep > 0.0))
+        }
+    }
+}
+
+/// Where a tag's bubble sits: a leader's last vertex, a callout box's centre.
+fn bubble_of(kind: &EntityKind) -> Option<Point2> {
+    match kind {
+        EntityKind::Leader(l) => l.vertices.last().map(|v| Point2 { x: v.x, y: v.y }),
+        EntityKind::LwPolyline(pl) if !pl.vertices.is_empty() => {
+            let xs = pl.vertices.iter().map(|v| v.p.x);
+            let ys = pl.vertices.iter().map(|v| v.p.y);
+            let (x0, x1) = (xs.clone().fold(f64::INFINITY, f64::min), xs.fold(f64::NEG_INFINITY, f64::max));
+            let (y0, y1) = (ys.clone().fold(f64::INFINITY, f64::min), ys.fold(f64::NEG_INFINITY, f64::max));
+            Some(Point2 { x: (x0 + x1) / 2.0, y: (y0 + y1) / 2.0 })
+        }
+        _ => None,
+    }
+}
+
+/// Each edge tag's (run, outside-on-left) in `view`, in block order: the run's automatic side in
+/// `sides` when its structure closes there (one side `Outside`), else its bubble's side, inverted by `flip`. A tag whose side is undecided
+/// (bubble inside the wall band) or that attaches to no run is left out.
+fn tag_sources(d: &Drawing, view: Id, graph: &WallGraph, sides: &WallSides) -> Vec<(usize, bool)> {
+    let Ok(tags) = tags_in(d, view) else { return Vec::new() };
+    let Some(block) = d.block(&view_block_name(view)) else { return Vec::new() };
+    tags.into_iter()
+        .filter(|(_, _, t)| !t.corner)
+        .filter_map(|(h, tip, t)| {
+            let run = attach_run(graph, tip)?;
+            // The closed-structure side only: an outside point never overrules a tag.
+            let auto = sides.runs.get(run).and_then(|r| outside_on_left(&RunSides { open_outside_left: None, ..r.clone() }));
+            let side = auto.or_else(|| {
+                let e = block.entities.iter().find(|e| e.handle == h)?;
+                let r = &graph.runs[run];
+                point_side(&r.centreline, r.width, bubble_of(&e.kind)?)
+            })?;
+            Some((run, side != t.flip))
+        })
+        .collect()
+}
+
+/// The runs each run's side carries to: `(other run, swap)` through every two-arm junction and every
+/// opening bridge; `swap` when the two ends meeting are alike (Start–Start, End–End).
+fn chain_links(graph: &WallGraph) -> Vec<Vec<(usize, bool)>> {
+    let mut out = vec![Vec::new(); graph.runs.len()];
+    let mut link = |(a, ea): (usize, RunEnd), (b, eb): (usize, RunEnd)| {
+        if a < out.len() && b < out.len() {
+            out[a].push((b, ea == eb));
+            out[b].push((a, ea == eb));
+        }
+    };
+    for j in graph.junctions.iter().filter(|j| j.arms.len() == 2) {
+        link((j.arms[0].run, j.arms[0].end), (j.arms[1].run, j.arms[1].end));
+    }
+    for b in &graph.bridges {
+        link(b.a, b.b);
+    }
+    out
+}
+
+/// Each run's tag-governed outside-on-left (parallel to `graph.runs`), `None` where no tag reaches:
+/// a breadth-first walk from every tagged run at once along [`chain_links`], each run taking the
+/// first tag to reach it — ties to the earlier tag, a tagged run always its own (first) tag's.
+pub(crate) fn tag_sides(d: &Drawing, view: Id, graph: &WallGraph, sides: &WallSides) -> Vec<Option<bool>> {
+    let mut out = vec![None; graph.runs.len()];
+    let mut queue = std::collections::VecDeque::new();
+    for (run, left) in tag_sources(d, view, graph, sides) {
+        if out[run].is_none() {
+            out[run] = Some(left);
+            queue.push_back(run);
+        }
+    }
+    let links = chain_links(graph);
+    while let Some(r) = queue.pop_front() {
+        let Some(left) = out[r] else { continue };
+        for &(n, swap) in &links[r] {
+            if out[n].is_none() {
+                out[n] = Some(left != swap);
+                queue.push_back(n);
+            }
+        }
+    }
+    out
+}
+
+/// Writes [`tag_sides`] into `sides`: each governed run's `open_outside_left`.
+pub(crate) fn apply_tag_sides(d: &Drawing, view: Id, graph: &WallGraph, sides: &mut WallSides) {
+    for (r, side) in tag_sides(d, view, graph, sides).into_iter().enumerate() {
+        if let (Some(left), Some(rs)) = (side, sides.runs.get_mut(r)) {
+            rs.open_outside_left = Some(left);
+        }
+    }
 }
 
 /// A circle of radius `r` about `c`, closed (its first point repeated).
@@ -402,6 +526,196 @@ mod tests {
         assert!(screen.points(&screen.prims[0]).iter().all(|q| ((q.x - 2500.0).hypot(q.y - 2000.0) - 80.0).abs() < 1e-6));
         assert!(draw(d, &Space::Block(view_block_name(detail)), &opts).prims.is_empty());
         assert!(draw(d, &Space::Model, &opts).prims.is_empty());
+        Ok(())
+    }
+
+    // ---- Detail-tag sides (LAMB T615) ----
+
+    /// A detail view `D1` added to `s`, then back to editing `plan`.
+    fn add_detail(s: &mut Session, plan: Id) -> T<Id> {
+        let d = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        Ok(d)
+    }
+
+    /// An edge tag of `detail` at `tip` with its bubble at `bubble`; returns its handle.
+    fn edge_tag(s: &mut Session, detail: Id, tip: (f64, f64), bubble: (f64, f64), flip: bool) -> T<Handle> {
+        let r = s.execute(
+            "detailtag",
+            &json!({ "detailViewId": detail.0, "flip": flip, "tip": {"x": tip.0, "y": tip.1}, "bubble": {"x": bubble.0, "y": bubble.1} }),
+        )?;
+        Ok(Handle::parse_hex(r["handle"].as_str().ok_or("no handle")?).ok_or("bad handle")?)
+    }
+
+    /// The run whose band holds `p`, and whether its outside is on `far`'s side: `Some(true)` when
+    /// it is, `Some(false)` when it is the other side, `None` when undecided.
+    fn faces(d: &Drawing, plan: Id, on: (f64, f64), far: (f64, f64)) -> T<Option<bool>> {
+        let p = DrawingProject::new(d)?;
+        let (graph, sides) = graph_and_sides(&p, plan);
+        let r = attach_run(&graph, Point2 { x: on.0, y: on.1 }).ok_or("no run there")?;
+        let run = &graph.runs[r];
+        let want = point_side(&run.centreline, run.width, Point2 { x: far.0, y: far.1 }).ok_or("far point in the band")?;
+        Ok(outside_on_left(&sides.runs[r]).map(|left| left == want))
+    }
+
+    /// [`l_chain`]'s two runs: (bottom, right) — a point in each band and one well outside the L.
+    const L_RUNS: [((f64, f64), (f64, f64)); 2] = [((2500.0, 100.0), (2500.0, -1000.0)), ((4900.0, 2000.0), (6000.0, 2000.0))];
+
+    fn l_faces(d: &Drawing, plan: Id) -> T<Vec<Option<bool>>> {
+        L_RUNS.iter().map(|&(on, far)| faces(d, plan, on, far)).collect()
+    }
+
+    #[test]
+    fn one_edge_tag_gives_an_open_l_chain_its_bubble_s_side_and_detailflip_inverts_it_in_one_undo_step() -> R {
+        let (mut s, plan) = l_chain()?;
+        let detail = add_detail(&mut s, plan)?;
+        assert_eq!(l_faces(s.doc()?, plan)?, [None, None]);
+        let h = edge_tag(&mut s, detail, (2500.0, 0.0), (2500.0, -1000.0), false)?;
+        assert_eq!(l_faces(s.doc()?, plan)?, [Some(true), Some(true)]);
+
+        let undo = s.state()?.undo.len();
+        let out = s.execute("detailflip", &json!({ "handle": h.hex() }))?;
+        assert_eq!((out["handle"].as_str(), out["flip"].as_bool()), (Some(h.hex().as_str()), Some(true)));
+        assert_eq!(s.state()?.undo.len(), undo + 1);
+        assert_eq!(l_faces(s.doc()?, plan)?, [Some(false), Some(false)]);
+        s.undo()?;
+        assert_eq!(l_faces(s.doc()?, plan)?, [Some(true), Some(true)]);
+        s.redo()?;
+        assert_eq!(l_faces(s.doc()?, plan)?, [Some(false), Some(false)]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_whose_bubble_is_inside_the_wall_band_decides_nothing() -> R {
+        let (mut s, plan) = l_chain()?;
+        let detail = add_detail(&mut s, plan)?;
+        edge_tag(&mut s, detail, (2500.0, 0.0), (2600.0, 150.0), false)?;
+        assert_eq!(l_faces(s.doc()?, plan)?, [None, None]);
+        Ok(())
+    }
+
+    #[test]
+    fn detailflip_refuses_what_is_not_a_tag_of_the_edited_view_and_records_nothing() -> R {
+        let (mut s, plan) = l_chain()?;
+        let detail = add_detail(&mut s, plan)?;
+        edge_tag(&mut s, detail, (2500.0, 0.0), (2500.0, -1000.0), false)?;
+        let wall = s.doc()?.block(&view_block_name(plan)).ok_or("no block")?.entities.iter().next().ok_or("empty")?.handle;
+        let undo = s.state()?.undo.len();
+        let e = s.execute("detailflip", &json!({ "handle": wall.hex() })).err().ok_or("accepted")?;
+        assert!(e.to_string().contains("That is not a detail tag in this view"), "{e}");
+        assert!(s.execute("detailflip", &json!({})).is_err());
+        assert_eq!(s.state()?.undo.len(), undo);
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_forms_flip_a_new_tag_and_an_existing_one() -> R {
+        let (mut s, plan) = l_chain()?;
+        add_detail(&mut s, plan)?;
+        s.start("detailtag")?;
+        s.input(Input::Enter)?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Specify tag point on a wall face or [Flip]:"));
+        s.input(Input::Keyword("Flip".into()))?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point on a wall face (flipped)"));
+        s.input(Input::Point(Vec2::new(2500.0, 0.0)))?;
+        s.input(Input::Point(Vec2::new(2500.0, -1000.0)))?;
+        assert!(s.running.is_none());
+        let tags = tags_in(s.doc()?, plan)?;
+        assert_eq!(tags.len(), 1);
+        assert!(tags[0].2.flip);
+        assert_eq!(l_faces(s.doc()?, plan)?, [Some(false), Some(false)]);
+
+        s.start("detailflip")?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Select detail tag to flip"));
+        s.input(Input::Pick(vec![tags[0].0]))?;
+        assert!(s.running.is_none());
+        assert!(!tags_in(s.doc()?, plan)?[0].2.flip);
+        assert_eq!(l_faces(s.doc()?, plan)?, [Some(true), Some(true)]);
+        Ok(())
+    }
+
+    /// [`room`]'s four runs: a point in each band and one outside the room beside it.
+    const ROOM_RUNS: [((f64, f64), (f64, f64)); 4] = [
+        ((2500.0, 100.0), (2500.0, -1000.0)),
+        ((4900.0, 2000.0), (6000.0, 2000.0)),
+        ((2500.0, 3900.0), (2500.0, 5000.0)),
+        ((100.0, 2000.0), (-1000.0, 2000.0)),
+    ];
+
+    fn room_faces(d: &Drawing, plan: Id) -> T<Vec<Option<bool>>> {
+        ROOM_RUNS.iter().map(|&(on, far)| faces(d, plan, on, far)).collect()
+    }
+
+    #[test]
+    fn in_a_closed_room_a_flipped_tag_inverts_the_loop_and_a_second_tag_splits_it_by_hops() -> R {
+        let (mut s, plan, detail) = room()?;
+        let auto = [Some(true); 4];
+        assert_eq!(room_faces(s.doc()?, plan)?, auto);
+        let h = edge_tag(&mut s, detail, (2500.0, 0.0), (2500.0, -1000.0), false)?;
+        assert_eq!(room_faces(s.doc()?, plan)?, auto, "an unflipped tag changes no side");
+        s.execute("detailflip", &json!({ "handle": h.hex() }))?;
+        assert_eq!(room_faces(s.doc()?, plan)?, [Some(false); 4]);
+        // Unflipped on the top wall: the top keeps the automatic side; the side walls are one hop
+        // from both tags, so the earlier (flipped) tag takes them.
+        edge_tag(&mut s, detail, (2500.0, 4000.0), (2500.0, 5000.0), false)?;
+        assert_eq!(room_faces(s.doc()?, plan)?, [Some(false), Some(false), Some(true), Some(false)]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_side_stops_at_a_t_junction_and_crosses_an_opening_bridge() -> R {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let detail = add_detail(&mut s, plan)?;
+        s.execute("layer.new", &json!({ "name": "WALL", "current": true }))?;
+        // An open straight wall y 0..200 with a window gap at x 2000..3000, and a stub wall
+        // x 3900..4100 standing on it (a T).
+        s.execute("pline", &json!({ "vertices": [[0, 0], [2000, 0]] }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 200], [2000, 200]] }))?;
+        s.execute("pline", &json!({ "vertices": [[3000, 0], [6000, 0]] }))?;
+        s.execute("pline", &json!({ "vertices": [[3000, 200], [3900, 200], [3900, 3000]] }))?;
+        s.execute("pline", &json!({ "vertices": [[4100, 3000], [4100, 200], [6000, 200]] }))?;
+        s.execute("layer.new", &json!({ "name": "WINDOW", "current": true }))?;
+        s.execute("line", &json!({ "points": [[2000, 100], [3000, 100]] }))?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        {
+            let p = DrawingProject::new(s.doc()?)?;
+            let (graph, _) = graph_and_sides(&p, plan);
+            assert_eq!(graph.bridges.len(), 1, "{graph:?}");
+            assert!(graph.junctions.iter().any(|j| j.arms.len() == 3), "{graph:?}");
+        }
+        edge_tag(&mut s, detail, (1000.0, 0.0), (1000.0, -1000.0), false)?;
+        let d = s.doc()?;
+        assert_eq!(faces(d, plan, (1000.0, 100.0), (1000.0, -1000.0))?, Some(true));
+        assert_eq!(faces(d, plan, (3500.0, 100.0), (3500.0, -1000.0))?, Some(true), "across the window");
+        assert_eq!(faces(d, plan, (5000.0, 100.0), (5000.0, -1000.0))?, None, "past the T");
+        assert_eq!(faces(d, plan, (4000.0, 2000.0), (5000.0, 2000.0))?, None, "up the stub");
+        Ok(())
+    }
+
+    #[test]
+    fn an_outside_point_on_a_tag_governed_run_changes_nothing_there() -> R {
+        let (mut s, plan) = l_chain()?;
+        let detail = add_detail(&mut s, plan)?;
+        edge_tag(&mut s, detail, (2500.0, 0.0), (2500.0, -1000.0), false)?;
+        // Inside the L: plain sides would face it; the tag's side wins.
+        mark(&mut s, 2500.0, 1500.0)?;
+        assert_eq!(l_faces(s.doc()?, plan)?, [Some(true), Some(true)]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_s_flip_survives_dxf() -> R {
+        let (mut s, plan) = l_chain()?;
+        let detail = add_detail(&mut s, plan)?;
+        edge_tag(&mut s, detail, (2500.0, 0.0), (2500.0, -1000.0), true)?;
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert!(tags_in(&back, plan)?[0].2.flip);
+        assert_eq!(l_faces(&back, plan)?, [Some(false), Some(false)]);
+        assert_eq!(sides_of(&back, plan)?, sides_of(s.doc()?, plan)?);
         Ok(())
     }
 }
