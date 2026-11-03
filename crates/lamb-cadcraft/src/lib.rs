@@ -18,7 +18,7 @@
 //! that pick back to their source lines ([`scene`]), lamb-core's `ProjectWrite` over a `Drawing`
 //! ([`project_mut`]) and the after-command AI-line / solid-cut sweeps written through it ([`sweeps`]), and
 //! each plan's assembly lines, written by ASSEMBLYPLAN into a block that an after-command observer
-//! keeps regenerated ([`assembly`]), each detail tag's bubble — a `LAMB_DTAG` insert naming its detail — kept by an after-command observer ([`bubbles`]), each placed plan's plotted section cut symbols and each placed vertical view's level lines in a `LAMB_ANNO` block kept by an after-command observer ([`annotations`]), each section or elevation hole's revealed parallel-view line work in a `LAMB_HOLE` block kept the same way ([`holes`]), and ACCEPT /
+//! keeps regenerated ([`assembly`]), each detail tag's bubble — a `LAMB_DTAG` insert naming its detail — kept by an after-command observer ([`bubbles`]), each sheet viewport's drawing title — number, view name and scale in a `LAMB_VTITLE` insert below it — kept the same way ([`vptitles`]), each placed plan's plotted section cut symbols and each placed vertical view's level lines in a `LAMB_ANNO` block kept by an after-command observer ([`annotations`]), each section or elevation hole's revealed parallel-view line work in a `LAMB_HOLE` block kept the same way ([`holes`]), and ACCEPT /
 //! SETROLE / LAYERROLE ([`entitycmds`]), the read-only SHOWLINKS / QUERY ([`querycmds`]), and
 //! DUPLICATEVIEW / PLACEVIEW / UNPLACEVIEW / LEVEL ([`viewlife`]), and CUTLINE ([`cutlinecmd`]), MAKEVIEW turning loose model-space entities into a plan view ([`makeview`]), and the Properties palette's LAMB group — Role, cut/seen height source per segment ([`props`]), and clicking a cut line in a plan picks that view ([`viewpick`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
@@ -88,6 +88,7 @@ mod viewlife;
 pub mod viewpick;
 mod viewprops;
 pub mod views;
+pub mod vptitles;
 pub mod wallfit;
 mod wallrun;
 
@@ -118,3 +119,4 @@ pub use sheets::{SheetError, create_sheet};
 pub use sweeps::{run_sweeps, sweep_observer};
 pub use taghighlight::selection_changed;
 pub use views::{ViewError, create_view};
+pub use vptitles::vptitle_observer;

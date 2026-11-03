@@ -284,27 +284,38 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
 /// `frozen_layers` (how [`create_sheet`] builds them); assembly viewports freeze every view and
 /// take no number.
 pub fn sheet_refs(d: &Drawing, view_blocks: &[(Id, String)]) -> Vec<(Id, usize, String)> {
+    let mut out: Vec<(Id, usize, String)> = Vec::new();
+    for (view, n, layout, _) in numbered_viewports(d, view_blocks) {
+        if !out.iter().any(|(v, _, _)| *v == view) {
+            out.push((view, n, layout));
+        }
+    }
+    out
+}
+
+/// Every single-view viewport on every layout, layouts by name and viewports by `id`:
+/// `(view, n, layout, viewport handle)`, numbered as [`sheet_refs`] numbers them. A view shown on
+/// several layouts appears once per viewport.
+pub(crate) fn numbered_viewports(d: &Drawing, view_blocks: &[(Id, String)]) -> Vec<(Id, usize, String, Handle)> {
     let mut layouts: Vec<&Layout> = d.layouts.iter().collect();
     layouts.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut out: Vec<(Id, usize, String)> = Vec::new();
+    let mut out = Vec::new();
     for l in layouts {
-        let mut vps: Vec<&Viewport> = l
+        let mut vps: Vec<(Handle, &Viewport)> = l
             .entities
             .iter()
             .filter_map(|e| match &e.kind {
-                EntityKind::Viewport(vp) => Some(vp),
+                EntityKind::Viewport(vp) => Some((e.handle, vp)),
                 _ => None,
             })
             .collect();
-        vps.sort_by_key(|vp| vp.id);
+        vps.sort_by_key(|(_, vp)| vp.id);
         let mut n = 0;
-        for vp in vps {
+        for (h, vp) in vps {
             let mut shown = view_blocks.iter().filter(|(_, b)| !vp.frozen_layers.iter().any(|f| f.eq_ignore_ascii_case(b)));
             let (Some((view, _)), None) = (shown.next(), shown.next()) else { continue };
             n += 1;
-            if !out.iter().any(|(v, _, _)| v == view) {
-                out.push((*view, n, l.name.clone()));
-            }
+            out.push((*view, n, l.name.clone(), h));
         }
     }
     out
