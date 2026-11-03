@@ -446,6 +446,7 @@ pub fn place_corner(
             let t = if cross(dir, image(ni)).signum() == want { dir } else { Point2 { x: -dir.x, y: -dir.y } };
             (c, t, ni)
         }
+        [_, _, _, _] => return Err("an X corner is placed through place_corner_x".into()),
         _ => return Err("only L and T corners are placed yet".into()),
     };
     let ni = image(ni);
@@ -456,6 +457,66 @@ pub fn place_corner(
         Point2 { x: c.x + t.x * u + ni.x * v, y: c.y + t.y * u + ni.y * v }
     };
     Ok(lines.iter().map(|(p, q, layer)| AssemblyLine { from: map(*p), to: map(*q), layer: layer.clone(), arc: None }).collect())
+}
+
+/// The quadrant of a four-arm (X) junction holding `tip` (LAMB T587): the `k` whose gap — from
+/// `j.arms[k]` CCW through `j.gaps_deg[k]` to `j.arms[(k + 1) % 4]` — contains the direction
+/// `j.point → tip`. `None` for any other junction, and for a tip within `TOLERANCE.coincidence_mm`
+/// of the node.
+pub fn x_quadrant(j: &Junction, tip: Point2) -> Option<usize> {
+    if j.arms.len() != 4 || j.gaps_deg.len() != 4 {
+        return None;
+    }
+    let (dx, dy) = (tip.x - j.point.x, tip.y - j.point.y);
+    if dx.hypot(dy) <= TOLERANCE.coincidence_mm {
+        return None;
+    }
+    let a = dy.atan2(dx).to_degrees();
+    (0..4).find(|&k| (a - j.arms[k].direction_deg).rem_euclid(360.0) < j.gaps_deg[k]).or(Some(3))
+}
+
+/// Quadrant `k` of the four-arm junction `j` as the two-arm junction a corner detail is laid on
+/// (LAMB T587), and a copy of `sides` in which each of its two runs has the quadrant's side
+/// `Outside`: arm `k`'s quadrant side is the left of its direction out of the node, arm `k + 1`'s
+/// the right. Arc arms are an error.
+pub fn x_corner(j: &Junction, k: usize, runs: &[WallRun], sides: &[RunSides]) -> Result<(Junction, Vec<RunSides>), String> {
+    if j.arms.len() != 4 || j.gaps_deg.len() != 4 || k >= 4 {
+        return Err("not a quadrant of an X junction".into());
+    }
+    let (a, b) = (j.arms[k].clone(), j.arms[(k + 1) % 4].clone());
+    let mut quadrant_sides = sides.to_vec();
+    // Left of the direction out of the node is the run's own left at its Start, its right at its End.
+    for (arm, quadrant_on_left) in [(&a, true), (&b, false)] {
+        let run = runs.get(arm.run).ok_or("junction arm names no run")?;
+        if matches!(run.centreline, RunCurve::Arc { .. }) {
+            return Err("an X corner needs straight arms".into());
+        }
+        let side = quadrant_sides.get_mut(arm.run).ok_or("junction arm has no sides")?;
+        let along = arm.end == RunEnd::Start;
+        side.left = super::wall_spaces::SideKind::Outside;
+        side.right = super::wall_spaces::SideKind::Outside;
+        side.open_outside_left = Some(along == quadrant_on_left);
+    }
+    let gap = j.gaps_deg[k];
+    Ok((Junction { point: j.point, arms: vec![a, b], gaps_deg: vec![gap, 360.0 - gap] }, quadrant_sides))
+}
+
+/// A corner detail laid at quadrant `k` of the four-arm junction `j` (LAMB T587): exactly
+/// [`place_corner`]'s L on [`x_corner`]'s two arms, its reference on the quadrant's faces —
+/// whatever face the detail names — `to` end at their crossing. `insets` are those two arms'.
+#[allow(clippy::too_many_arguments)]
+pub fn place_corner_x(
+    j: &Junction,
+    k: usize,
+    runs: &[WallRun],
+    sides: &[RunSides],
+    reference: (Point2, Point2),
+    lines: &[(Point2, Point2, String)],
+    insets: [f64; 2],
+    outward: bool,
+) -> Result<Vec<AssemblyLine>, String> {
+    let (l, quadrant_sides) = x_corner(j, k, runs, sides)?;
+    place_corner(&l, runs, &quadrant_sides, FaceRef::Exterior, reference, lines, &insets, outward)
 }
 
 /// A jamb of an opening bridge (§9 item 3, LAMB T485): the run `end`'s `face` line end `c` — its
@@ -1401,6 +1462,84 @@ mod tests {
         runs[1] = run(p(100.0, 100.0), p(-5000.0, 100.0), 200.0);
         sides[1] = RunSides { left: SideKind::Outside, right: SideKind::Space(0), exterior: true, open_outside_left: None };
         assert_eq!(place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap_err(), "the corner's arms are parallel");
+    }
+
+    /// An orthogonal X of four 200 mm runs at the origin: east, north, west, south (arms CCW, gaps
+    /// all 90). `reversed` makes the west and south runs end at the node instead of start there.
+    /// Every side is a space.
+    fn x_junction(reversed: bool) -> (Junction, Vec<WallRun>, Vec<RunSides>) {
+        use crate::derivation::wall_junctions::JunctionArm;
+        let o = p(0.0, 0.0);
+        let far = [p(5000.0, 0.0), p(0.0, 5000.0), p(-5000.0, 0.0), p(0.0, -5000.0)];
+        let mut runs = Vec::new();
+        let mut arms = Vec::new();
+        for (i, f) in far.into_iter().enumerate() {
+            let rev = reversed && i >= 2;
+            runs.push(if rev { run(f, o, 200.0) } else { run(o, f, 200.0) });
+            let end = if rev { RunEnd::End } else { RunEnd::Start };
+            arms.push(JunctionArm { run: i, end, direction_deg: 90.0 * i as f64 });
+        }
+        let sides = (0..4)
+            .map(|i| RunSides { left: SideKind::Space(i), right: SideKind::Space((i + 1) % 4), exterior: false, open_outside_left: None })
+            .collect();
+        (Junction { point: o, arms, gaps_deg: vec![90.0; 4] }, runs, sides)
+    }
+
+    #[test]
+    fn x_quadrant_is_the_gap_holding_the_tip() {
+        let (j, _, _) = x_junction(false);
+        assert_eq!(
+            [(300.0, 200.0), (-300.0, 200.0), (-300.0, -200.0), (300.0, -200.0)].map(|(x, y)| x_quadrant(&j, p(x, y))),
+            [Some(0), Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(x_quadrant(&j, p(0.0, 0.0)), None);
+        // Signature order starting at the south arm: quadrant 0 is the south-east.
+        let mut r = j.clone();
+        r.arms.rotate_right(1);
+        assert_eq!(x_quadrant(&r, p(300.0, -200.0)), Some(0));
+        let (l, _, _) = l_corner(false);
+        assert_eq!(x_quadrant(&l, p(300.0, 300.0)), None);
+    }
+
+    #[test]
+    fn an_x_corner_detail_lays_as_an_l_in_the_tagged_quadrant() {
+        use crate::derivation::wall_junctions::JunctionArm;
+        let (reference, mut lines) = crn();
+        lines.push((reference.0, reference.1, "REF".into()));
+        let corners = [(100.0, 100.0), (-100.0, 100.0), (-100.0, -100.0), (100.0, -100.0)];
+        for reversed in [false, true] {
+            let (j, runs, sides) = x_junction(reversed);
+            for (k, (cx, cy)) in corners.into_iter().enumerate() {
+                let out = place_corner_x(&j, k, &runs, &sides, reference, &lines, [0.0, 0.0], false).unwrap();
+                let r = &rounded(&out)[2];
+                assert_eq!((r.2, r.3), (cx, cy), "reversed {reversed}, k {k}: the reference ends on the quadrant's face corner");
+                // No member lies in the open quadrant itself.
+                let inside = |q: Point2| q.x * cx.signum() > 100.0 + 1e-6 && q.y * cy.signum() > 100.0 + 1e-6;
+                assert!(out.iter().all(|l| !inside(l.from) && !inside(l.to)), "reversed {reversed}, k {k}: {:?}", rounded(&out));
+                // Equal to the L built by hand: the quadrant's sides outside, the rest as they were.
+                let (a, b): (&JunctionArm, &JunctionArm) = (&j.arms[k], &j.arms[(k + 1) % 4]);
+                let mut l_sides = sides.clone();
+                for (arm, quadrant_left_of_out) in [(a, true), (b, false)] {
+                    let on_left = (arm.end == RunEnd::Start) == quadrant_left_of_out;
+                    let s = &mut l_sides[arm.run];
+                    if on_left {
+                        s.left = SideKind::Outside;
+                    } else {
+                        s.right = SideKind::Outside;
+                    }
+                    s.exterior = true;
+                }
+                let l = Junction { point: j.point, arms: vec![a.clone(), b.clone()], gaps_deg: vec![90.0, 270.0] };
+                assert_eq!(out, place_corner(&l, &runs, &l_sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap());
+            }
+            assert_eq!(
+                place_corner(&j, &runs, &sides, FaceRef::Exterior, reference, &lines, &[], false).unwrap_err(),
+                "an X corner is placed through place_corner_x"
+            );
+        }
+        let (j, mut runs, sides) = x_junction(false);
+        runs[1].centreline = RunCurve::Arc { center: p(-2000.0, 0.0), radius: 2000.0, start_angle: 0.0, sweep: 1.0 };
+        assert_eq!(place_corner_x(&j, 0, &runs, &sides, reference, &lines, [0.0, 0.0], false).unwrap_err(), "an X corner needs straight arms");
     }
 
     /// The corner detail of the adapter's tests: reference (−1000,0)–(0,0), `CRN-A` (0,0)–(0,1000),

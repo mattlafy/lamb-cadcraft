@@ -53,8 +53,8 @@ use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult
 use cadcraft_geom::{Vec2, Vec3};
 use lamb_core::derivation::assembly::{
     AssemblyLine, FaceRef, WidthConflict, arc_delta, arc_end, arm_direction, corner_arc_reach, corner_reach, detail_bands, detail_frame,
-    end_on_circle, jamb_arc_reach, jamb_reach, junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner, place_opening, place_opening_end,
-    place_run_end, tee_butt, tee_face_circle, trim_to_reach, width_conflict,
+    end_on_circle, jamb_arc_reach, jamb_reach, junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner, place_corner_x, place_opening,
+    place_opening_end, place_run_end, tee_butt, tee_face_circle, trim_to_reach, width_conflict, x_corner, x_quadrant,
 };
 use lamb_core::derivation::detail_tags::{EndLevel, RunDetail};
 use lamb_core::derivation::issues::{Issue, IssueKind};
@@ -71,8 +71,8 @@ use crate::commands::{id_value, other};
 use crate::convert::to_polyline;
 use crate::detailref::{DetailRefKind, detail_reference};
 use crate::detailtags::{
-    bridge_upper, edited_wall_view, graph_and_sides, resolve_view_details, resolve_view_ends, resolve_view_opening_ends, resolve_view_openings,
-    run_end_point, view_detail_tags, view_direction,
+    attach_junction, bridge_upper, edited_wall_view, graph_and_sides, resolve_view_details, resolve_view_ends, resolve_view_opening_ends,
+    resolve_view_openings, run_end_point, tags_in, view_detail_tags, view_direction,
 };
 use crate::project::DrawingProject;
 use crate::repeats::{detail_repeats, repeat_members};
@@ -612,12 +612,16 @@ fn junction_placement(
     }
 }
 
-/// One corner detail's lines placed at junction `j`, or why not.
+/// One corner detail's lines placed at junction `j`, or why not. At a four-arm (X) junction the
+/// detail lays as an L in `quadrant` ([`place_corner_x`], LAMB T587), whose two arms alone take the
+/// reference's insets; the quadrant's faces are the reference face whatever kind it names.
+#[allow(clippy::too_many_arguments)]
 fn corner_lines(
     d: &Drawing,
     view: Id,
     detail: Id,
     j: &lamb_core::derivation::wall_junctions::Junction,
+    quadrant: Option<usize>,
     runs: &[WallRun],
     sides: &[lamb_core::derivation::wall_spaces::RunSides],
 ) -> Result<Vec<AssemblyLine>, String> {
@@ -625,6 +629,14 @@ fn corner_lines(
     let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
     let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| *h != r.handle).collect();
     let lines = member_segments(d, detail, &others);
+    if j.arms.len() == 4 {
+        let k = quadrant.ok_or("pick the quadrant's corner, not the crossing")?;
+        let (l, quadrant_sides) = x_corner(j, k, runs, sides)?;
+        let arms = [Some(l.arms[0].run), Some(l.arms[1].run)];
+        let (_, insets, outward) = junction_placement(d, view, &r, &lines, &arms, runs, &quadrant_sides)?;
+        let inset = |i: usize| insets.get(i).copied().unwrap_or(0.0);
+        return place_corner_x(j, k, runs, sides, (r.from, r.to), &lines, [inset(0), inset(1)], outward);
+    }
     // A T's branch arm carries no reference, so it needs no grid line.
     let branch = if j.arms.len() == 3 { lamb_core::derivation::assembly::tee_butt(j, runs).map(|(b, _, _)| b) } else { None };
     let arms: Vec<Option<usize>> = j.arms.iter().enumerate().map(|(k, a)| (Some(k) != branch).then_some(a.run)).collect();
@@ -634,11 +646,25 @@ fn corner_lines(
 
 /// Every junction of `view`'s wall graph whose corner detail resolves (`Tagged`, `Spread` or
 /// `Gap`), in junction order, with that detail placed there ([`place_corner`]); a failure is the
-/// entry's `skipped` reason, never an error of the view.
+/// entry's `skipped` reason, never an error of the view. At a four-arm (X) junction the detail
+/// lays in the quadrant its tag tip sits in ([`x_quadrant`], LAMB T587): the junction's own corner
+/// tag naming that detail, else — a spread or gap X — the first corner tag in block order naming it
+/// at an X junction of the view.
 pub fn corner_assembly(d: &Drawing, view: Id) -> Result<Vec<CornerAssembly>, String> {
     let (_, corners) = resolve_view_details(d, view)?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let (graph, sides) = graph_and_sides(&p, view);
+    // Every corner tag attached to a junction: (junction, tip, detail id).
+    let corner_tags: Vec<(usize, Point2, String)> = tags_in(d, view)?
+        .into_iter()
+        .filter(|(_, _, t)| t.corner)
+        .filter_map(|(_, tip, t)| attach_junction(&graph, tip).map(|i| (i, tip, t.detail_view_id.0.to_string())))
+        .collect();
+    let quadrant_of = |i: usize, id: &str| {
+        let own = corner_tags.iter().find(|t| t.0 == i && t.2 == id);
+        let tag = own.or_else(|| corner_tags.iter().find(|t| t.2 == id && graph.junctions.get(t.0).is_some_and(|j| j.arms.len() == 4)))?;
+        x_quadrant(graph.junctions.get(tag.0)?, tag.1)
+    };
     let mut out = Vec::new();
     for (i, (j, corner)) in graph.junctions.iter().zip(&corners).enumerate() {
         let id = match corner {
@@ -650,7 +676,8 @@ pub fn corner_assembly(d: &Drawing, view: Id) -> Result<Vec<CornerAssembly>, Str
             out.push(skip("detail id is not a number".into(), None));
             continue;
         };
-        out.push(match corner_lines(d, view, detail, j, &graph.runs, &sides.runs) {
+        let quadrant = if j.arms.len() == 4 { quadrant_of(i, id) } else { None };
+        out.push(match corner_lines(d, view, detail, j, quadrant, &graph.runs, &sides.runs) {
             Ok(lines) => CornerAssembly { junction: i, detail: Some(detail), lines, skipped: None },
             Err(e) => skip(e, Some(detail)),
         });
@@ -2924,6 +2951,68 @@ pub(crate) mod tests {
         assert!(trims_something(s.doc()?, plan)?, "no band was clipped at a corner");
         s.undo()?;
         assert!(s.doc()?.block(&assembly_block_name(plan)).is_none(), "undo removes the block");
+        Ok(())
+    }
+
+    /// Two rows of `cols` 5000 x 4000 rooms: a 200 mm outer wall and 200 mm interior walls
+    /// crossing at (5000·i, 4000) — X junctions — with [`room`]'s edge detail tagged on the bottom.
+    fn x_plan(cols: usize) -> T<(Session, Id)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let detail = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": format!("{:X}", r.0), "kind": "exterior_face" }))?;
+        s.execute("layer.new", &json!({ "name": "GYP", "current": true }))?;
+        line(&mut s, [0.0, 200.0], [1000.0, 200.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        let w = 5000.0 * cols as f64;
+        s.execute("pline", &json!({ "vertices": [[0.0, 0.0], [w, 0.0], [w, 8000.0], [0.0, 8000.0]], "closed": true }))?;
+        for c in 0..cols {
+            let (x0, x1) = (5000.0 * c as f64, 5000.0 * (c + 1) as f64);
+            let (l, r) = (if c == 0 { x0 + 200.0 } else { x0 + 100.0 }, if c + 1 == cols { x1 - 200.0 } else { x1 - 100.0 });
+            for (b, t) in [(200.0, 3900.0), (4100.0, 7800.0)] {
+                s.execute("pline", &json!({ "vertices": [[l, b], [r, b], [r, t], [l, t]], "closed": true }))?;
+            }
+        }
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 2500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
+        Ok((s, plan))
+    }
+
+    #[test]
+    fn a_corner_detail_tagged_at_an_x_junction_lays_in_the_tag_s_quadrant() -> R {
+        // (tip, the reference's corner at each X) — the tag in the north-east quadrant, then south-west.
+        for (tip, want) in [((5080.0, 4080.0), [(5100.0, 4100.0), (10100.0, 4100.0)]), ((4920.0, 3920.0), [(4900.0, 3900.0), (9900.0, 3900.0)])] {
+            let (mut s, plan) = x_plan(3)?;
+            let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, plan);
+            let xs: Vec<usize> = (0..graph.junctions.len()).filter(|&i| graph.junctions[i].arms.len() == 4).collect();
+            assert_eq!(
+                xs.iter().map(|&i| (r6(graph.junctions[i].point.x), r6(graph.junctions[i].point.y))).collect::<Vec<_>>(),
+                [(5000.0, 4000.0), (10000.0, 4000.0)]
+            );
+            let cd = corner_detail(&mut s, plan, "exterior_face", false, tip)?;
+            let corners = corner_assembly(s.doc()?, plan)?;
+            for (&i, c) in xs.iter().zip(want) {
+                let a = corners.iter().find(|a| a.junction == i).ok_or(format!("X {i} not resolved: {corners:?}"))?;
+                assert_eq!((a.detail, a.skipped.as_deref()), (Some(cd), None), "{a:?}");
+                let crn_a = a.lines.iter().find(|l| l.layer == "CRN-A").ok_or("no CRN-A")?;
+                assert_eq!((r6(crn_a.from.x), r6(crn_a.from.y)), c, "the reference ends on the quadrant's face corner: {a:?}");
+            }
+            let r = s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+            assert!(
+                r["skipped"].as_array().ok_or("no skipped")?.iter().all(|x| !xs.iter().any(|&i| x["junction"].as_u64() == Some(i as u64))),
+                "{r}"
+            );
+        }
+        // A tip on the node picks no quadrant.
+        let (mut s, plan) = x_plan(2)?;
+        corner_detail(&mut s, plan, "exterior_face", false, (5000.0, 4000.0))?;
+        let corners = corner_assembly(s.doc()?, plan)?;
+        assert!(corners.iter().any(|c| c.skipped.as_deref() == Some("pick the quadrant's corner, not the crossing")), "{corners:?}");
         Ok(())
     }
 
