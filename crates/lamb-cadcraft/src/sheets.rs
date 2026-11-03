@@ -10,7 +10,11 @@
 //!
 //! Arrangement: a grid over the layout's printable area (columns = ceil(sqrt(n)), filled row by
 //! row from the top left in the given order), each viewport its cell shrunk by 5 % on every side
-//! and zoomed to its own view block's extents. No shared plot scale yet.
+//! and centred on its own view block's extents at a standard drawing scale ([`STANDARD_SCALES`]):
+//! plans, sections and elevations at the project's `plot_scale` when it fits, else the next larger
+//! standard denominator that does; details at the smallest standard denominator ≥ 5 that fits; an
+//! assembly viewport at its plan's scale. "Fits" means the extents grown 5 % each way fit the
+//! viewport at that scale. VPVIEW rescales the same way; existing viewports are not rescaled.
 
 use std::fmt;
 
@@ -63,16 +67,65 @@ impl From<SchemaError> for SheetError {
 /// Every assembly block's (and its layer's) name starts with this ([`assembly_block_name`]).
 const ASSEMBLY_PREFIX: &str = "LAMB_ASSEMBLY_";
 
-/// Model height shown by a viewport onto an empty view.
-const EMPTY_VIEW_HEIGHT: f64 = 10_000.0;
+/// The standard drawing-scale denominators (1:n) a LAMB viewport plots at, ascending.
+pub const STANDARD_SCALES: [f64; 13] = [1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0, 2000.0];
 
-fn zoom(d: &Drawing, block: &str, vp_width: f64, vp_height: f64) -> (Vec2, f64) {
-    let ext = d.extents(&Space::Block(block.to_owned()));
-    if ext.is_empty() {
-        return (Vec2::new(0.0, 0.0), EMPTY_VIEW_HEIGHT);
+/// Details plot no larger than 1:this.
+const DETAIL_MIN_SCALE: f64 = 5.0;
+
+/// How a viewport's drawing scale is chosen ([`scaled_zoom`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScaleRule {
+    /// Plan and vertical views (and assembly plans): `plot_scale` when it fits, else the next
+    /// larger standard denominator that fits.
+    Plan,
+    /// Detail views: the smallest standard denominator ≥ [`DETAIL_MIN_SCALE`] that fits.
+    Detail,
+}
+
+fn rule_of(v: &AnyView) -> ScaleRule {
+    match v {
+        AnyView::Detail(_) => ScaleRule::Detail,
+        _ => ScaleRule::Plan,
     }
-    let h = ext.height().max(ext.width() * vp_height / vp_width) * 1.1;
-    (ext.center(), if h.is_finite() && h > 0.0 { h } else { EMPTY_VIEW_HEIGHT })
+}
+
+/// Whether bounds `ext` grown 5 % each way fit a `w` × `h` paper viewport at 1:`n`.
+fn fits(ext: &Bounds2, n: f64, w: f64, h: f64) -> bool {
+    let slack = 1.0 + 1e-9;
+    ext.width() * 1.1 <= w * n * slack && ext.height() * 1.1 <= h * n * slack
+}
+
+/// The 1:n denominator `rule` picks for bounds `ext` in a `w` × `h` viewport. Empty bounds take
+/// `plot_scale`; nothing fitting even at the series' largest takes the largest.
+fn scale_for(ext: &Bounds2, rule: ScaleRule, plot_scale: f64, w: f64, h: f64) -> f64 {
+    let largest = STANDARD_SCALES[STANDARD_SCALES.len() - 1];
+    let plot_scale = if plot_scale.is_finite() && plot_scale > 0.0 { plot_scale } else { 50.0 };
+    if ext.is_empty() || !(ext.width().is_finite() && ext.height().is_finite()) {
+        return plot_scale;
+    }
+    let first_fitting = |min: f64| STANDARD_SCALES.iter().copied().filter(|n| *n >= min).find(|n| fits(ext, *n, w, h)).unwrap_or(largest);
+    match rule {
+        ScaleRule::Plan if fits(ext, plot_scale, w, h) => plot_scale,
+        ScaleRule::Plan => first_fitting(plot_scale),
+        ScaleRule::Detail => first_fitting(DETAIL_MIN_SCALE),
+    }
+}
+
+/// `(view_center, view_height)` of a `w` × `h` viewport showing `block` at the scale `rule`
+/// picks: centred on the block's extents (the origin when empty), `view_height = h * n`.
+fn scaled_zoom(d: &Drawing, block: &str, rule: ScaleRule, plot_scale: f64, w: f64, h: f64) -> (Vec2, f64) {
+    let ext = d.extents(&Space::Block(block.to_owned()));
+    let n = scale_for(&ext, rule, plot_scale, w, h);
+    (if ext.is_empty() { Vec2::new(0.0, 0.0) } else { ext.center() }, h * n)
+}
+
+/// A viewport's drawing scale as the 1:n denominator, model mm per paper mm
+/// (`view_height / height`): the nearest [`STANDARD_SCALES`] entry when within 1e-6 relative,
+/// else the raw ratio.
+pub fn viewport_scale(vp: &Viewport) -> f64 {
+    let r = vp.view_height / vp.height;
+    STANDARD_SCALES.iter().copied().find(|n| ((r - n) / n).abs() <= 1e-6).unwrap_or(r)
 }
 
 /// The frozen-layer list of a viewport showing block `shown`: every LAMB view layer and every
@@ -90,7 +143,7 @@ fn assembly_layers(d: &Drawing) -> Vec<String> {
 
 /// Binds viewport `vp` to `view` (VPVIEW): writes its `EntityData.view_id`, freezes every other LAMB
 /// view layer and every assembly layer in it (the rule [`create_sheet`] applies; non-LAMB frozen
-/// layers are kept) and zooms it to the view block's extents. `None` clears `view_id` and thaws
+/// layers are kept) and centres it on the view block at the view kind's standard scale. `None` clears `view_id` and thaws
 /// every LAMB view layer. Refuses a handle that is not a paper-space viewport, a layout's overall
 /// viewport (id 1), or an unknown view; nothing is changed on error.
 pub fn set_viewport_view(d: &mut Drawing, vp: Handle, view: Option<Id>) -> Result<(), SheetError> {
@@ -121,7 +174,8 @@ pub fn set_viewport_view(d: &mut Drawing, vp: Handle, view: Option<Id>) -> Resul
             frozen.extend(frozen_except(&view_layers, &assemblies, &block));
             frozen.sort();
             port.frozen_layers = frozen;
-            (port.view_center, port.view_height) = zoom(d, &block, port.width, port.height);
+            let rule = doc.views.iter().find(|x| x.id() == v).map_or(ScaleRule::Plan, rule_of);
+            (port.view_center, port.view_height) = scaled_zoom(d, &block, rule, doc.defaults.plot_scale, port.width, port.height);
         }
         None => port.frozen_layers.retain(|l| !is_view_layer(l)),
     }
@@ -160,13 +214,14 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
     let view_layers: Vec<String> = all.iter().map(|v| view_block_name(*v)).collect();
     let assembly_layers = assembly_layers(d);
     // (block shown, EntityData) per viewport, built before anything changes.
-    let slots: Vec<(String, EntityData)> = chosen
+    // An assembly slot also names its plan, whose scale it takes.
+    let slots: Vec<(String, EntityData, Option<Id>)> = chosen
         .iter()
-        .map(|v| (view_block_name(*v), EntityData { view_id: Some(*v), ..EntityData::default() }))
-        .chain(assemblies.iter().map(|p| (assembly_block_name(*p), EntityData::default())))
+        .map(|v| (view_block_name(*v), EntityData { view_id: Some(*v), ..EntityData::default() }, None))
+        .chain(assemblies.iter().map(|p| (assembly_block_name(*p), EntityData::default(), Some(*p))))
         .collect();
     let mut commons = Vec::with_capacity(slots.len());
-    for (_, dt) in &slots {
+    for (_, dt, _) in &slots {
         let mut c = Common::default();
         set_entity_data(&mut c, dt)?;
         commons.push(c);
@@ -199,10 +254,16 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
     let (w, h) = (cell.x * 0.9, cell.y * 0.9);
     let space = Space::Paper(name.to_owned());
     let mut handles = Vec::with_capacity(n);
-    for (i, ((block, _), common)) in slots.iter().zip(commons).enumerate() {
+    let plot_scale = doc.defaults.plot_scale;
+    for (i, ((block, dt, plan), common)) in slots.iter().zip(commons).enumerate() {
         let (r, c) = (i / cols, i % cols);
         let center = Vec3::new(area.min.x + cell.x * (c as f64 + 0.5), area.max.y - cell.y * (r as f64 + 0.5), 0.0);
-        let (view_center, view_height) = zoom(d, block, w, h);
+        let rule = dt.view_id.and_then(|v| doc.views.iter().find(|x| x.id() == v)).map_or(ScaleRule::Plan, rule_of);
+        let (view_center, mut view_height) = scaled_zoom(d, block, rule, plot_scale, w, h);
+        if let Some(p) = plan {
+            // The plan's own scale, unless the assembly block needs a smaller one to fit.
+            view_height = view_height.max(scaled_zoom(d, &view_block_name(*p), ScaleRule::Plan, plot_scale, w, h).1);
+        }
         let frozen_layers = frozen_except(&view_layers, &assembly_layers, block);
         let vp = Viewport { center, width: w, height: h, view_center, view_height, id: next_id + i as u32, frozen_layers, ..Viewport::default() };
         match d.add(&space, common, EntityKind::Viewport(vp)) {
@@ -342,6 +403,71 @@ mod tests {
         assert_eq!(view_sheet_ref(s.doc()?, detail), Some((1, "S1".to_owned())));
         assert_eq!(view_sheet_ref(s.doc()?, plan), Some((1, "S3".to_owned())));
         Ok(())
+    }
+
+    /// The single viewport of layout `name`.
+    fn only_viewport(s: &Session, name: &str) -> T<Viewport> {
+        let vps = viewports(s.doc()?, name)?;
+        assert_eq!(vps.len(), 1, "{vps:?}");
+        Ok(vps[0].0.clone())
+    }
+
+    #[test]
+    fn viewports_plot_at_standard_scales_by_view_kind() -> R {
+        let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
+        let detail = views(&s)?.iter().find(|v| !v.1).ok_or("no detail")?.0;
+        assert_eq!(read_document(s.doc()?)?.defaults.plot_scale, 50.0);
+
+        // The room fits its cell at the project's 1:50.
+        s.execute("newsheet", &json!({ "name": "P1", "viewIds": [plan.0] }))?;
+        let vp = only_viewport(&s, "P1")?;
+        assert!((vp.view_height - vp.height * 50.0).abs() < 1e-9, "{vp:?}");
+        assert_eq!(viewport_scale(&vp), 50.0);
+        let c = s.doc()?.extents(&Space::Block(view_block_name(plan))).center();
+        assert!((vp.view_center.x - c.x).abs() < 1e-6 && (vp.view_center.y - c.y).abs() < 1e-6);
+
+        // The 1 m detail plots at 1:5, the largest a detail plots at.
+        let out = s.execute("newsheet", &json!({ "name": "D1", "viewIds": [detail.0] }))?;
+        assert_eq!(viewport_scale(&only_viewport(&s, "D1")?), 5.0);
+
+        // VPVIEW onto the plan applies the plan rule.
+        let hex = out["viewports"][0].as_str().ok_or("no handle")?.to_owned();
+        s.execute("vpview", &json!({ "handle": hex, "viewId": plan.0 }))?;
+        assert_eq!(viewport_scale(&only_viewport(&s, "D1")?), 50.0);
+
+        // An assembly viewport takes its plan's scale.
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        s.execute("newsheet", &json!({ "name": "A1", "assemblyIds": [plan.0] }))?;
+        assert_eq!(viewport_scale(&only_viewport(&s, "A1")?), 50.0);
+
+        // A plan too big for 1:50 takes the next standard scale that fits.
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("line", &json!({ "points": [[0, 0], [20000, 0]] }))?;
+        s.execute("newsheet", &json!({ "name": "P2", "viewIds": [plan.0] }))?;
+        let vp = only_viewport(&s, "P2")?;
+        assert_eq!(viewport_scale(&vp), 100.0, "{vp:?}");
+        // Existing viewports are not rescaled.
+        assert_eq!(viewport_scale(&only_viewport(&s, "P1")?), 50.0);
+        Ok(())
+    }
+
+    #[test]
+    fn scale_rules_pick_from_the_series() {
+        let b = |w: f64, h: f64| Bounds2::new(Vec2::new(0.0, 0.0), Vec2::new(w, h));
+        // 100 × 100 paper: 1:50 holds 5000 / 1.1.
+        assert_eq!(scale_for(&b(4000.0, 4000.0), ScaleRule::Plan, 50.0, 100.0, 100.0), 50.0);
+        assert_eq!(scale_for(&b(6000.0, 100.0), ScaleRule::Plan, 50.0, 100.0, 100.0), 100.0);
+        assert_eq!(scale_for(&b(100.0, 100.0), ScaleRule::Plan, 50.0, 100.0, 100.0), 50.0, "never larger than plot_scale");
+        assert_eq!(scale_for(&b(100.0, 100.0), ScaleRule::Plan, 75.0, 100.0, 100.0), 75.0, "off-series plot_scale used as-is");
+        assert_eq!(scale_for(&b(8000.0, 100.0), ScaleRule::Plan, 75.0, 100.0, 100.0), 100.0);
+        assert_eq!(scale_for(&b(10.0, 10.0), ScaleRule::Detail, 50.0, 100.0, 100.0), 5.0, "never 1:2 or 1:1");
+        assert_eq!(scale_for(&b(900.0, 10.0), ScaleRule::Detail, 50.0, 100.0, 100.0), 10.0);
+        assert_eq!(scale_for(&b(1e9, 10.0), ScaleRule::Detail, 50.0, 100.0, 100.0), 2000.0, "nothing fits: 1:2000");
+        assert_eq!(scale_for(&Bounds2::EMPTY, ScaleRule::Detail, 50.0, 100.0, 100.0), 50.0, "empty: plot_scale");
+        let vp = Viewport { height: 3.0, view_height: 3.0 * 25.0 * (1.0 + 1e-9), ..Viewport::default() };
+        assert_eq!(viewport_scale(&vp), 25.0);
+        let vp = Viewport { height: 3.0, view_height: 3.0 * 30.0, ..Viewport::default() };
+        assert!((viewport_scale(&vp) - 30.0).abs() < 1e-9);
     }
 
     /// Plots layout `sheet` and returns, per optional content group (by layer name) whose marked

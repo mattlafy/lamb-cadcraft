@@ -4,8 +4,8 @@
 //! prefix `A5`), `perSheet` per sheet (default 6, the 3 × 2 grid of [`create_sheet`]) in document
 //! view order. Each sheet's viewport order numbers its details 1..n, so every tag bubble's `SHEET`
 //! attribute fills in (`3/A501`) in the same undo step. Details already on a sheet keep their
-//! number; existing sheets are never re-flowed. Viewports stay zoomed to extents (no shared plot
-//! scale yet).
+//! number; existing sheets are never re-flowed. Each detail plots at the smallest standard scale
+//! that is no larger than 1:5 and fits its viewport ([`crate::sheets::STANDARD_SCALES`]).
 //!
 //! `detailsheets {prefix?, perSheet?}` (`dsh`) returns
 //! `{sheets: [{layout, viewports: [hex], detailIds: [n]}], alreadyOnSheets, message}`; nothing to
@@ -283,6 +283,27 @@ mod tests {
         assert_eq!(assigned_details(s.doc()?), [sd]);
         let r = s.execute("detailsheets", &json!({}))?;
         assert_eq!(details_on(&r), [("A501".to_owned(), vec![sd.0])], "{r}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_small_detail_plots_at_one_to_five_never_larger() -> R {
+        let (mut s, plan, [d1, ..]) = room()?;
+        s.execute("editview", &json!({ "viewId": d1.0 }))?;
+        s.execute("line", &json!({ "points": [[0, 0], [100, 50]] }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        tag(&mut s, d1, (2500.0, 0.0))?;
+        s.execute("detailsheets", &json!({}))?;
+        let l = s.doc()?.layout("A501").ok_or("no sheet")?;
+        let scales: Vec<f64> = l
+            .entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Viewport(vp) if vp.id > 1 => Some(crate::sheets::viewport_scale(vp)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scales, [5.0], "a 100 mm detail would fit at 1:1");
         Ok(())
     }
 
