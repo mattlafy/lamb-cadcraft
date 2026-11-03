@@ -14,6 +14,8 @@
 //!   MVIEW) whose viewports each pick their view with VPVIEW.
 //! - `detailsheets {prefix?, perSheet?}` (`dsh`): every detail assigned to a wall and on no sheet yet,
 //!   laid out on new numbered sheets `A501`, `A502`, … — see [`crate::detailsheets`].
+//! - `bomtable {layout?, at?}` (`bom`): the framing BOM — repeat copies and placed corner and jamb
+//!   details counted per level — as a table on layout `BOM` — see [`crate::bom`].
 //! - `vpview {handle, viewId | null}`: binds a layout viewport to a view — its `view_id`, every other
 //!   view's layer frozen in it, zoomed to the view; `null` unbinds it. One undo step; the
 //!   Properties palette's View row runs it ([`crate::props`]).
@@ -843,6 +845,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["dsh"])
             .params("{prefix?, perSheet?}")
             .interactive(crate::detailsheets::detailsheets_machine),
+        CommandSpec::new("bomtable", "Framing BOM", crate::bom::bomtable)
+            .alias(&["bom"])
+            .params("{layout?, at?}")
+            .interactive(crate::bom::bomtable_machine),
         CommandSpec::new("vpview", "Viewport View", vpview).params("{handle, viewId | null} → {handle, viewId}"),
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU_VIEW_SETUP).interactive(editview_machine),
         CommandSpec::new("viewprops", "View Properties", crate::viewprops::viewprops)

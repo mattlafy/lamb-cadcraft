@@ -192,6 +192,17 @@ const DETAIL_SHEETS: IconDef = &[
     a(Loop(&[(10.5, 13.0), (15.0, 13.0), (15.0, 17.0), (10.5, 17.0)])),
 ];
 
+/// A sheet holding a table: a title bar over ruled rows and a count column.
+const FRAMING_BOM: IconDef = &[
+    b(Loop(&[(2.0, 5.0), (22.0, 5.0), (22.0, 19.0), (2.0, 19.0)])),
+    b(Line(&[(17.0, 5.0), (17.0, 19.0)])),
+    a(Loop(&[(4.0, 7.0), (15.0, 7.0), (15.0, 17.0), (4.0, 17.0)])),
+    a(Line(&[(4.0, 9.5), (15.0, 9.5)])),
+    a(Line(&[(4.0, 12.0), (15.0, 12.0)])),
+    a(Line(&[(4.0, 14.5), (15.0, 14.5)])),
+    a(Line(&[(11.0, 9.5), (11.0, 17.0)])),
+];
+
 /// The LAMB tab: everything a user would start from View ▸ LAMB, grouped by what it works on.
 pub const LAMB_TAB: ExtTab = ExtTab {
     name: "LAMB",
@@ -264,6 +275,7 @@ pub const LAMB_TAB: ExtTab = ExtTab {
                 tool(DXF_IMPORT, "dxfimport", "Import DXF as View"),
                 tool(NEW_SHEET, "newsheet", "New Sheet"),
                 tool(DETAIL_SHEETS, "detailsheets", "Detail Sheets"),
+                tool(FRAMING_BOM, "bomtable", "Framing BOM"),
             ],
         },
     ],
