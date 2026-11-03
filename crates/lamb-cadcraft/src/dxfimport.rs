@@ -177,7 +177,7 @@ mod tests {
         set_io(IoHooks {
             read: |b, n| cadcraft_io::read(b, n).map_err(|e| e.to_string()),
             write: |d, n| cadcraft_io::write(d, n).map_err(|e| e.to_string()),
-            plot: None,
+            plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
         });
     }
 

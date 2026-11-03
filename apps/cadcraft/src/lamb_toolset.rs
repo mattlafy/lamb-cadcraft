@@ -192,6 +192,14 @@ const DETAIL_SHEETS: IconDef = &[
     a(Loop(&[(10.5, 13.0), (15.0, 13.0), (15.0, 17.0), (10.5, 17.0)])),
 ];
 
+/// A fanned stack of three sheets, the front one with its title strip.
+const SHEET_SET: IconDef = &[
+    b(Line(&[(6.0, 3.0), (22.0, 3.0), (22.0, 14.0)])),
+    b(Line(&[(4.0, 5.5), (20.0, 5.5), (20.0, 16.5)])),
+    a(Loop(&[(2.0, 8.0), (18.0, 8.0), (18.0, 21.0), (2.0, 21.0)])),
+    a(Line(&[(14.0, 8.0), (14.0, 21.0)])),
+];
+
 /// A sheet holding a table: a title bar over ruled rows and a count column.
 const FRAMING_BOM: IconDef = &[
     b(Loop(&[(2.0, 5.0), (22.0, 5.0), (22.0, 19.0), (2.0, 19.0)])),
@@ -275,6 +283,7 @@ pub const LAMB_TAB: ExtTab = ExtTab {
                 tool(DXF_IMPORT, "dxfimport", "Import DXF as View"),
                 tool(NEW_SHEET, "newsheet", "New Sheet"),
                 tool(DETAIL_SHEETS, "detailsheets", "Detail Sheets"),
+                tool(SHEET_SET, "sheetset", "Sheet Set"),
                 tool(FRAMING_BOM, "bomtable", "Framing BOM"),
             ],
         },

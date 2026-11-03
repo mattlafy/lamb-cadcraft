@@ -14,6 +14,9 @@
 //!   MVIEW) whose viewports each pick their view with VPVIEW.
 //! - `detailsheets {prefix?, perSheet?}` (`dsh`): every detail assigned to a wall and on no sheet yet,
 //!   laid out on new numbered sheets `A501`, `A502`, … — see [`crate::detailsheets`].
+//! - `sheetset {pdf?}` (`sset`): every placed plan, elevation and section on no sheet yet on its own
+//!   sheet (`A1nn`, `A2nn`, `A3nn`), the unplaced assigned details on `A5nn`, tabs in set order,
+//!   optionally plotted to one PDF — see [`crate::sheetset`].
 //! - `bomtable {layout?, at?}` (`bom`): the framing BOM — repeat copies and placed corner and jamb
 //!   details counted per level — as a table on layout `BOM` — see [`crate::bom`].
 //! - `vpview {handle, viewId | null}`: binds a layout viewport to a view — its `view_id`, every other
@@ -845,6 +848,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["dsh"])
             .params("{prefix?, perSheet?}")
             .interactive(crate::detailsheets::detailsheets_machine),
+        CommandSpec::new("sheetset", "Sheet Set", crate::sheetset::sheetset).alias(&["sset"]).params("{pdf?}"),
         CommandSpec::new("bomtable", "Framing BOM", crate::bom::bomtable)
             .alias(&["bom"])
             .params("{layout?, at?}")

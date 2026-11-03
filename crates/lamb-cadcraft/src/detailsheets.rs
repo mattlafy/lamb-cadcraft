@@ -11,7 +11,7 @@
 //! `{sheets: [{layout, viewports: [hex], detailIds: [n]}], alreadyOnSheets, message}`; nothing to
 //! place is `Ok` with no change and no undo step. Interactively `Enter detail sheet prefix <A5>:`.
 
-use cadcraft_doc::Drawing;
+use cadcraft_doc::{Drawing, Handle};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use lamb_core::derivation::detail_tags::RunDetail;
 use lamb_core::model::{AnyView, Id};
@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use crate::commands::{bad, name_input, other};
 use crate::detailtags::{resolve_view_details, resolve_view_opening_ends, resolve_view_openings};
 use crate::schema::read_document;
-use crate::sheets::{create_sheet, view_sheet_ref};
+use crate::sheets::{SheetError, create_sheet, view_sheet_ref};
 
 const DEFAULT_PREFIX: &str = "A5";
 const DEFAULT_PER_SHEET: usize = 6;
@@ -52,8 +52,26 @@ pub fn assigned_details(d: &Drawing) -> Vec<Id> {
 }
 
 /// `{prefix}{k:02}` for the first k ≥ 1 with no layout of that name.
-fn next_sheet_name(d: &Drawing, prefix: &str) -> String {
+pub(crate) fn next_sheet_name(d: &Drawing, prefix: &str) -> String {
     (1..).map(|k| format!("{prefix}{k:02}")).find(|n| d.layout(n).is_none()).unwrap_or_default()
+}
+
+/// One detail sheet laid out: (layout name, viewport handles, detail view ids).
+pub(crate) type DetailSheet = (String, Vec<Handle>, Vec<Id>);
+
+/// Lays every assigned detail that no sheet shows yet onto new sheets `{prefix}nn`, `per` to a
+/// sheet, in document view order. Returns the sheets laid out and how many assigned details were
+/// already on sheets.
+pub(crate) fn lay_detail_sheets(d: &mut Drawing, prefix: &str, per: usize) -> std::result::Result<(Vec<DetailSheet>, usize), SheetError> {
+    let assigned = assigned_details(d);
+    let (placed, todo): (Vec<Id>, Vec<Id>) = assigned.iter().partition(|id| view_sheet_ref(d, **id).is_some());
+    let mut sheets = Vec::new();
+    for chunk in todo.chunks(per.max(1)) {
+        let name = next_sheet_name(d, prefix);
+        let handles = create_sheet(d, &name, chunk, &[])?;
+        sheets.push((name, handles, chunk.to_vec()));
+    }
+    Ok((sheets, placed.len()))
 }
 
 pub(crate) fn detailsheets(s: &mut Session, p: &Value) -> Result<Value> {
@@ -68,38 +86,35 @@ pub(crate) fn detailsheets(s: &mut Session, p: &Value) -> Result<Value> {
             _ => return Err(bad("detailsheets", "`perSheet` must be a whole number of at least 1")),
         },
     };
-    let d0 = s.doc()?;
-    let assigned = assigned_details(d0);
-    let (placed, todo): (Vec<Id>, Vec<Id>) = assigned.iter().partition(|id| view_sheet_ref(d0, **id).is_some());
-    if todo.is_empty() {
-        let message = if assigned.is_empty() {
+    // Build every sheet on a copy and assign it back once: one undo step.
+    let mut d = s.doc()?.clone();
+    let (laid, placed) = lay_detail_sheets(&mut d, &prefix, per).map_err(other)?;
+    if laid.is_empty() {
+        let message = if placed == 0 {
             "No details are assigned to walls.".to_owned()
         } else {
-            format!("Every assigned detail is already on a sheet ({}).", placed.len())
+            format!("Every assigned detail is already on a sheet ({placed}).")
         };
-        return Ok(json!({ "sheets": [], "alreadyOnSheets": placed.len(), "message": message }));
-    }
-    // Build every sheet on a copy and assign it back once: one undo step.
-    let mut d = d0.clone();
-    let mut sheets = Vec::new();
-    let mut parts = Vec::new();
-    for chunk in todo.chunks(per) {
-        let name = next_sheet_name(&d, &prefix);
-        let handles = create_sheet(&mut d, &name, chunk, &[]).map_err(other)?;
-        parts.push(format!("{name} ({})", chunk.len()));
-        sheets.push(json!({
-            "layout": name,
-            "viewports": handles.iter().map(|h| format!("{:X}", h.0)).collect::<Vec<_>>(),
-            "detailIds": chunk.iter().map(|id| id.0).collect::<Vec<_>>(),
-        }));
+        return Ok(json!({ "sheets": [], "alreadyOnSheets": placed, "message": message }));
     }
     *s.doc_mut()? = d;
+    let parts: Vec<String> = laid.iter().map(|(name, _, ids)| format!("{name} ({})", ids.len())).collect();
+    let sheets: Vec<Value> = laid
+        .iter()
+        .map(|(name, handles, ids)| {
+            json!({
+                "layout": name,
+                "viewports": handles.iter().map(|h| format!("{:X}", h.0)).collect::<Vec<_>>(),
+                "detailIds": ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     let mut message = format!("Detail sheets: {}", parts.join(", "));
-    if !placed.is_empty() {
-        message.push_str(&format!("; {} already on sheets", placed.len()));
+    if placed > 0 {
+        message.push_str(&format!("; {placed} already on sheets"));
     }
     message.push('.');
-    Ok(json!({ "sheets": sheets, "alreadyOnSheets": placed.len(), "message": message }))
+    Ok(json!({ "sheets": sheets, "alreadyOnSheets": placed, "message": message }))
 }
 
 /// DETAILSHEETS: `Enter detail sheet prefix <A5>:`.
