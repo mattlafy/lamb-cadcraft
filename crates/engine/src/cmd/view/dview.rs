@@ -13,7 +13,6 @@
 //! ZOOM (view history, not undo). A layout viewport's twist belongs to the viewport entity, so a
 //! DVIEW that changed it is one undo step.
 
-use std::f64::consts::TAU;
 use std::sync::Arc;
 
 use cadcraft_doc::{Entity, EntityKind, Handle, Insert, Line, Space};
@@ -69,7 +68,7 @@ pub(super) fn target(s: &Session) -> Result<Target> {
 
 /// A twist kept as files hold it: [0, 2π).
 fn normal(twist: f64) -> f64 {
-    twist.rem_euclid(TAU)
+    cadcraft_geom::norm_angle(twist)
 }
 
 /// The active viewport's twist, if it is `h`.
@@ -94,6 +93,10 @@ pub(super) fn set_twist(s: &mut Session, target: Target, twist: f64) -> Result<(
         Target::Viewport(h) => {
             if viewport_twist(s, h) == Some(twist) {
                 return Ok(());
+            }
+            // A locked viewport keeps its view, the twist with it.
+            if s.state()?.active_viewport().is_some_and(|(vh, vp)| vh == h && vp.locked) {
+                return Err(EngineError::Other("The viewport is locked.".into()));
             }
             let space = s.state()?.space.clone();
             let d = s.doc_mut()?;

@@ -1422,4 +1422,5 @@ mod panes;
 pub mod scalebar;
 
 /// Background rebuilds of the display list for a new view.
+mod images;
 mod rebuild;

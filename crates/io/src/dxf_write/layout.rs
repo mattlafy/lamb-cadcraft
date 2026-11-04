@@ -72,15 +72,24 @@ pub(super) fn paper_view(w: &mut W, d: &Drawing, e: &Entity, owner: &str, cx: &C
 /// The VPORT table: the `*Active` model space tiles (one viewport on the extents when there is no
 /// tiled configuration) and the saved configurations, each tile a record, the current one first.
 pub(super) fn vport_table(w: &mut W, d: &Drawing, ext: Bounds2) {
-    let single = VportTile {
-        min: Vec2::ZERO,
-        max: Vec2::new(1.0, 1.0),
-        center: if ext.is_empty() { Vec2::new(6.0, 4.5) } else { ext.center() },
-        height: if ext.is_empty() { 9.0 } else { (ext.height() * 1.1).max(1e-6) },
-        aspect: 1.6,
-        // An untiled view's twist: the lone `*Active` tile the editor keeps for it.
-        twist: d.vports.iter().find(|c| c.is_active() && c.tiles.len() == 1).and_then(|c| c.tiles.first()).map_or(0.0, |t| t.twist),
+    // An untiled view's twist: the lone `*Active` tile the editor keeps for it.
+    let twist = d
+        .vports
+        .iter()
+        .find(|c| c.is_active() && c.tiles.len() == 1)
+        .and_then(|c| c.tiles.first())
+        .map_or(0.0, |t| cadcraft_geom::norm_angle(t.twist));
+    // The extents fitted as the turned view sees them.
+    let (center, height) = if ext.is_empty() {
+        (Vec2::new(6.0, 4.5), 9.0)
+    } else if twist == 0.0 {
+        (ext.center(), (ext.height() * 1.1).max(1e-6))
+    } else {
+        let r = Bounds2::from_points(ext.corners().map(|p| p.rotate(twist)));
+        let height = r.height() * 1.1;
+        (r.center().rotate(-twist), if height.is_finite() { height.max(1e-6) } else { 9.0 })
     };
+    let single = VportTile { min: Vec2::ZERO, max: Vec2::new(1.0, 1.0), center, height, aspect: 1.6, twist };
     let tiled = d.vports.iter().find(|c| c.is_active() && c.tiles.len() > 1);
     let mut records: Vec<(&str, &VportTile)> = match tiled {
         Some(c) => c.tiles.iter().map(|t| (VportConfig::ACTIVE, t)).collect(),
@@ -95,7 +104,7 @@ pub(super) fn vport_table(w: &mut W, d: &Drawing, ext: Bounds2) {
         w.i(70, 0);
         w.p2(10, finite(t.min, Vec2::ZERO));
         w.p2(11, finite(t.max, Vec2::new(1.0, 1.0)));
-        let twist = if t.twist.is_finite() { t.twist } else { 0.0 };
+        let twist = cadcraft_geom::norm_angle(t.twist);
         w.p2(12, dxf_ext::model_center_to_dcs(finite(t.center, Vec2::ZERO), twist));
         // Snap grid origin and rotation (SNAPBASE, SNAPANG in degrees): R13+ files keep them here.
         w.p2(13, d.header.point("SNAPBASE").map(|p| p.xy()).filter(|p| p.is_finite()).unwrap_or(Vec2::ZERO));

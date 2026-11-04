@@ -245,12 +245,13 @@ pub(super) fn entity_with_table_budget(kind: &str, tags: &[Tag], table_cells_lef
         "ACAD_TABLE" => EntityKind::Table(acad_table(tags, table_cells_left)),
         "VIEWPORT" => EntityKind::Viewport({
             // View twist (group 51, degrees).
-            let twist = t.f(51).filter(|a| a.is_finite()).map_or(0.0, |a| a.rem_euclid(360.0).to_radians());
+            let twist = t.f(51).map_or(0.0, |a| cadcraft_geom::norm_angle(a.to_radians()));
             Viewport {
                 center: t.p(10),
                 width: t.fd(40, 1.0),
                 height: t.fd(41, 1.0),
-                view_center: crate::dxf_ext::dcs_center_to_model(Vec2::new(t.fd(12, 0.0), t.fd(22, 0.0)), twist, t.p(17).xy()),
+                // 12/22 is in display coordinates, whose origin is the view target 17/27/37.
+                view_center: t.view_center(12, 17, twist),
                 view_height: t.fd(45, 1.0),
                 id: t.i(69).unwrap_or(0) as u32,
                 locked: t.i(90).unwrap_or(0) & 16384 != 0,
