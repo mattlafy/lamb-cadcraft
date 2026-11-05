@@ -1,12 +1,16 @@
 //! Sheets (`cadcraft-integration.md` §13 phase 2): a paper layout with one viewport per LAMB
-//! view. Each viewport freezes every **other** view's layer, so CADCraft hides those views'
-//! whole canonical inserts there, while model space keeps showing all views overlaid. The
-//! viewport records which view it shows in its `EntityData.view_id`.
+//! view. What a viewport shows is its data: `EntityData.view_id` names the view. Its frozen layers
+//! follow from that: each viewport freezes every **other** view's layer, so CADCraft hides those
+//! views' whole canonical inserts there, while model space keeps showing all views overlaid.
 //!
 //! A plan's assembly plan (§10, [`crate::assembly`]) is a canonical model-space insert on its own
 //! layer [`assembly_block_name`]`(plan)`. Every viewport freezes every assembly layer except its
 //! own; an assembly viewport (requested by plan id) shows only that plan's assembly block, is laid
-//! after the views, and has no `view_id`.
+//! after the views, and names its plan in `EntityData.assembly_of` instead of a `view_id`.
+//!
+//! [`sheet_freeze_observer`] keeps this true as views and assembly blocks are created: a viewport
+//! naming what it shows freezes each new one in the creating command's own undo step. A viewport
+//! naming neither is model space or a foreign one, is left alone and takes no number.
 //!
 //! Arrangement: a grid over the layout's printable area (columns = ceil(sqrt(n)), filled row by
 //! row from the top left in the given order), each viewport its cell shrunk by 5 % on every side
@@ -17,8 +21,10 @@
 //! viewport at that scale. VPVIEW rescales the same way; existing viewports are not rescaled.
 
 use std::fmt;
+use std::sync::Arc;
 
 use cadcraft_doc::{Common, Drawing, EntityKind, Handle, Layout, PageSetup, Space, Viewport};
+use cadcraft_engine::Session;
 use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use lamb_core::model::Id;
 
@@ -145,7 +151,8 @@ fn assembly_layers(d: &Drawing) -> Vec<String> {
 /// view layer and every assembly layer in it (the rule [`create_sheet`] applies; non-LAMB frozen
 /// layers are kept) and centres it on the view block at the view kind's standard scale. `None` clears `view_id` and thaws
 /// every LAMB view layer. Refuses a handle that is not a paper-space viewport, a layout's overall
-/// viewport (id 1), or an unknown view; nothing is changed on error.
+/// viewport (id 1), or an unknown view; nothing is changed on error. Either way the viewport stops
+/// being an assembly viewport (`assembly_of` is cleared).
 pub fn set_viewport_view(d: &mut Drawing, vp: Handle, view: Option<Id>) -> Result<(), SheetError> {
     let doc = read_document(d)?;
     let e = d.entity(vp).ok_or(SheetError::NotAViewport)?;
@@ -165,6 +172,7 @@ pub fn set_viewport_view(d: &mut Drawing, vp: Handle, view: Option<Id>) -> Resul
     let mut common = e.common.clone();
     let mut data = read_entity_data(&common)?;
     data.view_id = view;
+    data.assembly_of = None;
     set_entity_data(&mut common, &data)?;
     match view {
         Some(v) => {
@@ -218,7 +226,7 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
     let slots: Vec<(String, EntityData, Option<Id>)> = chosen
         .iter()
         .map(|v| (view_block_name(*v), EntityData { view_id: Some(*v), ..EntityData::default() }, None))
-        .chain(assemblies.iter().map(|p| (assembly_block_name(*p), EntityData::default(), Some(*p))))
+        .chain(assemblies.iter().map(|p| (assembly_block_name(*p), EntityData { assembly_of: Some(*p), ..EntityData::default() }, Some(*p))))
         .collect();
     let mut commons = Vec::with_capacity(slots.len());
     for (_, dt, _) in &slots {
@@ -277,12 +285,74 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
     Ok(handles)
 }
 
+/// The after-command observer: every paper viewport (id > 1) naming what it shows in `view_id` or
+/// `assembly_of` freezes every LAMB view layer and assembly layer except the one it shows. Layers
+/// are only ever added, non-LAMB layers untouched, and the drawing is written back only when one
+/// was missing, so a view or assembly block made by a command is frozen in that command's undo step.
+pub fn sheet_freeze_observer(s: &mut Session, _before: &Arc<Drawing>) {
+    let Ok(d) = s.doc() else { return };
+    let named: Vec<(Handle, String, &Viewport)> = d
+        .layouts
+        .iter()
+        .flat_map(|l| l.entities.iter())
+        .filter_map(|e| {
+            let EntityKind::Viewport(vp) = &e.kind else { return None };
+            if vp.id <= 1 {
+                return None;
+            }
+            let data = read_entity_data(&e.common).ok()?;
+            let shown = data.view_id.map(view_block_name).or_else(|| data.assembly_of.map(assembly_block_name))?;
+            Some((e.handle, shown, vp))
+        })
+        .collect();
+    if named.is_empty() {
+        return;
+    }
+    let doc = match read_document(d) {
+        Ok(doc) => doc,
+        Err(e) => {
+            s.echo(format!("LAMB sheets: {e}"));
+            return;
+        }
+    };
+    let view_layers: Vec<String> = doc.views.iter().map(|v| view_block_name(v.id())).collect();
+    let assemblies = assembly_layers(d);
+    let todo: Vec<(Handle, Vec<String>)> = named
+        .into_iter()
+        .filter_map(|(h, shown, vp)| {
+            let missing: Vec<String> = frozen_except(&view_layers, &assemblies, &shown)
+                .into_iter()
+                .filter(|l| !vp.frozen_layers.iter().any(|f| f.eq_ignore_ascii_case(l)))
+                .collect();
+            (!missing.is_empty()).then_some((h, missing))
+        })
+        .collect();
+    if todo.is_empty() {
+        return;
+    }
+    let mut after = d.clone();
+    for (h, missing) in todo {
+        let frozen = after.modify_entity(h, |e| {
+            if let EntityKind::Viewport(vp) = &mut e.kind {
+                vp.frozen_layers.extend(missing);
+                vp.frozen_layers.sort();
+            }
+        });
+        if let Err(e) = frozen {
+            s.echo(format!("LAMB sheets: {e}"));
+            return;
+        }
+    }
+    if let Ok(d) = s.doc_mut() {
+        *d = after;
+    }
+}
+
 /// Every view's sheet reference at once: `(view, n, layout)` for each view some single-view
 /// viewport shows, `n` that viewport's 1-based position (by viewport `id`) among its layout's
 /// single-view viewports, the first layout by name winning. `view_blocks` is every LAMB view with
-/// its block name. A viewport shows exactly one view when exactly one view block is absent from its
-/// `frozen_layers` (how [`create_sheet`] builds them); assembly viewports freeze every view and
-/// take no number.
+/// its block name. A single-view viewport is one whose `EntityData.view_id` names one of those
+/// views, whatever it freezes; assembly viewports name no view and take no number.
 pub fn sheet_refs(d: &Drawing, view_blocks: &[(Id, String)]) -> Vec<(Id, usize, String)> {
     let mut out: Vec<(Id, usize, String)> = Vec::new();
     for (view, n, layout, _) in numbered_viewports(d, view_blocks) {
@@ -301,21 +371,18 @@ pub(crate) fn numbered_viewports(d: &Drawing, view_blocks: &[(Id, String)]) -> V
     layouts.sort_by(|a, b| a.name.cmp(&b.name));
     let mut out = Vec::new();
     for l in layouts {
-        let mut vps: Vec<(Handle, &Viewport)> = l
+        let mut vps: Vec<(u32, Handle, Id)> = l
             .entities
             .iter()
-            .filter_map(|e| match &e.kind {
-                EntityKind::Viewport(vp) => Some((e.handle, vp)),
-                _ => None,
+            .filter_map(|e| {
+                let EntityKind::Viewport(vp) = &e.kind else { return None };
+                let view = read_entity_data(&e.common).ok()?.view_id?;
+                view_blocks.iter().any(|(v, _)| *v == view).then_some((vp.id, e.handle, view))
             })
             .collect();
-        vps.sort_by_key(|(_, vp)| vp.id);
-        let mut n = 0;
-        for (h, vp) in vps {
-            let mut shown = view_blocks.iter().filter(|(_, b)| !vp.frozen_layers.iter().any(|f| f.eq_ignore_ascii_case(b)));
-            let (Some((view, _)), None) = (shown.next(), shown.next()) else { continue };
-            n += 1;
-            out.push((*view, n, l.name.clone(), h));
+        vps.sort_by_key(|(id, _, _)| *id);
+        for (i, (_, h, view)) in vps.into_iter().enumerate() {
+            out.push((view, i + 1, l.name.clone(), h));
         }
     }
     out
@@ -413,6 +480,89 @@ mod tests {
         s.execute("newsheet", &json!({ "name": "S1", "viewIds": [detail.0] }))?;
         assert_eq!(view_sheet_ref(s.doc()?, detail), Some((1, "S1".to_owned())));
         assert_eq!(view_sheet_ref(s.doc()?, plan), Some((1, "S3".to_owned())));
+        Ok(())
+    }
+
+    /// The frozen layers of layout `name`'s single viewport.
+    fn frozen_in(s: &Session, name: &str) -> T<Vec<String>> {
+        Ok(only_viewport(s, name)?.frozen_layers)
+    }
+
+    /// The `EntityData` of layout `name`'s single viewport, with its handle.
+    fn only_viewport_data(s: &Session, name: &str) -> T<(Handle, EntityData)> {
+        let l = s.doc()?.layout(name).ok_or("no layout")?;
+        for e in l.entities.iter() {
+            if matches!(e.kind, EntityKind::Viewport(_)) {
+                return Ok((e.handle, read_entity_data(&e.common)?));
+            }
+        }
+        Err("no viewport".into())
+    }
+
+    #[test]
+    fn numbering_reads_view_id_not_frozen_layers() -> R {
+        let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
+        let detail = views(&s)?.iter().find(|v| !v.1).ok_or("no detail")?.0;
+        s.execute("newsheet", &json!({ "name": "S1", "viewIds": [plan.0, detail.0] }))?;
+        let d = s.doc_mut()?;
+        let hs: Vec<Handle> =
+            d.layout("S1").ok_or("no S1")?.entities.iter().filter(|e| matches!(e.kind, EntityKind::Viewport(_))).map(|e| e.handle).collect();
+        for h in hs {
+            d.modify_entity(h, |e| {
+                if let EntityKind::Viewport(vp) = &mut e.kind {
+                    vp.frozen_layers.clear();
+                }
+            })?;
+        }
+        assert_eq!(view_sheet_ref(s.doc()?, plan), Some((1, "S1".to_owned())));
+        assert_eq!(view_sheet_ref(s.doc()?, detail), Some((2, "S1".to_owned())));
+        // A viewport naming a view outside the list takes no number.
+        let refs = sheet_refs(s.doc()?, &[(detail, view_block_name(detail))]);
+        assert_eq!(refs, [(detail, 1, "S1".to_owned())]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_assembly_block_made_later_is_frozen_in_existing_viewports() -> R {
+        let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
+        crate::maintain::install(&mut s);
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        s.execute("newsheet", &json!({ "name": "A1", "assemblyIds": [plan.0] }))?;
+        let (asm, data) = only_viewport_data(&s, "A1")?;
+        assert_eq!((data.view_id, data.assembly_of), (None, Some(plan)));
+        assert_eq!(view_sheet_ref(s.doc()?, plan), None, "assembly viewports take no number");
+
+        let second = Id(s.execute("newplan", &json!({ "name": "Second" }))?["viewId"].as_u64().ok_or("no id")?);
+        let name = assembly_block_name(second);
+        assert!(frozen_in(&s, "A1")?.contains(&view_block_name(second)), "a later view too");
+        assert!(!frozen_in(&s, "A1")?.contains(&name));
+        s.execute("assemblyplan", &json!({ "viewId": second.0 }))?;
+        assert!(s.doc()?.block(&name).is_some(), "the block exists");
+        let frozen = frozen_in(&s, "A1")?;
+        assert!(frozen.contains(&name), "{frozen:?}");
+        assert!(!frozen.contains(&assembly_block_name(plan)), "its own stays thawed");
+
+        // VPVIEW turns it into a view viewport, whichever way it rebinds.
+        s.execute("vpview", &json!({ "handle": format!("{:X}", asm.0), "viewId": plan.0 }))?;
+        assert_eq!(only_viewport_data(&s, "A1")?.1.assembly_of, None);
+        s.undo()?;
+        assert_eq!(only_viewport_data(&s, "A1")?.1.assembly_of, Some(plan));
+        s.execute("vpview", &json!({ "handle": format!("{:X}", asm.0), "viewId": null }))?;
+        assert_eq!(only_viewport_data(&s, "A1")?.1, EntityData::default());
+        Ok(())
+    }
+
+    #[test]
+    fn a_viewport_naming_nothing_is_left_alone() -> R {
+        let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
+        crate::maintain::install(&mut s);
+        s.execute("newsheet", &json!({ "name": "S1", "viewIds": [plan.0] }))?;
+        let (h, _) = only_viewport_data(&s, "S1")?;
+        s.execute("vpview", &json!({ "handle": format!("{:X}", h.0), "viewId": null }))?;
+        let before = frozen_in(&s, "S1")?;
+        s.execute("newplan", &json!({ "name": "Second" }))?;
+        assert_eq!(frozen_in(&s, "S1")?, before, "model space or foreign: untouched");
+        assert_eq!(view_sheet_ref(s.doc()?, plan), None);
         Ok(())
     }
 

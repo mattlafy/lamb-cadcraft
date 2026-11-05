@@ -139,7 +139,8 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::write_document;
+    use crate::schema::{view_block_name, write_document};
+    use cadcraft_doc::EntityKind;
     use cadcraft_engine::cmd::file::{IoHooks, set_io};
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -264,6 +265,65 @@ mod tests {
         s.undo()?;
         assert!(s.doc()?.layout("A103").is_none());
         assert!(s.doc()?.layout("A102").is_some());
+        Ok(())
+    }
+
+    /// The `SHEET` attribute of every bubble in `view`'s block.
+    fn bubble_sheets(s: &Session, view: Id) -> T<Vec<String>> {
+        let b = s.doc()?.block(&view_block_name(view)).ok_or("no block")?;
+        Ok(b.entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Insert(i) => i.attribs.iter().find(|a| a.tag == "SHEET").map(|a| a.text.value.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// The frozen layers of layout `name`'s viewports.
+    fn frozen(s: &Session, name: &str) -> T<Vec<String>> {
+        let l = s.doc()?.layout(name).ok_or("no layout")?;
+        Ok(l.entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Viewport(vp) if vp.id > 1 => Some(vp.frozen_layers.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect())
+    }
+
+    #[test]
+    fn a_plan_made_after_the_set_gets_its_own_sheet_and_stays_out_of_the_others() -> R {
+        let (mut s, [ground, ..]) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let bubbles = bubble_sheets(&s, ground)?;
+        assert_eq!(bubbles.len(), 2);
+        assert!(bubbles.iter().all(|b| b.ends_with("/A501")), "{bubbles:?}");
+        let held = frozen(&s, "A101")?;
+
+        let n = undo_len(&s)?;
+        let later = id(&s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": ground.0, "floorToFloorMm": 6000, "name": "Later" }))?)?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let layer = view_block_name(later);
+        for sheet in ["A101", "A102", "A201", "A301", "A501"] {
+            assert!(frozen(&s, sheet)?.contains(&layer), "{sheet}");
+        }
+        assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
+        assert_eq!(bubble_sheets(&s, ground)?, bubbles);
+
+        // The undo takes the frozen layer with the view.
+        s.undo()?;
+        assert_eq!(frozen(&s, "A101")?, held);
+        s.redo()?;
+        assert!(frozen(&s, "A101")?.contains(&layer));
+
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(laid(&r), [("A103".to_owned(), "plan".to_owned(), vec![later.0])], "{r}");
+        assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
+        assert_eq!(view_sheet_ref(s.doc()?, later), Some((1, "A103".to_owned())));
+        assert_eq!(bubble_sheets(&s, ground)?, bubbles);
+        assert!(frozen(&s, "A101")?.contains(&layer));
         Ok(())
     }
 
