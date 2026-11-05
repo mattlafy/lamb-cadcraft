@@ -26,11 +26,12 @@ use std::sync::Arc;
 use cadcraft_doc::{Common, Drawing, EntityKind, Handle, Layout, PageSetup, Space, Viewport};
 use cadcraft_engine::Session;
 use cadcraft_geom::{Bounds2, Vec2, Vec3};
+use cadcraft_render::{PaperSize, Sheet, paper_size};
 use lamb_core::model::Id;
 
 use lamb_core::model::AnyView;
 
-use crate::schema::{EntityData, SchemaError, assembly_block_name, read_document, read_entity_data, set_entity_data, view_block_name};
+use crate::schema::{EntityData, LambDocument, SchemaError, assembly_block_name, read_document, read_entity_data, set_entity_data, view_block_name};
 
 /// Why a sheet could not be created.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,6 +195,26 @@ pub fn set_viewport_view(d: &mut Drawing, vp: Handle, view: Option<Id>) -> Resul
     .map_err(|e| SheetError::Schema(SchemaError::Malformed { what: "viewport".into(), message: e.to_string() }))
 }
 
+/// The paper a project's sheets default to.
+pub(crate) const DEFAULT_SHEET_PAPER: &str = "ARCH D";
+
+/// The paper size `doc` makes new sheets on: its `sheet_paper`, else ARCH D.
+pub(crate) fn sheet_paper_size(doc: &LambDocument) -> Option<&'static PaperSize> {
+    doc.sheet_paper.as_deref().and_then(paper_size).or_else(|| paper_size(DEFAULT_SHEET_PAPER))
+}
+
+/// The page setup of a new sheet in `doc`: its paper in landscape, 10 mm margins, and paper units
+/// of millimetres whatever the drawing's MEASUREMENT says, as every paper constant here assumes.
+pub(crate) fn sheet_page(doc: &LambDocument) -> PageSetup {
+    let mut page = PageSetup { landscape: true, paper_mm: true, margins_mm: [10.0; 4], ..PageSetup::default() };
+    if let Some(p) = sheet_paper_size(doc) {
+        page.paper = p.name.to_owned();
+        page.width_mm = p.width_mm;
+        page.height_mm = p.height_mm;
+    }
+    page
+}
+
 /// Creates layout `name` with one viewport per view in `views`, then one per plan in `assemblies`
 /// showing that plan's assembly block (every view in document order when both are empty). Each
 /// viewport freezes every other LAMB view's layer and every assembly layer but its own. Returns
@@ -246,13 +267,12 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
         .fold(1u32, u32::max)
         + 1;
     let tab_order = d.layouts.iter().map(|l| l.tab_order).max().map_or(0, |t| t + 1);
-    d.layouts.push(Layout { page: PageSetup::default(), ..Layout::new(name, tab_order) });
+    let page = sheet_page(&doc);
+    let fallback = Sheet::from_page(&page, 1.0).bounds();
+    d.layouts.push(Layout { page, ..Layout::new(name, tab_order) });
     let area = match cadcraft_render::sheet(d, name) {
         Some(s) if !s.printable.is_empty() => s.printable,
-        _ => {
-            let p = PageSetup::default();
-            Bounds2::new(Vec2::new(0.0, 0.0), Vec2::new(p.width_mm, p.height_mm))
-        }
+        _ => fallback,
     };
 
     let n = slots.len();
@@ -603,7 +623,7 @@ mod tests {
 
         // A plan too big for 1:50 takes the next standard scale that fits.
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
-        s.execute("line", &json!({ "points": [[0, 0], [20000, 0]] }))?;
+        s.execute("line", &json!({ "points": [[0, 0], [40000, 0]] }))?;
         s.execute("newsheet", &json!({ "name": "P2", "viewIds": [plan.0] }))?;
         let vp = only_viewport(&s, "P2")?;
         assert_eq!(viewport_scale(&vp), 100.0, "{vp:?}");

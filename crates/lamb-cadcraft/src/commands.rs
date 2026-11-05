@@ -17,6 +17,8 @@
 //! - `sheetset {pdf?}` (`sset`): every placed plan, elevation and section on no sheet yet on its own
 //!   sheet (`A1nn`, `A2nn`, `A3nn`), the unplaced assigned details on `A5nn`, tabs in set order,
 //!   optionally plotted to one PDF — see [`crate::sheetset`].
+//! - `sheetsize {paper}` (`ssize`): the paper new sheets are made on, ARCH D landscape until set;
+//!   existing sheets keep their size — see [`crate::sheetset`].
 //! - `bomtable {layout?, at?}` (`bom`): the framing BOM — repeat copies and placed corner and jamb
 //!   details counted per level — as a table on layout `BOM` — see [`crate::bom`].
 //! - `vpview {handle, viewId | null}`: binds a layout viewport to a view — its `view_id`, every other
@@ -849,6 +851,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{prefix?, perSheet?}")
             .interactive(crate::detailsheets::detailsheets_machine),
         CommandSpec::new("sheetset", "Sheet Set", crate::sheetset::sheetset).alias(&["sset"]).params("{pdf?}"),
+        CommandSpec::new("sheetsize", "Sheet Size", crate::sheetset::sheetsize)
+            .alias(&["ssize"])
+            .params("{paper} → {paper, widthMm, heightMm, message}")
+            .interactive(crate::sheetset::sheetsize_machine),
         CommandSpec::new("bomtable", "Framing BOM", crate::bom::bomtable)
             .alias(&["bom"])
             .params("{layout?, at?}")

@@ -311,13 +311,13 @@ mod tests {
         let (vp1, vp2) = (viewport(&s, hx(&out["viewports"][0])?)?, viewport(&s, hx(&out["viewports"][1])?)?);
         let t = titles(&s, "A501")?;
         assert_eq!(t.len(), 2, "{t:?}");
-        // The 1 m detail in a half-width cell fits 1:10, not 1:5 (T625's rule); the title reads the viewport.
+        // The 1 m detail plots at 1:5 in a half-width cell (T625's rule); the title reads the viewport.
         let rows: Vec<_> = t.iter().map(|t| (t.1, t.2.as_str(), t.3.as_str(), t.4.as_str(), t.5.as_str(), t.6.clone())).collect();
         assert_eq!(
             rows,
             [
                 (corner(&vp1), TITLE_LAYER, "1", "Ground", "1:50", vp1.id.to_string()),
-                (corner(&vp2), TITLE_LAYER, "2", "D1", "1:10", vp2.id.to_string()),
+                (corner(&vp2), TITLE_LAYER, "2", "D1", "1:5", vp2.id.to_string()),
             ]
         );
         let def = s.doc()?.block(TITLE_BLOCK).ok_or("no block definition")?;

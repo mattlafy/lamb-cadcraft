@@ -24,9 +24,10 @@
 
 use std::collections::HashMap;
 
-use cadcraft_doc::{Common, Drawing, EntityKind, Layout, PageSetup, Space, Table, TableCell};
+use cadcraft_doc::{Common, Drawing, EntityKind, Layout, Space, Table, TableCell};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::Vec3;
+use cadcraft_render::Sheet;
 use lamb_core::derivation::assembly::AssemblyLine;
 use lamb_core::derivation::projection::vertical_local_to_uz;
 use lamb_core::derivation::read::view_ref;
@@ -41,6 +42,7 @@ use crate::commands::{bad, name_input, other, point_param};
 use crate::detailtags::graph_and_sides;
 use crate::project::DrawingProject;
 use crate::schema::read_document;
+use crate::sheets::sheet_page;
 
 pub const BOM_TITLE: &str = "Framing BOM";
 const DEFAULT_LAYOUT: &str = "BOM";
@@ -198,9 +200,11 @@ pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // Build on a copy and assign it back once: one undo step.
     let mut d = d0.clone();
+    let page = sheet_page(&read_document(&d).map_err(other)?);
+    let fallback_top = Sheet::from_page(&page, 1.0).size.y;
     if d.layout(&layout).is_none() {
         let tab_order = d.layouts.iter().map(|l| l.tab_order).max().map_or(0, |t| t + 1);
-        d.layouts.push(Layout { page: PageSetup::default(), ..Layout::new(&layout, tab_order) });
+        d.layouts.push(Layout { page, ..Layout::new(&layout, tab_order) });
     }
     let old: Vec<cadcraft_doc::Handle> =
         d.layout(&layout).map(|l| l.entities.iter().filter(|e| is_bom(e)).map(|e| e.handle).collect()).unwrap_or_default();
@@ -209,13 +213,7 @@ pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let at = at.unwrap_or_else(|| {
         let area = cadcraft_render::sheet(&d, &layout).map(|s| s.printable).filter(|a| !a.is_empty());
-        let (x, y) = area.map_or_else(
-            || {
-                let pg = PageSetup::default();
-                (0.0, pg.height_mm)
-            },
-            |a| (a.min.x, a.max.y),
-        );
+        let (x, y) = area.map_or((0.0, fallback_top), |a| (a.min.x, a.max.y));
         Point2 { x: x + INSET, y: y - INSET }
     });
     let handle = d.add(&Space::Paper(layout.clone()), Common::default(), EntityKind::Table(bom_table(&rows, at))).map_err(other)?;

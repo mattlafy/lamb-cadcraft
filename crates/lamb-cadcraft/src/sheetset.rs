@@ -11,16 +11,21 @@
 //! `sheetset {pdf?}` (`sset`) returns `{sheets: [{layout, group, viewIds}], alreadyOnSheets,
 //! pdf?, message}`. With `pdf`, every set sheet in tab order is plotted to that one PDF, a page
 //! per sheet, whether or not this run placed anything.
+//!
+//! SHEETSIZE (LAMB T633): `sheetsize {paper}` (`ssize`) sets the one project setting new sheets
+//! take their paper from ([`crate::sheets::sheet_page`]), in one undo step, and returns
+//! `{paper, widthMm, heightMm, message}` with the landscape sheet size. Existing sheets are never
+//! resized or re-flowed.
 
 use cadcraft_doc::Drawing;
-use cadcraft_engine::{Result, Session};
+use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use lamb_core::model::{AnyView, Id, VerticalIntent};
 use serde_json::{Value, json};
 
-use crate::commands::{bad, other};
+use crate::commands::{bad, name_input, other};
 use crate::detailsheets::{lay_detail_sheets, next_sheet_name};
-use crate::schema::read_document;
-use crate::sheets::{create_sheet, view_sheet_ref};
+use crate::schema::{read_document, write_document};
+use crate::sheets::{DEFAULT_SHEET_PAPER, create_sheet, sheet_paper_size, view_sheet_ref};
 
 const PLAN_PREFIX: &str = "A1";
 const ELEVATION_PREFIX: &str = "A2";
@@ -136,10 +141,60 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+pub(crate) fn sheetsize(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = p.get("paper").and_then(Value::as_str).ok_or_else(|| bad("sheetsize", "`paper` must be a paper size name"))?;
+    let paper = cadcraft_render::paper_size(name)
+        .ok_or_else(|| bad("sheetsize", &format!("Unknown sheet size \"{name}\"; try ARCH D, ARCH C, ANSI D, ANSI B or A1")))?;
+    let mut doc = read_document(s.doc()?).map_err(other)?;
+    if sheet_paper_size(&doc).map(|c| c.name) != Some(paper.name) {
+        doc.sheet_paper = Some(paper.name.to_owned());
+        write_document(s.doc_mut()?, &doc).map_err(other)?;
+    }
+    let (w, h) = (paper.width_mm.max(paper.height_mm), paper.width_mm.min(paper.height_mm));
+    let message = format!("New sheets are {}; existing sheets keep their size.", short_name(paper));
+    Ok(json!({ "paper": paper.name, "widthMm": w, "heightMm": h, "message": message }))
+}
+
+/// `paper`'s short name (`ARCH D`), as typed at the prompt.
+fn short_name(paper: &cadcraft_render::PaperSize) -> &'static str {
+    paper.aliases.first().copied().unwrap_or(paper.name)
+}
+
+/// SHEETSIZE: `Enter sheet size <ARCH D>:`, the current setting as default.
+struct SheetSize {
+    current: String,
+}
+
+impl Interactive for SheetSize {
+    fn name(&self) -> &'static str {
+        "sheetsize"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Enter sheet size", Accept::TEXT).default(self.current.clone())
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let Some(paper) = name_input(i, &self.current) else { return Ok(Step::Continue) };
+        match sheetsize(s, &json!({ "paper": paper })) {
+            Ok(r) => s.echo(r["message"].as_str().unwrap_or_default().to_owned()),
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn sheetsize_machine(s: &Session) -> Result<Box<dyn Interactive>> {
+    let doc = read_document(s.doc()?).map_err(other)?;
+    let current = sheet_paper_size(&doc).map_or(DEFAULT_SHEET_PAPER, short_name).to_owned();
+    Ok(Box::new(SheetSize { current }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{view_block_name, write_document};
+    use crate::schema::view_block_name;
     use cadcraft_doc::EntityKind;
     use cadcraft_engine::cmd::file::{IoHooks, set_io};
 
@@ -357,6 +412,11 @@ mod tests {
         let bytes = std::fs::read(&path)?;
         let pdf = craft_pdf::open_slice(&bytes, None).map_err(|e| format!("the PDF opens: {e:?}"))?;
         assert_eq!(pdf.pages().len(), 5);
+        for page in pdf.pages().iter() {
+            let m = page.media_box();
+            let size = ((m.x1 - m.x0).abs() / 72.0 * 25.4, (m.y1 - m.y0).abs() / 72.0 * 25.4);
+            assert!((size.0 - ARCH_D.0).abs() < 0.1 && (size.1 - ARCH_D.1).abs() < 0.1, "{size:?}");
+        }
         // A re-run with nothing new still plots the set.
         let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
         assert_eq!(r["pdf"]["pages"], 5, "{r}");
@@ -367,6 +427,97 @@ mod tests {
         empty.new_drawing(true);
         let e = empty.execute("sheetset", &json!({ "pdf": path_s })).err().ok_or("plotted")?;
         assert!(e.to_string().contains("There are no set sheets to plot"), "{e}");
+        Ok(())
+    }
+
+    fn sheet_size(s: &Session, layout: &str) -> T<(f64, f64)> {
+        let sheet = cadcraft_render::sheet(s.doc()?, layout).ok_or("no sheet")?;
+        Ok((sheet.size.x, sheet.size.y))
+    }
+
+    fn near(a: (f64, f64), b: (f64, f64)) -> bool {
+        (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6
+    }
+
+    const ARCH_D: (f64, f64) = (914.4, 609.6);
+    const ANSI_B: (f64, f64) = (431.8, 279.4);
+
+    #[test]
+    fn a_fresh_projects_set_is_arch_d_landscape_with_the_plan_at_1_50() -> R {
+        let (mut s, _) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        for sheet in ["A101", "A102", "A201", "A301", "A501"] {
+            assert!(near(sheet_size(&s, sheet)?, ARCH_D), "{sheet}: {:?}", sheet_size(&s, sheet)?);
+        }
+        let layout = s.doc()?.layout("A101").ok_or("no A101")?;
+        assert_eq!(layout.page.paper, "ARCH D (24.00 x 36.00 Inches)");
+        assert!(layout.page.landscape && layout.page.paper_mm);
+        assert_eq!(layout.page.margins_mm, [10.0; 4]);
+        let scale = layout.entities.iter().find_map(|e| match &e.kind {
+            EntityKind::Viewport(vp) if vp.id > 1 => Some(crate::sheets::viewport_scale(vp)),
+            _ => None,
+        });
+        assert_eq!(scale, Some(50.0));
+        Ok(())
+    }
+
+    #[test]
+    fn sheetsize_sets_new_sheets_only_in_one_undo_step_and_refuses_an_unknown_name() -> R {
+        let (mut s, [ground, ..]) = set()?;
+        s.execute("newsheet", &json!({ "name": "A101", "viewIds": [ground.0] }))?;
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetsize", &json!({ "paper": "ansi b" }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!(r["paper"], "ANSI B (11.00 x 17.00 Inches)");
+        assert!(near((r["widthMm"].as_f64().ok_or("no width")?, r["heightMm"].as_f64().ok_or("no height")?), ANSI_B), "{r}");
+        assert_eq!(r["message"], "New sheets are ANSI B; existing sheets keep their size.");
+        assert_eq!(read_document(s.doc()?)?.sheet_paper.as_deref(), Some("ANSI B (11.00 x 17.00 Inches)"));
+
+        s.execute("newsheet", &json!({ "name": "B1", "viewIds": [ground.0] }))?;
+        assert!(near(sheet_size(&s, "B1")?, ANSI_B), "{:?}", sheet_size(&s, "B1")?);
+        assert!(near(sheet_size(&s, "A101")?, ARCH_D), "an existing sheet keeps its size");
+        s.undo()?;
+
+        // Setting the same paper again changes nothing.
+        s.execute("sheetsize", &json!({ "paper": "ANSI B" }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "no undo step");
+
+        let e = s.execute("sheetsize", &json!({ "paper": "nope" })).err().ok_or("accepted")?;
+        assert!(e.to_string().contains("nope") && e.to_string().contains("ARCH D"), "{e}");
+        assert_eq!(read_document(s.doc()?)?.sheet_paper.as_deref(), Some("ANSI B (11.00 x 17.00 Inches)"));
+        assert_eq!(undo_len(&s)?, n + 1, "a refusal is no undo step");
+
+        s.undo()?;
+        assert_eq!(read_document(s.doc()?)?.sheet_paper, None);
+        assert!(near(sheet_size(&s, "A101")?, ARCH_D));
+        Ok(())
+    }
+
+    #[test]
+    fn the_setting_survives_a_dxf_round_trip() -> R {
+        let (mut s, _) = set()?;
+        s.execute("sheetsize", &json!({ "paper": "ANSI B" }))?;
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(read_document(&back)?.sheet_paper.as_deref(), Some("ANSI B (11.00 x 17.00 Inches)"));
+        Ok(())
+    }
+
+    #[test]
+    fn sheetsize_prompts_with_the_current_setting() -> R {
+        let (mut s, _) = set()?;
+        s.start("ssize")?;
+        assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("ARCH D"));
+        s.input(Input::Text("ANSI B".into()))?;
+        assert!(s.log.iter().any(|l| l == "New sheets are ANSI B; existing sheets keep their size."), "{:?}", s.log);
+        s.start("sheetsize")?;
+        assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("ANSI B"));
+        let n = undo_len(&s)?;
+        s.input(Input::Enter)?;
+        assert_eq!(undo_len(&s)?, n, "Enter keeps the setting");
+        s.start("sheetsize")?;
+        s.input(Input::Text("nope".into()))?;
+        assert!(s.log.iter().any(|l| l.contains("Unknown sheet size")), "{:?}", s.log);
+        assert_eq!(read_document(s.doc()?)?.sheet_paper.as_deref(), Some("ANSI B (11.00 x 17.00 Inches)"));
         Ok(())
     }
 

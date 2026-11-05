@@ -90,6 +90,10 @@ pub struct LambDocument {
     /// ([`crate::assembly`], `assemblyplan {mitre}`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mitre_plans: Vec<Id>,
+    /// The paper new sheets are made on (`sheetsize`, [`crate::sheets::sheet_page`]), a canonical
+    /// [`cadcraft_render::PaperSize`] name; none means ARCH D.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet_paper: Option<String>,
 }
 
 impl LambDocument {
@@ -105,6 +109,7 @@ impl LambDocument {
             links: Vec::new(),
             suppressed_proposals: Vec::new(),
             mitre_plans: Vec::new(),
+            sheet_paper: None,
         }
     }
 }
