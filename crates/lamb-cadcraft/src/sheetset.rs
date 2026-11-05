@@ -1,8 +1,8 @@
 //! SHEETSET (LAMB T627): the automatic first try at the whole drawing set. Every placed plan,
 //! elevation and section that no sheet shows yet gets a sheet of its own — plans `A101`, `A102`, …
 //! by level order (then document order), elevations `A201`, …, sections `A301`, … in document
-//! order — and the unplaced assigned details are gathered onto detail sheets `A501`, … six to a
-//! sheet, exactly as DETAILSHEETS does ([`crate::detailsheets::lay_detail_sheets`]). Plan sheets
+//! order — and the unplaced assigned details are packed onto detail sheets `A501`, …, exactly as
+//! DETAILSHEETS does ([`crate::detailsheets::lay_detail_sheets`]). Plan sheets
 //! show the outline only: the walls as their details build them go on framing sheets `A401`, …
 //! (LAMB T635), one per placed view with an assembly block, plans in level order and then
 //! verticals in document order, each showing only that block. SHEETSET does not generate
@@ -37,7 +37,6 @@ const SECTION_PREFIX: &str = "A3";
 const FRAMING_PREFIX: &str = "A4";
 const DETAIL_PREFIX: &str = "A5";
 const FRAMING_GROUP: &str = "framing";
-const DETAILS_PER_SHEET: usize = 6;
 const SET_PREFIXES: [&str; 5] = [PLAN_PREFIX, ELEVATION_PREFIX, SECTION_PREFIX, FRAMING_PREFIX, DETAIL_PREFIX];
 
 /// Whether `name` is a set sheet name: a set prefix and two digits.
@@ -139,7 +138,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
             sheets.push(json!({ "layout": layout, "group": group, "viewIds": [view.0] }));
         }
     }
-    let (laid, placed_details) = lay_detail_sheets(&mut d, DETAIL_PREFIX, DETAILS_PER_SHEET).map_err(other)?;
+    let (laid, placed_details) = lay_detail_sheets(&mut d, DETAIL_PREFIX, None).map_err(other)?;
     already += placed_details;
     for (layout, _, ids) in &laid {
         let n = ids.len();

@@ -19,6 +19,13 @@
 //! standard denominator that does; details at the smallest standard denominator ≥ 5 that fits; an
 //! assembly viewport at its plan's scale. "Fits" means the extents grown 5 % each way fit the
 //! viewport at that scale. VPVIEW rescales the same way; existing viewports are not rescaled.
+//!
+//! Detail sheets (LAMB T637) are packed instead ([`pack_details`], [`create_detail_sheet`]): each
+//! detail takes the Detail rule's scale against the whole [`usable_area`] less [`TITLE_ROOM_MM`],
+//! and a viewport of its grown extents at that scale, at least [`MIN_VP_WIDTH_MM`] wide and
+//! [`MIN_VP_HEIGHT_MM`] tall. Viewports fill rows from the top left in the given order, tops
+//! aligned, [`GAP_X_MM`] apart; the next row starts [`GAP_Y_MM`] below the row's tallest, and a row
+//! leaving less than [`TITLE_ROOM_MM`] above the bottom of the area starts a new sheet.
 
 use std::fmt;
 use std::sync::Arc;
@@ -232,6 +239,176 @@ pub(crate) fn usable_area(sheet: &Sheet) -> Bounds2 {
     Bounds2::new(Vec2::new(p.min.x + inset, p.min.y + inset), Vec2::new(p.max.x - frame_strip_width(sheet) - inset, p.max.y - inset))
 }
 
+/// A packed viewport is at least this wide, so a drawing title stays within it.
+const MIN_VP_WIDTH_MM: f64 = 95.0;
+/// A packed viewport is at least this tall.
+const MIN_VP_HEIGHT_MM: f64 = 40.0;
+/// Between packed viewports in a row.
+const GAP_X_MM: f64 = 15.0;
+/// Between a row's tallest viewport and the next row; clears the title under it.
+const GAP_Y_MM: f64 = 25.0;
+/// What a viewport's drawing title needs below it: [`crate::vptitles::TITLE_DROP_MM`] and the
+/// title's lower half.
+const TITLE_ROOM_MM: f64 = 15.0;
+/// An empty detail is laid out as a square of this side, mm.
+const EMPTY_DETAIL_MM: f64 = 500.0;
+
+/// One viewport's place on paper and what it shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Packed {
+    pub center: Vec2,
+    pub width: f64,
+    pub height: f64,
+    pub view_center: Vec2,
+    pub view_height: f64,
+}
+
+impl Packed {
+    fn viewport(&self, id: u32, frozen_layers: Vec<String>) -> Viewport {
+        Viewport {
+            center: Vec3::new(self.center.x, self.center.y, 0.0),
+            width: self.width,
+            height: self.height,
+            view_center: self.view_center,
+            view_height: self.view_height,
+            id,
+            frozen_layers,
+            ..Viewport::default()
+        }
+    }
+}
+
+/// `(1:n, width, height)` of the viewport a detail with extents `ext` takes in `area`.
+fn detail_viewport(ext: &Bounds2, area: &Bounds2) -> (f64, f64, f64) {
+    let n = scale_for(ext, ScaleRule::Detail, DETAIL_MIN_SCALE, area.width(), area.height() - TITLE_ROOM_MM);
+    (n, (ext.width() * 1.1 / n).max(MIN_VP_WIDTH_MM), (ext.height() * 1.1 / n).max(MIN_VP_HEIGHT_MM))
+}
+
+/// Packs `sizes` (width, height) into rows over `area`, in order: each one's centre, sheet by
+/// sheet. A sheet holds at most `per` when given. A viewport too big for an empty sheet still
+/// takes one, alone.
+fn pack_rows(sizes: &[(f64, f64)], area: &Bounds2, per: Option<usize>) -> Vec<Vec<Vec2>> {
+    const SLACK: f64 = 1e-6;
+    let room_for = |top: f64, h: f64| top - h - TITLE_ROOM_MM >= area.min.y - SLACK;
+    let mut sheets = Vec::new();
+    let mut sheet: Vec<Vec2> = Vec::new();
+    let (mut x, mut top, mut tallest) = (area.min.x, area.max.y, 0.0_f64);
+    for &(w, h) in sizes {
+        let open = !sheet.is_empty() && per.is_none_or(|p| sheet.len() < p.max(1));
+        let in_row = open && x + w <= area.max.x + SLACK && room_for(top, tallest.max(h));
+        if !in_row {
+            if open && room_for(top - tallest - GAP_Y_MM, h) {
+                top -= tallest + GAP_Y_MM;
+            } else {
+                if !sheet.is_empty() {
+                    sheets.push(std::mem::take(&mut sheet));
+                }
+                top = area.max.y;
+            }
+            (x, tallest) = (area.min.x, 0.0);
+        }
+        sheet.push(Vec2::new(x + w / 2.0, top - h / 2.0));
+        x += w + GAP_X_MM;
+        tallest = tallest.max(h);
+    }
+    if !sheet.is_empty() {
+        sheets.push(sheet);
+    }
+    sheets
+}
+
+/// Packs detail views `views`, in order, onto as many new sheets of the project's paper as they
+/// need, at most `per` to a sheet when given.
+pub(crate) fn pack_details(d: &Drawing, views: &[Id], per: Option<usize>) -> Result<Vec<Vec<(Id, Packed)>>, SheetError> {
+    let doc = read_document(d)?;
+    let area = usable_area(&Sheet::from_page(&sheet_page(&doc), 1.0));
+    let half = EMPTY_DETAIL_MM / 2.0;
+    let sized: Vec<(Id, Bounds2, f64, f64, f64)> = views
+        .iter()
+        .map(|v| {
+            let ext = d.extents(&Space::Block(view_block_name(*v)));
+            let drawn = !ext.is_empty() && ext.width().is_finite() && ext.height().is_finite();
+            let ext = if drawn { ext } else { Bounds2::new(Vec2::new(-half, -half), Vec2::new(half, half)) };
+            let (n, w, h) = detail_viewport(&ext, &area);
+            (*v, ext, n, w, h)
+        })
+        .collect();
+    let sizes: Vec<(f64, f64)> = sized.iter().map(|(_, _, _, w, h)| (*w, *h)).collect();
+    let mut rest = sized.iter();
+    Ok(pack_rows(&sizes, &area, per)
+        .into_iter()
+        .map(|centers| {
+            centers
+                .into_iter()
+                .zip(rest.by_ref())
+                .map(|(center, (v, ext, n, w, h))| (*v, Packed { center, width: *w, height: *h, view_center: ext.center(), view_height: h * n }))
+                .collect()
+        })
+        .collect())
+}
+
+/// The id after every viewport's in `d`, overall ones included.
+fn next_viewport_id(d: &Drawing) -> u32 {
+    d.layouts
+        .iter()
+        .flat_map(|l| l.entities.iter())
+        .filter_map(|e| match &e.kind {
+            EntityKind::Viewport(vp) => Some(vp.id),
+            _ => None,
+        })
+        .fold(1u32, u32::max)
+        + 1
+}
+
+/// Adds layout `name` on the project's paper, after every other tab.
+fn push_sheet_layout(d: &mut Drawing, doc: &LambDocument, name: &str) {
+    let tab_order = d.layouts.iter().map(|l| l.tab_order).max().map_or(0, |t| t + 1);
+    d.layouts.push(Layout { page: sheet_page(doc), ..Layout::new(name, tab_order) });
+}
+
+/// Adds `viewports` to the just-pushed layout `name`, taking the layout back out on failure.
+fn add_viewports(d: &mut Drawing, name: &str, viewports: Vec<(Common, Viewport)>) -> Result<Vec<Handle>, SheetError> {
+    let space = Space::Paper(name.to_owned());
+    let mut handles = Vec::with_capacity(viewports.len());
+    for (common, vp) in viewports {
+        match d.add(&space, common, EntityKind::Viewport(vp)) {
+            Ok(hd) => handles.push(hd),
+            Err(e) => {
+                d.layouts.retain(|l| l.name != name);
+                return Err(SheetError::Schema(SchemaError::Malformed { what: format!("layout {name}"), message: e.to_string() }));
+            }
+        }
+    }
+    Ok(handles)
+}
+
+/// Creates layout `name` with one viewport per placed view, in that order, each freezing every
+/// other LAMB view's layer and every assembly layer. Returns the viewports' handles. Nothing is
+/// changed on error.
+pub(crate) fn create_detail_sheet(d: &mut Drawing, name: &str, placed: &[(Id, Packed)]) -> Result<Vec<Handle>, SheetError> {
+    let doc = read_document(d)?;
+    if d.layout(name).is_some() {
+        return Err(SheetError::LayoutExists(name.to_owned()));
+    }
+    if placed.is_empty() {
+        return Err(SheetError::NoViews);
+    }
+    let view_layers: Vec<String> = doc.views.iter().map(|v| view_block_name(v.id())).collect();
+    let assemblies = assembly_layers(d);
+    let next_id = next_viewport_id(d);
+    let mut viewports = Vec::with_capacity(placed.len());
+    for (i, (view, packed)) in placed.iter().enumerate() {
+        if !doc.views.iter().any(|v| v.id() == *view) {
+            return Err(SheetError::NoSuchView(*view));
+        }
+        let mut common = Common::default();
+        set_entity_data(&mut common, &EntityData { view_id: Some(*view), ..EntityData::default() })?;
+        viewports.push((common, packed.viewport(next_id + i as u32, frozen_except(&view_layers, &assemblies, &view_block_name(*view)))));
+    }
+    push_sheet_layout(d, &doc, name);
+    add_viewports(d, name, viewports)
+}
+
 /// Creates layout `name` with one viewport per view in `views`, then one per plan or placed
 /// vertical in `assemblies` showing that view's assembly block (every view in document order when both are empty). Each
 /// viewport freezes every other LAMB view's layer and every assembly layer but its own. Returns
@@ -278,33 +455,20 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
         commons.push(c);
     }
 
-    let next_id = d
-        .layouts
-        .iter()
-        .flat_map(|l| l.entities.iter())
-        .filter_map(|e| match &e.kind {
-            EntityKind::Viewport(vp) => Some(vp.id),
-            _ => None,
-        })
-        .fold(1u32, u32::max)
-        + 1;
-    let tab_order = d.layouts.iter().map(|l| l.tab_order).max().map_or(0, |t| t + 1);
-    let page = sheet_page(&doc);
-    let fallback = Sheet::from_page(&page, 1.0);
-    d.layouts.push(Layout { page, ..Layout::new(name, tab_order) });
-    let area = usable_area(&cadcraft_render::sheet(d, name).unwrap_or(fallback));
+    let next_id = next_viewport_id(d);
+    push_sheet_layout(d, &doc, name);
+    let area = usable_area(&cadcraft_render::sheet(d, name).unwrap_or_else(|| Sheet::from_page(&sheet_page(&doc), 1.0)));
 
     let n = slots.len();
     let cols = (n as f64).sqrt().ceil().max(1.0) as usize;
     let rows = n.div_ceil(cols);
     let cell = Vec2::new(area.width() / cols as f64, area.height() / rows as f64);
     let (w, h) = (cell.x * 0.9, cell.y * 0.9);
-    let space = Space::Paper(name.to_owned());
-    let mut handles = Vec::with_capacity(n);
     let plot_scale = doc.defaults.plot_scale;
+    let mut viewports = Vec::with_capacity(n);
     for (i, ((block, dt, plan), common)) in slots.iter().zip(commons).enumerate() {
         let (r, c) = (i / cols, i % cols);
-        let center = Vec3::new(area.min.x + cell.x * (c as f64 + 0.5), area.max.y - cell.y * (r as f64 + 0.5), 0.0);
+        let center = Vec2::new(area.min.x + cell.x * (c as f64 + 0.5), area.max.y - cell.y * (r as f64 + 0.5));
         let rule = dt.view_id.and_then(|v| doc.views.iter().find(|x| x.id() == v)).map_or(ScaleRule::Plan, rule_of);
         let (view_center, mut view_height) = scaled_zoom(d, block, rule, plot_scale, w, h);
         if let Some(p) = plan {
@@ -312,16 +476,10 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
             view_height = view_height.max(scaled_zoom(d, &view_block_name(*p), ScaleRule::Plan, plot_scale, w, h).1);
         }
         let frozen_layers = frozen_except(&view_layers, &assembly_layers, block);
-        let vp = Viewport { center, width: w, height: h, view_center, view_height, id: next_id + i as u32, frozen_layers, ..Viewport::default() };
-        match d.add(&space, common, EntityKind::Viewport(vp)) {
-            Ok(hd) => handles.push(hd),
-            Err(e) => {
-                d.layouts.retain(|l| l.name != name);
-                return Err(SheetError::Schema(SchemaError::Malformed { what: format!("layout {name}"), message: e.to_string() }));
-            }
-        }
+        let packed = Packed { center, width: w, height: h, view_center, view_height };
+        viewports.push((common, packed.viewport(next_id + i as u32, frozen_layers)));
     }
-    Ok(handles)
+    add_viewports(d, name, viewports)
 }
 
 /// The after-command observer: every paper viewport (id > 1) naming what it shows in `view_id` or
@@ -668,6 +826,78 @@ mod tests {
         assert_eq!(viewport_scale(&vp), 25.0);
         let vp = Viewport { height: 3.0, view_height: 3.0 * 30.0, ..Viewport::default() };
         assert!((viewport_scale(&vp) - 30.0).abs() < 1e-9);
+    }
+
+    /// The rectangle a viewport of `size` at `c` and its title need, as (min x, min y, max x, max y).
+    fn claim(c: Vec2, size: (f64, f64)) -> (f64, f64, f64, f64) {
+        (c.x - size.0 / 2.0, c.y - size.1 / 2.0 - TITLE_ROOM_MM, c.x + size.0 / 2.0, c.y + size.1 / 2.0)
+    }
+
+    #[test]
+    fn mixed_sizes_pack_in_order_inside_the_area_without_touching() {
+        let area = Bounds2::new(Vec2::new(15.0, 15.0), Vec2::new(829.0, 594.6));
+        let sizes: Vec<(f64, f64)> =
+            [(95.0, 40.0), (300.0, 120.0), (95.0, 66.0), (500.0, 200.0), (400.0, 90.0), (95.0, 300.0), (700.0, 250.0), (95.0, 40.0)]
+                .iter()
+                .cycle()
+                .take(40)
+                .copied()
+                .collect();
+        let sheets = pack_rows(&sizes, &area, None);
+        assert!(sheets.len() > 1, "they overflow");
+        assert_eq!(sheets.iter().map(Vec::len).sum::<usize>(), sizes.len(), "every one placed, once");
+        let mut left = sizes.iter();
+        for centers in &sheets {
+            let rects: Vec<_> = centers.iter().zip(left.by_ref()).map(|(c, s)| claim(*c, *s)).collect();
+            for (i, a) in rects.iter().enumerate() {
+                assert!(a.0 >= area.min.x - 1e-6 && a.1 >= area.min.y - 1e-6 && a.2 <= area.max.x + 1e-6 && a.3 <= area.max.y + 1e-6, "{a:?}");
+                for b in &rects[i + 1..] {
+                    assert!(a.2 <= b.0 || b.2 <= a.0 || a.3 <= b.1 || b.3 <= a.1, "{a:?} and {b:?}");
+                    // Reads left to right, then down: tops never rise, and a level top moves right.
+                    assert!(b.3 < a.3 || (b.3 == a.3 && b.0 > a.0), "{a:?} before {b:?}");
+                }
+            }
+        }
+        // The order within a row is the given one, and a row's gaps are the settled ones.
+        let first = &sheets[0];
+        assert_eq!(first[0], Vec2::new(15.0 + 47.5, 594.6 - 20.0));
+        assert!((first[1].x - (15.0 + 95.0 + GAP_X_MM + 150.0)).abs() < 1e-9, "{first:?}");
+    }
+
+    #[test]
+    fn the_next_row_clears_the_tallest_and_a_row_too_low_for_its_title_turns_the_sheet() {
+        let area = Bounds2::new(Vec2::new(0.0, 0.0), Vec2::new(300.0, 200.0));
+        // 100 tall and 50 tall in a row; the next row starts below the 100.
+        let s = pack_rows(&[(120.0, 100.0), (120.0, 50.0), (120.0, 40.0)], &area, None);
+        assert_eq!(s, [vec![Vec2::new(60.0, 150.0), Vec2::new(195.0, 175.0), Vec2::new(60.0, 55.0)]]);
+        // 75 still leaves room for the title (200 - 125 - 75 = 0 is short of 15): a new sheet.
+        let s = pack_rows(&[(120.0, 100.0), (290.0, 75.0)], &area, None);
+        assert_eq!(s.len(), 2, "{s:?}");
+        // 60 leaves exactly 15.
+        let s = pack_rows(&[(120.0, 100.0), (290.0, 60.0)], &area, None);
+        assert_eq!(s.len(), 1, "{s:?}");
+        // A taller neighbour that would push the row's title off the bottom turns the sheet too.
+        let s = pack_rows(&[(120.0, 100.0), (120.0, 190.0)], &area, None);
+        assert_eq!(s.len(), 2, "{s:?}");
+        // Too big for any sheet: alone, and packing still ends.
+        let s = pack_rows(&[(50.0, 50.0), (900.0, 900.0), (50.0, 50.0)], &area, None);
+        assert_eq!(s.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1, 1], "{s:?}");
+        // `per` caps a sheet.
+        let s = pack_rows(&[(50.0, 50.0); 5], &area, Some(2));
+        assert_eq!(s.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 1]);
+    }
+
+    #[test]
+    fn a_detail_viewport_takes_the_scale_that_fits_and_its_minimum_size() {
+        let area = Bounds2::new(Vec2::new(15.0, 15.0), Vec2::new(829.0, 594.6));
+        let b = |w: f64, h: f64| Bounds2::new(Vec2::new(0.0, 0.0), Vec2::new(w, h));
+        assert_eq!(detail_viewport(&b(300.0, 300.0), &area), (5.0, 95.0, 300.0 * 1.1 / 5.0), "never larger than 1:5; a title's width");
+        assert_eq!(detail_viewport(&b(10.0, 10.0), &area), (5.0, 95.0, 40.0));
+        assert_eq!(detail_viewport(&b(6000.0, 6000.0), &area).0, 20.0, "6600 / 1:10 is too tall");
+        // Tall enough for the area but not for the area and a title: the next scale.
+        let (n, _, h) = detail_viewport(&b(100.0, 2600.0), &area);
+        assert_eq!(n, 10.0);
+        assert!(h + TITLE_ROOM_MM <= area.height(), "{h}");
     }
 
     /// Plots layout `sheet` and returns, per optional content group (by layer name) whose marked
