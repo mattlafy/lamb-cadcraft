@@ -10,10 +10,20 @@
 //! untagged details are left alone; a view already on a sheet, or an assembly already in a
 //! viewport, is skipped and counted. The set's layouts (prefix + two digits) then lead the layout tabs in
 //! name order, every other layout after them in its previous order, so PLOT `layouts: "all"` and
-//! PUBLISH run in set order. All of it is one undo step; nothing new to place changes nothing.
+//! PUBLISH run in set order.
+//!
+//! The set opens on a drawing list and ends on the BOM (LAMB T636), both rewritten by this command
+//! alone, so a sheet renamed by hand shows at the next run. `A001` holds a `Drawing List` table
+//! (`Sheet | Title`) of every set sheet in tab order, itself included, titled by
+//! [`crate::titleblock::sheet_title`]; it is made once another set sheet exists. `A601` holds the
+//! [`crate::bom`] table when there is framing to count; with none an existing one is left alone.
+//! Each table is compared with what it would become and replaced, at its own corner, only when its
+//! text differs. A table taller than the sheet is written whole and the message says it runs off.
+//! All of it is one undo step; nothing to change changes nothing.
 //!
 //! `sheetset {pdf?}` (`sset`) returns `{sheets: [{layout, group, viewIds}], alreadyOnSheets,
-//! pdf?, message}`. With `pdf`, every set sheet in tab order is plotted to that one PDF, a page
+//! pdf?, message}`, `group` being `list` or `bom` for a table made or updated, with no `viewIds`.
+//! With `pdf`, every set sheet in tab order is plotted to that one PDF, a page
 //! per sheet, whether or not this run placed anything.
 //!
 //! SHEETSIZE (LAMB T633): `sheetsize {paper}` (`ssize`) sets the one project setting new sheets
@@ -26,10 +36,12 @@ use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step}
 use lamb_core::model::{AnyView, Id, VerticalIntent};
 use serde_json::{Value, json};
 
+use crate::bom::{self, BOM_TITLE, Refreshed};
 use crate::commands::{bad, name_input, other};
 use crate::detailsheets::{lay_detail_sheets, next_sheet_name};
 use crate::schema::{assembly_block_name, read_document, read_entity_data, write_document};
 use crate::sheets::{DEFAULT_SHEET_PAPER, create_sheet, sheet_paper_size, view_sheet_ref};
+use crate::titleblock::sheet_title;
 
 const PLAN_PREFIX: &str = "A1";
 const ELEVATION_PREFIX: &str = "A2";
@@ -37,7 +49,12 @@ const SECTION_PREFIX: &str = "A3";
 const FRAMING_PREFIX: &str = "A4";
 const DETAIL_PREFIX: &str = "A5";
 const FRAMING_GROUP: &str = "framing";
-const SET_PREFIXES: [&str; 5] = [PLAN_PREFIX, ELEVATION_PREFIX, SECTION_PREFIX, FRAMING_PREFIX, DETAIL_PREFIX];
+const LIST_PREFIX: &str = "A0";
+const BOM_PREFIX: &str = "A6";
+const SET_PREFIXES: [&str; 7] = [LIST_PREFIX, PLAN_PREFIX, ELEVATION_PREFIX, SECTION_PREFIX, FRAMING_PREFIX, DETAIL_PREFIX, BOM_PREFIX];
+const LIST_SHEET: &str = "A001";
+const LIST_TITLE: &str = "Drawing List";
+const LIST_COL_WIDTHS: [f64; 2] = [30.0, 150.0];
 
 /// Whether `name` is a set sheet name: a set prefix and two digits.
 fn is_set_name(name: &str) -> bool {
@@ -109,6 +126,30 @@ fn set_sheets(d: &Drawing) -> Vec<String> {
     ls.into_iter().map(|l| l.name.clone()).collect()
 }
 
+/// Brings `A001`'s list up to the set sheets, once there is another to list. Sorts the tabs first,
+/// since the list follows them.
+fn refresh_list(d: &mut Drawing) -> Result<Option<Refreshed>> {
+    if set_sheets(d).iter().all(|n| n == LIST_SHEET) {
+        return Ok(None);
+    }
+    bom::ensure_sheet_layout(d, LIST_SHEET)?;
+    order_tabs(d);
+    let doc = read_document(d).map_err(other)?;
+    // The list's own row names the table being written, which a new sheet does not hold yet.
+    let title = |n: &str| if n == LIST_SHEET { LIST_TITLE.to_owned() } else { sheet_title(d, &doc, n) };
+    let rows: Vec<Vec<String>> = set_sheets(d).into_iter().map(|n| vec![n.clone(), title(&n)]).collect();
+    bom::refresh_table(d, LIST_SHEET, LIST_TITLE, &|at| bom::schedule_table(LIST_TITLE, &["Sheet", "Title"], &LIST_COL_WIDTHS, &rows, at))
+}
+
+/// A table's part of the message and its `sheets` entry.
+fn table_report(layout: &str, group: &str, title: &str, change: Refreshed) -> (String, Value) {
+    let part = match change {
+        Refreshed::Made => format!("{layout} {title}"),
+        Refreshed::Updated => format!("{layout} {title} updated"),
+    };
+    (part, json!({ "layout": layout, "group": group, "viewIds": [] }))
+}
+
 pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     let pdf = match p.get("pdf").filter(|v| !v.is_null()) {
         None => None,
@@ -145,6 +186,23 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         parts.push(format!("{layout} ({n} detail{})", if n == 1 { "" } else { "s" }));
         sheets.push(json!({ "layout": layout, "group": "details", "viewIds": ids.iter().map(|id| id.0).collect::<Vec<_>>() }));
     }
+    // The BOM's row in the list needs the BOM, so the BOM goes first; set order in what is reported.
+    if let Some(change) = bom::refresh_bom(&mut d)? {
+        let (part, sheet) = table_report(bom::DEFAULT_LAYOUT, "bom", BOM_TITLE, change);
+        parts.push(part);
+        sheets.push(sheet);
+    }
+    if let Some(change) = refresh_list(&mut d)? {
+        let (part, sheet) = table_report(LIST_SHEET, "list", LIST_TITLE, change);
+        parts.insert(0, part);
+        sheets.insert(0, sheet);
+    }
+    let mut off_sheet: Vec<String> = Vec::new();
+    for (layout, title) in [(LIST_SHEET, LIST_TITLE), (bom::DEFAULT_LAYOUT, BOM_TITLE)] {
+        if bom::table_runs_off(&d, layout, title)? {
+            off_sheet.push(format!("{layout} {title}"));
+        }
+    }
     if !sheets.is_empty() {
         order_tabs(&mut d);
         *s.doc_mut()? = d;
@@ -153,6 +211,9 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     let mut message = if parts.is_empty() { "Sheet set: nothing new to lay out".to_owned() } else { format!("Sheet set: {}", parts.join(", ")) };
     if already > 0 {
         message.push_str(&format!("; {already} already on sheets"));
+    }
+    if !off_sheet.is_empty() {
+        message.push_str(&format!("; {} runs off the sheet", off_sheet.join(" and ")));
     }
     message.push('.');
     let mut out = json!({ "sheets": sheets, "alreadyOnSheets": already, "message": message });
@@ -222,6 +283,7 @@ pub(crate) fn sheetsize_machine(s: &Session) -> Result<Box<dyn Interactive>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bom::tests::{new_handle, stud_room};
     use crate::schema::view_block_name;
     use cadcraft_doc::EntityKind;
     use cadcraft_engine::cmd::file::{IoHooks, set_io};
@@ -312,6 +374,7 @@ mod tests {
         let r = s.execute("sheetset", &json!({}))?;
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
         let want = [
+            ("A001".to_owned(), "list".to_owned(), vec![]),
             ("A101".to_owned(), "plan".to_owned(), vec![ground.0]),
             ("A102".to_owned(), "plan".to_owned(), vec![first.0]),
             ("A201".to_owned(), "elevation".to_owned(), vec![elev.0]),
@@ -322,10 +385,10 @@ mod tests {
         assert_eq!(laid(&r), want, "{r}");
         assert_eq!(
             r["message"],
-            "Sheet set: A101 Ground Floor, A102 First, A201 North, A301 Section A, A401 Ground Floor framing, A501 (2 details)."
+            "Sheet set: A001 Drawing List, A101 Ground Floor, A102 First, A201 North, A301 Section A, A401 Ground Floor framing, A501 (2 details)."
         );
         assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
-        let mut want_tabs: Vec<String> = ["A101", "A102", "A201", "A301", "A401", "A501"].map(String::from).to_vec();
+        let mut want_tabs: Vec<String> = ["A001", "A101", "A102", "A201", "A301", "A401", "A501"].map(String::from).to_vec();
         want_tabs.extend(before);
         assert_eq!(tabs(&s)?, want_tabs, "set sheets lead, other layouts follow in order");
 
@@ -343,9 +406,9 @@ mod tests {
         let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
         s.execute("placeview", &json!({ "viewId": third.0, "kind": "plan", "levelId": level, "cutElevation": 7200, "transform": t }))?;
         let r = s.execute("sheetset", &json!({}))?;
-        assert_eq!(laid(&r), [("A103".to_owned(), "plan".to_owned(), vec![third.0])], "{r}");
+        assert_eq!(laid(&r), [("A001".to_owned(), "list".to_owned(), vec![]), ("A103".to_owned(), "plan".to_owned(), vec![third.0])], "{r}");
         let t = tabs(&s)?;
-        assert_eq!(t[..7], ["A101", "A102", "A103", "A201", "A301", "A401", "A501"], "{t:?}");
+        assert_eq!(t[..8], ["A001", "A101", "A102", "A103", "A201", "A301", "A401", "A501"], "{t:?}");
         assert_eq!(t.last().map(String::as_str), Some("Notes"), "a non-set layout follows");
 
         // Undo takes the whole run back.
@@ -406,7 +469,7 @@ mod tests {
         assert!(frozen(&s, "A101")?.contains(&layer));
 
         let r = s.execute("sheetset", &json!({}))?;
-        assert_eq!(laid(&r), [("A103".to_owned(), "plan".to_owned(), vec![later.0])], "{r}");
+        assert_eq!(laid(&r), [("A001".to_owned(), "list".to_owned(), vec![]), ("A103".to_owned(), "plan".to_owned(), vec![later.0])], "{r}");
         assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
         assert_eq!(view_sheet_ref(s.doc()?, later), Some((1, "A103".to_owned())));
         assert_eq!(bubble_sheets(&s, ground)?, bubbles);
@@ -491,8 +554,8 @@ mod tests {
         // A section's assembly gets the next number.
         s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
         let r = s.execute("sheetset", &json!({}))?;
-        assert_eq!(laid(&r), [("A402".to_owned(), "framing".to_owned(), vec![sec.0])], "{r}");
-        assert_eq!(r["message"], "Sheet set: A402 Section A framing; 7 already on sheets.");
+        assert_eq!(laid(&r), [("A001".to_owned(), "list".to_owned(), vec![]), ("A402".to_owned(), "framing".to_owned(), vec![sec.0])], "{r}");
+        assert_eq!(r["message"], "Sheet set: A001 Drawing List updated, A402 Section A framing; 7 already on sheets.");
 
         // A re-run adds nothing and no undo step.
         let n = undo_len(&s)?;
@@ -503,9 +566,9 @@ mod tests {
         // A second plan's assembly adds exactly one, and the tabs stay in set order.
         s.execute("assemblyplan", &json!({ "viewId": first.0 }))?;
         let r = s.execute("sheetset", &json!({}))?;
-        assert_eq!(laid(&r), [("A403".to_owned(), "framing".to_owned(), vec![first.0])], "{r}");
+        assert_eq!(laid(&r), [("A001".to_owned(), "list".to_owned(), vec![]), ("A403".to_owned(), "framing".to_owned(), vec![first.0])], "{r}");
         let t = tabs(&s)?;
-        assert_eq!(t[..8], ["A101", "A102", "A201", "A301", "A401", "A402", "A403", "A501"], "{t:?}");
+        assert_eq!(t[..9], ["A001", "A101", "A102", "A201", "A301", "A401", "A402", "A403", "A501"], "{t:?}");
 
         assert_eq!(refs(&s)?, before_refs);
         assert_eq!(bubble_sheets(&s, ground)?, before_bubbles);
@@ -529,7 +592,7 @@ mod tests {
         s.execute("newsheet", &json!({ "name": "Mine", "viewIds": [elev.0] }))?;
         let r = s.execute("sheetset", &json!({}))?;
         let names: Vec<String> = laid(&r).into_iter().map(|(l, _, _)| l).collect();
-        assert_eq!(names, ["A101", "A102", "A301", "A401", "A501"], "{r}");
+        assert_eq!(names, ["A001", "A101", "A102", "A301", "A401", "A501"], "{r}");
         assert_eq!(r["alreadyOnSheets"], 1);
         assert!(r["message"].as_str().unwrap_or_default().ends_with("; 1 already on sheets."), "{r}");
         assert_eq!(view_sheet_ref(s.doc()?, elev), Some((1, "Mine".to_owned())));
@@ -549,10 +612,10 @@ mod tests {
         let path = dir.join("set.pdf");
         let path_s = path.to_string_lossy().into_owned();
         let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
-        assert_eq!(r["pdf"]["pages"], 6, "{r}");
+        assert_eq!(r["pdf"]["pages"], 7, "{r}");
         let bytes = std::fs::read(&path)?;
         let pdf = craft_pdf::open_slice(&bytes, None).map_err(|e| format!("the PDF opens: {e:?}"))?;
-        assert_eq!(pdf.pages().len(), 6, "the framing sheet is a page");
+        assert_eq!(pdf.pages().len(), 7, "the framing and list sheets are pages");
         for page in pdf.pages().iter() {
             let m = page.media_box();
             let size = ((m.x1 - m.x0).abs() / 72.0 * 25.4, (m.y1 - m.y0).abs() / 72.0 * 25.4);
@@ -560,7 +623,15 @@ mod tests {
         }
         // A re-run with nothing new still plots the set.
         let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
-        assert_eq!(r["pdf"]["pages"], 6, "{r}");
+        assert_eq!(r["pdf"]["pages"], 7, "{r}");
+
+        // Counted framing: the BOM sheet is a page too.
+        let (mut s, _) = stud_room()?;
+        let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
+        let names = set_sheets(s.doc()?);
+        assert!(names.first().is_some_and(|n| n == "A001") && names.last().is_some_and(|n| n == "A601"), "{names:?}");
+        assert_eq!(r["pdf"]["pages"], names.len(), "{r}");
+        assert_eq!(craft_pdf::open_slice(&std::fs::read(&path)?, None).map_err(|e| format!("{e:?}"))?.pages().len(), names.len());
         let _ = std::fs::remove_dir_all(&dir);
 
         // A drawing with no set sheets has nothing to plot.
@@ -662,9 +733,214 @@ mod tests {
         Ok(())
     }
 
+    /// Layout `layout`'s table titled `title`.
+    fn table(s: &Session, layout: &str, title: &str) -> T<cadcraft_doc::Table> {
+        let l = s.doc()?.layout(layout).ok_or("no layout")?;
+        l.entities
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::Table(t) if t.cells[0][0].text == title => Some(t.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| format!("no {title} on {layout}").into())
+    }
+
+    /// A table's data rows as text.
+    fn body(t: &cadcraft_doc::Table) -> Vec<Vec<String>> {
+        t.cells[2..].iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect()
+    }
+
+    fn row(sheet: &str, title: &str) -> Vec<String> {
+        vec![sheet.to_owned(), title.to_owned()]
+    }
+
+    /// Moves the table on `layout` by hand.
+    fn move_table(s: &mut Session, layout: &str, x: f64, y: f64) -> R {
+        let d = s.doc_mut()?;
+        let l = d.layouts.iter_mut().find(|l| l.name == layout).ok_or("no layout")?;
+        let h = l.entities.iter().find(|e| matches!(e.kind, EntityKind::Table(_))).map(|e| e.handle).ok_or("no table")?;
+        l.entities.modify(h, |e| {
+            if let EntityKind::Table(t) = &mut e.kind {
+                t.insert = cadcraft_geom::Vec3::new(x, y, 0.0);
+            }
+        });
+        Ok(())
+    }
+
+    /// A second stud repeat in the only detail of a `stud_room`, so the count changes.
+    fn add_stud(s: &mut Session, plan: Id) -> R {
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let stud = new_handle(s, "pline", json!({ "vertices": [[300, 50], [338, 50], [338, 200], [300, 200]], "closed": true }))?;
+        let dim = new_handle(s, "dimaligned", json!({ "p1": [300, 0], "p2": [700, 0], "at": [500, -300] }))?;
+        s.execute("repeat", &json!({ "dimension": dim, "handles": [stud] }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        Ok(())
+    }
+
+    #[test]
+    fn counted_framing_opens_on_the_list_and_ends_on_the_bom_in_one_undo_step() -> R {
+        let (mut s, plan) = stud_room()?;
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let got = laid(&r);
+        assert_eq!(got.first(), Some(&("A001".to_owned(), "list".to_owned(), vec![])), "{r}");
+        assert_eq!(got.last(), Some(&("A601".to_owned(), "bom".to_owned(), vec![])), "{r}");
+
+        let names: Vec<String> = tabs(&s)?.into_iter().filter(|n| is_set_name(n)).collect();
+        assert_eq!(names.first().map(String::as_str), Some("A001"));
+        assert_eq!(names.last().map(String::as_str), Some("A601"));
+        assert_eq!(tabs(&s)?[..names.len()], names[..], "the set leads the tabs");
+        let list = table(&s, "A001", "Drawing List")?;
+        assert_eq!(list.cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Sheet", "Title"]);
+        assert_eq!(list.col_widths, [30.0, 150.0]);
+        assert_eq!((list.text_height, list.row_heights[0]), (2.5, 7.0));
+        let rows = body(&list);
+        assert_eq!(rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(), names, "every set sheet in tab order");
+        assert_eq!(rows[0], row("A001", "Drawing List"));
+        assert_eq!(rows.last(), Some(&row("A601", "Framing BOM")));
+        assert!(rows.contains(&row("A101", "Ground")), "{rows:?}");
+
+        let area = crate::sheets::usable_area(&cadcraft_render::sheet(s.doc()?, "A001").ok_or("no sheet")?);
+        assert_eq!((list.insert.x, list.insert.y), (area.min.x, area.max.y), "the usable area's top-left");
+        let bom = table(&s, "A601", "Framing BOM")?;
+        assert_eq!((bom.insert.x, bom.insert.y), (area.min.x, area.max.y));
+        assert_eq!(body(&bom)[0][..2], ["Level 1".to_owned(), "STUD".to_owned()]);
+
+        // An immediate re-run changes nothing and adds no undo step.
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n, "no undo step");
+        assert_eq!(laid(&r), [], "{r}");
+        assert_eq!(r["message"].as_str().map(|m| m.starts_with("Sheet set: nothing new to lay out")), Some(true), "{r}");
+
+        // More framing changes only the BOM.
+        add_stud(&mut s, plan)?;
+        let list_before = table(&s, "A001", "Drawing List")?;
+        let bom_before = table(&s, "A601", "Framing BOM")?;
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!(laid(&r), [("A601".to_owned(), "bom".to_owned(), vec![])], "{r}");
+        assert!(r["message"].as_str().is_some_and(|m| m.contains("A601 Framing BOM updated")), "{r}");
+        assert_eq!(table(&s, "A001", "Drawing List")?, list_before, "the list holds");
+        let bom = table(&s, "A601", "Framing BOM")?;
+        assert_ne!(body(&bom), body(&bom_before), "the count moved");
+        s.undo()?;
+        assert_eq!(table(&s, "A601", "Framing BOM")?, bom_before, "undo restores the old count");
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_plan_joins_the_list_in_its_sheets_undo_step() -> R {
+        let (mut s, [ground, ..]) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let before = body(&table(&s, "A001", "Drawing List")?);
+        assert_eq!(
+            before,
+            [
+                row("A001", "Drawing List"),
+                row("A101", "Ground Floor"),
+                row("A102", "First"),
+                row("A201", "North"),
+                row("A301", "Section A"),
+                row("A401", "Ground Floor framing"),
+                row("A501", "Details"),
+            ]
+        );
+        s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": ground.0, "floorToFloorMm": 6000, "name": "Later" }))?;
+        let n = undo_len(&s)?;
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!(body(&table(&s, "A001", "Drawing List")?)[3], row("A103", "Later"));
+        s.undo()?;
+        assert_eq!(body(&table(&s, "A001", "Drawing List")?), before);
+        assert!(s.doc()?.layout("A103").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn no_framing_means_no_bom_sheet_and_an_empty_project_no_list() -> R {
+        let (mut s, _) = set()?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert!(s.doc()?.layout("A601").is_none(), "{r}");
+
+        crate::commands::install_app()?;
+        let mut empty = Session::new();
+        empty.new_drawing(true);
+        crate::maintain::install(&mut empty);
+        empty.execute("lambproject", &json!({}))?;
+        // With its one view gone the project has nothing to put on a sheet.
+        let d = empty.doc_mut()?;
+        let mut doc = read_document(d)?;
+        doc.views.clear();
+        write_document(d, &doc)?;
+        let n = undo_len(&empty)?;
+        let r = empty.execute("sheetset", &json!({}))?;
+        assert!(empty.doc()?.layout("A001").is_none(), "{r}");
+        assert_eq!(undo_len(&empty)?, n, "no undo step");
+        Ok(())
+    }
+
+    #[test]
+    fn a_bom_with_no_rows_left_stays_as_it_was() -> R {
+        let (mut s, _) = stud_room()?;
+        s.execute("sheetset", &json!({}))?;
+        let before = table(&s, "A601", "Framing BOM")?;
+        // Floating, the plan counts nothing.
+        let d = s.doc_mut()?;
+        let mut doc = read_document(d)?;
+        for v in &mut doc.views {
+            if let AnyView::Plan(p) = v {
+                p.placement = None;
+            }
+        }
+        write_document(d, &doc)?;
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(table(&s, "A601", "Framing BOM")?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_moved_table_stays_where_it_was_put_and_a_renamed_view_shows_next_run() -> R {
+        let (mut s, [ground, ..]) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        move_table(&mut s, "A001", 40.0, 400.0)?;
+        let d = s.doc_mut()?;
+        let mut doc = read_document(d)?;
+        for v in &mut doc.views {
+            if let AnyView::Plan(p) = v
+                && p.id == ground
+            {
+                p.name = "Renamed".into();
+            }
+        }
+        write_document(d, &doc)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert!(r["message"].as_str().is_some_and(|m| m.contains("A001 Drawing List updated")), "{r}");
+        let list = table(&s, "A001", "Drawing List")?;
+        assert_eq!((list.insert.x, list.insert.y), (40.0, 400.0));
+        assert!(body(&list).contains(&row("A101", "Renamed")), "{:?}", body(&list));
+        Ok(())
+    }
+
+    #[test]
+    fn a_table_past_the_sheets_edge_is_kept_whole_and_reported() -> R {
+        let (mut s, _) = stud_room()?;
+        s.execute("sheetset", &json!({}))?;
+        move_table(&mut s, "A601", 40.0, 10.0)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert!(r["message"].as_str().is_some_and(|m| m.ends_with("; A601 Framing BOM runs off the sheet.")), "{r}");
+        assert_eq!(body(&table(&s, "A601", "Framing BOM")?).len(), 1, "written whole");
+        Ok(())
+    }
+
     #[test]
     fn set_names_are_a_prefix_and_two_digits() {
-        assert!(is_set_name("A101") && is_set_name("A599") && is_set_name("A301") && is_set_name("A401"));
-        assert!(!is_set_name("A601") && !is_set_name("A1") && !is_set_name("A1001") && !is_set_name("Layout1") && !is_set_name("A1x1"));
+        assert!(
+            is_set_name("A001") && is_set_name("A101") && is_set_name("A599") && is_set_name("A301") && is_set_name("A401") && is_set_name("A601")
+        );
+        assert!(!is_set_name("A701") && !is_set_name("A1") && !is_set_name("A1001") && !is_set_name("Layout1") && !is_set_name("A1x1"));
     }
 }

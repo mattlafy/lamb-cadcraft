@@ -17,7 +17,8 @@
 //! by level order, then item, then view document order.
 //!
 //! `bomtable {layout?, at?}` (`bom`): the table (`Level | Item | Count | View`, titled
-//! `Framing BOM`) on layout `layout` (default `BOM`, created without viewports when absent) at
+//! `Framing BOM`) on layout `layout` (default `A601`, the BOM's sheet in the set
+//! ([`crate::sheetset`]), created without viewports when absent) at
 //! paper point `at` (default the top-left corner of the sheet's
 //! [`crate::sheets::usable_area`]). A table on that
 //! layout titled `Framing BOM` is replaced; one undo step. Nothing to count is refused, nothing
@@ -46,7 +47,7 @@ use crate::schema::read_document;
 use crate::sheets::{sheet_page, usable_area};
 
 pub const BOM_TITLE: &str = "Framing BOM";
-const DEFAULT_LAYOUT: &str = "BOM";
+pub(crate) const DEFAULT_LAYOUT: &str = "A601";
 const NO_LEVEL: &str = "—";
 const TEXT_HEIGHT: f64 = 2.5;
 const ROW_HEIGHT: f64 = 7.0;
@@ -161,16 +162,19 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
         .collect()
 }
 
-/// The BOM table with its top-left corner at `at` (paper mm).
-pub fn bom_table(rows: &[BomRow], at: Point2) -> Table {
+/// A schedule table with its top-left corner at `at` (paper mm): a merged title row over a header
+/// row over `rows`.
+pub(crate) fn schedule_table(title: &str, header: &[&str], col_widths: &[f64], rows: &[Vec<String>], at: Point2) -> Table {
     let cell = |s: &str| TableCell { text: s.to_owned(), ..TableCell::default() };
-    let mut title = vec![TableCell::default(); COL_WIDTHS.len()];
-    title[0] = TableCell { text: BOM_TITLE.to_owned(), merged: Some((1, COL_WIDTHS.len() as u32)), ..TableCell::default() };
-    let mut cells = vec![title, ["Level", "Item", "Count", "View"].iter().map(|s| cell(s)).collect()];
-    cells.extend(rows.iter().map(|r| vec![cell(&r.level), cell(&r.item), cell(&r.count.to_string()), cell(&r.view)]));
+    let mut title_row = vec![TableCell::default(); col_widths.len()];
+    if let Some(c) = title_row.first_mut() {
+        *c = TableCell { text: title.to_owned(), merged: Some((1, col_widths.len() as u32)), ..TableCell::default() };
+    }
+    let mut cells = vec![title_row, header.iter().map(|s| cell(s)).collect()];
+    cells.extend(rows.iter().map(|r| r.iter().map(|s| cell(s)).collect()));
     Table {
         insert: Vec3::new(at.x, at.y, 0.0),
-        col_widths: COL_WIDTHS.to_vec(),
+        col_widths: col_widths.to_vec(),
         row_heights: vec![ROW_HEIGHT; cells.len()],
         cells,
         text_height: TEXT_HEIGHT,
@@ -180,8 +184,102 @@ pub fn bom_table(rows: &[BomRow], at: Point2) -> Table {
     }
 }
 
-fn is_bom(e: &cadcraft_doc::Entity) -> bool {
-    matches!(&e.kind, EntityKind::Table(t) if t.cells.first().and_then(|r| r.first()).is_some_and(|c| c.text == BOM_TITLE))
+/// The BOM table with its top-left corner at `at` (paper mm).
+pub fn bom_table(rows: &[BomRow], at: Point2) -> Table {
+    let rows: Vec<Vec<String>> = rows.iter().map(|r| vec![r.level.clone(), r.item.clone(), r.count.to_string(), r.view.clone()]).collect();
+    schedule_table(BOM_TITLE, &["Level", "Item", "Count", "View"], &COL_WIDTHS, &rows, at)
+}
+
+/// Whether `e` is a table titled `title`.
+fn is_titled(e: &cadcraft_doc::Entity, title: &str) -> bool {
+    matches!(&e.kind, EntityKind::Table(t) if t.cells.first().and_then(|r| r.first()).is_some_and(|c| c.text == title))
+}
+
+/// The table titled `title` on `layout`.
+fn titled_table<'a>(d: &'a Drawing, layout: &str, title: &str) -> Option<&'a Table> {
+    d.layout(layout)?.entities.iter().filter(|e| is_titled(e, title)).find_map(|e| match &e.kind {
+        EntityKind::Table(t) => Some(t),
+        _ => None,
+    })
+}
+
+/// Adds `layout`, without viewports and on the project's sheet paper, unless it exists.
+pub(crate) fn ensure_sheet_layout(d: &mut Drawing, layout: &str) -> Result<()> {
+    if d.layout(layout).is_none() {
+        let page = sheet_page(&read_document(d).map_err(other)?);
+        let tab_order = d.layouts.iter().map(|l| l.tab_order).max().map_or(0, |t| t + 1);
+        d.layouts.push(Layout { page, ..Layout::new(layout, tab_order) });
+    }
+    Ok(())
+}
+
+/// `layout`'s sheet, by its own page or else the project's sheet paper.
+fn layout_sheet(d: &Drawing, layout: &str) -> Result<Sheet> {
+    match cadcraft_render::sheet(d, layout) {
+        Some(sheet) => Ok(sheet),
+        None => Ok(Sheet::from_page(&sheet_page(&read_document(d).map_err(other)?), 1.0)),
+    }
+}
+
+/// Writes the table `make` builds to `layout`, created if absent, in place of any table titled
+/// `title` there: at `at`, or else the top-left corner of the sheet's usable area.
+fn write_table(d: &mut Drawing, layout: &str, title: &str, at: Option<Point2>, make: &dyn Fn(Point2) -> Table) -> Result<cadcraft_doc::Handle> {
+    ensure_sheet_layout(d, layout)?;
+    let old: Vec<cadcraft_doc::Handle> =
+        d.layout(layout).map(|l| l.entities.iter().filter(|e| is_titled(e, title)).map(|e| e.handle).collect()).unwrap_or_default();
+    for h in old {
+        d.remove_entity(h);
+    }
+    let at = match at {
+        Some(at) => at,
+        None => {
+            let area = usable_area(&layout_sheet(d, layout)?);
+            Point2 { x: area.min.x, y: area.max.y }
+        }
+    };
+    d.add(&Space::Paper(layout.to_owned()), Common::default(), EntityKind::Table(make(at))).map_err(other)
+}
+
+/// What [`refresh_table`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refreshed {
+    Made,
+    Updated,
+}
+
+/// Brings the table titled `title` on `layout` up to what `make` builds, where it stands: a table
+/// with the same cell text is left alone (`None`), a different one replaced at its own corner, a
+/// missing one written at the sheet's usable top-left.
+pub(crate) fn refresh_table(d: &mut Drawing, layout: &str, title: &str, make: &dyn Fn(Point2) -> Table) -> Result<Option<Refreshed>> {
+    let texts = |t: &Table| -> Vec<Vec<String>> { t.cells.iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect() };
+    let at = match titled_table(d, layout, title) {
+        None => None,
+        Some(t) => {
+            let at = Point2 { x: t.insert.x, y: t.insert.y };
+            if texts(t) == texts(&make(at)) {
+                return Ok(None);
+            }
+            Some(at)
+        }
+    };
+    write_table(d, layout, title, at, make)?;
+    Ok(Some(if at.is_some() { Refreshed::Updated } else { Refreshed::Made }))
+}
+
+/// Refreshes the Framing BOM on its set sheet from [`bom_rows`]; no rows touches nothing.
+pub(crate) fn refresh_bom(d: &mut Drawing) -> Result<Option<Refreshed>> {
+    let rows = bom_rows(d);
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    refresh_table(d, DEFAULT_LAYOUT, BOM_TITLE, &|at| bom_table(&rows, at))
+}
+
+/// Whether the table titled `title` on `layout` reaches below the sheet's usable area.
+pub(crate) fn table_runs_off(d: &Drawing, layout: &str, title: &str) -> Result<bool> {
+    let Some(t) = titled_table(d, layout, title) else { return Ok(false) };
+    let area = usable_area(&layout_sheet(d, layout)?);
+    Ok(t.insert.y - t.row_heights.iter().sum::<f64>() < area.min.y - TOLERANCE.coincidence_mm)
 }
 
 pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
@@ -200,22 +298,7 @@ pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // Build on a copy and assign it back once: one undo step.
     let mut d = d0.clone();
-    let page = sheet_page(&read_document(&d).map_err(other)?);
-    let fallback = Sheet::from_page(&page, 1.0);
-    if d.layout(&layout).is_none() {
-        let tab_order = d.layouts.iter().map(|l| l.tab_order).max().map_or(0, |t| t + 1);
-        d.layouts.push(Layout { page, ..Layout::new(&layout, tab_order) });
-    }
-    let old: Vec<cadcraft_doc::Handle> =
-        d.layout(&layout).map(|l| l.entities.iter().filter(|e| is_bom(e)).map(|e| e.handle).collect()).unwrap_or_default();
-    for h in old {
-        d.remove_entity(h);
-    }
-    let at = at.unwrap_or_else(|| {
-        let area = usable_area(&cadcraft_render::sheet(&d, &layout).unwrap_or(fallback));
-        Point2 { x: area.min.x, y: area.max.y }
-    });
-    let handle = d.add(&Space::Paper(layout.clone()), Common::default(), EntityKind::Table(bom_table(&rows, at))).map_err(other)?;
+    let handle = write_table(&mut d, &layout, BOM_TITLE, at, &|at| bom_table(&rows, at))?;
     *s.doc_mut()? = d;
     let items: usize = rows.iter().map(|r| r.count).sum();
     let message = format!("{BOM_TITLE} on \"{layout}\": {} rows, {items} items.", rows.len());
@@ -227,7 +310,7 @@ pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
-/// BOMTABLE: `Enter layout for the BOM <BOM>:`.
+/// BOMTABLE: `Enter layout for the BOM <A601>:`.
 struct BomTable;
 
 impl Interactive for BomTable {
@@ -255,7 +338,7 @@ pub(crate) fn bomtable_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::assembly::tests::{corner_detail, gap_room, room_with, undo_len, window_room};
     use crate::schema::{read_document, write_document};
@@ -292,7 +375,7 @@ mod tests {
     }
 
     /// The assembly room with a 38-wide `STUD` repeated at 400 in its detail, placed on `Level 1`.
-    fn stud_room() -> T<(Session, Id)> {
+    pub(crate) fn stud_room() -> T<(Session, Id)> {
         let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
         let l1 = add_level(&mut s, "Level 1", 0.0)?;
         place(&mut s, plan, l1)?;
@@ -307,7 +390,7 @@ mod tests {
     }
 
     /// Runs `cmd` and returns the hex handle of the one entity it added to the edited block.
-    fn new_handle(s: &mut Session, cmd: &str, p: Value) -> T<String> {
+    pub(crate) fn new_handle(s: &mut Session, cmd: &str, p: Value) -> T<String> {
         let all = |s: &Session| -> T<Vec<cadcraft_doc::Handle>> {
             let d = s.doc()?;
             Ok(d.blocks.values().flat_map(|b| b.entities.iter().map(|e| e.handle)).collect())
@@ -391,11 +474,11 @@ mod tests {
     }
 
     fn boms(s: &Session) -> T<Vec<Table>> {
-        let l = s.doc()?.layout("BOM").ok_or("no BOM layout")?;
+        let l = s.doc()?.layout(DEFAULT_LAYOUT).ok_or("no BOM layout")?;
         Ok(l.entities
             .iter()
             .filter_map(|e| match &e.kind {
-                EntityKind::Table(t) if is_bom(e) => Some(t.clone()),
+                EntityKind::Table(t) if is_titled(e, BOM_TITLE) => Some(t.clone()),
                 _ => None,
             })
             .collect())
@@ -408,7 +491,7 @@ mod tests {
         let r = s.execute("bomtable", &json!({}))?;
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
         let studs = copies(s.doc()?, plan)?;
-        assert_eq!(r["message"], format!("Framing BOM on \"BOM\": 1 rows, {studs} items."));
+        assert_eq!(r["message"], format!("Framing BOM on \"A601\": 1 rows, {studs} items."));
         let t = boms(&s)?;
         assert_eq!(t.len(), 1);
         let texts: Vec<Vec<&str>> = t[0].cells.iter().map(|r| r.iter().map(|c| c.text.as_str()).collect()).collect();
@@ -426,21 +509,21 @@ mod tests {
         s.undo()?;
         assert_eq!(boms(&s)?, [first], "undo restores the first");
         s.undo()?;
-        assert!(s.doc()?.layout("BOM").is_none(), "and the layout it created");
+        assert!(s.doc()?.layout(DEFAULT_LAYOUT).is_none(), "and the layout it created");
         Ok(())
     }
 
     #[test]
-    fn nothing_to_count_is_refused_and_interactive_defaults_to_bom() -> R {
+    fn nothing_to_count_is_refused_and_interactive_defaults_to_the_bom_sheet() -> R {
         let (mut s, _plan) = room_with("exterior_face", true, 200.0)?;
         let n = undo_len(&s)?;
         assert!(s.execute("bomtable", &json!({})).is_err(), "a floating plan counts nothing");
         assert_eq!(undo_len(&s)?, n);
-        assert!(s.doc()?.layout("BOM").is_none());
+        assert!(s.doc()?.layout(DEFAULT_LAYOUT).is_none());
 
         let (mut s, _plan) = stud_room()?;
         s.start("bomtable")?;
-        assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("BOM"));
+        assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("A601"));
         s.input(Input::Text("Sched".into()))?;
         assert!(s.doc()?.layout("Sched").is_some());
         assert!(s.log.iter().any(|l| l.starts_with("Framing BOM on \"Sched\": 1 rows")), "{:?}", s.log);

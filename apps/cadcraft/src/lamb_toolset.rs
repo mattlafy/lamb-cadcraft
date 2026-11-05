@@ -200,6 +200,15 @@ const SHEET_SET: IconDef = &[
     a(Line(&[(14.0, 8.0), (14.0, 21.0)])),
 ];
 
+/// A sheet's border with its title strip ruled into cells down the right edge.
+const TITLE_BLOCK: IconDef = &[
+    b(Loop(&[(2.0, 4.0), (22.0, 4.0), (22.0, 20.0), (2.0, 20.0)])),
+    a(Line(&[(15.0, 4.0), (15.0, 20.0)])),
+    a(Line(&[(15.0, 8.0), (22.0, 8.0)])),
+    a(Line(&[(15.0, 12.0), (22.0, 12.0)])),
+    a(Line(&[(15.0, 16.0), (22.0, 16.0)])),
+];
+
 /// A sheet holding a table: a title bar over ruled rows and a count column.
 const FRAMING_BOM: IconDef = &[
     b(Loop(&[(2.0, 5.0), (22.0, 5.0), (22.0, 19.0), (2.0, 19.0)])),
@@ -284,6 +293,7 @@ pub const LAMB_TAB: ExtTab = ExtTab {
                 tool(NEW_SHEET, "newsheet", "New Sheet"),
                 tool(DETAIL_SHEETS, "detailsheets", "Detail Sheets"),
                 tool(SHEET_SET, "sheetset", "Sheet Set"),
+                tool(TITLE_BLOCK, "titleblock", "Title Block"),
                 tool(FRAMING_BOM, "bomtable", "Framing BOM"),
             ],
         },
