@@ -94,6 +94,20 @@ pub struct LambDocument {
     /// [`cadcraft_render::PaperSize`] name; none means ARCH D.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sheet_paper: Option<String>,
+    /// What the sheets' title blocks say about the project (`titleblock`, [`crate::titleblock`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet_info: Option<SheetInfo>,
+}
+
+/// A project's title-block text; empty until set. An empty `project` shows the document's name.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SheetInfo {
+    pub project: String,
+    pub client: String,
+    pub address: String,
+    pub drawn_by: String,
+    pub date: String,
 }
 
 impl LambDocument {
@@ -110,6 +124,7 @@ impl LambDocument {
             suppressed_proposals: Vec::new(),
             mitre_plans: Vec::new(),
             sheet_paper: None,
+            sheet_info: None,
         }
     }
 }

@@ -18,7 +18,8 @@
 //!
 //! `bomtable {layout?, at?}` (`bom`): the table (`Level | Item | Count | View`, titled
 //! `Framing BOM`) on layout `layout` (default `BOM`, created without viewports when absent) at
-//! paper point `at` (default 10 mm inside the printable area's top-left corner). A table on that
+//! paper point `at` (default the top-left corner of the sheet's
+//! [`crate::sheets::usable_area`]). A table on that
 //! layout titled `Framing BOM` is replaced; one undo step. Nothing to count is refused, nothing
 //! changed. Returns `{layout, handle, rows: [{level, item, count, view}], message}`.
 
@@ -42,7 +43,7 @@ use crate::commands::{bad, name_input, other, point_param};
 use crate::detailtags::graph_and_sides;
 use crate::project::DrawingProject;
 use crate::schema::read_document;
-use crate::sheets::sheet_page;
+use crate::sheets::{sheet_page, usable_area};
 
 pub const BOM_TITLE: &str = "Framing BOM";
 const DEFAULT_LAYOUT: &str = "BOM";
@@ -50,7 +51,6 @@ const NO_LEVEL: &str = "—";
 const TEXT_HEIGHT: f64 = 2.5;
 const ROW_HEIGHT: f64 = 7.0;
 const COL_WIDTHS: [f64; 4] = [30.0, 45.0, 15.0, 45.0];
-const INSET: f64 = 10.0;
 
 /// One BOM row: `count` of `item` on `level`, as laid in view `view`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,7 +201,7 @@ pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
     // Build on a copy and assign it back once: one undo step.
     let mut d = d0.clone();
     let page = sheet_page(&read_document(&d).map_err(other)?);
-    let fallback_top = Sheet::from_page(&page, 1.0).size.y;
+    let fallback = Sheet::from_page(&page, 1.0);
     if d.layout(&layout).is_none() {
         let tab_order = d.layouts.iter().map(|l| l.tab_order).max().map_or(0, |t| t + 1);
         d.layouts.push(Layout { page, ..Layout::new(&layout, tab_order) });
@@ -212,9 +212,8 @@ pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
         d.remove_entity(h);
     }
     let at = at.unwrap_or_else(|| {
-        let area = cadcraft_render::sheet(&d, &layout).map(|s| s.printable).filter(|a| !a.is_empty());
-        let (x, y) = area.map_or((0.0, fallback_top), |a| (a.min.x, a.max.y));
-        Point2 { x: x + INSET, y: y - INSET }
+        let area = usable_area(&cadcraft_render::sheet(&d, &layout).unwrap_or(fallback));
+        Point2 { x: area.min.x, y: area.max.y }
     });
     let handle = d.add(&Space::Paper(layout.clone()), Common::default(), EntityKind::Table(bom_table(&rows, at))).map_err(other)?;
     *s.doc_mut()? = d;

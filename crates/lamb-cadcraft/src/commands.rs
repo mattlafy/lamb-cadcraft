@@ -19,6 +19,8 @@
 //!   optionally plotted to one PDF — see [`crate::sheetset`].
 //! - `sheetsize {paper}` (`ssize`): the paper new sheets are made on, ARCH D landscape until set;
 //!   existing sheets keep their size — see [`crate::sheetset`].
+//! - `titleblock {project?, client?, address?, drawnBy?, date?}` (`tblock`): the text every sheet's
+//!   title block shows, in one undo step — see [`crate::titleblock`].
 //! - `bomtable {layout?, at?}` (`bom`): the framing BOM — repeat copies and placed corner and jamb
 //!   details counted per level — as a table on layout `BOM` — see [`crate::bom`].
 //! - `vpview {handle, viewId | null}`: binds a layout viewport to a view — its `view_id`, every other
@@ -855,6 +857,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["ssize"])
             .params("{paper} → {paper, widthMm, heightMm, message}")
             .interactive(crate::sheetset::sheetsize_machine),
+        CommandSpec::new("titleblock", "Title Block", crate::titleblock::titleblock)
+            .alias(&["tblock"])
+            .params("{project?, client?, address?, drawnBy?, date?} → {project, client, address, drawnBy, date}")
+            .interactive(crate::titleblock::titleblock_machine),
         CommandSpec::new("bomtable", "Framing BOM", crate::bom::bomtable)
             .alias(&["bom"])
             .params("{layout?, at?}")

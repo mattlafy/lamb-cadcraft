@@ -12,7 +12,7 @@
 //! naming what it shows freezes each new one in the creating command's own undo step. A viewport
 //! naming neither is model space or a foreign one, is left alone and takes no number.
 //!
-//! Arrangement: a grid over the layout's printable area (columns = ceil(sqrt(n)), filled row by
+//! Arrangement: a grid over the layout's [`usable_area`] (columns = ceil(sqrt(n)), filled row by
 //! row from the top left in the given order), each viewport its cell shrunk by 5 % on every side
 //! and centred on its own view block's extents at a standard drawing scale ([`STANDARD_SCALES`]):
 //! plans, sections and elevations at the project's `plot_scale` when it fits, else the next larger
@@ -206,13 +206,30 @@ pub(crate) fn sheet_paper_size(doc: &LambDocument) -> Option<&'static PaperSize>
 /// The page setup of a new sheet in `doc`: its paper in landscape, 10 mm margins, and paper units
 /// of millimetres whatever the drawing's MEASUREMENT says, as every paper constant here assumes.
 pub(crate) fn sheet_page(doc: &LambDocument) -> PageSetup {
-    let mut page = PageSetup { landscape: true, paper_mm: true, margins_mm: [10.0; 4], ..PageSetup::default() };
+    let mut page = PageSetup { landscape: true, paper_mm: true, margins_mm: [SHEET_MARGIN_MM; 4], ..PageSetup::default() };
     if let Some(p) = sheet_paper_size(doc) {
         page.paper = p.name.to_owned();
         page.width_mm = p.width_mm;
         page.height_mm = p.height_mm;
     }
     page
+}
+
+/// The margin [`sheet_page`] gives a new sheet, mm.
+pub(crate) const SHEET_MARGIN_MM: f64 = 10.0;
+
+/// The width of the title strip down the right edge of `sheet`'s printable area
+/// ([`crate::titleblock`]), in paper units: 70 mm, or a quarter of the printable width when less.
+pub(crate) fn frame_strip_width(sheet: &Sheet) -> f64 {
+    let p = if sheet.printable.is_empty() { sheet.bounds() } else { sheet.printable };
+    (70.0 / sheet.unit_mm).min(0.25 * p.width())
+}
+
+/// Where a sheet's drawings go: the printable area less the title strip, 5 mm inside the border.
+pub(crate) fn usable_area(sheet: &Sheet) -> Bounds2 {
+    let p = if sheet.printable.is_empty() { sheet.bounds() } else { sheet.printable };
+    let inset = 5.0 / sheet.unit_mm;
+    Bounds2::new(Vec2::new(p.min.x + inset, p.min.y + inset), Vec2::new(p.max.x - frame_strip_width(sheet) - inset, p.max.y - inset))
 }
 
 /// Creates layout `name` with one viewport per view in `views`, then one per plan in `assemblies`
@@ -268,12 +285,9 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
         + 1;
     let tab_order = d.layouts.iter().map(|l| l.tab_order).max().map_or(0, |t| t + 1);
     let page = sheet_page(&doc);
-    let fallback = Sheet::from_page(&page, 1.0).bounds();
+    let fallback = Sheet::from_page(&page, 1.0);
     d.layouts.push(Layout { page, ..Layout::new(name, tab_order) });
-    let area = match cadcraft_render::sheet(d, name) {
-        Some(s) if !s.printable.is_empty() => s.printable,
-        _ => fallback,
-    };
+    let area = usable_area(&cadcraft_render::sheet(d, name).unwrap_or(fallback));
 
     let n = slots.len();
     let cols = (n as f64).sqrt().ceil().max(1.0) as usize;
