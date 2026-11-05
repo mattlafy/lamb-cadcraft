@@ -10,15 +10,18 @@
 //! The annotation lives in its own block per view, [`annotation_block_name`]`(view)`, never in the
 //! view block, so derivation, the wall graph, links and LAMBSAVE never see them. The block's one
 //! model-space INSERT sits at the origin on the view's own view layer, so a sheet viewport showing
-//! the view shows its annotation and every other viewport freezes it. [`annotation_observer`]
-//! regenerates the blocks after every command, writing the drawing back only when one changed, so
-//! the change lands in the command's own undo step.
+//! the view shows its annotation and every other viewport freezes it. Editing a view's block draws
+//! no model-space INSERT, so [`draw`] shows the view's annotation there as an overlay: visible,
+//! non-pickable and never plotted. [`annotation_observer`] regenerates the blocks after every
+//! command, writing the drawing back only when one changed, so the change lands in the command's own
+//! undo step.
 
 use std::sync::Arc;
 
 use cadcraft_doc::{Block, Common, DimKind, Dimension, Drawing, Entity, EntityKind, HAlign, Insert, Line, Space, Text, VAlign};
 use cadcraft_engine::Session;
-use cadcraft_geom::Vec3;
+use cadcraft_geom::{Bounds2, Vec3};
+use cadcraft_render::{DisplayList, Options};
 use lamb_core::derivation::markers::compute_cut_lines_for_view;
 use lamb_core::derivation::projection::{Uz, vertical_uz_to_local};
 use lamb_core::derivation::read::{ProjectRead, ViewKind};
@@ -307,9 +310,20 @@ pub fn annotation_observer(s: &mut Session, _before: &Arc<Drawing>) {
     }
 }
 
+/// The annotation of the view whose block `space` edits, as an overlay in the view's local
+/// coordinates. Empty for any other space and for a view without an annotation block.
+pub(crate) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
+    let block = crate::overlays::view_id(space).and_then(|id| d.block(&annotation_block_name(id)));
+    let Some(block) = block else { return DisplayList { bounds: Bounds2::EMPTY, ..DisplayList::default() } };
+    cadcraft_render::build_entities(d, block.entities.iter().map(|e| &**e), &Options { view: None, ..opts.clone() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::overlays::lamb_overlay;
+    use cadcraft_geom::Vec2;
+    use cadcraft_render::{Kind, build_plot};
     use serde_json::json;
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -704,6 +718,73 @@ mod tests {
         assert_eq!(all(&with), all(&without));
         let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(d).as_bytes()).map_err(|e| format!("{e:?}"))?;
         assert!(plan_changes(&back)?.is_empty(), "the observer would change nothing after a round trip");
+        Ok(())
+    }
+
+    /// Whether `list` holds a polyline with a point at (x, y).
+    fn has_point(list: &DisplayList, x: f64, y: f64) -> bool {
+        let at = Vec2::new(x, y);
+        list.prims.iter().filter(|p| p.kind == Kind::Polyline).any(|p| list.points(p).iter().any(|q| q.dist(at) < 1e-6))
+    }
+
+    #[test]
+    fn editing_a_plan_shows_the_arrows_on_the_side_the_section_faces() -> R {
+        let (mut s, plan, sec) = fixture()?;
+        let space = Space::Block(view_block_name(plan));
+        let Item::Line(_, tip) = items(&s, plan)?[1].clone() else { return Err("no arrow".into()) };
+        let g = tip.y;
+        assert_eq!(g.abs(), CUT_ARROW_MM);
+        let list = lamb_overlay(s.doc()?, &space, &Options::default());
+        assert!(has_point(&list, 0.0, g) && has_point(&list, 5000.0, g), "both tips");
+        assert!(!has_point(&list, 0.0, -g) && !has_point(&list, 5000.0, -g), "not the far side");
+        s.execute("viewprops", &json!({ "mode": "flip", "viewId": sec.0, "flipped": true }))?;
+        let list = lamb_overlay(s.doc()?, &space, &Options::default());
+        assert!(has_point(&list, 0.0, -g) && has_point(&list, 5000.0, -g), "flipped tips");
+        assert!(!has_point(&list, 0.0, g) && !has_point(&list, 5000.0, g), "the old side is empty");
+        Ok(())
+    }
+
+    #[test]
+    fn editing_a_section_shows_its_level_lines() -> R {
+        let (s, _plan, sec, _l1, _l2) = levelled()?;
+        let list = lamb_overlay(s.doc()?, &Space::Block(view_block_name(sec)), &Options::default());
+        let got = levels_of(&s, sec)?;
+        assert_eq!(got.len(), 2, "{got:?}");
+        for (y, a, b, _) in got {
+            assert!(has_point(&list, a, y) && has_point(&list, b, y), "level line at {y}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_space_and_sheets_gain_nothing_and_a_plot_shows_the_annotation_once() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, plan, sec) = fixture()?;
+        s.execute("newsheet", &json!({ "name": "A301", "viewIds": [plan.0, sec.0] }))?;
+        let d = s.doc()?;
+        let mut bare = d.clone();
+        let handles: Vec<_> = bare
+            .model
+            .iter()
+            .filter(|e| matches!(&e.kind, EntityKind::Insert(i) if i.block == annotation_block_name(plan) || i.block == annotation_block_name(sec)))
+            .map(|e| e.handle)
+            .collect();
+        assert!(!handles.is_empty());
+        for h in handles {
+            bare.remove_entity(h);
+        }
+        let opts = Options::default();
+        let paper = Space::Paper("A301".into());
+        for space in [Space::Model, paper.clone()] {
+            assert!(draw(d, &space, &opts).prims.is_empty());
+            assert_eq!(lamb_overlay(d, &space, &opts).prims.len(), lamb_overlay(&bare, &space, &opts).prims.len());
+        }
+        // Through a viewport the INSERT draws the block; the overlay adds no second copy.
+        let edited = draw(d, &Space::Block(view_block_name(plan)), &opts).prims.len();
+        assert!(edited > 0);
+        let (with, without) = (build_plot(d, &paper, &opts).prims.len(), build_plot(&bare, &paper, &opts).prims.len());
+        assert!(with > without && with - without <= edited, "{with} {without} {edited}");
+        assert!(cadcraft_render::overlays(d, &paper, &opts).iter().all(|l| l.prims.is_empty()));
         Ok(())
     }
 }
