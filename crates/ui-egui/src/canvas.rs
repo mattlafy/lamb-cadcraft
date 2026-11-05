@@ -360,22 +360,16 @@ fn handle_scroll_zoom(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>,
     {
         let _ = app.session.zoom_about(f64::from(pinch), nav.xf.to_world(at));
     }
-    // CADCRAFT_MOBILE_TWO_FINGER_PAN
-    // Move the model viewport with the midpoint of a multitouch gesture.
-    // Keep the existing egui pinch-to-zoom handling above unchanged.
-    #[cfg(target_arch = "wasm32")]
-    if let Some(touch) = ui.input(|i| i.multi_touch()) {
-        if !touch_elsewhere && nav.rect.contains(touch.center_pos) && touch.translation_delta != egui::Vec2::ZERO {
-            if let Ok(st) = app.session.state_mut() {
-                let v = st.view();
-                st.set_view_quiet(cadcraft_engine::View {
-                    center: v.center - nav.xf.screen_delta_to_world(touch.translation_delta),
-                    height: v.height,
-                    twist: v.twist,
-                });
-            }
-            ui.ctx().request_repaint();
-        }
+    // Two fingers pan with their midpoint; one finger drives the crosshair ([`crate::touch`]).
+    // Only under the virtual mouse: elsewhere the first finger is already a left drag.
+    if app.touch.gesturing()
+        && let Some(touch) = ui.input(|i| i.multi_touch())
+        && nav.rect.contains(touch.center_pos)
+        && touch.translation_delta != egui::Vec2::ZERO
+        && let Ok(st) = app.session.state_mut()
+    {
+        let view = st.view();
+        st.set_view_quiet(cadcraft_engine::View { center: view.center - nav.xf.screen_delta_to_world(touch.translation_delta), ..view });
     }
 }
 
