@@ -46,7 +46,7 @@
 //!   undo step; returns `{on, message}` (`<UCS align on>` / `<UCS align off>`).
 //!
 //! - `newoffsetplan` (`np`) and `newplanline` (`npln`): placed plans at a new level — see
-//!   [`crate::newviews`]. NEWSECTIONLINE in a placed section takes one click for a perpendicular cut.
+//!   [`crate::newviews`]. NEWSECTIONLINE and NEWELEVATIONLINE in a placed section take one click for a perpendicular cut.
 //! - `newoffsetsection` (`nos`) and `newoffsetelevation` (`noe`): a parallel section/elevation a
 //!   typed distance from the edited one — see [`crate::offsetviews`].
 //!
@@ -525,7 +525,7 @@ struct NewVertical {
     host: Option<Id>,
     first: Option<Vec2>,
     second: Option<Vec2>,
-    /// NEWSECTIONLINE begun in a placed section: one click gives a cut perpendicular to it, on its
+    /// Begun in a placed section: one click gives a cut perpendicular to it, on its
     /// host plan ([`newviews::perpendicular_cut`]); `host` is the section until then.
     one_click: bool,
 }
@@ -549,7 +549,10 @@ impl Interactive for NewVertical {
     }
     fn prompt(&self, s: &Session) -> Prompt {
         match (self.first, self.second) {
-            (None, _) if self.one_click => Prompt::new("Click a point for a section perpendicular to this one", Accept::POINT),
+            (None, _) if self.one_click => {
+                let article = if self.intent == VerticalIntent::Elevation { "an" } else { "a" };
+                Prompt::new(format!("Click a point for {article} {} perpendicular to this one", self.word().to_ascii_lowercase()), Accept::POINT)
+            }
             (None, _) => Prompt::new("Specify first point of cut line", Accept::POINT),
             (Some(a), None) => Prompt::new("Specify second point of cut line", Accept::POINT).base(a),
             (Some(_), Some(_)) => Prompt::new(format!("Enter {} name", self.word().to_ascii_lowercase()), Accept::TEXT).default(self.default_name(s)),
@@ -561,7 +564,7 @@ impl Interactive for NewVertical {
             s.echo("Edit a plan or section first (EDITVIEW).");
             return Ok(Step::Done);
         }
-        self.one_click = self.intent == VerticalIntent::Section && self.host.is_some_and(|h| newviews::is_placed_vertical(s, h));
+        self.one_click = self.host.is_some_and(|h| newviews::is_placed_vertical(s, h));
         Ok(Step::Continue)
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
@@ -1231,6 +1234,54 @@ mod tests {
         s.input(Input::Point(Vec2::new(3.0, -4.0)))?;
         s.input(Input::Enter)?;
         assert!(views(&s)?.iter().any(|v| v.name() == "Elevation 1"));
+        Ok(())
+    }
+
+    /// Both buttons take one click in a placed section and two points in a plan; only the name and
+    /// the sheet group differ.
+    #[test]
+    fn newelevationline_in_a_section_takes_the_same_one_click_cut_as_newsectionline() -> R {
+        let mut s = session()?;
+        let plan = Id(s.execute("lambproject", &json!({}))?["viewId"].as_u64().ok_or("no id")?);
+        for cmd in ["newsectionline", "newelevationline"] {
+            s.start(cmd)?;
+            assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify first point of cut line"), "{cmd} in a plan");
+            s.input(Input::Cancel)?;
+        }
+        let host = Id(s.execute(
+            "newsectionline",
+            &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 0}, "cutTo": {"x": 10000, "y": 0} }),
+        )?["viewId"]
+            .as_u64()
+            .ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": host.0 }))?;
+        let click = Vec2::new(4000.0, 1500.0);
+
+        s.start("newelevationline")?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Click a point for an elevation perpendicular to this one"));
+        s.input(Input::Point(click))?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter elevation name <Elevation 1>:"));
+        s.input(Input::Enter)?;
+        s.start("newsectionline")?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Click a point for a section perpendicular to this one"));
+        s.input(Input::Point(click))?;
+        text(&mut s, "B-B")?;
+
+        let v = views(&s)?;
+        let vertical = |name: &str| v.iter().find_map(|x| if let AnyView::Vertical(x) = x { Some(x).filter(|x| x.name == name) } else { None });
+        let (elev, sec) = (vertical("Elevation 1").ok_or("no elevation")?, vertical("B-B").ok_or("no section")?);
+        assert_eq!((elev.intent, sec.intent), (VerticalIntent::Elevation, VerticalIntent::Section));
+        let Some(Placement::Vertical { host_view_id, cut_line, .. }) = &elev.placement else { return Err("not placed".into()) };
+        assert_eq!(*host_view_id, plan, "on the host plan, not the section");
+        let Some(Placement::Vertical { host_view_id: sec_host, cut_line: sec_cut, .. }) = &sec.placement else { return Err("not placed".into()) };
+        assert_eq!((host_view_id, cut_line), (sec_host, sec_cut), "the same line from the same click");
+
+        let r = s.execute("sheetset", &json!({}))?;
+        let sheets = r["sheets"].as_array().ok_or("no sheets")?;
+        let holding =
+            |id: Id| sheets.iter().find(|x| x["viewIds"].as_array().is_some_and(|ids| ids.contains(&json!(id.0))) && x["group"] != "framing");
+        assert_eq!(holding(elev.id).ok_or("elevation on no sheet")?["layout"], "A201");
+        assert_eq!(holding(sec.id).ok_or("section on no sheet")?["group"], "section");
         Ok(())
     }
 
