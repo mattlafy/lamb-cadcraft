@@ -2,9 +2,13 @@
 //! elevation and section that no sheet shows yet gets a sheet of its own — plans `A101`, `A102`, …
 //! by level order (then document order), elevations `A201`, …, sections `A301`, … in document
 //! order — and the unplaced assigned details are gathered onto detail sheets `A501`, … six to a
-//! sheet, exactly as DETAILSHEETS does ([`crate::detailsheets::lay_detail_sheets`]). Floating
-//! plans, unplaced vertical views and untagged details are left alone; a view already on a sheet
-//! is skipped and counted. The set's layouts (prefix + two digits) then lead the layout tabs in
+//! sheet, exactly as DETAILSHEETS does ([`crate::detailsheets::lay_detail_sheets`]). Plan sheets
+//! show the outline only: the walls as their details build them go on framing sheets `A401`, …
+//! (LAMB T635), one per placed view with an assembly block, plans in level order and then
+//! verticals in document order, each showing only that block. SHEETSET does not generate
+//! assemblies, so no block means no framing sheet. Floating plans, unplaced vertical views and
+//! untagged details are left alone; a view already on a sheet, or an assembly already in a
+//! viewport, is skipped and counted. The set's layouts (prefix + two digits) then lead the layout tabs in
 //! name order, every other layout after them in its previous order, so PLOT `layouts: "all"` and
 //! PUBLISH run in set order. All of it is one undo step; nothing new to place changes nothing.
 //!
@@ -17,34 +21,38 @@
 //! `{paper, widthMm, heightMm, message}` with the landscape sheet size. Existing sheets are never
 //! resized or re-flowed.
 
-use cadcraft_doc::Drawing;
+use cadcraft_doc::{Drawing, EntityKind};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use lamb_core::model::{AnyView, Id, VerticalIntent};
 use serde_json::{Value, json};
 
 use crate::commands::{bad, name_input, other};
 use crate::detailsheets::{lay_detail_sheets, next_sheet_name};
-use crate::schema::{read_document, write_document};
+use crate::schema::{assembly_block_name, read_document, read_entity_data, write_document};
 use crate::sheets::{DEFAULT_SHEET_PAPER, create_sheet, sheet_paper_size, view_sheet_ref};
 
 const PLAN_PREFIX: &str = "A1";
 const ELEVATION_PREFIX: &str = "A2";
 const SECTION_PREFIX: &str = "A3";
+const FRAMING_PREFIX: &str = "A4";
 const DETAIL_PREFIX: &str = "A5";
+const FRAMING_GROUP: &str = "framing";
 const DETAILS_PER_SHEET: usize = 6;
-const SET_PREFIXES: [&str; 4] = [PLAN_PREFIX, ELEVATION_PREFIX, SECTION_PREFIX, DETAIL_PREFIX];
+const SET_PREFIXES: [&str; 5] = [PLAN_PREFIX, ELEVATION_PREFIX, SECTION_PREFIX, FRAMING_PREFIX, DETAIL_PREFIX];
 
 /// Whether `name` is a set sheet name: a set prefix and two digits.
 fn is_set_name(name: &str) -> bool {
     SET_PREFIXES.iter().any(|p| name.strip_prefix(p).is_some_and(|rest| rest.len() == 2 && rest.bytes().all(|b| b.is_ascii_digit())))
 }
 
-/// The placed plans, elevations and sections, as (group, prefix, [(view, name)]) in set order.
+/// The placed plans, elevations and sections, then the placed views with an assembly block (plans
+/// in level order, then verticals in document order), as (group, prefix, [(view, name)]) in set
+/// order.
 fn set_views(d: &Drawing) -> Result<Vec<(&'static str, &'static str, Vec<(Id, String)>)>> {
     let doc = read_document(d).map_err(other)?;
     let level_order = |level: Id| doc.levels.iter().find(|l| l.id == level).map_or(f64::INFINITY, |l| l.order);
     let mut plans: Vec<(f64, Id, String)> = Vec::new();
-    let (mut elevations, mut sections) = (Vec::new(), Vec::new());
+    let (mut elevations, mut sections, mut verticals) = (Vec::new(), Vec::new(), Vec::new());
     for v in &doc.views {
         match v {
             AnyView::Plan(p) => {
@@ -52,19 +60,33 @@ fn set_views(d: &Drawing) -> Result<Vec<(&'static str, &'static str, Vec<(Id, St
                     plans.push((level_order(*level_id), p.id, p.name.clone()));
                 }
             }
-            AnyView::Vertical(x) if x.placement.is_some() => match x.intent {
-                VerticalIntent::Elevation => elevations.push((x.id, x.name.clone())),
-                VerticalIntent::Section => sections.push((x.id, x.name.clone())),
-            },
+            AnyView::Vertical(x) if x.placement.is_some() => {
+                verticals.push((x.id, x.name.clone()));
+                match x.intent {
+                    VerticalIntent::Elevation => elevations.push((x.id, x.name.clone())),
+                    VerticalIntent::Section => sections.push((x.id, x.name.clone())),
+                }
+            }
             _ => {}
         }
     }
     plans.sort_by(|a, b| a.0.total_cmp(&b.0)); // stable: document order within a level
+    let plans: Vec<(Id, String)> = plans.into_iter().map(|(_, id, n)| (id, n)).collect();
+    let framing = plans.iter().chain(&verticals).filter(|(id, _)| d.block(&assembly_block_name(*id)).is_some()).cloned().collect();
     Ok(vec![
-        ("plan", PLAN_PREFIX, plans.into_iter().map(|(_, id, n)| (id, n)).collect()),
+        ("plan", PLAN_PREFIX, plans),
         ("elevation", ELEVATION_PREFIX, elevations),
         ("section", SECTION_PREFIX, sections),
+        (FRAMING_GROUP, FRAMING_PREFIX, framing),
     ])
+}
+
+/// Whether some viewport on some layout shows `view`'s assembly block.
+fn assembly_on_sheet(d: &Drawing, view: Id) -> bool {
+    d.layouts
+        .iter()
+        .flat_map(|l| l.entities.iter())
+        .any(|e| matches!(e.kind, EntityKind::Viewport(_)) && read_entity_data(&e.common).is_ok_and(|data| data.assembly_of == Some(view)))
 }
 
 /// Renumbers the layout tabs: set sheets first by name, every other layout after them in its
@@ -99,14 +121,21 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     let mut parts: Vec<String> = Vec::new();
     let mut already = 0usize;
     for (group, prefix, views) in set_views(&d)? {
+        let framing = group == FRAMING_GROUP;
         for (view, name) in views {
-            if view_sheet_ref(&d, view).is_some() {
+            let on_sheet = if framing { assembly_on_sheet(&d, view) } else { view_sheet_ref(&d, view).is_some() };
+            if on_sheet {
                 already += 1;
                 continue;
             }
             let layout = next_sheet_name(&d, prefix);
-            create_sheet(&mut d, &layout, &[view], &[]).map_err(other)?;
-            parts.push(format!("{layout} {name}"));
+            if framing {
+                create_sheet(&mut d, &layout, &[], &[view]).map_err(other)?;
+                parts.push(format!("{layout} {name} framing"));
+            } else {
+                create_sheet(&mut d, &layout, &[view], &[]).map_err(other)?;
+                parts.push(format!("{layout} {name}"));
+            }
             sheets.push(json!({ "layout": layout, "group": group, "viewIds": [view.0] }));
         }
     }
@@ -288,19 +317,23 @@ mod tests {
             ("A102".to_owned(), "plan".to_owned(), vec![first.0]),
             ("A201".to_owned(), "elevation".to_owned(), vec![elev.0]),
             ("A301".to_owned(), "section".to_owned(), vec![sec.0]),
+            ("A401".to_owned(), "framing".to_owned(), vec![ground.0]),
             ("A501".to_owned(), "details".to_owned(), details.iter().map(|d| d.0).collect()),
         ];
         assert_eq!(laid(&r), want, "{r}");
-        assert_eq!(r["message"], "Sheet set: A101 Ground Floor, A102 First, A201 North, A301 Section A, A501 (2 details).");
+        assert_eq!(
+            r["message"],
+            "Sheet set: A101 Ground Floor, A102 First, A201 North, A301 Section A, A401 Ground Floor framing, A501 (2 details)."
+        );
         assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
-        let mut want_tabs: Vec<String> = ["A101", "A102", "A201", "A301", "A501"].map(String::from).to_vec();
+        let mut want_tabs: Vec<String> = ["A101", "A102", "A201", "A301", "A401", "A501"].map(String::from).to_vec();
         want_tabs.extend(before);
         assert_eq!(tabs(&s)?, want_tabs, "set sheets lead, other layouts follow in order");
 
         // A re-run changes nothing.
         let r = s.execute("sheetset", &json!({}))?;
         assert_eq!(undo_len(&s)?, n + 1, "no undo step");
-        assert_eq!(r["message"], "Sheet set: nothing new to lay out; 6 already on sheets.");
+        assert_eq!(r["message"], "Sheet set: nothing new to lay out; 7 already on sheets.");
 
         // A third plan, placed later (the floating one): only A103, and the tabs stay in set order.
         s.execute("newsheet", &json!({ "name": "Notes", "viewIds": [ground.0] }))?;
@@ -313,7 +346,7 @@ mod tests {
         let r = s.execute("sheetset", &json!({}))?;
         assert_eq!(laid(&r), [("A103".to_owned(), "plan".to_owned(), vec![third.0])], "{r}");
         let t = tabs(&s)?;
-        assert_eq!(t[..6], ["A101", "A102", "A103", "A201", "A301", "A501"], "{t:?}");
+        assert_eq!(t[..7], ["A101", "A102", "A103", "A201", "A301", "A401", "A501"], "{t:?}");
         assert_eq!(t.last().map(String::as_str), Some("Notes"), "a non-set layout follows");
 
         // Undo takes the whole run back.
@@ -361,7 +394,7 @@ mod tests {
         let later = id(&s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": ground.0, "floorToFloorMm": 6000, "name": "Later" }))?)?;
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
         let layer = view_block_name(later);
-        for sheet in ["A101", "A102", "A201", "A301", "A501"] {
+        for sheet in ["A101", "A102", "A201", "A301", "A401", "A501"] {
             assert!(frozen(&s, sheet)?.contains(&layer), "{sheet}");
         }
         assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
@@ -382,13 +415,122 @@ mod tests {
         Ok(())
     }
 
+    /// The one viewport on layout `name`, as (viewport, its assembly_of).
+    fn only_viewport(s: &Session, name: &str) -> T<(cadcraft_doc::Viewport, Option<Id>)> {
+        let l = s.doc()?.layout(name).ok_or("no layout")?;
+        let mut vps = l.entities.iter().filter_map(|e| match &e.kind {
+            EntityKind::Viewport(vp) if vp.id > 1 => Some((vp.clone(), read_entity_data(&e.common).ok()?.assembly_of)),
+            _ => None,
+        });
+        let first = vps.next().ok_or("no viewport")?;
+        assert!(vps.next().is_none(), "one viewport on {name}");
+        Ok(first)
+    }
+
+    /// Layout `name`'s drawing titles, as (NUM, NAME, SCALE).
+    fn sheet_titles(s: &Session, name: &str) -> T<Vec<(String, String, String)>> {
+        let l = s.doc()?.layout(name).ok_or("no layout")?;
+        Ok(l.entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Insert(i) if i.block == crate::vptitles::TITLE_BLOCK => {
+                    let v = |t: &str| i.attribs.iter().find(|a| a.tag == t).map_or_else(String::new, |a| a.text.value.clone());
+                    Some((v("NUM"), v("NAME"), v("SCALE")))
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    #[test]
+    fn a_framing_sheet_shows_the_views_assembly_at_its_scale_with_a_title() -> R {
+        let (mut s, [ground, first, ..]) = set()?;
+        assert!(s.doc()?.block(&assembly_block_name(first)).is_none(), "First's details are untagged");
+        let r = s.execute("sheetset", &json!({}))?;
+        let framing: Vec<_> = laid(&r).into_iter().filter(|(_, g, _)| g == "framing").collect();
+        assert_eq!(framing, [("A401".to_owned(), "framing".to_owned(), vec![ground.0])], "First has no assembly, so no sheet: {r}");
+
+        let (vp, of) = only_viewport(&s, "A401")?;
+        assert_eq!(of, Some(ground));
+        let shown = assembly_block_name(ground);
+        assert!(!vp.frozen_layers.contains(&shown), "its own block shows");
+        assert!(vp.frozen_layers.contains(&view_block_name(ground)), "the outline does not");
+        let (plan_vp, _) = only_viewport(&s, "A101")?;
+        assert!(plan_vp.frozen_layers.contains(&shown), "the plan sheet stays outline-only");
+        let scale = crate::sheets::viewport_scale(&vp);
+        assert_eq!(scale, crate::sheets::viewport_scale(&plan_vp), "the plan's scale");
+        assert_eq!(sheet_titles(&s, "A401")?, [("1".to_owned(), "Ground Floor framing".to_owned(), crate::vptitles::scale_label(scale))]);
+        Ok(())
+    }
+
+    #[test]
+    fn framing_sheets_run_plans_by_level_then_verticals_by_document_order() -> R {
+        let (mut s, [ground, first, elev, sec]) = set()?;
+        for v in [sec, elev, first] {
+            s.execute("assemblyplan", &json!({ "viewId": v.0 }))?;
+        }
+        let r = s.execute("sheetset", &json!({}))?;
+        let framing: Vec<_> = laid(&r).into_iter().filter(|(_, g, _)| g == "framing").map(|(l, _, ids)| (l, ids)).collect();
+        let want = [("A401", ground), ("A402", first), ("A403", elev), ("A404", sec)].map(|(l, v)| (l.to_owned(), vec![v.0]));
+        assert_eq!(framing, want, "{r}");
+        assert_eq!(only_viewport(&s, "A404")?.1, Some(sec));
+        assert_eq!(sheet_titles(&s, "A404")?.first().map(|t| t.1.as_str()), Some("Section A framing"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_assembly_made_later_adds_one_framing_sheet_and_moves_no_reference() -> R {
+        let (mut s, [ground, first, elev, sec]) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let refs = |s: &Session| -> T<Vec<_>> {
+            Ok([ground, first, elev, sec].iter().map(|v| s.doc().map(|d| view_sheet_ref(d, *v))).collect::<std::result::Result<Vec<_>, _>>()?)
+        };
+        let (before_refs, before_bubbles) = (refs(&s)?, bubble_sheets(&s, ground)?);
+        assert_eq!(before_refs[0], Some((1, "A101".to_owned())), "the framing sheet takes no reference");
+        assert!(before_bubbles.len() == 2 && before_bubbles.iter().all(|b| b.ends_with("/A501")), "{before_bubbles:?}");
+
+        // A section's assembly gets the next number.
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(laid(&r), [("A402".to_owned(), "framing".to_owned(), vec![sec.0])], "{r}");
+        assert_eq!(r["message"], "Sheet set: A402 Section A framing; 7 already on sheets.");
+
+        // A re-run adds nothing and no undo step.
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n, "no undo step");
+        assert_eq!(r["message"], "Sheet set: nothing new to lay out; 8 already on sheets.");
+
+        // A second plan's assembly adds exactly one, and the tabs stay in set order.
+        s.execute("assemblyplan", &json!({ "viewId": first.0 }))?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(laid(&r), [("A403".to_owned(), "framing".to_owned(), vec![first.0])], "{r}");
+        let t = tabs(&s)?;
+        assert_eq!(t[..8], ["A101", "A102", "A201", "A301", "A401", "A402", "A403", "A501"], "{t:?}");
+
+        assert_eq!(refs(&s)?, before_refs);
+        assert_eq!(bubble_sheets(&s, ground)?, before_bubbles);
+        Ok(())
+    }
+
+    #[test]
+    fn an_assembly_already_in_a_viewport_gets_no_framing_sheet() -> R {
+        let (mut s, [ground, ..]) = set()?;
+        s.execute("newsheet", &json!({ "name": "Mine", "assemblyIds": [ground.0] }))?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert!(laid(&r).iter().all(|(_, g, _)| g != "framing"), "{r}");
+        assert_eq!(r["alreadyOnSheets"], 1, "{r}");
+        assert!(s.doc()?.layout("A401").is_none());
+        Ok(())
+    }
+
     #[test]
     fn a_view_already_on_a_sheet_is_skipped_and_counted() -> R {
         let (mut s, [_, _, elev, _]) = set()?;
         s.execute("newsheet", &json!({ "name": "Mine", "viewIds": [elev.0] }))?;
         let r = s.execute("sheetset", &json!({}))?;
         let names: Vec<String> = laid(&r).into_iter().map(|(l, _, _)| l).collect();
-        assert_eq!(names, ["A101", "A102", "A301", "A501"], "{r}");
+        assert_eq!(names, ["A101", "A102", "A301", "A401", "A501"], "{r}");
         assert_eq!(r["alreadyOnSheets"], 1);
         assert!(r["message"].as_str().unwrap_or_default().ends_with("; 1 already on sheets."), "{r}");
         assert_eq!(view_sheet_ref(s.doc()?, elev), Some((1, "Mine".to_owned())));
@@ -408,10 +550,10 @@ mod tests {
         let path = dir.join("set.pdf");
         let path_s = path.to_string_lossy().into_owned();
         let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
-        assert_eq!(r["pdf"]["pages"], 5, "{r}");
+        assert_eq!(r["pdf"]["pages"], 6, "{r}");
         let bytes = std::fs::read(&path)?;
         let pdf = craft_pdf::open_slice(&bytes, None).map_err(|e| format!("the PDF opens: {e:?}"))?;
-        assert_eq!(pdf.pages().len(), 5);
+        assert_eq!(pdf.pages().len(), 6, "the framing sheet is a page");
         for page in pdf.pages().iter() {
             let m = page.media_box();
             let size = ((m.x1 - m.x0).abs() / 72.0 * 25.4, (m.y1 - m.y0).abs() / 72.0 * 25.4);
@@ -419,7 +561,7 @@ mod tests {
         }
         // A re-run with nothing new still plots the set.
         let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
-        assert_eq!(r["pdf"]["pages"], 5, "{r}");
+        assert_eq!(r["pdf"]["pages"], 6, "{r}");
         let _ = std::fs::remove_dir_all(&dir);
 
         // A drawing with no set sheets has nothing to plot.
@@ -523,7 +665,7 @@ mod tests {
 
     #[test]
     fn set_names_are_a_prefix_and_two_digits() {
-        assert!(is_set_name("A101") && is_set_name("A599") && is_set_name("A301"));
-        assert!(!is_set_name("A401") && !is_set_name("A1") && !is_set_name("A1001") && !is_set_name("Layout1") && !is_set_name("A1x1"));
+        assert!(is_set_name("A101") && is_set_name("A599") && is_set_name("A301") && is_set_name("A401"));
+        assert!(!is_set_name("A601") && !is_set_name("A1") && !is_set_name("A1001") && !is_set_name("Layout1") && !is_set_name("A1x1"));
     }
 }

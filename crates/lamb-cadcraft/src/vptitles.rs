@@ -7,21 +7,27 @@
 //! view's name), `SCALE` (`1:<n>`, [`crate::sheets::viewport_scale`]) and the invisible `VP` (the
 //! viewport's `id`, the title's identity). All have Lock position set.
 //!
+//! An assembly viewport (`EntityData.assembly_of`, LAMB T635) gets a title too: `NAME` is
+//! `<view name> framing`, and `NUM` continues after its layout's single-view viewports, by viewport
+//! `id`. It is not in [`crate::sheets::sheet_refs`]' numbering, so no bubble's `SHEET` names it.
+//!
 //! [`vptitle_observer`] reconciles every layout's titles after every command: a title whose `VP`
 //! matches is updated in place (same handle) when its place or text is off — so a title moved by
 //! hand snaps back under its viewport — missing ones are added and the rest erased, and the drawing
 //! is written back only when something changed, so the change lands in the command's own undo
-//! step. Assembly viewports (every view frozen) and non-LAMB viewports get no title.
+//! step. Non-LAMB viewports get no title.
 
 use std::sync::Arc;
 
-use cadcraft_doc::{Attrib, AttribModes, Block, Circle, Common, Drawing, Entity, EntityKind, HAlign, Handle, Insert, Line, Space, Text, VAlign};
+use cadcraft_doc::{
+    Attrib, AttribModes, Block, Circle, Common, Drawing, Entity, EntityKind, HAlign, Handle, Insert, Line, Space, Text, VAlign, Viewport,
+};
 use cadcraft_engine::Session;
 use cadcraft_geom::Vec3;
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::Id;
 
-use crate::schema::{read_document, view_block_name};
+use crate::schema::{read_document, read_entity_data, view_block_name};
 use crate::sheets::{numbered_viewports, viewport_scale};
 use cadcraft_doc::color::Color;
 
@@ -166,16 +172,35 @@ fn plan(d: &Drawing) -> Result<Vec<LayoutPlan>, String> {
     let mut out = Vec::new();
     for l in &d.layouts {
         let mut wanted: Vec<Wanted> = Vec::new();
+        let view_name = |view: Id| doc.views.iter().find(|v| v.id() == view).map(|v| v.name().to_owned());
+        let title = |vp: &Viewport, num: usize, name: String| Wanted {
+            at: Vec3::new(vp.center.x - vp.width / 2.0, vp.center.y - vp.height / 2.0 - TITLE_DROP_MM, 0.0),
+            vp: vp.id.to_string(),
+            num: num.to_string(),
+            name,
+            scale: scale_label(viewport_scale(vp)),
+        };
         for (view, n, _, h) in numbered.iter().filter(|(_, _, ln, _)| *ln == l.name) {
             let Some(EntityKind::Viewport(vp)) = l.entities.get(*h).map(|e| &e.kind) else { continue };
-            let name = doc.views.iter().find(|v| v.id() == *view).map_or_else(String::new, |v| v.name().to_owned());
-            wanted.push(Wanted {
-                at: Vec3::new(vp.center.x - vp.width / 2.0, vp.center.y - vp.height / 2.0 - TITLE_DROP_MM, 0.0),
-                vp: vp.id.to_string(),
-                num: n.to_string(),
-                name,
-                scale: scale_label(viewport_scale(vp)),
-            });
+            wanted.push(title(vp, *n, view_name(*view).unwrap_or_default()));
+        }
+        // Assembly viewports number on from the single-view ones, by viewport id.
+        let mut assemblies: Vec<(&Viewport, String)> = l
+            .entities
+            .iter()
+            .filter_map(|e| {
+                let EntityKind::Viewport(vp) = &e.kind else { return None };
+                let data = read_entity_data(&e.common).ok()?;
+                if data.view_id.is_some() {
+                    return None;
+                }
+                Some((vp, format!("{} framing", view_name(data.assembly_of?)?)))
+            })
+            .collect();
+        assemblies.sort_by_key(|(vp, _)| vp.id);
+        let singles = wanted.len();
+        for (i, (vp, name)) in assemblies.into_iter().enumerate() {
+            wanted.push(title(vp, singles + i + 1, name));
         }
         let mut lp = LayoutPlan { layout: l.name.clone(), ..LayoutPlan::default() };
         let mut claimed: Vec<Handle> = Vec::new();
@@ -258,7 +283,7 @@ pub fn vptitle_observer(s: &mut Session, _before: &Arc<Drawing>) {
 mod tests {
     use super::*;
     use crate::assembly::tests::{room_with, undo_len};
-    use cadcraft_doc::{Layout, PageSetup, Viewport};
+    use cadcraft_doc::{Layout, PageSetup};
     use serde_json::json;
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -367,11 +392,33 @@ mod tests {
     }
 
     #[test]
-    fn assembly_and_non_lamb_viewports_get_no_title() -> R {
-        let (mut s, plan, _) = room()?;
+    fn assembly_viewports_number_after_single_view_ones_and_leave_sheet_refs_alone() -> R {
+        let (mut s, plan, detail) = room()?;
         s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
-        s.execute("newsheet", &json!({ "name": "A1", "assemblyIds": [plan.0] }))?;
-        assert!(titles(&s, "A1")?.is_empty());
+        let out = s.execute("newsheet", &json!({ "name": "A1", "assemblyIds": [plan.0] }))?;
+        let vp = viewport(&s, hx(&out["viewports"][0])?)?;
+        let t = titles(&s, "A1")?;
+        let rows: Vec<_> = t.iter().map(|t| (t.1, t.3.as_str(), t.4.as_str(), t.5.clone(), t.6.clone())).collect();
+        assert_eq!(rows, [(corner(&vp), "1", "Ground framing", scale_label(viewport_scale(&vp)), vp.id.to_string())]);
+        assert_eq!(crate::sheets::view_sheet_ref(s.doc()?, plan), None, "no number a bubble could name");
+
+        // On a sheet with views the assembly comes last.
+        s.execute("newsheet", &json!({ "name": "A2", "viewIds": [plan.0, detail.0], "assemblyIds": [plan.0] }))?;
+        let t = titles(&s, "A2")?;
+        assert_eq!(t.iter().map(|t| (t.3.as_str(), t.4.as_str())).collect::<Vec<_>>(), [("1", "Ground"), ("2", "D1"), ("3", "Ground framing")]);
+        assert_eq!(crate::sheets::view_sheet_ref(s.doc()?, detail), Some((2, "A2".to_owned())));
+
+        // The title follows a rename, with the same handle.
+        let h = t[2].0;
+        s.execute("viewprops", &json!({ "mode": "rename", "viewId": plan.0, "name": "Lower" }))?;
+        let t = titles(&s, "A2")?;
+        assert!(t.iter().any(|t| t.0 == h && t.4 == "Lower framing"), "{t:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn non_lamb_viewports_get_no_title() -> R {
+        let (mut s, ..) = room()?;
 
         // A plain layout whose viewport freezes nothing shows every view: no title.
         let d = s.doc_mut()?;

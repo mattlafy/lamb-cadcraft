@@ -232,8 +232,8 @@ pub(crate) fn usable_area(sheet: &Sheet) -> Bounds2 {
     Bounds2::new(Vec2::new(p.min.x + inset, p.min.y + inset), Vec2::new(p.max.x - frame_strip_width(sheet) - inset, p.max.y - inset))
 }
 
-/// Creates layout `name` with one viewport per view in `views`, then one per plan in `assemblies`
-/// showing that plan's assembly block (every view in document order when both are empty). Each
+/// Creates layout `name` with one viewport per view in `views`, then one per plan or placed
+/// vertical in `assemblies` showing that view's assembly block (every view in document order when both are empty). Each
 /// viewport freezes every other LAMB view's layer and every assembly layer but its own. Returns
 /// the viewports' handles in that order. Nothing is changed on error.
 pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]) -> Result<Vec<Handle>, SheetError> {
@@ -250,7 +250,12 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
         return Err(SheetError::NoSuchView(*bad));
     }
     for plan in assemblies {
-        if !doc.views.iter().any(|v| v.id() == *plan && matches!(v, AnyView::Plan(_))) {
+        let host = |v: &AnyView| match v {
+            AnyView::Plan(_) => true,
+            AnyView::Vertical(x) => x.placement.is_some(),
+            _ => false,
+        };
+        if !doc.views.iter().any(|v| v.id() == *plan && host(v)) {
             return Err(SheetError::NoSuchView(*plan));
         }
         if d.block(&assembly_block_name(*plan)).is_none() {
@@ -260,7 +265,7 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
     let view_layers: Vec<String> = all.iter().map(|v| view_block_name(*v)).collect();
     let assembly_layers = assembly_layers(d);
     // (block shown, EntityData) per viewport, built before anything changes.
-    // An assembly slot also names its plan, whose scale it takes.
+    // An assembly slot also names its view, whose scale it takes.
     let slots: Vec<(String, EntityData, Option<Id>)> = chosen
         .iter()
         .map(|v| (view_block_name(*v), EntityData { view_id: Some(*v), ..EntityData::default() }, None))
@@ -303,7 +308,7 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
         let rule = dt.view_id.and_then(|v| doc.views.iter().find(|x| x.id() == v)).map_or(ScaleRule::Plan, rule_of);
         let (view_center, mut view_height) = scaled_zoom(d, block, rule, plot_scale, w, h);
         if let Some(p) = plan {
-            // The plan's own scale, unless the assembly block needs a smaller one to fit.
+            // The view's own scale, unless the assembly block needs a smaller one to fit.
             view_height = view_height.max(scaled_zoom(d, &view_block_name(*p), ScaleRule::Plan, plot_scale, w, h).1);
         }
         let frozen_layers = frozen_except(&view_layers, &assembly_layers, block);
