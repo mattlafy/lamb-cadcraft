@@ -20,6 +20,13 @@
 //! assembly viewport at its plan's scale. "Fits" means the extents grown 5 % each way fit the
 //! viewport at that scale. VPVIEW rescales the same way; existing viewports are not rescaled.
 //!
+//! Generated annotation is the same size on paper at any scale (LAMB T644): [`view_scale`] sizes a
+//! view's annotation block and detail-tag bubbles. One block serves every viewport of a view, so a
+//! view on two sheets at two scales sizes for the first in [`numbered_viewports`] order. A plan,
+//! section or elevation's viewport also fits its annotation: the block's overhang past the view
+//! block counts in paper mm and the view is centred so the overhang is inside. An assembly viewport
+//! and a detail take none, since the annotation's layer is frozen there or the view has none.
+//!
 //! Detail sheets (LAMB T637) are packed instead ([`pack_details`], [`create_detail_sheet`]): each
 //! detail takes the Detail rule's scale against the whole [`usable_area`] less [`TITLE_ROOM_MM`],
 //! and a viewport of its grown extents at that scale, at least [`MIN_VP_WIDTH_MM`] wide and
@@ -42,7 +49,10 @@ use lamb_core::model::Id;
 
 use lamb_core::model::AnyView;
 
-use crate::schema::{EntityData, LambDocument, SchemaError, assembly_block_name, read_document, read_entity_data, set_entity_data, view_block_name};
+use crate::schema::{
+    EntityData, LambDocument, SchemaError, annotation_block_name, assembly_block_name, read_document, read_entity_data, set_entity_data,
+    view_block_name,
+};
 
 /// Why a sheet could not be created.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,12 +153,44 @@ fn scale_for(ext: &Bounds2, rule: ScaleRule, plot_scale: f64, w: f64, h: f64) ->
     }
 }
 
-/// `(view_center, view_height)` of a `w` × `h` viewport showing `block` at the scale `rule`
-/// picks: centred on the block's extents (the origin when empty), `view_height = h * n`.
-fn scaled_zoom(d: &Drawing, block: &str, rule: ScaleRule, plot_scale: f64, w: f64, h: f64) -> (Vec2, f64) {
+/// What a viewport's content reaches past the shown block's extents on each side, in paper mm.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Overhang {
+    left: f64,
+    right: f64,
+    bottom: f64,
+    top: f64,
+}
+
+/// How far `view`'s annotation block reaches past its view block under `rule`, on paper at the
+/// annotation's current size, which is what makes it independent of the scale being chosen. A
+/// detail, an empty view block or an empty annotation block has none.
+fn annotation_overhang(d: &Drawing, doc: &LambDocument, view: Id, rule: ScaleRule) -> Overhang {
+    let ext = d.extents(&Space::Block(view_block_name(view)));
+    let ann = d.extents(&Space::Block(annotation_block_name(view)));
+    if rule != ScaleRule::Plan || ext.is_empty() || ann.is_empty() {
+        return Overhang::default();
+    }
+    let n = view_scale(d, doc, view);
+    Overhang {
+        left: (ext.min.x - ann.min.x).max(0.0) / n,
+        right: (ann.max.x - ext.max.x).max(0.0) / n,
+        bottom: (ext.min.y - ann.min.y).max(0.0) / n,
+        top: (ann.max.y - ext.max.y).max(0.0) / n,
+    }
+}
+
+/// `(view_center, view_height)` of a `w` × `h` viewport showing `block` at the scale `rule` picks
+/// for the room `over` leaves: centred on the block's extents plus `over` (the origin when empty),
+/// `view_height = h * n`.
+fn scaled_zoom(d: &Drawing, block: &str, rule: ScaleRule, plot_scale: f64, w: f64, h: f64, over: Overhang) -> (Vec2, f64) {
     let ext = d.extents(&Space::Block(block.to_owned()));
-    let n = scale_for(&ext, rule, plot_scale, w, h);
-    (if ext.is_empty() { Vec2::new(0.0, 0.0) } else { ext.center() }, h * n)
+    let n = scale_for(&ext, rule, plot_scale, w - over.left - over.right, h - over.bottom - over.top);
+    if ext.is_empty() {
+        return (Vec2::new(0.0, 0.0), h * n);
+    }
+    let shift = Vec2::new((over.right - over.left) / 2.0 * n, (over.top - over.bottom) / 2.0 * n);
+    (ext.center() + shift, h * n)
 }
 
 /// A viewport's drawing scale as the 1:n denominator, model mm per paper mm
@@ -157,6 +199,21 @@ fn scaled_zoom(d: &Drawing, block: &str, rule: ScaleRule, plot_scale: f64, w: f6
 pub fn viewport_scale(vp: &Viewport) -> f64 {
     let r = vp.view_height / vp.height;
     STANDARD_SCALES.iter().copied().find(|n| ((r - n) / n).abs() <= 1e-6).unwrap_or(r)
+}
+
+/// The 1:n denominator `view`'s generated annotation is sized for: the scale of its first viewport
+/// in [`numbered_viewports`] order, else the project's `plot_scale`, else 50.
+pub(crate) fn view_scale(d: &Drawing, doc: &LambDocument, view: Id) -> f64 {
+    let usable = |n: &f64| n.is_finite() && *n > 0.0;
+    numbered_viewports(d, &[(view, view_block_name(view))])
+        .first()
+        .and_then(|(_, _, _, h)| match &d.entity(*h)?.kind {
+            EntityKind::Viewport(vp) => Some(viewport_scale(vp)),
+            _ => None,
+        })
+        .filter(usable)
+        .or(Some(doc.defaults.plot_scale).filter(usable))
+        .unwrap_or(50.0)
 }
 
 /// The frozen-layer list of a viewport showing block `shown`: every LAMB view layer and every
@@ -208,7 +265,8 @@ pub fn set_viewport_view(d: &mut Drawing, vp: Handle, view: Option<Id>) -> Resul
             frozen.sort();
             port.frozen_layers = frozen;
             let rule = doc.views.iter().find(|x| x.id() == v).map_or(ScaleRule::Plan, rule_of);
-            (port.view_center, port.view_height) = scaled_zoom(d, &block, rule, doc.defaults.plot_scale, port.width, port.height);
+            let over = annotation_overhang(d, &doc, v, rule);
+            (port.view_center, port.view_height) = scaled_zoom(d, &block, rule, doc.defaults.plot_scale, port.width, port.height, over);
         }
         None => port.frozen_layers.retain(|l| !is_view_layer(l)),
     }
@@ -500,10 +558,11 @@ pub fn create_sheet(d: &mut Drawing, name: &str, views: &[Id], assemblies: &[Id]
         let (r, c) = (i / cols, i % cols);
         let center = Vec2::new(area.min.x + cell.x * (c as f64 + 0.5), area.max.y - cell.y * (r as f64 + 0.5));
         let rule = dt.view_id.and_then(|v| doc.views.iter().find(|x| x.id() == v)).map_or(ScaleRule::Plan, rule_of);
-        let (view_center, mut view_height) = scaled_zoom(d, block, rule, plot_scale, w, h);
+        let over = dt.view_id.map_or_else(Overhang::default, |v| annotation_overhang(d, &doc, v, rule));
+        let (view_center, mut view_height) = scaled_zoom(d, block, rule, plot_scale, w, h, over);
         if let Some(p) = plan {
             // The view's own scale, unless the assembly block needs a smaller one to fit.
-            view_height = view_height.max(scaled_zoom(d, &view_block_name(*p), ScaleRule::Plan, plot_scale, w, h).1);
+            view_height = view_height.max(scaled_zoom(d, &view_block_name(*p), ScaleRule::Plan, plot_scale, w, h, Overhang::default()).1);
         }
         let frozen_layers = frozen_except(&view_layers, &assembly_layers, block);
         let packed = Packed { center, width: w, height: h, view_center, view_height };

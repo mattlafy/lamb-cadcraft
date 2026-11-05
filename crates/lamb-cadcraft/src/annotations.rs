@@ -15,10 +15,15 @@
 //! non-pickable and never plotted. [`annotation_observer`] regenerates the blocks after every
 //! command, writing the drawing back only when one changed, so the change lands in the command's own
 //! undo step.
+//!
+//! The annotation is the same size on paper at any scale (LAMB T644): every length here is its value
+//! at 1:50 and is multiplied by [`k`]`(`[`view_scale`]`)`, and a floor-to-floor dimension carries
+//! that scale as its DIMSCALE override. A viewport scale change resizes the block in the command
+//! that made it.
 
 use std::sync::Arc;
 
-use cadcraft_doc::{Block, Common, DimKind, Dimension, Drawing, Entity, EntityKind, HAlign, Insert, Line, Space, Text, VAlign};
+use cadcraft_doc::{Block, Common, DimKind, DimStyle, Dimension, Drawing, Entity, EntityKind, HAlign, Insert, Line, Space, Text, VAlign};
 use cadcraft_engine::Session;
 use cadcraft_geom::{Bounds2, Vec3};
 use cadcraft_render::{DisplayList, Options};
@@ -30,8 +35,10 @@ use lamb_core::model::{AnyView, Id};
 
 use crate::project::DrawingProject;
 use crate::schema::{annotation_block_name, read_document, view_block_name};
-use crate::sheets::sheet_refs;
+use crate::sheets::{sheet_refs, view_scale};
 
+/// The scale every length constant below is the value at.
+const BASE_SCALE: f64 = 50.0;
 /// Length of a gaze arrow's shaft, from the cut line's end.
 pub const CUT_ARROW_MM: f64 = 600.0;
 /// Length of each of an arrow head's two strokes, ±30° back from the tip.
@@ -56,13 +63,19 @@ const LAYER: &str = "0";
 #[derive(Clone, Debug, PartialEq)]
 enum Item {
     Line(Vec3, Vec3),
-    /// A cut symbol's name: centred, [`CUT_TEXT_MM`] high.
-    Text(Vec3, String),
-    /// A level label: left-aligned, [`LEVEL_TEXT_MM`] high.
-    Label(Vec3, String),
-    /// A floor-to-floor dimension: vertical rotated-linear, measuring from the lower to the upper
-    /// level line's right end, its dimension line [`LEVEL_DIM_OFFSET_MM`] further right.
-    Dim(Vec3, Vec3),
+    /// A cut symbol's name and its height: centred.
+    Text(Vec3, String, f64),
+    /// A level label and its height: left-aligned.
+    Label(Vec3, String, f64),
+    /// A floor-to-floor dimension at a view scale: vertical rotated-linear, measuring from the lower
+    /// to the upper level line's right end, its dimension line [`LEVEL_DIM_OFFSET_MM`] (at that
+    /// scale) further right, its DIMSCALE that scale.
+    Dim(Vec3, Vec3, f64),
+}
+
+/// What a length constant is multiplied by at 1:`scale`.
+fn k(scale: f64) -> f64 {
+    scale / BASE_SCALE
 }
 
 fn v(x: f64, y: f64) -> Vec3 {
@@ -78,30 +91,33 @@ fn near(a: Vec3, b: Vec3) -> bool {
 fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>) -> Result<Vec<Item>, String> {
     let dp = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let Some(view) = dp.view(id).filter(|v| v.placement.is_some()) else { return Ok(Vec::new()) };
+    let scale = view_scale(d, dp.document(), id);
     if view.kind == ViewKind::Vertical {
-        return Ok(level_lines(d, &dp, id));
+        return Ok(level_lines(d, &dp, id, scale));
     }
     let plan = id;
+    let f = k(scale);
+    let (arrow, head, height) = (CUT_ARROW_MM * f, CUT_HEAD_MM * f, CUT_TEXT_MM * f);
     let mut out = Vec::new();
     for c in compute_cut_lines_for_view(&dp, plan)? {
         let (g, n) = ((c.gaze_dir.x, c.gaze_dir.y), c.name);
         out.push(Item::Line(v(c.from.x, c.from.y), v(c.to.x, c.to.y)));
         for end in [c.from, c.to] {
-            let tip = v(end.x + g.0 * CUT_ARROW_MM, end.y + g.1 * CUT_ARROW_MM);
+            let tip = v(end.x + g.0 * arrow, end.y + g.1 * arrow);
             out.push(Item::Line(v(end.x, end.y), tip));
             for a in [30f64, -30f64] {
                 let (s, co) = a.to_radians().sin_cos();
                 // Back from the tip: -gaze rotated by ±30°.
                 let (bx, by) = (-(g.0 * co - g.1 * s), -(g.0 * s + g.1 * co));
-                out.push(Item::Line(tip, v(tip.x + bx * CUT_HEAD_MM, tip.y + by * CUT_HEAD_MM)));
+                out.push(Item::Line(tip, v(tip.x + bx * head, tip.y + by * head)));
             }
         }
         for end in [c.from, c.to] {
-            let k = CUT_ARROW_MM + CUT_TEXT_GAP_MM;
-            let at = v(end.x + g.0 * k, end.y + g.1 * k);
-            out.push(Item::Text(at, n.clone()));
+            let beyond = arrow + CUT_TEXT_GAP_MM * f;
+            let at = v(end.x + g.0 * beyond, end.y + g.1 * beyond);
+            out.push(Item::Text(at, n.clone(), height));
             if let Some(sheet) = sheet_of(c.source_view_id) {
-                out.push(Item::Text(v(at.x, at.y - 1.5 * CUT_TEXT_MM), sheet));
+                out.push(Item::Text(v(at.x, at.y - 1.5 * height), sheet, height));
             }
         }
     }
@@ -114,16 +130,17 @@ fn signed_mm(z: f64) -> String {
     format!("{:+.0}", if r == 0.0 { 0.0 } else { r })
 }
 
-/// Placed vertical view `id`'s level lines: per LEVEL (by `order`, then id) a LINE at its projected
-/// floor elevation across the view block's x-extents ±[`LEVEL_OVERRUN_MM`], then its label. An
-/// empty view block wants none.
-fn level_lines(d: &Drawing, dp: &DrawingProject, id: Id) -> Vec<Item> {
+/// Placed vertical view `id`'s level lines at 1:`scale`: per LEVEL (by `order`, then id) a LINE at
+/// its projected floor elevation across the view block's x-extents ±[`LEVEL_OVERRUN_MM`], then its
+/// label. An empty view block wants none.
+fn level_lines(d: &Drawing, dp: &DrawingProject, id: Id, scale: f64) -> Vec<Item> {
     let Some(view) = dp.view(id) else { return Vec::new() };
     let ext = d.extents(&Space::Block(view_block_name(id)));
     if ext.is_empty() {
         return Vec::new();
     }
-    let (x0, x1) = (ext.min.x - LEVEL_OVERRUN_MM, ext.max.x + LEVEL_OVERRUN_MM);
+    let f = k(scale);
+    let (x0, x1) = (ext.min.x - LEVEL_OVERRUN_MM * f, ext.max.x + LEVEL_OVERRUN_MM * f);
     let mut levels: Vec<_> = dp.document().levels.iter().collect();
     levels.sort_by(|a, b| a.order.total_cmp(&b.order).then(a.id.0.cmp(&b.id.0)));
     let y_of = |z: f64| vertical_uz_to_local(&view, Uz { u: 0.0, z }).y;
@@ -132,13 +149,13 @@ fn level_lines(d: &Drawing, dp: &DrawingProject, id: Id) -> Vec<Item> {
         let z = l.floor_elevation.value;
         let y = y_of(z);
         out.push(Item::Line(v(x0, y), v(x1, y)));
-        out.push(Item::Label(v(x1 + LEVEL_TEXT_GAP_MM, y), format!("{} {}", l.name, signed_mm(z))));
+        out.push(Item::Label(v(x1 + LEVEL_TEXT_GAP_MM * f, y), format!("{} {}", l.name, signed_mm(z)), LEVEL_TEXT_MM * f));
     }
     let mut zs: Vec<f64> = levels.iter().map(|l| l.floor_elevation.value).collect();
     zs.sort_by(f64::total_cmp);
     for w in zs.windows(2) {
         if w[1] - w[0] > TOLERANCE.coincidence_mm {
-            out.push(Item::Dim(v(x1, y_of(w[0])), v(x1, y_of(w[1]))));
+            out.push(Item::Dim(v(x1, y_of(w[0])), v(x1, y_of(w[1])), scale));
         }
     }
     out
@@ -162,23 +179,27 @@ fn text(at: Vec3, value: &str, height: f64, halign: HAlign) -> Text {
 fn entity_of(i: &Item) -> EntityKind {
     match i {
         Item::Line(a, b) => EntityKind::Line(Line { a: *a, b: *b }),
-        Item::Text(at, s) => EntityKind::Text(text(*at, s, CUT_TEXT_MM, HAlign::Center)),
-        Item::Label(at, s) => EntityKind::Text(text(*at, s, LEVEL_TEXT_MM, HAlign::Left)),
-        Item::Dim(a, b) => EntityKind::Dimension(level_dim(*a, *b)),
+        Item::Text(at, s, h) => EntityKind::Text(text(*at, s, *h, HAlign::Center)),
+        Item::Label(at, s, h) => EntityKind::Text(text(*at, s, *h, HAlign::Left)),
+        Item::Dim(a, b, scale) => EntityKind::Dimension(level_dim(*a, *b, *scale)),
     }
 }
 
-/// Where a floor-to-floor dimension's line passes: level with `b`, [`LEVEL_DIM_OFFSET_MM`] right.
-fn dim_line_pt(b: Vec3) -> Vec3 {
-    v(b.x + LEVEL_DIM_OFFSET_MM, b.y)
+/// Where a floor-to-floor dimension's line passes at 1:`scale`: level with `b`,
+/// [`LEVEL_DIM_OFFSET_MM`] right.
+fn dim_line_pt(b: Vec3, scale: f64) -> Vec3 {
+    v(b.x + LEVEL_DIM_OFFSET_MM * k(scale), b.y)
 }
 
-/// A vertical (rotation π/2) linear dimension from `a` to `b`, as DIMLINEAR draws one: `defpt` on
-/// the dimension line, measured text, style `Standard`, no overrides, never associative.
-fn level_dim(a: Vec3, b: Vec3) -> Dimension {
+/// A vertical (rotation π/2) linear dimension from `a` to `b` at 1:`scale`, as DIMLINEAR draws one:
+/// `defpt` on the dimension line, measured text, style `Standard` with DIMSCALE overridden to
+/// `scale`, never associative.
+fn level_dim(a: Vec3, b: Vec3, scale: f64) -> Dimension {
+    let mut overrides = serde_json::Map::new();
+    overrides.insert("scale".to_owned(), serde_json::json!(scale));
     Dimension {
         kind: DimKind::Linear { rotation: std::f64::consts::FRAC_PI_2 },
-        defpt: dim_line_pt(b),
+        defpt: dim_line_pt(b, scale),
         text_mid: Vec3::ZERO,
         p13: a,
         p14: b,
@@ -191,7 +212,7 @@ fn level_dim(a: Vec3, b: Vec3) -> Dimension {
         user_text_pos: false,
         block: None,
         insertion_point: Vec3::ZERO,
-        overrides: Default::default(),
+        overrides,
         assoc: Vec::new(),
         marks: Default::default(),
     }
@@ -201,27 +222,34 @@ fn is_vertical(k: &DimKind) -> bool {
     matches!(k, DimKind::Linear { rotation } if (rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9)
 }
 
+/// `true` when `a` and `b` are the same size or scale, whatever a file round trip did to the last
+/// few bits.
+fn same_size(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-9 * b.abs().max(1.0)
+}
+
 /// `true` when `block` holds exactly `want`, in order: each on layer `0`, LINE ends, TEXT
 /// alignment points and DIMENSION points within [`TOLERANCE`]`.coincidence_mm`, the same text
-/// strings, and every dimension vertical with measured text.
+/// strings and heights, and every dimension vertical with measured text and the wanted DIMSCALE.
 fn block_matches(block: &Block, want: &[Item]) -> bool {
     block.entities.len() == want.len()
         && block.entities.iter().zip(want).all(|(e, w)| {
             e.common.layer == LAYER
                 && match (&e.kind, w) {
                     (EntityKind::Line(l), Item::Line(a, b)) => near(l.a, *a) && near(l.b, *b),
-                    (EntityKind::Text(t), Item::Text(at, s)) => {
-                        t.halign == HAlign::Center && near(t.align_pt.unwrap_or(t.insert), *at) && t.value == *s
+                    (EntityKind::Text(t), Item::Text(at, s, h)) => {
+                        t.halign == HAlign::Center && near(t.align_pt.unwrap_or(t.insert), *at) && t.value == *s && same_size(t.height, *h)
                     }
-                    (EntityKind::Text(t), Item::Label(at, s)) => {
-                        t.halign == HAlign::Left && near(t.align_pt.unwrap_or(t.insert), *at) && t.value == *s
+                    (EntityKind::Text(t), Item::Label(at, s, h)) => {
+                        t.halign == HAlign::Left && near(t.align_pt.unwrap_or(t.insert), *at) && t.value == *s && same_size(t.height, *h)
                     }
-                    (EntityKind::Dimension(dm), Item::Dim(a, b)) => {
+                    (EntityKind::Dimension(dm), Item::Dim(a, b, scale)) => {
                         is_vertical(&dm.kind)
                             && near(dm.p13, *a)
                             && near(dm.p14, *b)
-                            && (dm.defpt.x - dim_line_pt(*b).x).abs() <= TOLERANCE.coincidence_mm
+                            && (dm.defpt.x - dim_line_pt(*b, *scale).x).abs() <= TOLERANCE.coincidence_mm
                             && dm.text.is_empty()
+                            && same_size(DimStyle::default().with_overrides(&dm.overrides).scale, *scale)
                     }
                     _ => false,
                 }
@@ -359,9 +387,11 @@ mod tests {
                 }
                 match &e.kind {
                     EntityKind::Line(l) => Ok(Item::Line(l.a, l.b)),
-                    EntityKind::Text(t) if t.halign == HAlign::Left => Ok(Item::Label(t.align_pt.unwrap_or(t.insert), t.value.clone())),
-                    EntityKind::Text(t) => Ok(Item::Text(t.align_pt.unwrap_or(t.insert), t.value.clone())),
-                    EntityKind::Dimension(dm) if is_vertical(&dm.kind) => Ok(Item::Dim(dm.p13, dm.p14)),
+                    EntityKind::Text(t) if t.halign == HAlign::Left => Ok(Item::Label(t.align_pt.unwrap_or(t.insert), t.value.clone(), t.height)),
+                    EntityKind::Text(t) => Ok(Item::Text(t.align_pt.unwrap_or(t.insert), t.value.clone(), t.height)),
+                    EntityKind::Dimension(dm) if is_vertical(&dm.kind) => {
+                        Ok(Item::Dim(dm.p13, dm.p14, DimStyle::default().with_overrides(&dm.overrides).scale))
+                    }
                     _ => Err("unexpected kind".into()),
                 }
             })
@@ -369,7 +399,7 @@ mod tests {
     }
 
     fn texts(s: &Session, plan: Id) -> T<Vec<String>> {
-        Ok(items(s, plan)?.into_iter().filter_map(|i| if let Item::Text(_, t) | Item::Label(_, t) = i { Some(t) } else { None }).collect())
+        Ok(items(s, plan)?.into_iter().filter_map(|i| if let Item::Text(_, t, _) | Item::Label(_, t, _) = i { Some(t) } else { None }).collect())
     }
 
     fn undo_len(s: &Session) -> T<usize> {
@@ -413,7 +443,7 @@ mod tests {
         let Item::Line(e2, _) = &it[4] else { return Err("no second arrow".into()) };
         assert!(close(*e2, 5000.0, 0.0));
         let k = gy * (CUT_ARROW_MM + CUT_TEXT_GAP_MM);
-        assert_eq!(it[7..].to_vec(), vec![Item::Text(v(0.0, k), "A-A".into()), Item::Text(v(5000.0, k), "A-A".into())]);
+        assert_eq!(it[7..].to_vec(), vec![Item::Text(v(0.0, k), "A-A".into(), CUT_TEXT_MM), Item::Text(v(5000.0, k), "A-A".into(), CUT_TEXT_MM)]);
         assert_eq!(inserts(&s, plan)?, [view_block_name(plan)]);
         let ins = s.doc()?.model.iter().find(|e| matches!(&e.kind, EntityKind::Insert(i) if i.block == annotation_block_name(plan))).cloned();
         let Some(EntityKind::Insert(i)) = ins.as_deref().map(|e| &e.kind) else { return Err("no insert".into()) };
@@ -456,7 +486,7 @@ mod tests {
         assert_eq!(undo_len(&s)?, n + 1);
         assert_eq!(texts(&s, plan)?, ["A-A", "2/A301", "A-A", "2/A301"]);
         let it = items(&s, plan)?;
-        let (Item::Text(a, _), Item::Text(b, _)) = (&it[7], &it[8]) else { return Err("no texts".into()) };
+        let (Item::Text(a, ..), Item::Text(b, ..)) = (&it[7], &it[8]) else { return Err("no texts".into()) };
         assert!(close(*b, a.x, a.y - 1.5 * CUT_TEXT_MM));
         s.undo()?;
         assert_eq!(texts(&s, plan)?, ["A-A", "A-A"]);
@@ -505,7 +535,7 @@ mod tests {
         let it: Vec<Item> = items(s, view)?.into_iter().filter(|i| !matches!(i, Item::Dim(..))).collect();
         it.chunks(2)
             .map(|c| match c {
-                [Item::Line(a, b), Item::Label(at, t)] => {
+                [Item::Line(a, b), Item::Label(at, t, _)] => {
                     assert!((a.y - b.y).abs() < 1e-9 && (at.y - a.y).abs() < 1e-9 && (at.x - b.x - LEVEL_TEXT_GAP_MM).abs() < 1e-9);
                     Ok((a.y, a.x, b.x, t.clone()))
                 }
@@ -718,6 +748,120 @@ mod tests {
         assert_eq!(all(&with), all(&without));
         let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(d).as_bytes()).map_err(|e| format!("{e:?}"))?;
         assert!(plan_changes(&back)?.is_empty(), "the observer would change nothing after a round trip");
+        Ok(())
+    }
+
+    /// A viewport made and rebound on a sheet: `view` alone on layout `name`, then a line far enough
+    /// across `view` that VPVIEW picks 1:100. Returns the viewport's handle (hex).
+    fn pushed_to_1_100(s: &mut Session, view: Id, name: &str) -> T<String> {
+        let out = s.execute("newsheet", &json!({ "name": name, "viewIds": [view.0] }))?;
+        let hex = out["viewports"][0].as_str().ok_or("no viewport")?.to_owned();
+        assert_eq!(scale_of(s, &hex)?, 50.0);
+        s.execute("editview", &json!({ "viewId": view.0 }))?;
+        s.execute("line", &json!({ "points": [[0, 500], [40000, 500]] }))?;
+        s.execute("vpview", &json!({ "handle": hex, "viewId": view.0 }))?;
+        assert_eq!(scale_of(s, &hex)?, 100.0);
+        Ok(hex)
+    }
+
+    fn scale_of(s: &Session, hex: &str) -> T<f64> {
+        let h = cadcraft_doc::Handle::parse_hex(hex).ok_or("bad handle")?;
+        let EntityKind::Viewport(vp) = &s.doc()?.entity(h).ok_or("gone")?.kind else { return Err("not a viewport".into()) };
+        Ok(crate::sheets::viewport_scale(vp))
+    }
+
+    /// Every text height in the view's annotation block.
+    fn heights(s: &Session, view: Id) -> T<Vec<f64>> {
+        Ok(items(s, view)?.into_iter().filter_map(|i| if let Item::Text(_, _, h) | Item::Label(_, _, h) = i { Some(h) } else { None }).collect())
+    }
+
+    #[test]
+    fn a_section_name_is_the_same_size_on_paper_at_1_50_and_1_100() -> R {
+        let (mut s, plan, _sec) = fixture()?;
+        assert!(heights(&s, plan)?.iter().all(|h| *h == 250.0));
+        let hex = pushed_to_1_100(&mut s, plan, "P1")?;
+        let hs = heights(&s, plan)?;
+        assert!(!hs.is_empty() && hs.iter().all(|h| *h == 500.0), "5 mm on paper at 1:100: {hs:?}");
+        let Item::Line(_, tip) = items(&s, plan)?[1].clone() else { return Err("no arrow".into()) };
+        assert_eq!(tip.y.abs(), 2.0 * CUT_ARROW_MM);
+
+        let b0 = block_of(&s, plan).ok_or("no block")?;
+        s.execute("line", &json!({ "points": [[100, 9000], [200, 9000]] }))?;
+        assert!(Arc::ptr_eq(&b0, &block_of(&s, plan).ok_or("no block")?), "an unrelated command rewrites nothing");
+        s.undo()?;
+
+        // One undo restores the viewport and the sizes.
+        let n = undo_len(&s)?;
+        s.undo()?;
+        assert_eq!(undo_len(&s)?, n - 1);
+        assert_eq!(scale_of(&s, &hex)?, 50.0);
+        assert!(heights(&s, plan)?.iter().all(|h| *h == 250.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_level_label_and_dimension_follow_the_scale_and_survive_a_round_trip() -> R {
+        let (mut s, _plan, sec, _l1, _l2) = levelled()?;
+        pushed_to_1_100(&mut s, sec, "S1")?;
+        let hs = heights(&s, sec)?;
+        assert_eq!(hs, [500.0, 500.0]);
+        let x1 = s.doc()?.extents(&Space::Block(view_block_name(sec))).max.x + 2.0 * LEVEL_OVERRUN_MM;
+        let dims = dims_of(&s, sec)?;
+        assert_eq!(dims.len(), 1);
+        assert!((dims[0].p14.x - x1).abs() < 1e-6 && (dims[0].defpt.x - (x1 + 2.0 * LEVEL_DIM_OFFSET_MM)).abs() < 1e-6, "{:?}", dims[0]);
+        let st = s.doc()?.dim_style(&dims[0].style).cloned().unwrap_or_default().with_overrides(&dims[0].overrides);
+        assert_eq!((dims[0].style.as_str(), st.scale), ("Standard", 100.0));
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert!(plan_changes(&back)?.is_empty(), "the observer would change nothing after a round trip");
+        Ok(())
+    }
+
+    #[test]
+    fn a_view_on_two_sheets_sizes_for_the_first_by_layout_name() -> R {
+        let (mut s, plan, _sec) = fixture()?;
+        s.execute("newsheet", &json!({ "name": "B1", "viewIds": [plan.0] }))?;
+        pushed_to_1_100(&mut s, plan, "A1")?;
+        assert!(heights(&s, plan)?.iter().all(|h| *h == 500.0), "A1 comes before B1");
+        Ok(())
+    }
+
+    #[test]
+    fn a_section_that_only_just_fits_without_its_levels_takes_the_next_scale_with_them_inside() -> R {
+        let (mut s, _plan, sec, _l1, _l2) = levelled()?;
+        // A sheet's single viewport, measured on a throwaway: its paper size at 1:50.
+        let out = s.execute("newsheet", &json!({ "name": "S0", "viewIds": [sec.0] }))?;
+        let h0 = cadcraft_doc::Handle::parse_hex(out["viewports"][0].as_str().ok_or("no viewport")?).ok_or("bad handle")?;
+        let EntityKind::Viewport(vp0) = &s.doc()?.entity(h0).ok_or("gone")?.kind else { return Err("not a viewport".into()) };
+        let w = vp0.width;
+        s.execute("erase", &json!({ "handles": [h0.hex()] }))?;
+
+        // A block whose width grown 5 % each way just fits that width at 1:50.
+        let ext = s.doc()?.extents(&Space::Block(view_block_name(sec)));
+        let wide = ext.min.x + w * 50.0 / 1.1 - 1.0;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("line", &json!({ "points": [[ext.min.x, 500], [wide, 500]] }))?;
+
+        s.execute("newsheet", &json!({ "name": "S1", "viewIds": [sec.0] }))?;
+        let vps: Vec<cadcraft_doc::Viewport> = s
+            .doc()?
+            .layout("S1")
+            .ok_or("no layout")?
+            .entities
+            .iter()
+            .filter_map(|e| if let EntityKind::Viewport(vp) = &e.kind { Some(vp.clone()) } else { None })
+            .collect();
+        let vp = vps.first().ok_or("no viewport")?;
+        assert_eq!(crate::sheets::viewport_scale(vp), 100.0, "{vp:?}");
+
+        let d = s.doc()?;
+        let (block, ann) = (d.extents(&Space::Block(view_block_name(sec))), d.extents(&Space::Block(annotation_block_name(sec))));
+        let shown = block.union(&ann);
+        let half = Vec2::new(vp.width * 100.0 / 2.0, vp.view_height / 2.0);
+        let window = Bounds2::new(vp.view_center - half, vp.view_center + half);
+        assert!(
+            window.min.x <= shown.min.x && window.min.y <= shown.min.y && window.max.x >= shown.max.x && window.max.y >= shown.max.y,
+            "{window:?} holds {shown:?}"
+        );
         Ok(())
     }
 

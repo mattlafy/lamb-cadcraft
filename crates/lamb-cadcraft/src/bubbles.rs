@@ -14,6 +14,11 @@
 //! leader's last vertex with it; otherwise the bubble goes to the leader's last vertex. The
 //! bubble's attributes have Lock position set, so they have no grips: the text can't be dragged
 //! off the bubble.
+//!
+//! A bubble is the same size on paper at any scale (LAMB T644): the block and the lengths here are
+//! their values at 1:50, the `Insert` takes the uniform scale of its view's
+//! [`crate::sheets::view_scale`] over 50, and its attributes, which hold world positions, take
+//! that scale's heights and offsets. A leader's geometry is not touched.
 
 use std::sync::Arc;
 
@@ -26,8 +31,10 @@ use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id};
 
 use crate::schema::{read_document, read_entity_data, view_block_name};
-use crate::sheets::sheet_refs;
+use crate::sheets::{sheet_refs, view_scale};
 
+/// The scale the bubble's lengths are the values at.
+const BASE_SCALE: f64 = 50.0;
 /// The bubble block's name; one definition per drawing.
 pub const BUBBLE_BLOCK: &str = "LAMB_DTAG";
 /// The bubble circle's radius.
@@ -40,27 +47,33 @@ pub const BUBBLE_TEXT_MM: f64 = 120.0;
 const DETAIL_OFFSET_MM: f64 = 60.0;
 const SHEET_OFFSET_MM: f64 = -180.0;
 
-/// One bubble a tag leader wants: where, on which layer, and its two attribute values.
+/// One bubble a tag leader wants: where, on which layer, its two attribute values, and what its
+/// lengths are multiplied by.
 #[derive(Clone, Debug, PartialEq)]
 struct Wanted {
     at: Vec3,
     layer: String,
     detail: String,
     sheet: String,
+    k: f64,
 }
 
 fn near(a: Vec3, b: Vec3) -> bool {
     (a.x - b.x).hypot(a.y - b.y) <= TOLERANCE.coincidence_mm
 }
 
-fn attrib(tag: &str, at: Vec3, dy: f64, value: &str) -> Attrib {
-    let p = Vec3::new(at.x, at.y + dy, at.z);
+fn same_size(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-9 * b.abs().max(1.0)
+}
+
+fn attrib(tag: &str, at: Vec3, dy: f64, value: &str, k: f64) -> Attrib {
+    let p = Vec3::new(at.x, at.y + dy * k, at.z);
     Attrib {
         tag: tag.into(),
         text: Text {
             insert: p,
             align_pt: Some(p),
-            height: BUBBLE_TEXT_MM,
+            height: BUBBLE_TEXT_MM * k,
             value: value.into(),
             rotation: 0.0,
             width_factor: 1.0,
@@ -83,9 +96,9 @@ fn insert_of(w: &Wanted) -> Insert {
         clip: None,
         block: BUBBLE_BLOCK.into(),
         insert: w.at,
-        scale: Vec3::new(1.0, 1.0, 1.0),
+        scale: Vec3::new(w.k, w.k, w.k),
         rotation: 0.0,
-        attribs: vec![attrib("DETAIL", w.at, DETAIL_OFFSET_MM, &w.detail), attrib("SHEET", w.at, SHEET_OFFSET_MM, &w.sheet)],
+        attribs: vec![attrib("DETAIL", w.at, DETAIL_OFFSET_MM, &w.detail, w.k), attrib("SHEET", w.at, SHEET_OFFSET_MM, &w.sheet, w.k)],
         cols: 1,
         rows: 1,
         col_spacing: 0.0,
@@ -97,10 +110,20 @@ fn attrib_value<'a>(i: &'a Insert, tag: &str) -> Option<&'a str> {
     i.attribs.iter().find(|a| a.tag.eq_ignore_ascii_case(tag)).map(|a| a.text.value.as_str())
 }
 
+/// Whether attribute `tag` of `i` has the height and position `w` wants, `dy` above the bubble.
+fn attrib_fits(i: &Insert, tag: &str, dy: f64, w: &Wanted) -> bool {
+    i.attribs.iter().find(|a| a.tag.eq_ignore_ascii_case(tag)).is_some_and(|a| {
+        same_size(a.text.height, BUBBLE_TEXT_MM * w.k) && near(a.text.align_pt.unwrap_or(a.text.insert), Vec3::new(w.at.x, w.at.y + dy * w.k, w.at.z))
+    })
+}
+
 /// Whether `e` is the bubble `w` wants, exactly.
 fn matches(e: &Entity, i: &Insert, w: &Wanted) -> bool {
     e.common.layer == w.layer
         && near(i.insert, w.at)
+        && [i.scale.x, i.scale.y, i.scale.z].iter().all(|s| same_size(*s, w.k))
+        && attrib_fits(i, "DETAIL", DETAIL_OFFSET_MM, w)
+        && attrib_fits(i, "SHEET", SHEET_OFFSET_MM, w)
         && attrib_value(i, "DETAIL") == Some(w.detail.as_str())
         && attrib_value(i, "SHEET") == Some(w.sheet.as_str())
         && i.attribs.len() == 2
@@ -207,6 +230,7 @@ fn plan(d: &Drawing, before: Option<&Drawing>) -> Result<Plan, String> {
         let block_name = view_block_name(v.id());
         let Some(block) = d.block(&block_name) else { continue };
         let bi = out.blocks.len();
+        let k = view_scale(d, &doc, v.id()) / BASE_SCALE;
         let mut bp = BlockPlan { block: block_name, ..BlockPlan::default() };
         let mut claimed: Vec<Handle> = Vec::new();
         let mut orphans = Vec::new();
@@ -219,6 +243,7 @@ fn plan(d: &Drawing, before: Option<&Drawing>) -> Result<Plan, String> {
                 layer: e.common.layer.clone(),
                 detail: name_of(tag.detail_view_id).unwrap_or_else(|| "?".into()),
                 sheet: sheet_of(tag.detail_view_id),
+                k,
             };
             let mine = d
                 .groups
@@ -541,6 +566,46 @@ mod tests {
         s.execute("line", &json!({ "points": [[9000, 9000], [9500, 9000]] }))?;
         assert_eq!((bubbles(&s, plan)?, undo_len(&s)?), (before, n + 1), "an unrelated command changes no bubble");
         Ok(())
+    }
+
+    #[test]
+    fn a_bubble_is_the_same_size_on_paper_at_1_50_and_1_100_and_one_undo_restores_it() -> R {
+        let (mut s, plan, detail) = room()?;
+        let leader = tag(&mut s, detail, (2500.0, 0.0))?;
+        let size = |s: &Session| -> T<(Vec3, f64, Option<Vec3>)> {
+            let hb = bubbles(s, plan)?[0].0;
+            let EntityKind::Insert(i) = &s.doc()?.entity(hb).ok_or("gone")?.kind else { return Err("not an insert".into()) };
+            Ok((i.scale, i.attribs[0].text.height, i.attribs[1].text.align_pt))
+        };
+        let at_50 = (Vec3::new(1.0, 1.0, 1.0), BUBBLE_TEXT_MM, Some(Vec3::new(1500.0, -1180.0, 0.0)));
+        assert_eq!(size(&s)?, at_50);
+        let out = s.execute("newsheet", &json!({ "name": "P1", "viewIds": [plan.0] }))?;
+        let vp = out["viewports"][0].as_str().ok_or("no viewport")?.to_owned();
+        s.execute("line", &json!({ "points": [[0, 500], [40000, 500]] }))?;
+        assert_eq!(size(&s)?, at_50, "the viewport has not changed");
+        let before: Vec<_> = leader_points(&s, &leader)?;
+        s.execute("vpview", &json!({ "handle": vp, "viewId": plan.0 }))?;
+        let at_100 = (Vec3::new(2.0, 2.0, 2.0), 2.0 * BUBBLE_TEXT_MM, Some(Vec3::new(1500.0, -1360.0, 0.0)));
+        assert_eq!(size(&s)?, at_100);
+        assert_eq!(leader_points(&s, &leader)?, before, "the leader is not touched");
+        let EntityKind::Insert(i) = &s.doc()?.entity(bubbles(&s, plan)?[0].0).ok_or("gone")?.kind else { return Err("not an insert".into()) };
+        assert_eq!(i.attribs[0].text.align_pt, Some(Vec3::new(1500.0, -880.0, 0.0)));
+
+        let b0 = bubbles(&s, plan)?;
+        s.execute("line", &json!({ "points": [[9000, 9000], [9500, 9000]] }))?;
+        assert_eq!(bubbles(&s, plan)?, b0, "an unrelated command changes no bubble");
+        s.undo()?;
+
+        s.undo()?;
+        assert_eq!(size(&s)?, at_50);
+        let back = cadcraft_io::read(&cadcraft_io::write(s.doc()?, "t.dxf").map_err(|e| format!("{e:?}"))?, "t.dxf").map_err(|e| format!("{e:?}"))?;
+        assert!(plan_for(&back)?.is_empty());
+        Ok(())
+    }
+
+    fn leader_points(s: &Session, leader: &str) -> T<Vec<Vec3>> {
+        let EntityKind::Leader(l) = &s.doc()?.entity(hx(leader)?).ok_or("gone")?.kind else { return Err("not a leader".into()) };
+        Ok(l.vertices.clone())
     }
 
     fn hx(h: &str) -> T<Handle> {
