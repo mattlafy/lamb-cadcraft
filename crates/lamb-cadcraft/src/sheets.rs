@@ -18,7 +18,8 @@
 //! plans, sections and elevations at the project's `plot_scale` when it fits, else the next larger
 //! standard denominator that does; details at the smallest standard denominator ≥ 5 that fits; an
 //! assembly viewport at its plan's scale. "Fits" means the extents grown 5 % each way fit the
-//! viewport at that scale. VPVIEW rescales the same way; existing viewports are not rescaled.
+//! viewport at that scale. VPVIEW rescales the same way. An existing viewport changes only through [`refit_viewport`],
+//! when SHEETSET finds its content has outgrown it.
 //!
 //! Generated annotation is the same size on paper at any scale (LAMB T644): [`view_scale`] sizes a
 //! view's annotation block and detail-tag bubbles. One block serves every viewport of a view, so a
@@ -199,6 +200,62 @@ fn scaled_zoom(d: &Drawing, block: &str, rule: ScaleRule, plot_scale: f64, w: f6
 pub fn viewport_scale(vp: &Viewport) -> f64 {
     let r = vp.view_height / vp.height;
     STANDARD_SCALES.iter().copied().find(|n| ((r - n) / n).abs() <= 1e-6).unwrap_or(r)
+}
+
+/// Whether `view` exists and is placed; a detail has no placement to lose.
+pub(crate) fn view_placed(doc: &LambDocument, view: Id) -> bool {
+    doc.views.iter().find(|v| v.id() == view).is_some_and(|v| match v {
+        AnyView::Plan(p) => p.placement.is_some(),
+        AnyView::Vertical(x) => x.placement.is_some(),
+        AnyView::Detail(_) => true,
+    })
+}
+
+/// The `(view_center, view_height)` that shows again what `vp` shows, when its content has outgrown
+/// its model window. Content inside the window takes `None`, so a viewport panned or scaled by hand
+/// that still shows everything stays as it is, as do an empty block, a viewport showing no LAMB
+/// view and a view no longer placed. Otherwise the content is centred at the viewport's scale if
+/// that [`fits`], else at the next larger [`STANDARD_SCALES`] denominator that does, never a
+/// smaller one; nothing fitting takes the largest, and `None` once it is already showing that.
+/// The content is the block plus, for a view, its [`annotation_overhang`].
+pub(crate) fn refit_viewport(d: &Drawing, doc: &LambDocument, vp: Handle) -> Result<Option<(Vec2, f64)>, SheetError> {
+    const EPS: f64 = 1e-6;
+    let Some(e) = d.entity(vp) else { return Ok(None) };
+    let EntityKind::Viewport(port) = &e.kind else { return Ok(None) };
+    let data = read_entity_data(&e.common)?;
+    let (view, block, over) = match (data.assembly_of, data.view_id) {
+        (Some(plan), _) => (plan, assembly_block_name(plan), Overhang::default()),
+        (None, Some(v)) => {
+            let rule = doc.views.iter().find(|x| x.id() == v).map_or(ScaleRule::Plan, rule_of);
+            (v, view_block_name(v), annotation_overhang(d, doc, v, rule))
+        }
+        (None, None) => return Ok(None),
+    };
+    let ext = d.extents(&Space::Block(block));
+    if !view_placed(doc, view) || ext.is_empty() || !(ext.width().is_finite() && ext.height().is_finite()) {
+        return Ok(None);
+    }
+    let n = viewport_scale(port);
+    if !n.is_finite() || n <= 0.0 {
+        return Ok(None);
+    }
+    let (half_w, half_h) = (port.width * n / 2.0, port.view_height / 2.0);
+    let c = port.view_center;
+    if ext.min.x - over.left * n >= c.x - half_w - EPS
+        && ext.max.x + over.right * n <= c.x + half_w + EPS
+        && ext.min.y - over.bottom * n >= c.y - half_h - EPS
+        && ext.max.y + over.top * n <= c.y + half_h + EPS
+    {
+        return Ok(None);
+    }
+    let (w, h) = (port.width - over.left - over.right, port.height - over.bottom - over.top);
+    let largest = STANDARD_SCALES[STANDARD_SCALES.len() - 1].max(n);
+    let to =
+        if fits(&ext, n, w, h) { n } else { STANDARD_SCALES.iter().copied().filter(|x| *x > n).find(|x| fits(&ext, *x, w, h)).unwrap_or(largest) };
+    let center = ext.center() + Vec2::new((over.right - over.left) / 2.0 * to, (over.top - over.bottom) / 2.0 * to);
+    let height = port.height * to;
+    let same = (center.x - c.x).abs() <= EPS && (center.y - c.y).abs() <= EPS && (height - port.view_height).abs() <= EPS;
+    Ok((!same).then_some((center, height)))
 }
 
 /// The 1:n denominator `view`'s generated annotation is sized for: the scale of its first viewport

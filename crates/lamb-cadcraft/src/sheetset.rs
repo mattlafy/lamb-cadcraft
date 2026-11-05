@@ -21,12 +21,20 @@
 //! text differs. A table taller than the sheet is written whole and the message says it runs off.
 //! All of it is one undo step; nothing to change changes nothing.
 //!
+//! A viewport on a set sheet whose content has outgrown it is refit (LAMB T643,
+//! [`crate::sheets::refit_viewport`]): re-centred, or taken to a larger scale when that is not
+//! enough, in the same undo step and before the tables and the PDF. Its size and place on the sheet
+//! stay, so a detail on a packed sheet shrinks rather than re-packing the sheet. A viewport naming
+//! a view no longer placed or no longer in the project stays as it is and the message names it.
+//!
 //! `sheetset {pdf?}` (`sset`) returns `{sheets: [{layout, group, viewIds}], alreadyOnSheets,
-//! pdf?, message}`, `group` being `list` or `bom` for a table made or updated, with no `viewIds`.
+//! refit: [{layout, view, scale}], pdf?, message}`, `group` being `list` or `bom` for a table made
+//! or updated, with no `viewIds`.
 //! With `pdf`, every set sheet in tab order is plotted to that one PDF, a page
 //! per sheet, whether or not this run placed anything, and `proposedLines` counts the unaccepted
 //! AI lines in the views those sheets show: a plot ignores their ghost transparency, so the
-//! message says they plot as drawn. Nothing is hidden.
+//! message says they plot as drawn. Nothing is hidden. The session's observers run on a changed
+//! drawing before it plots, so the PDF has the titles and annotation for the scales it shows.
 //!
 //! Older sheets come along for plotting (LAMB T645), in the same undo step: a viewport naming a
 //! view or an assembly that is still on layer `0` moves to [`VPORT_LAYER`], and a set sheet with
@@ -48,8 +56,11 @@ use crate::commands::{bad, name_input, other};
 use crate::detailsheets::{lay_detail_sheets, next_sheet_name};
 use crate::project::DrawingProject;
 use crate::schema::{assembly_block_name, read_document, read_entity_data, write_document};
-use crate::sheets::{DEFAULT_SHEET_PAPER, VPORT_LAYER, create_sheet, ensure_vport_layer, sheet_paper_size, view_sheet_ref};
+use crate::sheets::{
+    DEFAULT_SHEET_PAPER, VPORT_LAYER, create_sheet, ensure_vport_layer, refit_viewport, sheet_paper_size, view_placed, view_sheet_ref, viewport_scale,
+};
 use crate::titleblock::sheet_title;
+use crate::vptitles::scale_label;
 
 const PLAN_PREFIX: &str = "A1";
 const ELEVATION_PREFIX: &str = "A2";
@@ -208,6 +219,47 @@ fn proposed_lines(d: &Drawing) -> Result<usize> {
     Ok(views.into_iter().map(|v| project.entities(v).filter(|e| e.ai_origin.is_some_and(|o| !o.accepted)).count()).sum())
 }
 
+/// Refits every viewport on a set sheet that has outgrown its window, in sheet name order. Returns
+/// the `refit` report, each refit as `A101 now 1:100`, and each viewport left alone because its view
+/// is not placed as `A103 shows <name>, which is not placed`.
+fn refit_viewports(d: &mut Drawing) -> Result<(Vec<Value>, Vec<String>, Vec<String>)> {
+    let doc = read_document(d).map_err(other)?;
+    let mut layouts: Vec<_> = d.layouts.iter().filter(|l| is_set_name(&l.name)).collect();
+    layouts.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut changes = Vec::new();
+    let mut unplaced = Vec::new();
+    for l in layouts {
+        for e in l.entities.iter() {
+            if !matches!(e.kind, EntityKind::Viewport(_)) {
+                continue;
+            }
+            let data = read_entity_data(&e.common).map_err(other)?;
+            let Some(view) = data.assembly_of.or(data.view_id) else { continue };
+            if !view_placed(&doc, view) {
+                let name = doc.views.iter().find(|v| v.id() == view).map_or_else(|| format!("view {}", view.0), |v| v.name().to_owned());
+                unplaced.push(format!("{} shows {name}, which is not placed", l.name));
+            } else if let Some((center, height)) = refit_viewport(d, &doc, e.handle).map_err(other)? {
+                changes.push((l.name.clone(), view, e.handle, center, height));
+            }
+        }
+    }
+    let (mut refit, mut labels) = (Vec::new(), Vec::new());
+    for (layout, view, handle, center, height) in changes {
+        let mut scale = 0.0;
+        d.modify_entity(handle, |e| {
+            if let EntityKind::Viewport(vp) = &mut e.kind {
+                vp.view_center = center;
+                vp.view_height = height;
+                scale = viewport_scale(vp);
+            }
+        })
+        .map_err(other)?;
+        labels.push(format!("{layout} now {}", scale_label(scale)));
+        refit.push(json!({ "layout": layout, "view": view.0, "scale": scale }));
+    }
+    Ok((refit, labels, unplaced))
+}
+
 pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     let pdf = match p.get("pdf").filter(|v| !v.is_null()) {
         None => None,
@@ -245,6 +297,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         parts.push(format!("{layout} ({n} detail{})", if n == 1 { "" } else { "s" }));
         sheets.push(json!({ "layout": layout, "group": "details", "viewIds": ids.iter().map(|id| id.0).collect::<Vec<_>>() }));
     }
+    let (refit, refit_labels, unplaced) = refit_viewports(&mut d)?;
     // The BOM's row in the list needs the BOM, so the BOM goes first; set order in what is reported.
     if let Some(change) = bom::refresh_bom(&mut d)? {
         let (part, sheet) = table_report(bom::DEFAULT_LAYOUT, "bom", BOM_TITLE, change);
@@ -262,7 +315,9 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
             off_sheet.push(format!("{layout} {title}"));
         }
     }
-    if updated > 0 || !sheets.is_empty() {
+    let before = s.state()?.doc.clone();
+    let changed = updated > 0 || !sheets.is_empty() || !refit.is_empty();
+    if changed {
         order_tabs(&mut d);
         *s.doc_mut()? = d;
     }
@@ -274,15 +329,28 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     if updated > 0 {
         message.push_str(&format!("; {updated} sheet{} updated for plotting", if updated == 1 { "" } else { "s" }));
     }
+    if !refit.is_empty() {
+        let n = refit.len();
+        message.push_str(&format!("; {n} viewport{} refit ({})", if n == 1 { "" } else { "s" }, refit_labels.join(", ")));
+    }
+    for note in &unplaced {
+        message.push_str(&format!("; {note}"));
+    }
     if !off_sheet.is_empty() {
         message.push_str(&format!("; {} runs off the sheet", off_sheet.join(" and ")));
     }
     message.push('.');
-    let mut out = json!({ "sheets": sheets, "alreadyOnSheets": already, "message": message });
+    let mut out = json!({ "sheets": sheets, "alreadyOnSheets": already, "refit": refit, "message": message });
     if let Some(path) = pdf {
         let names = set_sheets(s.doc()?);
         if names.is_empty() {
             return Err(bad("sheetset", "There are no set sheets to plot"));
+        }
+        // This command's own observers run after it returns, which is too late for the PDF.
+        if changed {
+            for f in s.observers.clone() {
+                f(s, &before);
+            }
         }
         let r = s.execute("plot", &json!({ "layouts": names, "path": path }))?;
         let pages = r["pages"].as_u64().unwrap_or_default();
@@ -1187,6 +1255,159 @@ mod tests {
         assert_eq!(r["proposedLines"], 0, "{r}");
         assert!(!r["message"].as_str().ok_or("no message")?.contains("proposed"), "{r}");
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Adds a line to `view`'s block from the origin to `(x, 0)`.
+    fn far_line(s: &mut Session, view: Id, x: f64) -> R {
+        s.execute("editview", &json!({ "viewId": view.0 }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [x, 0]], "closed": false }))?;
+        s.execute("editview", &json!({}))?;
+        Ok(())
+    }
+
+    fn refit_layouts(r: &Value) -> Vec<(String, f64)> {
+        r["refit"].as_array().map_or_else(Vec::new, |a| {
+            a.iter().map(|x| (x["layout"].as_str().unwrap_or_default().to_owned(), x["scale"].as_f64().unwrap_or_default())).collect()
+        })
+    }
+
+    fn inside_window(s: &Session, view: Id, vp: &cadcraft_doc::Viewport) -> T<bool> {
+        let ext = s.doc()?.extents(&Space::Block(view_block_name(view)));
+        let (hw, hh) = (vp.width * viewport_scale(vp) / 2.0, vp.view_height / 2.0);
+        let c = vp.view_center;
+        Ok(ext.min.x >= c.x - hw && ext.max.x <= c.x + hw && ext.min.y >= c.y - hh && ext.max.y <= c.y + hh)
+    }
+
+    #[test]
+    fn a_plan_that_outgrew_its_viewport_recentres_at_its_scale_then_goes_larger() -> R {
+        let (mut s, [ground, ..]) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let (old, _) = only_viewport(&s, "A101")?;
+        assert_eq!(viewport_scale(&old), 50.0);
+
+        // Too far for the window, but the viewport holds it at 1:50.
+        far_line(&mut s, ground, old.width * 50.0 * 0.7)?;
+        assert!(!inside_window(&s, ground, &old)?, "the line is cut off");
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!(refit_layouts(&r), [("A101".to_owned(), 50.0)], "{r}");
+        assert_eq!(r["refit"][0]["view"], ground.0);
+        assert!(r["message"].as_str().is_some_and(|m| m.contains("; 1 viewport refit (A101 now 1:50)")), "{r}");
+        let (vp, _) = only_viewport(&s, "A101")?;
+        assert!(inside_window(&s, ground, &vp)?, "centred on the extents");
+        assert_eq!((vp.width, vp.height, vp.center, vp.view_height), (old.width, old.height, old.center, old.view_height), "only the centre moved");
+        assert_eq!(sheet_titles(&s, "A101")?[0].2, "1:50");
+
+        // One undo restores the old window.
+        s.undo()?;
+        let (back, _) = only_viewport(&s, "A101")?;
+        assert_eq!((back.view_center, back.view_height), (old.view_center, old.view_height));
+        s.redo()?;
+
+        // Past what 1:50 holds: the next larger denominator, and the title follows.
+        far_line(&mut s, ground, old.width * 50.0 * 1.5)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(refit_layouts(&r), [("A101".to_owned(), 100.0)], "{r}");
+        assert!(r["message"].as_str().is_some_and(|m| m.contains("; 1 viewport refit (A101 now 1:100)")), "{r}");
+        let (vp, _) = only_viewport(&s, "A101")?;
+        assert!(inside_window(&s, ground, &vp)?);
+        assert_eq!(vp.center, old.center, "same place on the sheet");
+        assert_eq!(sheet_titles(&s, "A101")?[0].2, "1:100");
+
+        // Done: a second run changes nothing.
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n, "no undo step");
+        assert_eq!(r["refit"], json!([]), "{r}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_viewport_panned_by_hand_that_still_shows_everything_is_untouched() -> R {
+        let (mut s, _) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let d = s.doc_mut()?;
+        let l = d.layout("A101").ok_or("no layout")?;
+        let h = l.entities.iter().find(|e| matches!(&e.kind, EntityKind::Viewport(vp) if vp.id > 1)).map(|e| e.handle).ok_or("no viewport")?;
+        d.modify_entity(h, |e| {
+            if let EntityKind::Viewport(vp) = &mut e.kind {
+                vp.view_center += cadcraft_geom::Vec2::new(500.0, -300.0);
+            }
+        })?;
+        let (panned, _) = only_viewport(&s, "A101")?;
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(r["refit"], json!([]), "{r}");
+        assert_eq!(undo_len(&s)?, n, "no undo step");
+        let (vp, _) = only_viewport(&s, "A101")?;
+        assert_eq!((vp.view_center, vp.view_height), (panned.view_center, panned.view_height));
+        Ok(())
+    }
+
+    #[test]
+    fn the_pdf_shows_the_refit_viewport_and_its_title() -> R {
+        set_io(IoHooks {
+            read: |b, n| cadcraft_io::read(b, n).map_err(|e| e.to_string()),
+            write: |d, n| cadcraft_io::write(d, n).map_err(|e| e.to_string()),
+            plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+        });
+        let (mut s, [ground, ..]) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let (old, _) = only_viewport(&s, "A101")?;
+        far_line(&mut s, ground, old.width * 50.0 * 1.5)?;
+        let dir = std::env::temp_dir().join(format!("lamb-sheetset-refit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("set.pdf");
+        let path_s = path.to_string_lossy().into_owned();
+        let a101_page = |p: &std::path::Path| -> T<Vec<u8>> {
+            let pdf = craft_pdf::open_slice(&std::fs::read(p)?, None).map_err(|e| format!("{e:?}"))?;
+            let pages = pdf.pages();
+            let page = pages.get(1).ok_or("no page")?;
+            Ok(page.page_stream().ok_or("no content")?.to_vec())
+        };
+        let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
+        assert_eq!(refit_layouts(&r), [("A101".to_owned(), 100.0)], "{r}");
+        let first = a101_page(&path)?;
+        // A run with nothing left to change plots the drawing as it now stands: the same page.
+        let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
+        assert_eq!(r["refit"], json!([]), "{r}");
+        assert_eq!(first, a101_page(&path)?, "the first PDF already showed the refit, its title and annotation");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sheet_whose_view_is_not_placed_is_reported_and_unchanged() -> R {
+        let (mut s, [ground, first, _, sec]) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let (old, _) = only_viewport(&s, "A102")?;
+        let (old_sec, _) = only_viewport(&s, "A301")?;
+        far_line(&mut s, first, old.width * 50.0 * 1.5)?;
+        far_line(&mut s, sec, old_sec.width * 50.0 * 1.5)?;
+        let d = s.doc_mut()?;
+        let mut doc = read_document(d)?;
+        for v in &mut doc.views {
+            if let AnyView::Plan(p) = v
+                && p.id == first
+            {
+                p.placement = None;
+            }
+        }
+        doc.views.retain(|v| v.id() != sec);
+        write_document(d, &doc)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(r["refit"], json!([]), "{r}");
+        assert!(laid(&r).iter().all(|(_, group, _)| group == "list"), "only the list's rows change: {r}");
+        let m = r["message"].as_str().ok_or("no message")?;
+        assert!(m.contains("; A102 shows First, which is not placed"), "{m}");
+        assert!(m.contains(&format!("; A301 shows view {}, which is not placed", sec.0)), "{m}");
+        let (vp, _) = only_viewport(&s, "A102")?;
+        assert_eq!((vp.view_center, vp.view_height), (old.view_center, old.view_height));
+        let (vp, _) = only_viewport(&s, "A301")?;
+        assert_eq!((vp.view_center, vp.view_height), (old_sec.view_center, old_sec.view_height));
+        assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
         Ok(())
     }
 
