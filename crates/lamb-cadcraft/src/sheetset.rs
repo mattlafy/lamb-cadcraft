@@ -24,23 +24,31 @@
 //! `sheetset {pdf?}` (`sset`) returns `{sheets: [{layout, group, viewIds}], alreadyOnSheets,
 //! pdf?, message}`, `group` being `list` or `bom` for a table made or updated, with no `viewIds`.
 //! With `pdf`, every set sheet in tab order is plotted to that one PDF, a page
-//! per sheet, whether or not this run placed anything.
+//! per sheet, whether or not this run placed anything, and `proposedLines` counts the unaccepted
+//! AI lines in the views those sheets show: a plot ignores their ghost transparency, so the
+//! message says they plot as drawn. Nothing is hidden.
+//!
+//! Older sheets come along for plotting (LAMB T645), in the same undo step: a viewport naming a
+//! view or an assembly that is still on layer `0` moves to [`VPORT_LAYER`], and a set sheet with
+//! no plot style table takes monochrome. A table a user chose stays, a foreign viewport stays.
 //!
 //! SHEETSIZE (LAMB T633): `sheetsize {paper}` (`ssize`) sets the one project setting new sheets
 //! take their paper from ([`crate::sheets::sheet_page`]), in one undo step, and returns
 //! `{paper, widthMm, heightMm, message}` with the landscape sheet size. Existing sheets are never
 //! resized or re-flowed.
 
-use cadcraft_doc::{Drawing, EntityKind};
+use cadcraft_doc::{Drawing, EntityKind, MONOCHROME_CTB, Space};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
+use lamb_core::derivation::read::ProjectRead;
 use lamb_core::model::{AnyView, Id, VerticalIntent};
 use serde_json::{Value, json};
 
 use crate::bom::{self, BOM_TITLE, Refreshed};
 use crate::commands::{bad, name_input, other};
 use crate::detailsheets::{lay_detail_sheets, next_sheet_name};
+use crate::project::DrawingProject;
 use crate::schema::{assembly_block_name, read_document, read_entity_data, write_document};
-use crate::sheets::{DEFAULT_SHEET_PAPER, create_sheet, sheet_paper_size, view_sheet_ref};
+use crate::sheets::{DEFAULT_SHEET_PAPER, VPORT_LAYER, create_sheet, ensure_vport_layer, sheet_paper_size, view_sheet_ref};
 use crate::titleblock::sheet_title;
 
 const PLAN_PREFIX: &str = "A1";
@@ -150,6 +158,56 @@ fn table_report(layout: &str, group: &str, title: &str, change: Refreshed) -> (S
     (part, json!({ "layout": layout, "group": group, "viewIds": [] }))
 }
 
+/// Brings sheets made before they plotted as drawings along: LAMB viewports on layer `0` move to
+/// [`VPORT_LAYER`] and set sheets without a plot style table take monochrome. Returns how many
+/// sheets changed.
+fn update_for_plotting(d: &mut Drawing) -> Result<usize> {
+    let mut moved = Vec::new();
+    let mut updated: Vec<String> = Vec::new();
+    for layout in &d.layouts {
+        let on_zero = d.space(&Space::Paper(layout.name.clone())).into_iter().flat_map(|store| store.iter()).filter(|e| {
+            matches!(e.kind, EntityKind::Viewport(_))
+                && e.common.layer == "0"
+                && read_entity_data(&e.common).is_ok_and(|x| x.view_id.is_some() || x.assembly_of.is_some())
+        });
+        let before = moved.len();
+        moved.extend(on_zero.map(|e| e.handle));
+        if moved.len() > before {
+            updated.push(layout.name.clone());
+        }
+    }
+    if !moved.is_empty() {
+        ensure_vport_layer(d);
+    }
+    for h in moved {
+        d.modify_entity(h, |e| e.common.layer = VPORT_LAYER.to_owned()).map_err(other)?;
+    }
+    for layout in d.layouts.iter_mut().filter(|l| is_set_name(&l.name) && l.page.plot_style_table.is_empty()) {
+        layout.page.plot_style_table = MONOCHROME_CTB.to_owned();
+        if !updated.contains(&layout.name) {
+            updated.push(layout.name.clone());
+        }
+    }
+    Ok(updated.len())
+}
+
+/// The unaccepted AI lines in the views the set sheets show.
+fn proposed_lines(d: &Drawing) -> Result<usize> {
+    let mut views: Vec<Id> = Vec::new();
+    for name in set_sheets(d) {
+        for e in d.space(&Space::Paper(name)).into_iter().flat_map(|store| store.iter()) {
+            if matches!(e.kind, EntityKind::Viewport(_))
+                && let Some(v) = read_entity_data(&e.common).ok().and_then(|x| x.view_id)
+                && !views.contains(&v)
+            {
+                views.push(v);
+            }
+        }
+    }
+    let project = DrawingProject::new(d).map_err(other)?;
+    Ok(views.into_iter().map(|v| project.entities(v).filter(|e| e.ai_origin.is_some_and(|o| !o.accepted)).count()).sum())
+}
+
 pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     let pdf = match p.get("pdf").filter(|v| !v.is_null()) {
         None => None,
@@ -157,6 +215,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     };
     // Build every sheet on a copy and assign it back once: one undo step.
     let mut d = s.doc()?.clone();
+    let updated = update_for_plotting(&mut d)?;
     let mut sheets: Vec<Value> = Vec::new();
     let mut parts: Vec<String> = Vec::new();
     let mut already = 0usize;
@@ -203,7 +262,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
             off_sheet.push(format!("{layout} {title}"));
         }
     }
-    if !sheets.is_empty() {
+    if updated > 0 || !sheets.is_empty() {
         order_tabs(&mut d);
         *s.doc_mut()? = d;
     }
@@ -211,6 +270,9 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     let mut message = if parts.is_empty() { "Sheet set: nothing new to lay out".to_owned() } else { format!("Sheet set: {}", parts.join(", ")) };
     if already > 0 {
         message.push_str(&format!("; {already} already on sheets"));
+    }
+    if updated > 0 {
+        message.push_str(&format!("; {updated} sheet{} updated for plotting", if updated == 1 { "" } else { "s" }));
     }
     if !off_sheet.is_empty() {
         message.push_str(&format!("; {} runs off the sheet", off_sheet.join(" and ")));
@@ -224,7 +286,14 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let r = s.execute("plot", &json!({ "layouts": names, "path": path }))?;
         let pages = r["pages"].as_u64().unwrap_or_default();
-        out["message"] = json!(format!("{message} Plotted {pages} sheet{} to {path}.", if pages == 1 { "" } else { "s" }));
+        let proposed = proposed_lines(s.doc()?)?;
+        let warning = match proposed {
+            0 => String::new(),
+            1 => "; 1 proposed AI line plots as drawn: accept or erase it".to_owned(),
+            n => format!("; {n} proposed AI lines plot as drawn: accept or erase them"),
+        };
+        out["message"] = json!(format!("{message} Plotted {pages} sheet{} to {path}{warning}.", if pages == 1 { "" } else { "s" }));
+        out["proposedLines"] = json!(proposed);
         out["pdf"] = r;
     }
     Ok(out)
@@ -933,6 +1002,191 @@ mod tests {
         let r = s.execute("sheetset", &json!({}))?;
         assert!(r["message"].as_str().is_some_and(|m| m.ends_with("; A601 Framing BOM runs off the sheet.")), "{r}");
         assert_eq!(body(&table(&s, "A601", "Framing BOM")?).len(), 1, "written whole");
+        Ok(())
+    }
+
+    /// The plain lines of a display list, as segments.
+    fn segments(list: &cadcraft_render::DisplayList) -> Vec<(cadcraft_geom::Vec2, cadcraft_geom::Vec2)> {
+        list.prims
+            .iter()
+            .filter(|p| matches!(p.kind, cadcraft_render::Kind::Polyline))
+            .flat_map(|p| {
+                let v = &list.verts[p.start as usize..(p.start + p.len) as usize];
+                v.windows(2).map(|w| (w[0], w[1])).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_set_sheet_plots_the_view_without_the_viewports_rectangle() -> R {
+        let (mut s, _) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let (vp, _) = only_viewport(&s, "A101")?;
+        let d = s.doc()?;
+        let (hw, hh) = (vp.width / 2.0, vp.height / 2.0);
+        let (c, near) = (vp.center, |a: f64, b: f64| (a - b).abs() < 1e-6);
+        let on_rect = |a: cadcraft_geom::Vec2, b: cadcraft_geom::Vec2| {
+            (near(a.x, b.x) && (near(a.x, c.x - hw) || near(a.x, c.x + hw))) || (near(a.y, b.y) && (near(a.y, c.y - hh) || near(a.y, c.y + hh)))
+        };
+        let space = Space::Paper("A101".into());
+        let opts = cadcraft_render::Options::default();
+        let shown = segments(&cadcraft_render::build(d, &space, &opts));
+        assert!(shown.iter().filter(|(a, b)| on_rect(*a, *b)).count() >= 4, "the border stays on screen: {shown:?}");
+        let plotted = segments(&cadcraft_render::build_plot(d, &space, &opts));
+        assert!(!plotted.iter().any(|(a, b)| on_rect(*a, *b)), "no rectangle on paper: {plotted:?}");
+        // The 5000 mm wall at the viewport's scale.
+        let wall = 5000.0 / crate::sheets::viewport_scale(&vp);
+        assert!(plotted.iter().any(|(a, b)| near((b.x - a.x).abs(), wall) && near(a.y, b.y)), "the view's lines plot: {plotted:?}");
+        Ok(())
+    }
+
+    /// The RGB colours a PDF's content stream sets, in 0..=1.
+    fn pdf_colours(d: &Drawing, sheet: &str) -> T<Vec<[f64; 3]>> {
+        let bytes = cadcraft_io::plot(d, &Space::Paper(sheet.into()), &json!({ "compress": false }))?;
+        let pdf = craft_pdf::open_slice(&bytes, None).map_err(|e| format!("the PDF opens: {e:?}"))?;
+        let pages = pdf.pages();
+        let page = pages.iter().next().ok_or("no page")?;
+        let content = String::from_utf8_lossy(page.page_stream().ok_or("no content")?).into_owned();
+        let tokens: Vec<&str> = content.split_whitespace().collect();
+        let mut out: Vec<[f64; 3]> = Vec::new();
+        for w in tokens.windows(4) {
+            if matches!(w[3], "RG" | "rg" | "SC" | "sc" | "SCN" | "scn")
+                && let (Ok(r), Ok(g), Ok(b)) = (w[0].parse(), w[1].parse(), w[2].parse())
+                && !out.contains(&[r, g, b])
+            {
+                out.push([r, g, b]);
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn a_red_layer_plots_black_and_a_chosen_table_survives() -> R {
+        let (mut s, _) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        s.doc_mut()?.layer_mut("WALL-EXT").ok_or("no layer")?.color = cadcraft_color::Color::Index(1);
+        let page = |d: &Drawing, name: &str| d.layout(name).map(|l| l.page.plot_style_table.clone());
+        assert_eq!(page(s.doc()?, "A101").as_deref(), Some(MONOCHROME_CTB));
+        let red = [1.0, 0.0, 0.0];
+        let black = pdf_colours(s.doc()?, "A101")?;
+        assert!(black.contains(&[0.0, 0.0, 0.0]) && !black.contains(&red), "{black:?}");
+        // The same sheet in the object's colours prints red: the test can see it.
+        let mut d = s.doc()?.clone();
+        d.layouts.iter_mut().find(|l| l.name == "A101").ok_or("no layout")?.page.plot_style_table.clear();
+        let coloured = pdf_colours(&d, "A101")?;
+        assert!(coloured.contains(&red), "{coloured:?}");
+
+        // A user's choice stands, and the screen keeps its colours.
+        s.doc_mut()?.layouts.iter_mut().find(|l| l.name == "A101").ok_or("no layout")?.page.plot_style_table = "grayscale.ctb".to_owned();
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(page(s.doc()?, "A101").as_deref(), Some("grayscale.ctb"), "{r}");
+        assert_eq!(undo_len(&s)?, n, "nothing to change: {r}");
+        assert!(!s.doc()?.layout("A101").ok_or("no layout")?.page.show_plot_styles);
+        Ok(())
+    }
+
+    #[test]
+    fn older_sheets_move_in_one_undo_step_and_a_second_run_is_a_no_op() -> R {
+        let (mut s, _) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        // As older sheets were built, with a foreign viewport beside them.
+        let handles: Vec<cadcraft_doc::Handle> = {
+            let d = s.doc()?;
+            let mut out = Vec::new();
+            for l in &d.layouts {
+                for e in d.space(&Space::Paper(l.name.clone())).into_iter().flat_map(|st| st.iter()) {
+                    if matches!(e.kind, EntityKind::Viewport(_))
+                        && read_entity_data(&e.common).is_ok_and(|x| x.view_id.is_some() || x.assembly_of.is_some())
+                    {
+                        out.push(e.handle);
+                    }
+                }
+            }
+            out
+        };
+        assert!(!handles.is_empty());
+        let (vp, _) = only_viewport(&s, "A101")?;
+        let d = s.doc_mut()?;
+        for h in &handles {
+            d.modify_entity(*h, |e| e.common.layer = "0".to_owned())?;
+        }
+        for l in &mut d.layouts {
+            l.page.plot_style_table.clear();
+        }
+        d.layers.retain(|l| l.name != VPORT_LAYER);
+        let foreign = d.add(&Space::Paper("A201".into()), cadcraft_doc::Common::default(), EntityKind::Viewport(vp))?;
+        let layer_of = |d: &Drawing, h| d.entity(h).map(|e| e.common.layer.clone());
+
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step: {r}");
+        let d = s.doc()?;
+        for h in &handles {
+            assert_eq!(layer_of(d, *h).as_deref(), Some(VPORT_LAYER), "{r}");
+        }
+        assert_eq!(layer_of(d, foreign).as_deref(), Some("0"), "a foreign viewport stays");
+        assert!(d.layer(VPORT_LAYER).is_some_and(|l| !l.plot));
+        for name in set_sheets(d) {
+            assert_eq!(d.layout(&name).ok_or("no layout")?.page.plot_style_table, MONOCHROME_CTB, "{name}");
+        }
+        assert!(r["message"].as_str().ok_or("no message")?.contains(&format!("; {} sheets updated for plotting", set_sheets(d).len())), "{r}");
+
+        let again = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "no change, no undo step: {again}");
+        assert!(!again["message"].as_str().ok_or("no message")?.contains("updated for plotting"), "{again}");
+
+        s.execute("undo", &json!({}))?;
+        let d = s.doc()?;
+        for h in &handles {
+            assert_eq!(layer_of(d, *h).as_deref(), Some("0"), "undone");
+        }
+        assert!(d.layout("A101").ok_or("no layout")?.page.plot_style_table.is_empty(), "undone");
+        Ok(())
+    }
+
+    #[test]
+    fn proposed_lines_are_counted_and_drop_to_zero_after_accept() -> R {
+        set_io(IoHooks {
+            read: |b, n| cadcraft_io::read(b, n).map_err(|e| e.to_string()),
+            write: |d, n| cadcraft_io::write(d, n).map_err(|e| e.to_string()),
+            plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+        });
+        // The room crossing the section line gives the section its proposed lines.
+        let (mut s, [_, _, _, sec]) = set()?;
+        let proposals = |s: &Session| -> T<Vec<cadcraft_doc::Handle>> {
+            let d = s.doc()?;
+            let block = d.block(&view_block_name(sec)).ok_or("no block")?;
+            let unaccepted =
+                |e: &&std::sync::Arc<cadcraft_doc::Entity>| read_entity_data(&e.common).is_ok_and(|x| x.ai_origin.is_some_and(|o| !o.accepted));
+            Ok(block.entities.iter().filter(unaccepted).map(|e| e.handle).collect())
+        };
+        let lines = proposals(&s)?;
+        assert!(!lines.is_empty(), "the fixture proposes lines");
+        let dir = std::env::temp_dir().join(format!("lamb-sheetset-ai-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("set.pdf").to_string_lossy().into_owned();
+
+        // Only with a plot: a sheet with no PDF says nothing about it.
+        let r = s.execute("sheetset", &json!({}))?;
+        assert!(r.get("proposedLines").is_none(), "{r}");
+        let r = s.execute("sheetset", &json!({ "pdf": path }))?;
+        assert_eq!(r["proposedLines"], lines.len(), "{r}");
+        let n = lines.len();
+        let plural = if n == 1 {
+            "; 1 proposed AI line plots as drawn: accept or erase it.".to_owned()
+        } else {
+            format!("; {n} proposed AI lines plot as drawn: accept or erase them.")
+        };
+        assert!(r["message"].as_str().ok_or("no message")?.ends_with(&plural), "{r}");
+
+        let hexes: Vec<String> = lines.iter().map(|h| h.hex()).collect();
+        s.execute("accept", &json!({ "handles": hexes }))?;
+        assert!(proposals(&s)?.is_empty());
+        let r = s.execute("sheetset", &json!({ "pdf": path }))?;
+        assert_eq!(r["proposedLines"], 0, "{r}");
+        assert!(!r["message"].as_str().ok_or("no message")?.contains("proposed"), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 

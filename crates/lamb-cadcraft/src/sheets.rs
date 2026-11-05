@@ -26,11 +26,15 @@
 //! [`MIN_VP_HEIGHT_MM`] tall. Viewports fill rows from the top left in the given order, tops
 //! aligned, [`GAP_X_MM`] apart; the next row starts [`GAP_Y_MM`] below the row's tallest, and a row
 //! leaving less than [`TITLE_ROOM_MM`] above the bottom of the area starts a new sheet.
+//!
+//! A sheet plots as a drawing (LAMB T645): its viewports sit on the no-plot [`VPORT_LAYER`], so a
+//! border shows on screen and not on paper while the contents still plot, and its page setup
+//! starts on the monochrome plot style table, which a user can change. Screen colours stay.
 
 use std::fmt;
 use std::sync::Arc;
 
-use cadcraft_doc::{Common, Drawing, EntityKind, Handle, Layout, PageSetup, Space, Viewport};
+use cadcraft_doc::{Common, Drawing, EntityKind, Handle, Layout, MONOCHROME_CTB, PageSetup, Space, Viewport};
 use cadcraft_engine::Session;
 use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use cadcraft_render::{PaperSize, Sheet, paper_size};
@@ -80,6 +84,19 @@ impl From<SchemaError> for SheetError {
 
 /// Every assembly block's (and its layer's) name starts with this ([`assembly_block_name`]).
 const ASSEMBLY_PREFIX: &str = "LAMB_ASSEMBLY_";
+
+/// The layer a sheet's viewports sit on: it does not plot, so no rectangle prints around a drawing.
+pub(crate) const VPORT_LAYER: &str = "LAMB-VPORTS";
+
+/// Makes [`VPORT_LAYER`] when `d` lacks it, not plotting. Returns whether it was made; a layer
+/// already there keeps its settings.
+pub(crate) fn ensure_vport_layer(d: &mut Drawing) -> bool {
+    let made = d.ensure_layer(VPORT_LAYER);
+    if made && let Some(l) = d.layer_mut(VPORT_LAYER) {
+        l.plot = false;
+    }
+    made
+}
 
 /// The standard drawing-scale denominators (1:n) a LAMB viewport plots at, ascending.
 pub const STANDARD_SCALES: [f64; 13] = [1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0, 2000.0];
@@ -210,10 +227,17 @@ pub(crate) fn sheet_paper_size(doc: &LambDocument) -> Option<&'static PaperSize>
     doc.sheet_paper.as_deref().and_then(paper_size).or_else(|| paper_size(DEFAULT_SHEET_PAPER))
 }
 
-/// The page setup of a new sheet in `doc`: its paper in landscape, 10 mm margins, and paper units
-/// of millimetres whatever the drawing's MEASUREMENT says, as every paper constant here assumes.
+/// The page setup of a new sheet in `doc`: its paper in landscape, 10 mm margins, the monochrome
+/// plot style table, and paper units of millimetres whatever the drawing's MEASUREMENT says, as
+/// every paper constant here assumes.
 pub(crate) fn sheet_page(doc: &LambDocument) -> PageSetup {
-    let mut page = PageSetup { landscape: true, paper_mm: true, margins_mm: [SHEET_MARGIN_MM; 4], ..PageSetup::default() };
+    let mut page = PageSetup {
+        landscape: true,
+        paper_mm: true,
+        margins_mm: [SHEET_MARGIN_MM; 4],
+        plot_style_table: MONOCHROME_CTB.to_owned(),
+        ..PageSetup::default()
+    };
     if let Some(p) = sheet_paper_size(doc) {
         page.paper = p.name.to_owned();
         page.width_mm = p.width_mm;
@@ -366,15 +390,21 @@ fn push_sheet_layout(d: &mut Drawing, doc: &LambDocument, name: &str) {
     d.layouts.push(Layout { page: sheet_page(doc), ..Layout::new(name, tab_order) });
 }
 
-/// Adds `viewports` to the just-pushed layout `name`, taking the layout back out on failure.
+/// Adds `viewports` to the just-pushed layout `name` on [`VPORT_LAYER`], taking the layout (and
+/// the layer, if made here) back out on failure.
 fn add_viewports(d: &mut Drawing, name: &str, viewports: Vec<(Common, Viewport)>) -> Result<Vec<Handle>, SheetError> {
     let space = Space::Paper(name.to_owned());
+    let made_layer = ensure_vport_layer(d);
     let mut handles = Vec::with_capacity(viewports.len());
-    for (common, vp) in viewports {
+    for (mut common, vp) in viewports {
+        common.layer = VPORT_LAYER.to_owned();
         match d.add(&space, common, EntityKind::Viewport(vp)) {
             Ok(hd) => handles.push(hd),
             Err(e) => {
                 d.layouts.retain(|l| l.name != name);
+                if made_layer {
+                    d.layers.retain(|l| l.name != VPORT_LAYER);
+                }
                 return Err(SheetError::Schema(SchemaError::Malformed { what: format!("layout {name}"), message: e.to_string() }));
             }
         }
