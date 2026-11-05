@@ -144,6 +144,7 @@ fn read_budgeted(bytes: &[u8], mut table_cells_left: usize) -> Result<Drawing> {
     for x in f.entities.values_mut().chain(f.records.values_mut()) {
         crate::dxf_ext::drop_ext_raw(&mut x.xdata);
     }
+    crate::dxf_clip::read(&mut d);
     d.skipped_records = skipped;
     Ok(d)
 }

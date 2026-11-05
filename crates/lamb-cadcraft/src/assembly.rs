@@ -1022,6 +1022,7 @@ fn ensure_assembly_insert(d: &mut Drawing, plan: Id) {
     }
     d.ensure_layer(&name);
     let insert = Insert {
+        clip: None,
         block: name.clone(),
         insert: Vec3::ZERO,
         scale: Vec3::new(1.0, 1.0, 1.0),

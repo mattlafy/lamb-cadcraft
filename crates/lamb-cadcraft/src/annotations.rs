@@ -235,6 +235,7 @@ fn ensure_insert(d: &mut Drawing, plan: Id) {
     let layer = view_block_name(plan);
     d.ensure_layer(&layer);
     let insert = Insert {
+        clip: None,
         block: name,
         insert: Vec3::ZERO,
         scale: Vec3::new(1.0, 1.0, 1.0),

@@ -68,6 +68,7 @@ fn far_block_contents_leave_a_window_page_unchanged() {
         }
         d.blocks.insert("PLAN".into(), std::sync::Arc::new(blk));
         let ins = cadcraft_doc::Insert {
+            clip: None,
             block: "PLAN".into(),
             insert: Vec3::new(0.0, 0.0, 0.0),
             scale: Vec3::new(1.0, 1.0, 1.0),

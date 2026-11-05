@@ -99,6 +99,7 @@ fn entities_with_child_records_keep_ext_and_children() {
         &Space::Model,
         with_ext(&ie),
         EntityKind::Insert(Insert {
+            clip: None,
             block: "Tag".into(),
             insert: Vec3::new(2.0, 3.0, 0.0),
             scale: Vec3::new(1.0, 1.0, 1.0),

@@ -58,7 +58,7 @@ upstream rejects it.
 | [#1292](https://github.com/storytold/cadcraft/pull/1292) Realtime PAN | `pr/realtime-pan` | merged; with #1230 its `realtime_pan` keeps the view's twist and turns the drag by it (`crates/engine/src/cmd/view.rs`), and the canvas click repair (patch 22) treats its drags like ZOOM Realtime's; the branch's `nav_drag` flag (a release of a drag that panned or zoomed places no point, also once Enter ended the command mid-drag) lives in patch 22's `handle_releases` here |
 | [#1293](https://github.com/storytold/cadcraft/pull/1293) Blocks window previews | `pr/block-previews` | merged |
 | [#1451](https://github.com/storytold/cadcraft/pull/1451) Copied hatch stays associative | `pr/hatch-copy-keeps-boundary` | merged |
-| [#1470](https://github.com/storytold/cadcraft/pull/1470) Window plot culling | `pr/plot-window-cull` | merged |
+| [#1470](https://github.com/storytold/cadcraft/pull/1470) Window plot culling | `pr/plot-window-cull` | merged; on `lamb` a clipped reference is never culled (`cull_bounds`, `blocks::insert`), since its plotted XCLIP frame can reach past the block |
 | [#1505](https://github.com/storytold/cadcraft/pull/1505) Locked-layer fade | `pr/locked-layer-fade` | merged |
 | [#1506](https://github.com/storytold/cadcraft/pull/1506) OFFSETGAPTYPE | `pr/offset-gap-type` | merged |
 | [#1507](https://github.com/storytold/cadcraft/pull/1507) SHAPES facts | `pr/shape-analysis` | merged |

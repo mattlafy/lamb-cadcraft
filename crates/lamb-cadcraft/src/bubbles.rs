@@ -80,6 +80,7 @@ fn attrib(tag: &str, at: Vec3, dy: f64, value: &str) -> Attrib {
 
 fn insert_of(w: &Wanted) -> Insert {
     Insert {
+        clip: None,
         block: BUBBLE_BLOCK.into(),
         insert: w.at,
         scale: Vec3::new(1.0, 1.0, 1.0),

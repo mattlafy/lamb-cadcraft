@@ -40,12 +40,13 @@ pub(crate) fn entity_reaches(d: &Drawing, e: &Entity, window: &Bounds2) -> bool 
 }
 
 /// The bounds a top-level object is culled by: its own, or none (it always reaches) for a point
-/// or a reference to a block that draws points.
+/// or a reference that is clipped (its plotted XCLIP frame can reach past the block) or to a block
+/// that draws points.
 fn cull_bounds(d: &Drawing, e: &Entity, depth: usize) -> Bounds2 {
     let draws_points = |name: &str| d.block(name).is_some_and(|blk| block_bounds(d, blk).points);
     let points = match &e.kind {
         EntityKind::Point(_) => true,
-        EntityKind::Insert(ins) => draws_points(&ins.block),
+        EntityKind::Insert(ins) => ins.clip.as_ref().is_some_and(|c| c.active()) || draws_points(&ins.block),
         EntityKind::Dimension(dm) => dm.block.as_deref().is_some_and(draws_points),
         EntityKind::MLeader(m) => m.block.as_ref().is_some_and(|ins| draws_points(&ins.block)),
         _ => false,
@@ -290,6 +291,18 @@ mod tests {
         assert_ne!(drawing_key(&d), before, "MTEXT bounds in blocks follow the style's width factor");
     }
 
+    #[test]
+    fn a_clipped_reference_is_never_ruled_out() {
+        let mut d = Drawing::new_imperial();
+        let window = Bounds2::from_points([Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0)]);
+        d.blocks.insert("CullClipped".into(), block("CullClipped", vec![line((0.0, 0.0), (1.0, 0.0))]));
+        let EntityKind::Insert(mut ins) = insert_kind("CullClipped") else { panic!("an insert") };
+        ins.insert = Vec3::new(100.0, 0.0, 0.0);
+        assert!(!entity_reaches(&d, &Entity::new(Handle(1), EntityKind::Insert(ins.clone())), &window));
+        ins.clip = Some(cadcraft_doc::ClipBoundary::new(vec![Vec2::new(-200.0, -200.0), Vec2::new(200.0, 200.0)]));
+        assert!(entity_reaches(&d, &Entity::new(Handle(2), EntityKind::Insert(ins)), &window));
+    }
+
     fn insert_kind(name: &str) -> EntityKind {
         EntityKind::Insert(cadcraft_doc::Insert {
             block: name.into(),
@@ -301,6 +314,7 @@ mod tests {
             rows: 1,
             col_spacing: 0.0,
             row_spacing: 0.0,
+            clip: None,
         })
     }
 

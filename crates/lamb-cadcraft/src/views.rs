@@ -65,6 +65,7 @@ pub fn create_view(d: &mut Drawing, mut view: AnyView) -> Result<Id, ViewError> 
     d.ensure_layer(&name);
     d.blocks.insert(name.clone(), Arc::new(Block::new(&name)));
     let insert = Insert {
+        clip: None,
         block: name.clone(),
         insert: Vec3::ZERO,
         scale: Vec3::new(1.0, 1.0, 1.0),

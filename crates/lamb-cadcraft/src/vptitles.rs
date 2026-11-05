@@ -97,6 +97,7 @@ fn attrib(tag: &str, p: Vec3, height: f64, halign: HAlign, valign: VAlign, value
 fn insert_of(w: &Wanted) -> Insert {
     let at = |dx: f64, dy: f64| Vec3::new(w.at.x + dx, w.at.y + dy, w.at.z);
     Insert {
+        clip: None,
         block: TITLE_BLOCK.into(),
         insert: w.at,
         scale: Vec3::new(1.0, 1.0, 1.0),
