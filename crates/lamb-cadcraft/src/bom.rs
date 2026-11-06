@@ -17,6 +17,14 @@
 //! is one of the item named by its layer, added to the same row as the run copies. A plan's
 //! opening `lines` hold both jambs, so its components need no doubling.
 //!
+//! Bands have a running length (LAMB T649), plans only: in a section a band's length is its height
+//! or its run across the cut. For each laid run of a placed plan, each layer among its bands
+//! (`lines[..bands]`) adds the length of its longest line in that run, once: a band is drawn as
+//! face lines, so summing would double it, and two separate bands on one layer in one run therefore
+//! count once. An arc line's length is its radius times its sweep. Corners, jambs and ends add no
+//! length: their pieces are short and counted as items. A layer that has both members and a band
+//! gets its count and its length on one row.
+//!
 //! A plan's level is its placement's level; a floating plan is skipped. In a vertical view a run
 //! belongs to the level with the greatest floor elevation at or below its centreline's mid-point
 //! height (view-local y is absolute z), a corner or opening to the one below the mid-point of its
@@ -24,13 +32,13 @@
 //! one floor show as two rows, each naming its view — nothing is silently counted twice. Sorted
 //! by level order, then item, then view document order.
 //!
-//! `bomtable {layout?, at?}` (`bom`): the table (`Level | Item | Count | View`, titled
-//! `Framing BOM`) on layout `layout` (default `A601`, the BOM's sheet in the set
+//! `bomtable {layout?, at?}` (`bom`): the table (`Level | Item | Count | Length | View`, titled
+//! `Framing BOM`, a zero count or length left blank, a length written `12.4 m`) on layout `layout` (default `A601`, the BOM's sheet in the set
 //! ([`crate::sheetset`]), created without viewports when absent) at
 //! paper point `at` (default the top-left corner of the sheet's
 //! [`crate::sheets::usable_area`]). A table on that
 //! layout titled `Framing BOM` is replaced; one undo step. Nothing to count is refused, nothing
-//! changed. Returns `{layout, handle, rows: [{level, item, count, view}], message}`.
+//! changed. Returns `{layout, handle, rows: [{level, item, count, lengthMm, view}], message}`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -43,6 +51,7 @@ use lamb_core::derivation::projection::vertical_local_to_uz;
 use lamb_core::derivation::read::view_ref;
 use lamb_core::derivation::walls::RunCurve;
 use lamb_core::geometry::Point2;
+use lamb_core::geometry::polyline::sweep_angle;
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id, Level, Placement};
 use serde_json::{Value, json};
@@ -60,14 +69,16 @@ pub(crate) const DEFAULT_LAYOUT: &str = "A601";
 const NO_LEVEL: &str = "—";
 const TEXT_HEIGHT: f64 = 2.5;
 const ROW_HEIGHT: f64 = 7.0;
-const COL_WIDTHS: [f64; 4] = [30.0, 45.0, 15.0, 45.0];
+const COL_WIDTHS: [f64; 5] = [30.0, 45.0, 15.0, 20.0, 45.0];
 
-/// One BOM row: `count` of `item` on `level`, as laid in view `view`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One BOM row: `count` of `item` and `length_mm` of it as a continuous band (0 when there is
+/// none) on `level`, as laid in view `view`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct BomRow {
     pub level: String,
     pub item: String,
     pub count: usize,
+    pub length_mm: f64,
     pub view: String,
 }
 
@@ -108,6 +119,23 @@ fn copy_layers(r: &RunAssembly) -> impl Iterator<Item = &str> {
     })
 }
 
+/// The length of a laid line: a straight one's distance, an arc's radius times its sweep.
+fn line_length(l: &AssemblyLine) -> f64 {
+    let Some(arc) = l.arc else { return (l.to.x - l.from.x).hypot(l.to.y - l.from.y) };
+    let angle = |p: Point2| (p.y - arc.center.y).atan2(p.x - arc.center.x);
+    arc.radius * sweep_angle(angle(l.from), angle(l.to), arc.ccw).abs()
+}
+
+/// Each band layer of `r` with the length of its longest line in the run.
+fn band_lengths(r: &RunAssembly) -> HashMap<&str, f64> {
+    let mut lengths: HashMap<&str, f64> = HashMap::new();
+    for l in r.lines.get(..r.bands).unwrap_or_default() {
+        let len = lengths.entry(l.layer.as_str()).or_insert(0.0);
+        *len = len.max(line_length(l));
+    }
+    lengths
+}
+
 /// The layers that hold framing members: those naming a repeat copy in `laid`, or a repeat's first
 /// member in a detail of `views`.
 fn member_layers(d: &Drawing, views: &[AnyView], laid: &[Option<Vec<RunAssembly>>]) -> HashSet<String> {
@@ -140,7 +168,7 @@ fn member_counts<'a>(lines: &'a [AssemblyLine], members: &HashSet<String>) -> Ha
     counts
 }
 
-/// Every framing count the assembly plans lay, per (level, item, view), sorted.
+/// Every framing count and band length the assembly plans lay, per (level, item, view), sorted.
 pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
     let Ok(doc) = read_document(d) else { return Vec::new() };
     let Ok(p) = DrawingProject::new(d) else { return Vec::new() };
@@ -150,11 +178,13 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
     };
     let laid: Vec<Option<Vec<RunAssembly>>> = doc.views.iter().map(|v| assembly_lines(d, v.id()).ok()).collect();
     let members = member_layers(d, &doc.views, &laid);
-    // (level order, level name, item, view index) → count.
-    let mut counts: HashMap<(String, String, usize), (f64, usize)> = HashMap::new();
-    let mut bump = |level: Option<&Level>, item: String, view: usize, n: usize| {
+    // (level name, item, view index) → (level order, count, length).
+    let mut counts: HashMap<(String, String, usize), (f64, usize, f64)> = HashMap::new();
+    let mut bump = |level: Option<&Level>, item: String, view: usize, n: usize, length: f64| {
         let (order, name) = level.map_or((f64::INFINITY, NO_LEVEL.to_owned()), |l| (l.order, l.name.clone()));
-        counts.entry((name, item, view)).or_insert((order, 0)).1 += n;
+        let entry = counts.entry((name, item, view)).or_insert((order, 0, 0.0));
+        entry.1 += n;
+        entry.2 += length;
     };
     for (vi, v) in doc.views.iter().enumerate() {
         let id = v.id();
@@ -177,16 +207,21 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
             for r in runs {
                 let level = graph.runs.get(r.run).and_then(|run| level_of(curve_mid(&run.centreline)));
                 for layer in copy_layers(r) {
-                    bump(level, layer.to_owned(), vi, 1);
+                    bump(level, layer.to_owned(), vi, 1, 0.0);
+                }
+                if vertical.is_none() {
+                    for (layer, length) in band_lengths(r) {
+                        bump(level, layer.to_owned(), vi, 0, length);
+                    }
                 }
             }
         }
         // A placed detail: its own row, plus the members drawn inside it, at one level.
         let mut place = |item: String, n: usize, lines: &[AssemblyLine]| {
             let level = level_of(lines_mid(lines));
-            bump(level, item, vi, n);
+            bump(level, item, vi, n, 0.0);
             for (layer, c) in member_counts(lines, &members) {
-                bump(level, layer.to_owned(), vi, c);
+                bump(level, layer.to_owned(), vi, c, 0.0);
             }
         };
         if let Ok(corners) = corner_assembly(d, id) {
@@ -206,14 +241,18 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
             }
         }
     }
-    let mut rows: Vec<((f64, String, String, usize), usize)> =
-        counts.into_iter().filter(|(_, (_, n))| *n > 0).map(|((level, item, view), (order, n))| ((order, level, item, view), n)).collect();
+    let mut rows: Vec<((f64, String, String, usize), (usize, f64))> = counts
+        .into_iter()
+        .filter(|(_, (_, n, length))| *n > 0 || *length > 0.0)
+        .map(|((level, item, view), (order, n, length))| ((order, level, item, view), (n, length)))
+        .collect();
     rows.sort_by(|a, b| a.0.0.total_cmp(&b.0.0).then_with(|| a.0.1.cmp(&b.0.1)).then_with(|| a.0.2.cmp(&b.0.2)).then_with(|| a.0.3.cmp(&b.0.3)));
     rows.into_iter()
-        .map(|((_, level, item, view), count)| BomRow {
+        .map(|((_, level, item, view), (count, length_mm))| BomRow {
             level,
             item,
             count,
+            length_mm,
             view: doc.views.get(view).map(|v| v.name().to_owned()).unwrap_or_default(),
         })
         .collect()
@@ -243,8 +282,11 @@ pub(crate) fn schedule_table(title: &str, header: &[&str], col_widths: &[f64], r
 
 /// The BOM table with its top-left corner at `at` (paper mm).
 pub fn bom_table(rows: &[BomRow], at: Point2) -> Table {
-    let rows: Vec<Vec<String>> = rows.iter().map(|r| vec![r.level.clone(), r.item.clone(), r.count.to_string(), r.view.clone()]).collect();
-    schedule_table(BOM_TITLE, &["Level", "Item", "Count", "View"], &COL_WIDTHS, &rows, at)
+    let count = |n: usize| if n > 0 { n.to_string() } else { String::new() };
+    let length = |mm: f64| if mm > 0.0 { format!("{:.1} m", mm / 1000.0) } else { String::new() };
+    let rows: Vec<Vec<String>> =
+        rows.iter().map(|r| vec![r.level.clone(), r.item.clone(), count(r.count), length(r.length_mm), r.view.clone()]).collect();
+    schedule_table(BOM_TITLE, &["Level", "Item", "Count", "Length", "View"], &COL_WIDTHS, &rows, at)
 }
 
 /// Whether `e` is a table titled `title`.
@@ -362,7 +404,7 @@ pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({
         "layout": layout,
         "handle": format!("{:X}", handle.0),
-        "rows": rows.iter().map(|r| json!({ "level": r.level, "item": r.item, "count": r.count, "view": r.view })).collect::<Vec<_>>(),
+        "rows": rows.iter().map(|r| json!({ "level": r.level, "item": r.item, "count": r.count, "lengthMm": r.length_mm, "view": r.view })).collect::<Vec<_>>(),
         "message": message,
     }))
 }
@@ -397,7 +439,7 @@ pub(crate) fn bomtable_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::assembly::tests::{corner_detail, gap_room, line, room_with, undo_len, window_room, window_section};
+    use crate::assembly::tests::{corner_detail, d_room, gap_room, line, room_with, undo_len, window_room, window_section, without_assembly};
     use crate::schema::{read_document, write_document};
     use lamb_core::geometry::IDENTITY_TRANSFORM;
     use lamb_core::model::{Actor, authored_field};
@@ -464,6 +506,183 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    fn length_of(rows: &[BomRow], item: &str) -> f64 {
+        rows.iter().filter(|r| r.item == item).map(|r| r.length_mm).sum()
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    /// A 4000 x 3000 room, 200 thick, on `Level 1`, whose detail has a `SHEATHING` band drawn as two
+    /// face lines and `STUD` repeats.
+    fn sheathed_room() -> T<(Session, Id)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let detail = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": format!("{:X}", r.0), "kind": "exterior_face" }))?;
+        s.execute("layer.new", &json!({ "name": "SHEATHING", "current": true }))?;
+        line(&mut s, [0.0, 20.0], [1000.0, 20.0])?;
+        line(&mut s, [0.0, 32.0], [1000.0, 32.0])?;
+        s.execute("layer.new", &json!({ "name": "GYP", "current": true }))?;
+        line(&mut s, [0.0, 200.0], [1000.0, 200.0])?;
+        repeat_on(&mut s, detail, "STUD")?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
+        s.execute("pline", &json!({ "vertices": [[200, 200], [3800, 200], [3800, 2800], [200, 2800]], "closed": true }))?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 2000.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
+        without_assembly(&mut s)?;
+        let l1 = add_level(&mut s, "Level 1", 0.0)?;
+        place(&mut s, plan, l1)?;
+        Ok((s, plan))
+    }
+
+    #[test]
+    fn a_band_of_two_face_lines_runs_once_per_run_and_studs_still_count() -> R {
+        let (s, plan) = sheathed_room()?;
+        let d = s.doc()?;
+        let runs = assembly_lines(d, plan)?;
+        assert_eq!(runs.len(), 4);
+        // Each run lays the band as two face lines, between the inner corners.
+        let mut laid = 0.0;
+        for r in &runs {
+            let faces: Vec<f64> = r.lines[..r.bands].iter().filter(|l| l.layer == "SHEATHING").map(line_length).collect();
+            assert_eq!(faces.len(), 2, "{r:?}");
+            assert!(close(faces[0], faces[1]), "{faces:?}");
+            laid += faces[0];
+        }
+        assert!(close(laid, 2.0 * 3600.0 + 2.0 * 2600.0), "{laid}");
+        let rows = bom_rows(d);
+        assert!(
+            rows.contains(&BomRow { level: "Level 1".into(), item: "SHEATHING".into(), count: 0, length_mm: laid, view: "Ground".into() }),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&BomRow { level: "Level 1".into(), item: "STUD".into(), count: copies(d, plan)?, length_mm: 0.0, view: "Ground".into() }),
+            "{rows:?}"
+        );
+        let cells = bom_table(&rows, Point2 { x: 0.0, y: 0.0 }).cells;
+        let texts: Vec<Vec<&str>> = cells.iter().map(|r| r.iter().map(|c| c.text.as_str()).collect()).collect();
+        assert!(texts.contains(&vec!["Level 1", "SHEATHING", "", "12.4 m", "Ground"]), "{texts:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_layer_s_longest_line_in_a_run_counts_once_and_repeat_lines_add_none() {
+        let at =
+            |x1: f64, layer: &str| AssemblyLine { from: Point2 { x: 0.0, y: 0.0 }, to: Point2 { x: x1, y: 0.0 }, layer: layer.to_owned(), arc: None };
+        let r = RunAssembly {
+            run: 0,
+            detail: None,
+            // Two separate bands on A, and a repeat copy on A past `bands`.
+            lines: vec![at(100.0, "A"), at(300.0, "A"), at(200.0, "B"), at(900.0, "A")],
+            bands: 3,
+            copies: vec![1],
+            skipped: None,
+            conflict: None,
+            face: None,
+            hatches: Vec::new(),
+        };
+        assert_eq!(band_lengths(&r), HashMap::from([("A", 300.0), ("B", 200.0)]));
+    }
+
+    #[test]
+    fn an_arc_line_s_length_is_its_radius_times_its_sweep_either_way_round() {
+        let center = Point2 { x: 10.0, y: -5.0 };
+        let arc = |ccw: bool| AssemblyLine {
+            from: Point2 { x: 1010.0, y: -5.0 },
+            to: Point2 { x: 10.0, y: 995.0 },
+            layer: "A".to_owned(),
+            arc: Some(lamb_core::derivation::assembly::ArcSpan { center, radius: 1000.0, ccw }),
+        };
+        assert!(close(line_length(&arc(true)), 500.0 * std::f64::consts::PI));
+        assert!(close(line_length(&arc(false)), 1500.0 * std::f64::consts::PI));
+    }
+
+    #[test]
+    fn an_arc_run_s_band_reads_its_arc_length() -> R {
+        let (mut s, plan) = d_room()?;
+        let l1 = add_level(&mut s, "Level 1", 0.0)?;
+        place(&mut s, plan, l1)?;
+        let rows = bom_rows(s.doc()?);
+        // Three straight runs between the inner corners, and the half circle at each layer's outer radius.
+        let straight = 2800.0 + 2800.0 + 1800.0;
+        let half = std::f64::consts::PI;
+        assert!(close(length_of(&rows, "CLAD"), straight + half * 1120.0), "{rows:?}");
+        assert!(close(length_of(&rows, "GYP"), straight + half * 1050.0), "{rows:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_section_adds_no_length_and_keeps_its_counted_rows() -> R {
+        let (mut s, sec, _) = window_section(true)?;
+        add_level(&mut s, "Level 1", 0.0)?;
+        add_level(&mut s, "Level 2", 2000.0)?;
+        let d = s.doc()?;
+        let gyp = assembly_lines(d, sec)?.iter().flat_map(|r| r.lines[..r.bands].to_vec()).filter(|l| l.layer == "GYP").count();
+        assert!(gyp > 0, "the section lays GYP bands");
+        let rows = bom_rows(d);
+        assert!(!rows.iter().any(|r| r.item == "GYP"), "{rows:?}");
+        assert!(count_of(&rows, "STUD") > 0, "{rows:?}");
+        assert!(rows.iter().all(|r| r.length_mm == 0.0), "{rows:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_layer_with_a_band_has_its_count_and_length_on_one_row() -> R {
+        let (mut s, plan) = stud_room()?;
+        let detail = view_named(&s, "D1")?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.current", &json!({ "name": "STUD" }))?;
+        line(&mut s, [0.0, 30.0], [1000.0, 30.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let d = s.doc()?;
+        let rows = bom_rows(d);
+        let stud: Vec<&BomRow> = rows.iter().filter(|r| r.item == "STUD").collect();
+        assert_eq!(stud.len(), 1, "{rows:?}");
+        assert_eq!(stud[0].count, copies(d, plan)?);
+        assert!(close(stud[0].length_mm, 16400.0), "{rows:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn sheetset_brings_an_old_four_column_bom_up_to_the_length_column_once() -> R {
+        let (mut s, _) = sheathed_room()?;
+        s.execute("sheetset", &json!({}))?;
+        let old = |at: Point2| {
+            let row = vec!["Level 1".to_owned(), "STUD".to_owned(), "3".to_owned(), "Ground".to_owned()];
+            schedule_table(BOM_TITLE, &["Level", "Item", "Count", "View"], &[30.0, 45.0, 15.0, 45.0], &[row], at)
+        };
+        write_table(s.doc_mut()?, DEFAULT_LAYOUT, BOM_TITLE, Some(Point2 { x: 50.0, y: 100.0 }), &old)?;
+        let n = undo_len(&s)?;
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let t = boms(&s)?;
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Level", "Item", "Count", "Length", "View"]);
+        assert_eq!((t[0].insert.x, t[0].insert.y, t[0].col_widths.clone()), (50.0, 100.0, COL_WIDTHS.to_vec()), "it stays where it stood");
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "a rerun adds no undo step");
+        Ok(())
+    }
+
+    #[test]
+    fn bomtable_returns_each_row_s_length() -> R {
+        let (mut s, _) = sheathed_room()?;
+        let r = s.execute("bomtable", &json!({}))?;
+        let rows = r["rows"].as_array().ok_or("no rows")?;
+        let of = |item: &str| rows.iter().find(|r| r["item"] == item).map(|r| (r["count"].as_u64(), r["lengthMm"].as_f64()));
+        assert_eq!(of("SHEATHING"), Some((Some(0), Some(12400.0))), "{r}");
+        assert_eq!(of("STUD").and_then(|c| c.1), Some(0.0), "{r}");
+        Ok(())
+    }
+
     fn count_of(rows: &[BomRow], item: &str) -> usize {
         rows.iter().filter(|r| r.item == item).map(|r| r.count).sum()
     }
@@ -495,7 +714,8 @@ pub(crate) mod tests {
         let n = copies(d, plan)?;
         assert!(n > 10, "studs laid round the room: {n}");
         let rows = bom_rows(d);
-        assert_eq!(rows, [BomRow { level: "Level 1".into(), item: "STUD".into(), count: n, view: "Ground".into() }]);
+        let studs: Vec<&BomRow> = rows.iter().filter(|r| r.item == "STUD").collect();
+        assert_eq!(studs, [&BomRow { level: "Level 1".into(), item: "STUD".into(), count: n, length_mm: 0.0, view: "Ground".into() }]);
         Ok(())
     }
 
@@ -506,7 +726,10 @@ pub(crate) mod tests {
         place(&mut s, plan, l1)?;
         s.execute("detailtag", &json!({ "detailViewId": jd.0, "corner": true, "tip": {"x": 2000, "y": 100}, "bubble": {"x": 1500, "y": -400} }))?;
         let rows = bom_rows(s.doc()?);
-        assert!(rows.contains(&BomRow { level: "Level 1".into(), item: "JD (end)".into(), count: 2, view: "Ground".into() }), "{rows:?}");
+        assert!(
+            rows.contains(&BomRow { level: "Level 1".into(), item: "JD (end)".into(), count: 2, length_mm: 0.0, view: "Ground".into() }),
+            "{rows:?}"
+        );
         assert!(!rows.iter().any(|r| r.item.ends_with("(jamb)")), "{rows:?}");
         Ok(())
     }
@@ -519,11 +742,17 @@ pub(crate) mod tests {
         let bridges = opening_assembly(s.doc()?, plan)?.iter().filter(|o| !o.lines.is_empty()).count();
         assert_eq!(bridges, 1);
         let rows = bom_rows(s.doc()?);
-        assert!(rows.contains(&BomRow { level: "Level 1".into(), item: "JD (jamb)".into(), count: 2, view: "Ground".into() }), "{rows:?}");
+        assert!(
+            rows.contains(&BomRow { level: "Level 1".into(), item: "JD (jamb)".into(), count: 2, length_mm: 0.0, view: "Ground".into() }),
+            "{rows:?}"
+        );
         // One corner tag spreads to all four corners of the room.
         corner_detail(&mut s, plan, "exterior_face", false, (0.0, 4000.0))?;
         let rows = bom_rows(s.doc()?);
-        assert!(rows.contains(&BomRow { level: "Level 1".into(), item: "CD (corner)".into(), count: 4, view: "Ground".into() }), "{rows:?}");
+        assert!(
+            rows.contains(&BomRow { level: "Level 1".into(), item: "CD (corner)".into(), count: 4, length_mm: 0.0, view: "Ground".into() }),
+            "{rows:?}"
+        );
         Ok(())
     }
 
@@ -551,8 +780,12 @@ pub(crate) mod tests {
         }
         let n = copies(s.doc()?, plan)?;
         let rows = bom_rows(s.doc()?);
-        let got: Vec<(&str, &str, usize, &str)> = rows.iter().map(|r| (r.level.as_str(), r.item.as_str(), r.count, r.view.as_str())).collect();
+        let got: Vec<(&str, &str, usize, &str)> =
+            rows.iter().filter(|r| r.item == "STUD").map(|r| (r.level.as_str(), r.item.as_str(), r.count, r.view.as_str())).collect();
         assert_eq!(got, [("Level 1", "STUD", n, "Ground"), ("Level 2", "STUD", copies(s.doc()?, upper)?, "Upper")]);
+        let clad: Vec<(&str, f64, &str)> =
+            rows.iter().filter(|r| r.item == "CLAD").map(|r| (r.level.as_str(), r.length_mm, r.view.as_str())).collect();
+        assert_eq!(clad, [("Level 1", 16400.0, "Ground"), ("Level 2", 16400.0, "Upper")], "each level its own row");
         Ok(())
     }
 
@@ -567,7 +800,10 @@ pub(crate) mod tests {
         assert!(corner_assembly(d, plan)?.iter().all(|c| c.skipped.is_none()), "{:?}", corner_assembly(d, plan)?);
         let n = copies(d, plan)?;
         let rows = bom_rows(d);
-        assert!(rows.contains(&BomRow { level: "Level 1".into(), item: "STUD".into(), count: n + 2 * 4, view: "Ground".into() }), "{n}: {rows:?}");
+        assert!(
+            rows.contains(&BomRow { level: "Level 1".into(), item: "STUD".into(), count: n + 2 * 4, length_mm: 0.0, view: "Ground".into() }),
+            "{n}: {rows:?}"
+        );
         assert_eq!(count_of(&rows, "CD (corner)"), 4, "{rows:?}");
         Ok(())
     }
@@ -658,14 +894,15 @@ pub(crate) mod tests {
         let r = s.execute("bomtable", &json!({}))?;
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
         let studs = copies(s.doc()?, plan)?;
-        assert_eq!(r["message"], format!("Framing BOM on \"A601\": 1 rows, {studs} items."));
+        assert_eq!(r["message"], format!("Framing BOM on \"A601\": 3 rows, {studs} items."));
         let t = boms(&s)?;
         assert_eq!(t.len(), 1);
         let texts: Vec<Vec<&str>> = t[0].cells.iter().map(|r| r.iter().map(|c| c.text.as_str()).collect()).collect();
-        assert_eq!(texts[1], ["Level", "Item", "Count", "View"]);
-        assert_eq!(texts[2], ["Level 1", "STUD", studs.to_string().as_str(), "Ground"]);
+        assert_eq!(texts[1], ["Level", "Item", "Count", "Length", "View"]);
+        assert_eq!(texts[2], ["Level 1", "CLAD", "", "16.4 m", "Ground"]);
+        assert_eq!(texts[4], ["Level 1", "STUD", studs.to_string().as_str(), "", "Ground"]);
         assert_eq!((t[0].title, t[0].header, t[0].text_height, t[0].col_widths.clone()), (true, true, 2.5, COL_WIDTHS.to_vec()));
-        assert_eq!(t[0].row_heights, [7.0; 3]);
+        assert_eq!(t[0].row_heights, [7.0; 5]);
         let first = t[0].clone();
 
         // A second run at another point replaces it.
@@ -693,7 +930,7 @@ pub(crate) mod tests {
         assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("A601"));
         s.input(Input::Text("Sched".into()))?;
         assert!(s.doc()?.layout("Sched").is_some());
-        assert!(s.log.iter().any(|l| l.starts_with("Framing BOM on \"Sched\": 1 rows")), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l.starts_with("Framing BOM on \"Sched\": 3 rows")), "{:?}", s.log);
         Ok(())
     }
 }

@@ -1084,7 +1084,7 @@ mod tests {
         assert_eq!((list.insert.x, list.insert.y), (area.min.x, area.max.y), "the usable area's top-left");
         let bom = table(&s, "A601", "Framing BOM")?;
         assert_eq!((bom.insert.x, bom.insert.y), (area.min.x, area.max.y));
-        assert_eq!(body(&bom)[0][..2], ["Level 1".to_owned(), "STUD".to_owned()]);
+        assert!(body(&bom).iter().any(|r| r[..2] == ["Level 1".to_owned(), "STUD".to_owned()]), "{bom:?}");
 
         // An immediate re-run changes nothing and adds no undo step.
         let n = undo_len(&s)?;
@@ -1210,7 +1210,7 @@ mod tests {
         move_table(&mut s, "A601", 40.0, 10.0)?;
         let r = s.execute("sheetset", &json!({}))?;
         assert!(r["message"].as_str().is_some_and(|m| m.ends_with("; A601 Framing BOM runs off the sheet.")), "{r}");
-        assert_eq!(body(&table(&s, "A601", "Framing BOM")?).len(), 1, "written whole");
+        assert_eq!(body(&table(&s, "A601", "Framing BOM")?).len(), 3, "written whole");
         Ok(())
     }
 
