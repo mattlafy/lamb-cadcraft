@@ -9,6 +9,14 @@
 //! both jambs (a plan), one for a single end (a section's head or sill); a placed termination at a
 //! wall's free end is one `"<detail> (end)"` (LAMB T617).
 //!
+//! Members drawn inside a placed corner, opening or end count too (LAMB T638). A drawing's member
+//! layers are those naming a repeat copy in any view, or a repeat's first member in any detail, so
+//! a project whose only studs are in corners still counts. In a placement's `lines`, those on a
+//! member layer are grouped per layer into connected components, ends joining within
+//! `TOLERANCE.coincidence_mm` (a drawn rectangle is one, a lone line is one), and each component
+//! is one of the item named by its layer, added to the same row as the run copies. A plan's
+//! opening `lines` hold both jambs, so its components need no doubling.
+//!
 //! A plan's level is its placement's level; a floating plan is skipped. In a vertical view a run
 //! belongs to the level with the greatest floor elevation at or below its centreline's mid-point
 //! height (view-local y is absolute z), a corner or opening to the one below the mid-point of its
@@ -24,7 +32,7 @@
 //! layout titled `Framing BOM` is replaced; one undo step. Nothing to count is refused, nothing
 //! changed. Returns `{layout, handle, rows: [{level, item, count, view}], message}`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cadcraft_doc::{Common, Drawing, EntityKind, Layout, Space, Table, TableCell};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
@@ -39,11 +47,12 @@ use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id, Level, Placement};
 use serde_json::{Value, json};
 
-use crate::assembly::{assembly_lines, corner_assembly, end_assembly, opening_assembly};
+use crate::assembly::{RunAssembly, assembly_lines, corner_assembly, end_assembly, opening_assembly};
 use crate::commands::{bad, name_input, other, point_param};
 use crate::detailtags::graph_and_sides;
 use crate::project::DrawingProject;
-use crate::schema::read_document;
+use crate::repeats::detail_repeats;
+use crate::schema::{read_document, view_block_name};
 use crate::sheets::{sheet_page, usable_area};
 
 pub const BOM_TITLE: &str = "Framing BOM";
@@ -89,6 +98,48 @@ fn lines_mid(lines: &[AssemblyLine]) -> Point2 {
     Point2 { x: (xl + xh) / 2.0, y: (lo + hi) / 2.0 }
 }
 
+/// The layer each repeat copy of `r` is counted under: its first line's.
+fn copy_layers(r: &RunAssembly) -> impl Iterator<Item = &str> {
+    let mut at = r.bands;
+    r.copies.iter().filter_map(move |&n| {
+        let first = r.lines.get(at..at + n).and_then(|c| c.first());
+        at += n;
+        first.map(|l| l.layer.as_str())
+    })
+}
+
+/// The layers that hold framing members: those naming a repeat copy in `laid`, or a repeat's first
+/// member in a detail of `views`.
+fn member_layers(d: &Drawing, views: &[AnyView], laid: &[Option<Vec<RunAssembly>>]) -> HashSet<String> {
+    let mut layers: HashSet<String> = laid.iter().flatten().flatten().flat_map(copy_layers).map(str::to_owned).collect();
+    for v in views.iter().filter(|v| matches!(v, AnyView::Detail(_))) {
+        let Some(block) = d.block(&view_block_name(v.id())) else { continue };
+        for r in detail_repeats(d, v.id()).unwrap_or_default() {
+            let first = r.members.first().and_then(|h| block.entities.iter().find(|e| e.handle == *h));
+            layers.extend(first.map(|e| e.common.layer.clone()));
+        }
+    }
+    layers
+}
+
+/// How many connected components `lines` hold on each of the `members` layers.
+fn member_counts<'a>(lines: &'a [AssemblyLine], members: &HashSet<String>) -> HashMap<&'a str, usize> {
+    let near = |a: Point2, b: Point2| (a.x - b.x).hypot(a.y - b.y) <= TOLERANCE.coincidence_mm;
+    let touches = |a: &AssemblyLine, b: &AssemblyLine| a.layer == b.layer && [a.from, a.to].into_iter().any(|p| near(p, b.from) || near(p, b.to));
+    let mut counts = HashMap::new();
+    let mut rest: Vec<&AssemblyLine> = lines.iter().filter(|l| members.contains(&l.layer)).collect();
+    while let Some(seed) = rest.pop() {
+        *counts.entry(seed.layer.as_str()).or_insert(0) += 1;
+        let mut open = vec![seed];
+        while let Some(l) = open.pop() {
+            let (touching, others): (Vec<_>, Vec<_>) = std::mem::take(&mut rest).into_iter().partition(|o| touches(l, o));
+            open.extend(touching);
+            rest = others;
+        }
+    }
+    counts
+}
+
 /// Every framing count the assembly plans lay, per (level, item, view), sorted.
 pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
     let Ok(doc) = read_document(d) else { return Vec::new() };
@@ -97,6 +148,8 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
         let id = id.unwrap_or(Id(0));
         doc.views.iter().find(|v| v.id() == id).map_or_else(|| format!("detail {}", id.0), |v| v.name().to_owned())
     };
+    let laid: Vec<Option<Vec<RunAssembly>>> = doc.views.iter().map(|v| assembly_lines(d, v.id()).ok()).collect();
+    let members = member_layers(d, &doc.views, &laid);
     // (level order, level name, item, view index) → count.
     let mut counts: HashMap<(String, String, usize), (f64, usize)> = HashMap::new();
     let mut bump = |level: Option<&Level>, item: String, view: usize, n: usize| {
@@ -119,33 +172,37 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
             Some(vr) => level_at(levels, vertical_local_to_uz(vr, pt).z),
             None => fixed,
         };
-        if let Ok(runs) = assembly_lines(d, id) {
+        if let Some(runs) = laid.get(vi).and_then(Option::as_ref) {
             let (graph, _) = graph_and_sides(&p, id);
-            for r in &runs {
+            for r in runs {
                 let level = graph.runs.get(r.run).and_then(|run| level_of(curve_mid(&run.centreline)));
-                let mut at = r.bands;
-                for &n in &r.copies {
-                    if let Some(first) = r.lines.get(at..at + n).and_then(|c| c.first()) {
-                        bump(level, first.layer.clone(), vi, 1);
-                    }
-                    at += n;
+                for layer in copy_layers(r) {
+                    bump(level, layer.to_owned(), vi, 1);
                 }
             }
         }
+        // A placed detail: its own row, plus the members drawn inside it, at one level.
+        let mut place = |item: String, n: usize, lines: &[AssemblyLine]| {
+            let level = level_of(lines_mid(lines));
+            bump(level, item, vi, n);
+            for (layer, c) in member_counts(lines, &members) {
+                bump(level, layer.to_owned(), vi, c);
+            }
+        };
         if let Ok(corners) = corner_assembly(d, id) {
             for c in corners.iter().filter(|c| c.detail.is_some() && c.skipped.is_none() && !c.lines.is_empty()) {
-                bump(level_of(lines_mid(&c.lines)), format!("{} (corner)", detail_name(c.detail)), vi, 1);
+                place(format!("{} (corner)", detail_name(c.detail)), 1, &c.lines);
             }
         }
         if let Ok(openings) = opening_assembly(d, id) {
             for o in openings.iter().filter(|o| o.detail.is_some() && o.skipped.is_none() && !o.lines.is_empty()) {
                 let n = if o.end.is_none() { 2 } else { 1 };
-                bump(level_of(lines_mid(&o.lines)), format!("{} (jamb)", detail_name(o.detail)), vi, n);
+                place(format!("{} (jamb)", detail_name(o.detail)), n, &o.lines);
             }
         }
         if let Ok(ends) = end_assembly(d, id) {
             for e in ends.iter().filter(|e| e.detail.is_some() && e.skipped.is_none() && !e.lines.is_empty()) {
-                bump(level_of(lines_mid(&e.lines)), format!("{} (end)", detail_name(e.detail)), vi, 1);
+                place(format!("{} (end)", detail_name(e.detail)), 1, &e.lines);
             }
         }
     }
@@ -340,7 +397,7 @@ pub(crate) fn bomtable_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::assembly::tests::{corner_detail, gap_room, room_with, undo_len, window_room};
+    use crate::assembly::tests::{corner_detail, gap_room, line, room_with, undo_len, window_room, window_section};
     use crate::schema::{read_document, write_document};
     use lamb_core::geometry::IDENTITY_TRANSFORM;
     use lamb_core::model::{Actor, authored_field};
@@ -380,13 +437,39 @@ pub(crate) mod tests {
         let l1 = add_level(&mut s, "Level 1", 0.0)?;
         place(&mut s, plan, l1)?;
         let detail = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
-        s.execute("editview", &json!({ "viewId": detail.0 }))?;
-        s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
-        let stud = new_handle(&mut s, "pline", json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?;
-        let dim = new_handle(&mut s, "dimaligned", json!({ "p1": [100, 0], "p2": [500, 0], "at": [300, -300] }))?;
-        s.execute("repeat", &json!({ "dimension": dim, "handles": [stud] }))?;
+        repeat_on(&mut s, detail, "STUD")?;
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
         Ok((s, plan))
+    }
+
+    /// Adds to `detail` a 38-wide member on the new layer `layer`, repeated at 400.
+    fn repeat_on(s: &mut Session, detail: Id, layer: &str) -> R {
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.new", &json!({ "name": layer, "current": true }))?;
+        let stud = new_handle(s, "pline", json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?;
+        let dim = new_handle(s, "dimaligned", json!({ "p1": [100, 0], "p2": [500, 0], "at": [300, -300] }))?;
+        s.execute("repeat", &json!({ "dimension": dim, "handles": [stud] }))?;
+        Ok(())
+    }
+
+    /// Draws a rectangle of four lines on `layer` in `detail`, then returns to editing `back`.
+    fn draw_rect(s: &mut Session, detail: Id, layer: &str, (x0, y0): (f64, f64), (x1, y1): (f64, f64), back: Id) -> R {
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.current", &json!({ "name": layer }))?;
+        line(s, [x0, y0], [x1, y0])?;
+        line(s, [x1, y0], [x1, y1])?;
+        line(s, [x1, y1], [x0, y1])?;
+        line(s, [x0, y1], [x0, y0])?;
+        s.execute("editview", &json!({ "viewId": back.0 }))?;
+        Ok(())
+    }
+
+    fn count_of(rows: &[BomRow], item: &str) -> usize {
+        rows.iter().filter(|r| r.item == item).map(|r| r.count).sum()
+    }
+
+    fn view_named(s: &Session, name: &str) -> T<Id> {
+        Ok(read_document(s.doc()?)?.views.iter().find(|v| v.name() == name).ok_or("no such view")?.id())
     }
 
     /// Runs `cmd` and returns the hex handle of the one entity it added to the edited block.
@@ -471,6 +554,90 @@ pub(crate) mod tests {
         let got: Vec<(&str, &str, usize, &str)> = rows.iter().map(|r| (r.level.as_str(), r.item.as_str(), r.count, r.view.as_str())).collect();
         assert_eq!(got, [("Level 1", "STUD", n, "Ground"), ("Level 2", "STUD", copies(s.doc()?, upper)?, "Upper")]);
         Ok(())
+    }
+
+    #[test]
+    fn studs_drawn_in_a_corner_detail_count_with_the_run_copies() -> R {
+        let (mut s, plan) = stud_room()?;
+        // One corner tag spreads to all four corners of the room.
+        let cd = corner_detail(&mut s, plan, "exterior_face", false, (0.0, 0.0))?;
+        draw_rect(&mut s, cd, "STUD", (-100.0, 50.0), (-62.0, 140.0), plan)?;
+        draw_rect(&mut s, cd, "STUD", (-50.0, 50.0), (-12.0, 140.0), plan)?;
+        let d = s.doc()?;
+        assert!(corner_assembly(d, plan)?.iter().all(|c| c.skipped.is_none()), "{:?}", corner_assembly(d, plan)?);
+        let n = copies(d, plan)?;
+        let rows = bom_rows(d);
+        assert!(rows.contains(&BomRow { level: "Level 1".into(), item: "STUD".into(), count: n + 2 * 4, view: "Ground".into() }), "{n}: {rows:?}");
+        assert_eq!(count_of(&rows, "CD (corner)"), 4, "{rows:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_jamb_stud_counts_at_both_jambs_and_sheathing_lines_are_not_members() -> R {
+        let (mut s, plan) = window_room(false, true)?;
+        let l1 = add_level(&mut s, "Level 1", 0.0)?;
+        place(&mut s, plan, l1)?;
+        let (d1, jd) = (view_named(&s, "D1")?, view_named(&s, "JD")?);
+        repeat_on(&mut s, d1, "STUD")?;
+        draw_rect(&mut s, jd, "STUD", (-48.0, 50.0), (-10.0, 150.0), plan)?;
+        corner_detail(&mut s, plan, "exterior_face", false, (0.0, 4000.0))?;
+        let d = s.doc()?;
+        let n = copies(d, plan)?;
+        let rows = bom_rows(d);
+        assert_eq!(count_of(&rows, "STUD"), n + 2, "{n}: {rows:?}");
+        assert_eq!(count_of(&rows, "JD (jamb)"), 2, "{rows:?}");
+        assert_eq!(count_of(&rows, "CD (corner)"), 4, "{rows:?}");
+        for layer in ["CRN-A", "CRN-B", "JAMB", "GYP", "CLAD"] {
+            assert_eq!(count_of(&rows, layer), 0, "{layer}: {rows:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_section_s_head_detail_counts_its_joist_at_the_level_under_its_mid_point() -> R {
+        let (mut s, sec, _) = window_section(true)?;
+        add_level(&mut s, "Level 1", 0.0)?;
+        add_level(&mut s, "Level 2", 2000.0)?;
+        // JOIST is a member layer only through this detail's repeat: no view lays a copy of it.
+        let r = s.execute("newdetail", &json!({ "name": "R" }))?;
+        let repeated = Id(r["viewId"].as_u64().ok_or("no id")?);
+        repeat_on(&mut s, repeated, "JOIST")?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        let head = view_named(&s, "H")?;
+        let block = s.doc()?.block(&view_block_name(head)).ok_or("no H block")?;
+        let handle = block.entities.iter().find(|e| e.common.layer == "HEAD").ok_or("no HEAD line")?.handle;
+        s.doc_mut()?.modify_entity(handle, |e| e.common.layer = "JOIST".to_owned())?;
+        let rows = bom_rows(s.doc()?);
+        let got: Vec<(&str, usize)> = rows.iter().filter(|r| r.item == "JOIST").map(|r| (r.level.as_str(), r.count)).collect();
+        assert_eq!(got, [("Level 2", 1)], "{rows:?}");
+        assert_eq!(count_of(&rows, "H (jamb)"), 1, "{rows:?}");
+        assert_eq!(count_of(&rows, "SILL"), 0, "{rows:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn members_group_into_connected_components_per_layer() {
+        let at = |x0: f64, y0: f64, x1: f64, y1: f64, layer: &str| AssemblyLine {
+            from: Point2 { x: x0, y: y0 },
+            to: Point2 { x: x1, y: y1 },
+            layer: layer.to_owned(),
+            arc: None,
+        };
+        let members: HashSet<String> = ["A".to_owned(), "B".to_owned()].into();
+        let lines = [
+            // A chain joined out of order, its ends either way round.
+            at(0.0, 0.0, 10.0, 0.0, "A"),
+            at(20.0, 0.0, 30.0, 0.0, "A"),
+            at(20.0, 0.0, 10.0, 0.0, "A"),
+            // A lone line.
+            at(0.0, 50.0, 10.0, 50.0, "A"),
+            // Touches A's chain, but on another layer.
+            at(0.0, 0.0, 0.0, 9.0, "B"),
+            // Not a member layer.
+            at(0.0, 0.0, 0.0, -9.0, "C"),
+        ];
+        let got = member_counts(&lines, &members);
+        assert_eq!(got, HashMap::from([("A", 2), ("B", 1)]));
     }
 
     fn boms(s: &Session) -> T<Vec<Table>> {
