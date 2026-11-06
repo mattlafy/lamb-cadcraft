@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use cadcraft_doc::color::Color;
-use cadcraft_doc::{Attrib, AttribModes, Block, Common, Drawing, Entity, EntityKind, HAlign, Handle, Insert, Line, Space, Text, VAlign};
+use cadcraft_doc::{Attrib, AttribModes, Block, Common, Drawing, Entity, EntityKind, HAlign, Handle, Insert, Layout, Line, Space, Text, VAlign};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::Vec3;
 use cadcraft_render::Sheet;
@@ -213,6 +213,12 @@ fn named(e: &Entity) -> Option<(Option<Id>, Option<Id>)> {
     (data.view_id.is_some() || data.assembly_of.is_some()).then_some((data.view_id, data.assembly_of))
 }
 
+/// Whether `l` is a LAMB sheet: a viewport names a view or an assembly, or it is named a capital
+/// letter and three digits.
+pub(crate) fn is_lamb_sheet(l: &Layout) -> bool {
+    is_sheet_name(&l.name) || l.entities.iter().any(|e| named(e).is_some())
+}
+
 /// What a sheet is called in its title block: one view viewport gives the view's name; one assembly
 /// viewport `<view name> framing`; several viewports all showing details `Details`, otherwise
 /// `Views`; no viewports the title cell of the layout's first table, else the layout's name.
@@ -269,7 +275,7 @@ fn plan(d: &Drawing) -> std::result::Result<Vec<LayoutPlan>, String> {
     let mut out = Vec::new();
     for l in &d.layouts {
         let mut frames = l.entities.iter().filter(|e| frame_of(e).is_some());
-        let is_sheet = is_sheet_name(&l.name) || l.entities.iter().any(|e| named(e).is_some());
+        let is_sheet = is_lamb_sheet(l);
         let Some(sheet) = cadcraft_render::sheet(d, &l.name).filter(|_| is_sheet) else {
             let remove: Vec<Handle> = frames.map(|e| e.handle).collect();
             if !remove.is_empty() {
