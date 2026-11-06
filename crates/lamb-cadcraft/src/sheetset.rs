@@ -1,8 +1,11 @@
-//! SHEETSET (LAMB T627): the automatic first try at the whole drawing set. Every placed plan,
-//! elevation and section that no sheet shows yet gets a sheet of its own — plans `A101`, `A102`, …
-//! by level order (then document order), elevations `A201`, …, sections `A301`, … in document
-//! order — and the unplaced assigned details are packed onto detail sheets `A501`, …, exactly as
-//! DETAILSHEETS does ([`crate::detailsheets::lay_detail_sheets`]). Plan sheets
+//! SHEETSET (LAMB T627): the automatic first try at the whole drawing set. Every placed plan that
+//! no sheet shows yet gets a sheet of its own — `A101`, `A102`, … by level order, then document
+//! order. The drawn elevations and sections no sheet shows yet share new sheets, elevations `A201`,
+//! … and sections `A301`, …, packed in rows in document order ([`crate::sheets::pack_verticals`],
+//! LAMB T647), so each is numbered on its sheet in that order; an undrawn one has nothing to size a
+//! viewport from and gets a sheet of its own after them. A rerun's new views go on a new sheet and
+//! existing sheets are left alone. The unplaced assigned details are packed onto detail sheets
+//! `A501`, …, exactly as DETAILSHEETS does ([`crate::detailsheets::lay_detail_sheets`]). Plan sheets
 //! show the outline only: the walls as their details build them go on framing sheets `A401`, …
 //! (LAMB T635), one per placed view with an assembly block, plans in level order and then
 //! verticals in document order, each showing only that block. SHEETSET does not generate
@@ -73,7 +76,8 @@ use crate::project::DrawingProject;
 use crate::schedule::{self, OPENING_TITLE, refresh_opening_schedule};
 use crate::schema::{assembly_block_name, read_document, read_entity_data, view_block_name, write_document};
 use crate::sheets::{
-    DEFAULT_SHEET_PAPER, VPORT_LAYER, create_sheet, ensure_vport_layer, refit_viewport, sheet_paper_size, view_placed, view_sheet_ref, viewport_scale,
+    DEFAULT_SHEET_PAPER, VPORT_LAYER, create_packed_sheet, create_sheet, ensure_vport_layer, pack_verticals, refit_viewport, sheet_paper_size,
+    view_drawn, view_placed, view_sheet_ref, viewport_scale,
 };
 use crate::titleblock::sheet_title;
 use crate::vptitles::scale_label;
@@ -83,6 +87,8 @@ const ELEVATION_PREFIX: &str = "A2";
 const SECTION_PREFIX: &str = "A3";
 const FRAMING_PREFIX: &str = "A4";
 const DETAIL_PREFIX: &str = "A5";
+const ELEVATION_GROUP: &str = "elevation";
+const SECTION_GROUP: &str = "section";
 const FRAMING_GROUP: &str = "framing";
 const LIST_PREFIX: &str = "A0";
 const BOM_PREFIX: &str = "A6";
@@ -126,8 +132,8 @@ fn set_views(d: &Drawing) -> Result<Vec<(&'static str, &'static str, Vec<(Id, St
     let framing = plans.iter().chain(&verticals).filter(|(id, _)| d.block(&assembly_block_name(*id)).is_some()).cloned().collect();
     Ok(vec![
         ("plan", PLAN_PREFIX, plans),
-        ("elevation", ELEVATION_PREFIX, elevations),
-        ("section", SECTION_PREFIX, sections),
+        (ELEVATION_GROUP, ELEVATION_PREFIX, elevations),
+        (SECTION_GROUP, SECTION_PREFIX, sections),
         (FRAMING_GROUP, FRAMING_PREFIX, framing),
     ])
 }
@@ -336,6 +342,50 @@ fn refit_viewports(d: &mut Drawing) -> Result<(Vec<Value>, Vec<String>, Vec<Stri
     Ok((refit, labels, unplaced))
 }
 
+/// Lays every set view no sheet shows yet: a sheet each, but for the drawn elevations and sections,
+/// which share packed sheets. Adds each new sheet to `sheets` and `parts` and returns how many views
+/// were already on sheets.
+fn lay_views(d: &mut Drawing, sheets: &mut Vec<Value>, parts: &mut Vec<String>) -> Result<usize> {
+    let mut already = 0usize;
+    for (group, prefix, mut views) in set_views(d)? {
+        let framing = group == FRAMING_GROUP;
+        if group == ELEVATION_GROUP || group == SECTION_GROUP {
+            let (placed, todo): (Vec<_>, Vec<_>) = views.into_iter().partition(|(v, _)| view_sheet_ref(d, *v).is_some());
+            already += placed.len();
+            let (drawn, undrawn): (Vec<_>, Vec<_>) = todo.into_iter().partition(|(v, _)| view_drawn(d, *v));
+            let ids: Vec<Id> = drawn.iter().map(|(v, _)| *v).collect();
+            for packed in pack_verticals(d, &ids).map_err(other)? {
+                let layout = next_sheet_name(d, prefix);
+                create_packed_sheet(d, &layout, &packed).map_err(other)?;
+                let shown: Vec<Id> = packed.iter().map(|(v, _)| *v).collect();
+                parts.push(match shown.as_slice() {
+                    [one] => format!("{layout} {}", drawn.iter().find(|(v, _)| v == one).map_or("", |(_, name)| name.as_str())),
+                    many => format!("{layout} ({} views)", many.len()),
+                });
+                sheets.push(json!({ "layout": layout, "group": group, "viewIds": shown.iter().map(|v| v.0).collect::<Vec<_>>() }));
+            }
+            views = undrawn;
+        }
+        for (view, name) in views {
+            let on_sheet = if framing { assembly_on_sheet(d, view) } else { view_sheet_ref(d, view).is_some() };
+            if on_sheet {
+                already += 1;
+                continue;
+            }
+            let layout = next_sheet_name(d, prefix);
+            if framing {
+                create_sheet(d, &layout, &[], &[view]).map_err(other)?;
+                parts.push(format!("{layout} {name} framing"));
+            } else {
+                create_sheet(d, &layout, &[view], &[]).map_err(other)?;
+                parts.push(format!("{layout} {name}"));
+            }
+            sheets.push(json!({ "layout": layout, "group": group, "viewIds": [view.0] }));
+        }
+    }
+    Ok(already)
+}
+
 pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     let pdf = match p.get("pdf").filter(|v| !v.is_null()) {
         None => None,
@@ -347,26 +397,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     let weighted = stamp_lineweights(&mut d)?;
     let mut sheets: Vec<Value> = Vec::new();
     let mut parts: Vec<String> = Vec::new();
-    let mut already = 0usize;
-    for (group, prefix, views) in set_views(&d)? {
-        let framing = group == FRAMING_GROUP;
-        for (view, name) in views {
-            let on_sheet = if framing { assembly_on_sheet(&d, view) } else { view_sheet_ref(&d, view).is_some() };
-            if on_sheet {
-                already += 1;
-                continue;
-            }
-            let layout = next_sheet_name(&d, prefix);
-            if framing {
-                create_sheet(&mut d, &layout, &[], &[view]).map_err(other)?;
-                parts.push(format!("{layout} {name} framing"));
-            } else {
-                create_sheet(&mut d, &layout, &[view], &[]).map_err(other)?;
-                parts.push(format!("{layout} {name}"));
-            }
-            sheets.push(json!({ "layout": layout, "group": group, "viewIds": [view.0] }));
-        }
-    }
+    let mut already = lay_views(&mut d, &mut sheets, &mut parts)?;
     let (laid, placed_details) = lay_detail_sheets(&mut d, DETAIL_PREFIX, None).map_err(other)?;
     already += placed_details;
     for (layout, _, ids) in &laid {
@@ -507,6 +538,7 @@ pub(crate) fn sheetsize_machine(s: &Session) -> Result<Box<dyn Interactive>> {
 mod tests {
     use super::*;
     use crate::bom::tests::{new_handle, stud_room};
+    use crate::schema::annotation_block_name;
     use cadcraft_doc::EntityKind;
     use cadcraft_engine::cmd::file::{IoHooks, set_io};
 
@@ -1732,6 +1764,224 @@ mod tests {
             assert!(b.entities.iter().next().is_some(), "{name} has lines");
             assert!(b.entities.iter().all(|e| e.common.lineweight == Lineweight::ByLayer), "{name}");
         }
+        Ok(())
+    }
+
+    /// A project of `lambproject`'s plan alone, plus a vertical view per `(command, name, width,
+    /// height)`, each drawn as a rectangle of that size (`width` 0: undrawn). Returns (session, plan,
+    /// the views).
+    fn drawn_verticals(views: &[(&str, &str, f64, f64)]) -> T<(Session, Id, Vec<Id>)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        crate::maintain::install(&mut s);
+        let plan = id(&s.execute("lambproject", &json!({}))?)?;
+        let mut ids = Vec::new();
+        for (k, (command, name, w, h)) in views.iter().enumerate() {
+            ids.push(add_vertical(&mut s, plan, command, name, 6000.0 + 500.0 * k as f64, *w, *h)?);
+        }
+        Ok((s, plan, ids))
+    }
+
+    /// One vertical view on `plan` with its cut at `y`, drawn as a `w` × `h` rectangle unless `w` is 0.
+    fn add_vertical(s: &mut Session, plan: Id, command: &str, name: &str, y: f64, w: f64, h: f64) -> T<Id> {
+        let v = id(&s.execute(command, &json!({ "name": name, "hostViewId": plan.0, "cutFrom": {"x": 0, "y": y}, "cutTo": {"x": 5000, "y": y} }))?)?;
+        if w > 0.0 {
+            s.execute("editview", &json!({ "viewId": v.0 }))?;
+            s.execute("pline", &json!({ "vertices": [[0, 0], [w, 0], [w, h], [0, h]], "closed": true }))?;
+            s.execute("editview", &json!({}))?;
+        }
+        Ok(v)
+    }
+
+    /// Layout `name`'s sheet viewports with the view each names, in numbering order.
+    fn sheet_viewports(s: &Session, name: &str) -> T<Vec<(Id, cadcraft_doc::Viewport)>> {
+        let l = s.doc()?.layout(name).ok_or("no layout")?;
+        let mut out: Vec<(Id, cadcraft_doc::Viewport)> = l
+            .entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Viewport(vp) if vp.id > 1 => Some((read_entity_data(&e.common).ok()?.view_id?, vp.clone())),
+                _ => None,
+            })
+            .collect();
+        out.sort_by_key(|(_, vp)| vp.id);
+        Ok(out)
+    }
+
+    /// Whether `vp`'s window holds `view`'s extents and its annotation's.
+    fn shows_all_of(s: &Session, view: Id, vp: &cadcraft_doc::Viewport) -> T<bool> {
+        let d = s.doc()?;
+        let (hw, hh) = (vp.width * viewport_scale(vp) / 2.0, vp.view_height / 2.0);
+        let c = vp.view_center;
+        let blocks = [view_block_name(view), annotation_block_name(view)];
+        Ok(blocks.into_iter().map(|b| d.extents(&Space::Block(b))).all(|b| {
+            b.is_empty() || (b.min.x >= c.x - hw - 1e-6 && b.max.x <= c.x + hw + 1e-6 && b.min.y >= c.y - hh - 1e-6 && b.max.y <= c.y + hh + 1e-6)
+        }))
+    }
+
+    /// Each viewport of `layout` and its title clear of the others and inside the usable area.
+    fn assert_packed(s: &Session, layout: &str) -> R {
+        let d = s.doc()?;
+        let area = crate::sheets::usable_area(&cadcraft_render::sheet(d, layout).ok_or("no sheet")?);
+        const TITLE: f64 = 15.0;
+        let claims: Vec<(f64, f64, f64, f64)> = sheet_viewports(s, layout)?
+            .iter()
+            .map(|(_, vp)| {
+                (vp.center.x - vp.width / 2.0, vp.center.y - vp.height / 2.0 - TITLE, vp.center.x + vp.width / 2.0, vp.center.y + vp.height / 2.0)
+            })
+            .collect();
+        for (i, a) in claims.iter().enumerate() {
+            assert!(a.0 >= area.min.x - 1e-6 && a.1 >= area.min.y - 1e-6 && a.2 <= area.max.x + 1e-6 && a.3 <= area.max.y + 1e-6, "{layout}: {a:?}");
+            for b in &claims[i + 1..] {
+                assert!(a.2 <= b.0 || b.2 <= a.0 || a.3 <= b.1 || b.3 <= a.1, "{layout}: {a:?} and {b:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The text values in `view`'s annotation block.
+    fn annotation_texts(s: &Session, view: Id) -> T<Vec<String>> {
+        let b = s.doc()?.block(&annotation_block_name(view)).ok_or("no annotation block")?;
+        Ok(b.entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Text(t) => Some(t.value.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    const ELEV: &str = "newelevationline";
+    const SECT: &str = "newsectionline";
+    const FOUR: [(&str, &str, f64, f64); 4] =
+        [(ELEV, "North", 5000.0, 3000.0), (ELEV, "East", 5000.0, 3000.0), (ELEV, "South", 5000.0, 3000.0), (ELEV, "West", 5000.0, 3000.0)];
+
+    #[test]
+    fn four_elevations_share_a_sheet_numbered_in_document_order() -> R {
+        let (mut s, plan, ids) = drawn_verticals(&FOUR)?;
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let elevations: Vec<_> = laid(&r).into_iter().filter(|(_, g, _)| g == "elevation").collect();
+        assert_eq!(elevations, [("A201".to_owned(), "elevation".to_owned(), ids.iter().map(|v| v.0).collect())], "{r}");
+        assert!(r["message"].as_str().unwrap_or_default().contains("A201 (4 views)"), "{r}");
+        assert!(s.doc()?.layout("A202").is_none());
+
+        let vps = sheet_viewports(&s, "A201")?;
+        assert_eq!(vps.iter().map(|(v, _)| *v).collect::<Vec<_>>(), ids);
+        assert_packed(&s, "A201")?;
+        let mut titles = sheet_titles(&s, "A201")?;
+        titles.sort();
+        let cut = annotation_texts(&s, plan)?;
+        for (k, ((view, vp), name)) in vps.iter().zip(["North", "East", "South", "West"]).enumerate() {
+            let num = k + 1;
+            assert_eq!(viewport_scale(vp), 50.0, "the plot scale on ARCH D");
+            assert!(shows_all_of(&s, *view, vp)?, "{view:?} in {vp:?}");
+            assert_eq!(view_sheet_ref(s.doc()?, *view), Some((num, "A201".to_owned())));
+            assert_eq!(titles[k], (num.to_string(), name.to_owned(), "1:50".to_owned()), "{titles:?}");
+            let reference = format!("{num}/A201");
+            assert!(cut.windows(2).any(|w| w[0] == name && w[1] == reference), "{name} {reference} in {cut:?}");
+        }
+
+        // A rerun adds nothing, refits nothing and takes no undo step.
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "no undo step");
+        assert_eq!(r["alreadyOnSheets"], 5, "the plan and the four: {r}");
+        assert_eq!(r["sheets"], json!([]), "{r}");
+        assert_eq!(r["refit"], json!([]), "{r}");
+
+        s.undo()?;
+        assert!(s.doc()?.layout("A201").is_none() && s.doc()?.layout("A101").is_none(), "one undo removes the run");
+        Ok(())
+    }
+
+    #[test]
+    fn sections_overflow_in_order_and_a_long_one_takes_its_own_scale() -> R {
+        // 250 × 200 on paper before the annotation's room: more than one sheet holds.
+        let many: Vec<String> = (1..=7).map(|k| format!("S{k}")).collect();
+        let spec: Vec<(&str, &str, f64, f64)> = many.iter().map(|n| (SECT, n.as_str(), 10_000.0, 8000.0)).collect();
+        let (mut s, _, ids) = drawn_verticals(&spec)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        let sections: Vec<_> = laid(&r).into_iter().filter(|(_, g, _)| g == "section").collect();
+        assert_eq!(sections.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["A301", "A302"], "{r}");
+        let order: Vec<u64> = sections.iter().flat_map(|x| x.2.iter().copied()).collect();
+        assert_eq!(order, ids.iter().map(|v| v.0).collect::<Vec<_>>(), "in document order: {r}");
+        let first = sections[0].2.len();
+        assert!(first > 1 && first < ids.len(), "{r}");
+        let message = r["message"].as_str().unwrap_or_default();
+        assert!(message.contains(&format!("A301 ({first} views), A302 ")), "{message}");
+        for layout in ["A301", "A302"] {
+            assert_packed(&s, layout)?;
+        }
+        assert_eq!(view_sheet_ref(s.doc()?, ids[first]), Some((1, "A302".to_owned())));
+
+        let (mut s, _, ids) =
+            drawn_verticals(&[(SECT, "Short", 5000.0, 3000.0), (SECT, "Long", 100_000.0, 3000.0), (SECT, "Also short", 5000.0, 3000.0)])?;
+        let r = s.execute("sheetset", &json!({}))?;
+        let vps = sheet_viewports(&s, "A301")?;
+        assert_eq!(vps.iter().map(|(v, vp)| (*v, viewport_scale(vp))).collect::<Vec<_>>(), [(ids[0], 50.0), (ids[1], 200.0), (ids[2], 50.0)], "{r}");
+        assert_packed(&s, "A301")?;
+        for (view, vp) in &vps {
+            assert!(shows_all_of(&s, *view, vp)?, "{view:?} in {vp:?}");
+        }
+        let long = sheet_titles(&s, "A301")?.into_iter().find(|t| t.1 == "Long").ok_or("no title")?;
+        assert_eq!(long.2, "1:200", "the title has its own scale from the first run");
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(r["refit"], json!([]), "{r}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_later_elevation_gets_a_new_sheet_and_an_empty_section_its_own() -> R {
+        let (mut s, plan, ids) = drawn_verticals(&[
+            (ELEV, "North", 5000.0, 3000.0),
+            (ELEV, "East", 5000.0, 3000.0),
+            (SECT, "Drawn", 5000.0, 3000.0),
+            (SECT, "Empty", 0.0, 0.0),
+        ])?;
+        let r = s.execute("sheetset", &json!({}))?;
+        let sections: Vec<_> = laid(&r).into_iter().filter(|(_, g, _)| g == "section").map(|(l, _, v)| (l, v)).collect();
+        assert_eq!(sections, [("A301".to_owned(), vec![ids[2].0]), ("A302".to_owned(), vec![ids[3].0])], "{r}");
+        assert!(r["message"].as_str().unwrap_or_default().contains("A301 Drawn, A302 Empty"), "{r}");
+        // An undrawn view keeps create_sheet's viewport, with room for what is drawn later.
+        let area = crate::sheets::usable_area(&cadcraft_render::sheet(s.doc()?, "A302").ok_or("no sheet")?);
+        let (vp, _) = only_viewport(&s, "A302")?;
+        assert!((vp.width - area.width() * 0.9).abs() < 1e-6 && (vp.height - area.height() * 0.9).abs() < 1e-6, "{vp:?}");
+
+        let held = sheet_viewports(&s, "A201")?;
+        let later = add_vertical(&mut s, plan, ELEV, "South", 9000.0, 5000.0, 3000.0)?;
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let new: Vec<_> = laid(&r).into_iter().filter(|(_, g, _)| g == "elevation").map(|(l, _, v)| (l, v)).collect();
+        assert_eq!(new, [("A202".to_owned(), vec![later.0])], "{r}");
+        assert_eq!(r["alreadyOnSheets"], 5, "the plan, two elevations, two sections: {r}");
+        assert!(r["message"].as_str().unwrap_or_default().contains("A202 South"), "{r}");
+        let now = sheet_viewports(&s, "A201")?;
+        assert_eq!(now.len(), held.len());
+        for ((_, a), (_, b)) in held.iter().zip(&now) {
+            assert_eq!((a.center, a.width, a.height, a.view_center, a.view_height), (b.center, b.width, b.height, b.view_center, b.view_height));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_packed_sets_pdf_has_a_page_per_sheet() -> R {
+        set_io(IoHooks {
+            read: |b, n| cadcraft_io::read(b, n).map_err(|e| e.to_string()),
+            write: |d, n| cadcraft_io::write(d, n).map_err(|e| e.to_string()),
+            plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+        });
+        let (mut s, _, _) = drawn_verticals(&FOUR)?;
+        let dir = std::env::temp_dir().join(format!("lamb-sheetset-packed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("set.pdf");
+        let r = s.execute("sheetset", &json!({ "pdf": path.to_string_lossy() }))?;
+        assert_eq!(set_sheets(s.doc()?), ["A001", "A101", "A201"], "{r}");
+        assert_eq!(r["pdf"]["pages"], 3, "{r}");
+        assert_eq!(craft_pdf::open_slice(&std::fs::read(&path)?, None).map_err(|e| format!("{e:?}"))?.pages().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 

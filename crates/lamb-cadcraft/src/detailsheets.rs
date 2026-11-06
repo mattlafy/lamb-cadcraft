@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use crate::commands::{bad, name_input, other};
 use crate::detailtags::{resolve_view_details, resolve_view_opening_ends, resolve_view_openings};
 use crate::schema::read_document;
-use crate::sheets::{SheetError, create_detail_sheet, pack_details, view_sheet_ref};
+use crate::sheets::{SheetError, create_packed_sheet, pack_details, view_sheet_ref};
 
 const DEFAULT_PREFIX: &str = "A5";
 
@@ -69,7 +69,7 @@ pub(crate) fn lay_detail_sheets(d: &mut Drawing, prefix: &str, per: Option<usize
     let mut sheets = Vec::new();
     for packed in pack_details(d, &todo, per)? {
         let name = next_sheet_name(d, prefix);
-        let handles = create_detail_sheet(d, &name, &packed)?;
+        let handles = create_packed_sheet(d, &name, &packed)?;
         sheets.push((name, handles, packed.iter().map(|(id, _)| *id).collect()));
     }
     Ok((sheets, placed.len()))

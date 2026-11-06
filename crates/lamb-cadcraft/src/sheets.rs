@@ -28,12 +28,20 @@
 //! block counts in paper mm and the view is centred so the overhang is inside. An assembly viewport
 //! and a detail take none, since the annotation's layer is frozen there or the view has none.
 //!
-//! Detail sheets (LAMB T637) are packed instead ([`pack_details`], [`create_detail_sheet`]): each
+//! Detail sheets (LAMB T637) are packed instead ([`pack_details`], [`create_packed_sheet`]): each
 //! detail takes the Detail rule's scale against the whole [`usable_area`] less [`TITLE_ROOM_MM`],
 //! and a viewport of its grown extents at that scale, at least [`MIN_VP_WIDTH_MM`] wide and
 //! [`MIN_VP_HEIGHT_MM`] tall. Viewports fill rows from the top left in the given order, tops
 //! aligned, [`GAP_X_MM`] apart; the next row starts [`GAP_Y_MM`] below the row's tallest, and a row
 //! leaving less than [`TITLE_ROOM_MM`] above the bottom of the area starts a new sheet.
+//!
+//! Elevations and sections pack the same way (LAMB T647, [`pack_verticals`]), under the Plan rule:
+//! each takes `plot_scale` when it and its annotation fit the whole area less [`TITLE_ROOM_MM`], else
+//! the next larger standard denominator that fits, on its own. Its viewport is the extents at that
+//! scale plus the annotation's overhang, grown by [`VERTICAL_ROOM`] so it can grow before
+//! [`refit_viewport`] takes a larger scale, at least [`MIN_VP_WIDTH_MM`] wide and [`MIN_VP_HEIGHT_MM`]
+//! tall and at most the area. An undrawn view ([`view_drawn`]) has no size to pack: it keeps a sheet
+//! of its own through [`create_sheet`], whose viewport has room for what is drawn later.
 //!
 //! A sheet plots as a drawing (LAMB T645): its viewports sit on the no-plot [`VPORT_LAYER`], so a
 //! border shows on screen and not on paper while the contents still plot, and its page setup
@@ -391,6 +399,8 @@ const GAP_Y_MM: f64 = 25.0;
 const TITLE_ROOM_MM: f64 = 15.0;
 /// An empty detail is laid out as a square of this side, mm.
 const EMPTY_DETAIL_MM: f64 = 500.0;
+/// A packed vertical view's viewport over what it shows now.
+const VERTICAL_ROOM: f64 = 1.25;
 
 /// One viewport's place on paper and what it shows.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -486,6 +496,54 @@ pub(crate) fn pack_details(d: &Drawing, views: &[Id], per: Option<usize>) -> Res
         .collect())
 }
 
+/// Whether `view`'s block has finite extents to lay out.
+pub(crate) fn view_drawn(d: &Drawing, view: Id) -> bool {
+    let ext = d.extents(&Space::Block(view_block_name(view)));
+    !ext.is_empty() && ext.width().is_finite() && ext.height().is_finite()
+}
+
+/// `(1:n, width, height)` of the viewport a vertical view with extents `ext` and annotation `over`
+/// takes in `area`.
+fn vertical_viewport(ext: &Bounds2, over: Overhang, plot_scale: f64, area: &Bounds2) -> (f64, f64, f64) {
+    let (ox, oy) = (over.left + over.right, over.bottom + over.top);
+    let room = area.height() - TITLE_ROOM_MM;
+    let n = scale_for(ext, ScaleRule::Plan, plot_scale, area.width() - ox, room - oy);
+    let size = |model: f64, overhang: f64, min: f64, max: f64| ((model / n + overhang) * VERTICAL_ROOM).max(min).min(max);
+    (n, size(ext.width(), ox, MIN_VP_WIDTH_MM, area.width()), size(ext.height(), oy, MIN_VP_HEIGHT_MM, room))
+}
+
+/// Packs drawn elevations and sections `views`, in order, onto as many new sheets of the project's
+/// paper as they need. An undrawn view is not for packing: see [`view_drawn`].
+pub(crate) fn pack_verticals(d: &Drawing, views: &[Id]) -> Result<Vec<Vec<(Id, Packed)>>, SheetError> {
+    let doc = read_document(d)?;
+    let area = usable_area(&Sheet::from_page(&sheet_page(&doc), 1.0));
+    let plot_scale = doc.defaults.plot_scale;
+    let sized: Vec<(Id, f64, f64, Vec2, f64)> = views
+        .iter()
+        .map(|v| {
+            let block = view_block_name(*v);
+            let over = annotation_overhang(d, &doc, *v, ScaleRule::Plan);
+            let (_, w, h) = vertical_viewport(&d.extents(&Space::Block(block.clone())), over, plot_scale, &area);
+            let (view_center, view_height) = scaled_zoom(d, &block, ScaleRule::Plan, plot_scale, w, h, over);
+            (*v, w, h, view_center, view_height)
+        })
+        .collect();
+    let sizes: Vec<(f64, f64)> = sized.iter().map(|(_, w, h, _, _)| (*w, *h)).collect();
+    let mut rest = sized.iter();
+    Ok(pack_rows(&sizes, &area, None)
+        .into_iter()
+        .map(|centers| {
+            centers
+                .into_iter()
+                .zip(rest.by_ref())
+                .map(|(center, (v, w, h, view_center, view_height))| {
+                    (*v, Packed { center, width: *w, height: *h, view_center: *view_center, view_height: *view_height })
+                })
+                .collect()
+        })
+        .collect())
+}
+
 /// The id after every viewport's in `d`, overall ones included.
 fn next_viewport_id(d: &Drawing) -> u32 {
     d.layouts
@@ -530,7 +588,7 @@ fn add_viewports(d: &mut Drawing, name: &str, viewports: Vec<(Common, Viewport)>
 /// Creates layout `name` with one viewport per placed view, in that order, each freezing every
 /// other LAMB view's layer and every assembly layer. Returns the viewports' handles. Nothing is
 /// changed on error.
-pub(crate) fn create_detail_sheet(d: &mut Drawing, name: &str, placed: &[(Id, Packed)]) -> Result<Vec<Handle>, SheetError> {
+pub(crate) fn create_packed_sheet(d: &mut Drawing, name: &str, placed: &[(Id, Packed)]) -> Result<Vec<Handle>, SheetError> {
     let doc = read_document(d)?;
     if d.layout(name).is_some() {
         return Err(SheetError::LayoutExists(name.to_owned()));
@@ -1044,6 +1102,27 @@ mod tests {
         let (n, _, h) = detail_viewport(&b(100.0, 2600.0), &area);
         assert_eq!(n, 10.0);
         assert!(h + TITLE_ROOM_MM <= area.height(), "{h}");
+    }
+
+    #[test]
+    fn a_vertical_viewport_has_room_to_grow_and_keeps_its_scale_inside_the_area() {
+        let area = Bounds2::new(Vec2::new(15.0, 15.0), Vec2::new(829.0, 594.6));
+        let b = |w: f64, h: f64| Bounds2::new(Vec2::new(0.0, 0.0), Vec2::new(w, h));
+        let none = Overhang::default();
+        assert_eq!(vertical_viewport(&b(5000.0, 3000.0), none, 50.0, &area), (50.0, 125.0, 75.0), "the extents at 1:50, over again by a quarter");
+        assert_eq!(vertical_viewport(&b(1000.0, 200.0), none, 50.0, &area), (50.0, MIN_VP_WIDTH_MM, MIN_VP_HEIGHT_MM));
+        let over = Overhang { left: 2.0, right: 18.0, bottom: 4.0, top: 6.0 };
+        assert_eq!(vertical_viewport(&b(5000.0, 3000.0), over, 50.0, &area), (50.0, 150.0, 87.5), "the overhang is on paper");
+        // A view too long for the sheet at the plot scale takes the next that fits.
+        assert_eq!(vertical_viewport(&b(100_000.0, 3000.0), none, 50.0, &area).0, 200.0);
+        // The overhang counts in choosing the scale: this fits 1:50 alone, not with it.
+        let wide = b(35_000.0, 3000.0);
+        assert_eq!(vertical_viewport(&wide, none, 50.0, &area).0, 50.0);
+        assert_eq!(vertical_viewport(&wide, Overhang { right: 60.0, ..none }, 50.0, &area).0, 100.0);
+        // Nearly the area: the room is capped at it, and the same scale still fits the capped size.
+        let (n, w, h) = vertical_viewport(&b(36_000.0, 25_000.0), none, 50.0, &area);
+        assert_eq!((n, w, h), (50.0, area.width(), area.height() - TITLE_ROOM_MM));
+        assert_eq!(scale_for(&b(36_000.0, 25_000.0), ScaleRule::Plan, 50.0, w, h), n);
     }
 
     /// Plots layout `sheet` and returns, per optional content group (by layer name) whose marked
