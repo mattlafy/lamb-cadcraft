@@ -131,6 +131,12 @@ const OUTSIDE_POINT: IconDef =
 const DETAIL_TAGS: IconDef =
     &[a(Circle(7.0, 7.0, 4.0)), b(Line(&[(13.0, 7.0), (21.0, 7.0)])), a(Circle(7.0, 17.0, 4.0)), b(Line(&[(13.0, 17.0), (21.0, 17.0)]))];
 
+const DIMENSION_PLAN: IconDef = &[
+    b(Loop(&[(5.0, 2.0), (22.0, 2.0), (22.0, 16.0), (5.0, 16.0)])),
+    a(Line(&[(5.0, 21.0), (22.0, 21.0)])),
+    a(Line(&[(5.0, 18.5), (5.0, 23.5)])),
+    a(Line(&[(22.0, 18.5), (22.0, 23.5)])),
+];
 // Assembly.
 const ASSEMBLY_PLAN: IconDef = &[
     b(Loop(&[(2.0, 8.0), (22.0, 8.0), (22.0, 16.0), (2.0, 16.0)])),
@@ -293,6 +299,7 @@ pub const LAMB_TAB: ExtTab = ExtTab {
                 tool(NEW_SHEET, "newsheet", "New Sheet"),
                 tool(DETAIL_SHEETS, "detailsheets", "Detail Sheets"),
                 tool(SHEET_SET, "sheetset", "Sheet Set"),
+                tool(DIMENSION_PLAN, "autodim", "Dimension Plan"),
                 tool(TITLE_BLOCK, "titleblock", "Title Block"),
                 tool(FRAMING_BOM, "bomtable", "Framing BOM"),
             ],

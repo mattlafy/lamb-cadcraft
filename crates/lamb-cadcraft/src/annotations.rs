@@ -5,7 +5,8 @@
 //! placed section or elevation gets a plotted level line for each LEVEL (LAMB T473): a LINE at the
 //! level's projected floor elevation spanning the view block's extents ±[`LEVEL_OVERRUN_MM`], and
 //! `"<name> <±elev>"` left-aligned past its right end, plus a vertical floor-to-floor dimension per
-//! pair of consecutive levels by elevation (LAMB T500). Plan cut elevations stay overlay-only.
+//! pair of consecutive levels by elevation (LAMB T500). Plan cut elevations stay overlay-only. A
+//! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641).
 //!
 //! The annotation lives in its own block per view, [`annotation_block_name`]`(view)`, never in the
 //! view block, so derivation, the wall graph, links and LAMBSAVE never see them. The block's one
@@ -67,10 +68,9 @@ enum Item {
     Text(Vec3, String, f64),
     /// A level label and its height: left-aligned.
     Label(Vec3, String, f64),
-    /// A floor-to-floor dimension at a view scale: vertical rotated-linear, measuring from the lower
-    /// to the upper level line's right end, its dimension line [`LEVEL_DIM_OFFSET_MM`] (at that
-    /// scale) further right, its DIMSCALE that scale.
-    Dim(Vec3, Vec3, f64),
+    /// A rotated-linear dimension: its two measured points, its rotation in radians, a point on its
+    /// dimension line, and the view scale that is its DIMSCALE.
+    Dim(Vec3, Vec3, f64, Vec3, f64),
 }
 
 /// What a length constant is multiplied by at 1:`scale`.
@@ -121,6 +121,10 @@ fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>) -> Resul
             }
         }
     }
+    if dp.document().auto_dim_plans.contains(&plan) {
+        let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
+        out.extend(crate::autodim::strings(&dp, plan, f).into_iter().map(|d| Item::Dim(at(d.a), at(d.b), d.rotation, at(d.line_at), scale)));
+    }
     Ok(out)
 }
 
@@ -155,7 +159,8 @@ fn level_lines(d: &Drawing, dp: &DrawingProject, id: Id, scale: f64) -> Vec<Item
     zs.sort_by(f64::total_cmp);
     for w in zs.windows(2) {
         if w[1] - w[0] > TOLERANCE.coincidence_mm {
-            out.push(Item::Dim(v(x1, y_of(w[0])), v(x1, y_of(w[1])), scale));
+            let (a, b) = (v(x1, y_of(w[0])), v(x1, y_of(w[1])));
+            out.push(Item::Dim(a, b, std::f64::consts::FRAC_PI_2, dim_line_pt(b, scale), scale));
         }
     }
     out
@@ -181,25 +186,26 @@ fn entity_of(i: &Item) -> EntityKind {
         Item::Line(a, b) => EntityKind::Line(Line { a: *a, b: *b }),
         Item::Text(at, s, h) => EntityKind::Text(text(*at, s, *h, HAlign::Center)),
         Item::Label(at, s, h) => EntityKind::Text(text(*at, s, *h, HAlign::Left)),
-        Item::Dim(a, b, scale) => EntityKind::Dimension(level_dim(*a, *b, *scale)),
+        Item::Dim(a, b, rotation, line_at, scale) => EntityKind::Dimension(rotated_dim(*a, *b, *rotation, *line_at, *scale)),
     }
 }
 
-/// Where a floor-to-floor dimension's line passes at 1:`scale`: level with `b`,
+/// Where a floor-to-floor dimension's line, vertical from the lower to the upper level line's right
+/// end, passes at 1:`scale`: level with `b`,
 /// [`LEVEL_DIM_OFFSET_MM`] right.
 fn dim_line_pt(b: Vec3, scale: f64) -> Vec3 {
     v(b.x + LEVEL_DIM_OFFSET_MM * k(scale), b.y)
 }
 
-/// A vertical (rotation π/2) linear dimension from `a` to `b` at 1:`scale`, as DIMLINEAR draws one:
-/// `defpt` on the dimension line, measured text, style `Standard` with DIMSCALE overridden to
-/// `scale`, never associative.
-fn level_dim(a: Vec3, b: Vec3, scale: f64) -> Dimension {
+/// A linear dimension from `a` to `b` at `rotation` and 1:`scale`, as DIMLINEAR draws one: `defpt`
+/// the point `line_at` on the dimension line, measured text, style `Standard` with DIMSCALE overridden
+/// to `scale`, never associative.
+fn rotated_dim(a: Vec3, b: Vec3, rotation: f64, line_at: Vec3, scale: f64) -> Dimension {
     let mut overrides = serde_json::Map::new();
     overrides.insert("scale".to_owned(), serde_json::json!(scale));
     Dimension {
-        kind: DimKind::Linear { rotation: std::f64::consts::FRAC_PI_2 },
-        defpt: dim_line_pt(b, scale),
+        kind: DimKind::Linear { rotation },
+        defpt: line_at,
         text_mid: Vec3::ZERO,
         p13: a,
         p14: b,
@@ -218,8 +224,13 @@ fn level_dim(a: Vec3, b: Vec3, scale: f64) -> Dimension {
     }
 }
 
-fn is_vertical(k: &DimKind) -> bool {
-    matches!(k, DimKind::Linear { rotation } if (rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9)
+/// `true` when `dm` is a linear dimension at `rotation` (or its reverse) whose dimension line passes
+/// through `line_at`.
+fn same_dim_line(dm: &Dimension, rotation: f64, line_at: Vec3) -> bool {
+    let DimKind::Linear { rotation: got } = dm.kind else { return false };
+    let (sin, cos) = rotation.sin_cos();
+    (got - rotation).sin().abs() <= TOLERANCE.angle_deg.to_radians().sin()
+        && ((dm.defpt.x - line_at.x) * sin - (dm.defpt.y - line_at.y) * cos).abs() <= TOLERANCE.coincidence_mm
 }
 
 /// `true` when `a` and `b` are the same size or scale, whatever a file round trip did to the last
@@ -230,7 +241,8 @@ fn same_size(a: f64, b: f64) -> bool {
 
 /// `true` when `block` holds exactly `want`, in order: each on layer `0`, LINE ends, TEXT
 /// alignment points and DIMENSION points within [`TOLERANCE`]`.coincidence_mm`, the same text
-/// strings and heights, and every dimension vertical with measured text and the wanted DIMSCALE.
+/// strings and heights, and every dimension at the wanted rotation and line with measured text and
+/// the wanted DIMSCALE.
 fn block_matches(block: &Block, want: &[Item]) -> bool {
     block.entities.len() == want.len()
         && block.entities.iter().zip(want).all(|(e, w)| {
@@ -243,11 +255,10 @@ fn block_matches(block: &Block, want: &[Item]) -> bool {
                     (EntityKind::Text(t), Item::Label(at, s, h)) => {
                         t.halign == HAlign::Left && near(t.align_pt.unwrap_or(t.insert), *at) && t.value == *s && same_size(t.height, *h)
                     }
-                    (EntityKind::Dimension(dm), Item::Dim(a, b, scale)) => {
-                        is_vertical(&dm.kind)
+                    (EntityKind::Dimension(dm), Item::Dim(a, b, rotation, line_at, scale)) => {
+                        same_dim_line(dm, *rotation, *line_at)
                             && near(dm.p13, *a)
                             && near(dm.p14, *b)
-                            && (dm.defpt.x - dim_line_pt(*b, *scale).x).abs() <= TOLERANCE.coincidence_mm
                             && dm.text.is_empty()
                             && same_size(DimStyle::default().with_overrides(&dm.overrides).scale, *scale)
                     }
@@ -312,6 +323,12 @@ fn plan_changes(d: &Drawing) -> Result<Vec<(Id, Vec<Item>)>, String> {
     Ok(out)
 }
 
+/// `true` when [`annotation_observer`] would change nothing.
+#[cfg(test)]
+pub(crate) fn settled(d: &Drawing) -> Result<bool, String> {
+    plan_changes(d).map(|t| t.is_empty())
+}
+
 /// The after-command observer: every view's [`annotation_block_name`] block made to equal its
 /// wanted annotation — untouched when it already does, rewritten (and given its INSERT) when not,
 /// emptied but kept when the view now wants nothing. The drawing is written back only when some
@@ -357,6 +374,10 @@ mod tests {
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
     type T<X> = std::result::Result<X, Box<dyn std::error::Error>>;
 
+    fn is_vertical(k: &DimKind) -> bool {
+        matches!(k, DimKind::Linear { rotation } if (rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9)
+    }
+
     /// LAMBPROJECT's placed ground-floor plan, edited, with section `A-A` cut from (0,0) to
     /// (5000,0); observers installed. Returns (session, plan, section).
     fn fixture() -> T<(Session, Id, Id)> {
@@ -390,7 +411,8 @@ mod tests {
                     EntityKind::Text(t) if t.halign == HAlign::Left => Ok(Item::Label(t.align_pt.unwrap_or(t.insert), t.value.clone(), t.height)),
                     EntityKind::Text(t) => Ok(Item::Text(t.align_pt.unwrap_or(t.insert), t.value.clone(), t.height)),
                     EntityKind::Dimension(dm) if is_vertical(&dm.kind) => {
-                        Ok(Item::Dim(dm.p13, dm.p14, DimStyle::default().with_overrides(&dm.overrides).scale))
+                        let scale = DimStyle::default().with_overrides(&dm.overrides).scale;
+                        Ok(Item::Dim(dm.p13, dm.p14, std::f64::consts::FRAC_PI_2, dm.defpt, scale))
                     }
                     _ => Err("unexpected kind".into()),
                 }

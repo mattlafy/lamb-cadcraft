@@ -33,6 +33,7 @@ pub mod assembly;
 pub mod assistant;
 pub mod assistant_cli;
 pub mod assistant_lint;
+pub mod autodim;
 pub mod bom;
 pub mod bubbles;
 pub mod cli;
