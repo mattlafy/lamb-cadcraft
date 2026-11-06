@@ -17,6 +17,8 @@
 //! (`Sheet | Title`) of every set sheet in tab order, itself included, titled by
 //! [`crate::titleblock::sheet_title`]; it is made once another set sheet exists. `A601` holds the
 //! [`crate::bom`] table when there is framing to count; with none an existing one is left alone.
+//! `A602` holds the [`crate::schedule`] opening schedule (LAMB T639) likewise, when a placed plan has
+//! openings.
 //! Each table is compared with what it would become and replaced, at its own corner, only when its
 //! text differs. A table taller than the sheet is written whole and the message says it runs off.
 //! All of it is one undo step; nothing to change changes nothing.
@@ -28,7 +30,7 @@
 //! a view no longer placed or no longer in the project stays as it is and the message names it.
 //!
 //! `sheetset {pdf?}` (`sset`) returns `{sheets: [{layout, group, viewIds}], alreadyOnSheets,
-//! refit: [{layout, view, scale}], pdf?, message}`, `group` being `list` or `bom` for a table made
+//! refit: [{layout, view, scale}], pdf?, message}`, `group` being `list`, `bom` or `schedule` for a table made
 //! or updated, with no `viewIds`.
 //! With `pdf`, every set sheet in tab order is plotted to that one PDF, a page and a bookmark
 //! per sheet, whether or not this run placed anything, and `proposedLines` counts the unaccepted
@@ -55,6 +57,7 @@ use crate::bom::{self, BOM_TITLE, Refreshed};
 use crate::commands::{bad, name_input, other};
 use crate::detailsheets::{lay_detail_sheets, next_sheet_name};
 use crate::project::DrawingProject;
+use crate::schedule::{self, OPENING_TITLE, refresh_opening_schedule};
 use crate::schema::{assembly_block_name, read_document, read_entity_data, write_document};
 use crate::sheets::{
     DEFAULT_SHEET_PAPER, VPORT_LAYER, create_sheet, ensure_vport_layer, refit_viewport, sheet_paper_size, view_placed, view_sheet_ref, viewport_scale,
@@ -322,13 +325,18 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         parts.push(part);
         sheets.push(sheet);
     }
+    if let Some(change) = refresh_opening_schedule(&mut d)? {
+        let (part, sheet) = table_report(schedule::DEFAULT_LAYOUT, "schedule", OPENING_TITLE, change);
+        parts.push(part);
+        sheets.push(sheet);
+    }
     if let Some(change) = refresh_list(&mut d)? {
         let (part, sheet) = table_report(LIST_SHEET, "list", LIST_TITLE, change);
         parts.insert(0, part);
         sheets.insert(0, sheet);
     }
     let mut off_sheet: Vec<String> = Vec::new();
-    for (layout, title) in [(LIST_SHEET, LIST_TITLE), (bom::DEFAULT_LAYOUT, BOM_TITLE)] {
+    for (layout, title) in [(LIST_SHEET, LIST_TITLE), (bom::DEFAULT_LAYOUT, BOM_TITLE), (schedule::DEFAULT_LAYOUT, OPENING_TITLE)] {
         if bom::table_runs_off(&d, layout, title)? {
             off_sheet.push(format!("{layout} {title}"));
         }

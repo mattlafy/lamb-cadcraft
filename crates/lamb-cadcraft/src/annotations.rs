@@ -6,7 +6,8 @@
 //! level's projected floor elevation spanning the view block's extents ±[`LEVEL_OVERRUN_MM`], and
 //! `"<name> <±elev>"` left-aligned past its right end, plus a vertical floor-to-floor dimension per
 //! pair of consecutive levels by elevation (LAMB T500). Plan cut elevations stay overlay-only. A
-//! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641).
+//! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641),
+//! and every placed plan a text of each opening's schedule mark outside it ([`crate::schedule`], LAMB T639).
 //!
 //! The annotation lives in its own block per view, [`annotation_block_name`]`(view)`, never in the
 //! view block, so derivation, the wall graph, links and LAMBSAVE never see them. The block's one
@@ -35,6 +36,7 @@ use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id};
 
 use crate::project::DrawingProject;
+use crate::schedule::{PlanMark, plan_marks};
 use crate::schema::{annotation_block_name, read_document, view_block_name};
 use crate::sheets::{sheet_refs, view_scale};
 
@@ -57,6 +59,8 @@ const LEVEL_TEXT_GAP_MM: f64 = 200.0;
 /// A floor-to-floor dimension's line sits this far right of the level lines' right end, clear of
 /// the labels.
 pub const LEVEL_DIM_OFFSET_MM: f64 = 1200.0;
+/// An opening's mark sits this far from the opening's midpoint, on the outside.
+pub const MARK_OFFSET_MM: f64 = 400.0;
 /// Every generated entity's layer inside the block.
 const LAYER: &str = "0";
 
@@ -86,9 +90,9 @@ fn near(a: Vec3, b: Vec3) -> bool {
     (a.x - b.x).hypot(a.y - b.y) <= TOLERANCE.coincidence_mm
 }
 
-/// What view `id` wants, in write order: a plan its cut symbols, a vertical view its level lines;
-/// nothing for an unplaced view.
-fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>) -> Result<Vec<Item>, String> {
+/// What view `id` wants, in write order: a plan its cut symbols and opening marks, a vertical view
+/// its level lines; nothing for an unplaced view.
+fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>, marks: &[PlanMark]) -> Result<Vec<Item>, String> {
     let dp = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let Some(view) = dp.view(id).filter(|v| v.placement.is_some()) else { return Ok(Vec::new()) };
     let scale = view_scale(d, dp.document(), id);
@@ -120,6 +124,10 @@ fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>) -> Resul
                 out.push(Item::Text(v(at.x, at.y - 1.5 * height), sheet, height));
             }
         }
+    }
+    for m in marks.iter().filter(|m| m.plan == plan) {
+        let off = MARK_OFFSET_MM * f;
+        out.push(Item::Text(v(m.at.x + m.out.x * off, m.at.y + m.out.y * off), m.mark.clone(), height));
     }
     if dp.document().auto_dim_plans.contains(&plan) {
         let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
@@ -309,9 +317,10 @@ fn plan_changes(d: &Drawing) -> Result<Vec<(Id, Vec<Item>)>, String> {
     let blocks: Vec<(Id, String)> = doc.views.iter().map(|v| (v.id(), view_block_name(v.id()))).collect();
     let refs = sheet_refs(d, &blocks);
     let sheet_of = |id: Id| refs.iter().find(|(v, _, _)| *v == id).map(|(_, n, l)| format!("{n}/{l}"));
+    let marks = plan_marks(d);
     let mut out = Vec::new();
     for p in doc.views.iter().map(AnyView::id) {
-        let want = wanted(d, p, &sheet_of)?;
+        let want = wanted(d, p, &sheet_of, &marks)?;
         let changed = match d.block(&annotation_block_name(p)) {
             Some(b) => !block_matches(b, &want),
             None => !want.is_empty(),
@@ -364,7 +373,7 @@ pub(crate) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::overlays::lamb_overlay;
     use cadcraft_geom::Vec2;
@@ -418,6 +427,15 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// The opening marks in the plan's annotation block: (mark, x, y), in block order.
+    pub(crate) fn mark_texts(s: &Session, plan: Id) -> T<Vec<(String, f64, f64)>> {
+        let is_mark = |t: &str| t.len() == 3 && (t.starts_with('D') || t.starts_with('W')) && t[1..].bytes().all(|b| b.is_ascii_digit());
+        Ok(items(s, plan)?
+            .into_iter()
+            .filter_map(|i| if let Item::Text(at, t, _) = i { is_mark(&t).then_some((t, at.x, at.y)) } else { None })
+            .collect())
     }
 
     fn texts(s: &Session, plan: Id) -> T<Vec<String>> {

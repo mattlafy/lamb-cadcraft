@@ -76,6 +76,7 @@ mod resolvecmd;
 mod revertex;
 pub mod rounding;
 pub mod scene;
+pub mod schedule;
 pub mod schema;
 pub mod script_cli;
 pub mod session_cli;

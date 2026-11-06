@@ -25,6 +25,8 @@
 //!   title block shows, in one undo step — see [`crate::titleblock`].
 //! - `bomtable {layout?, at?}` (`bom`): the framing BOM — repeat copies and placed corner and jamb
 //!   details counted per level — as a table on layout `BOM` — see [`crate::bom`].
+//! - `openingschedule {layout?, at?}` (`osch`): the door and window schedule, marks computed in row
+//!   order, as a table on layout `A602` — see [`crate::schedule`].
 //! - `vpview {handle, viewId | null}`: binds a layout viewport to a view — its `view_id`, every other
 //!   view's layer frozen in it, zoomed to the view; `null` unbinds it. One undo step; the
 //!   Properties palette's View row runs it ([`crate::props`]).
@@ -874,6 +876,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["bom"])
             .params("{layout?, at?}")
             .interactive(crate::bom::bomtable_machine),
+        CommandSpec::new("openingschedule", "Opening Schedule", crate::schedule::openingschedule)
+            .alias(&["osch"])
+            .params("{layout?, at?}")
+            .interactive(crate::schedule::openingschedule_machine),
         CommandSpec::new("vpview", "Viewport View", vpview).params("{handle, viewId | null} → {handle, viewId}"),
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU_VIEW_SETUP).interactive(editview_machine),
         CommandSpec::new("viewprops", "View Properties", crate::viewprops::viewprops)
