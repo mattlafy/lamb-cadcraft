@@ -47,6 +47,16 @@ pub(crate) fn entity(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     }
 }
 
+/// Sets the transparency the entity draws with and returns its own, without a locked layer's fade,
+/// which is what its block contents inherit. The fade shows on screen even when transparency
+/// display is off.
+fn set_transparency(b: &mut Builder, ctx: &Ctx, e: &Entity, layer_transparency: u8, fade: u8) -> u8 {
+    let fade = if b.opts.on_screen { fade } else { 0 };
+    let own = if b.opts.transparency { transparency(e.common.transparency, layer_transparency, ctx.block_transparency) } else { 0 };
+    b.transparency = own.max(fade);
+    own
+}
+
 fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     // A top-level annotative object draws at the view's annotation scale: a viewport's scale for
     // model space seen through it, else the drawing's (CANNOSCALE in model space, 1:1 on paper).
@@ -70,10 +80,7 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     if !visible {
         return;
     }
-    // A locked layer's fade shows on screen even when transparency display is off.
-    let fade = if b.opts.on_screen { fade } else { 0 };
-    let own = if b.opts.transparency { transparency(e.common.transparency, layer_transparency, ctx.block_transparency) } else { 0 };
-    b.transparency = own.max(fade);
+    let own = set_transparency(b, ctx, e, layer_transparency, fade);
     // A plot style's linetype replaces the object's.
     let lt = match b.styles.and_then(|s| s.linetype(rgb, b.named)) {
         Some(over) => over,
@@ -230,6 +237,12 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
             }
             for l in &fig.lines {
                 b.polyline(ctx, rgb, lw, l);
+            }
+        }
+        // An OLE object's content is not drawn; its frame, from its two corner points, is.
+        EntityKind::Unknown(u) if u.is_ole_frame() => {
+            if let Some(q) = cadcraft_doc::ole_frame(&u.tags) {
+                b.polyline(ctx, rgb, lw, &q);
             }
         }
         kind => {

@@ -84,7 +84,7 @@ pub struct MaintenanceReport {
     pub created: Vec<Id>,
     /// Partner entities (not links) slid to follow a rigidly moved linked segment.
     pub travelled: Vec<Id>,
-    /// Links moved onto a new piece of an entity the command replaced (TRIM, BREAK).
+    /// Links moved onto the piece of an entity holding their anchor (TRIM, BREAK).
     pub reanchored: Vec<Id>,
     /// New entities (not links) given a concrete `Cut`/`Seen` role from a cut-default layer.
     pub stamped: Vec<Id>,
