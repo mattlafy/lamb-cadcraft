@@ -10,7 +10,8 @@
 //!
 //! Several sheets go into one file ([`pdf_sheets`], the `layouts` option), each page labelled
 //! with its layout name. Drawing layers become PDF layers (optional content groups) that a PDF
-//! viewer can switch on and off, and entity hyperlinks become link annotations.
+//! viewer can switch on and off, and entity hyperlinks become link annotations. A file of several
+//! pages has a flat outline, one bookmark per page reading its label and any title for it.
 
 use std::fmt::Write as _;
 
@@ -24,10 +25,12 @@ use craft_pdf::write::backend as kr;
 use craft_pdf::write::{self, Metadata, WriteError, Writer};
 use kr::action::LinkAction;
 use kr::annotation::{Annotation, LinkAnnotation, Target};
+use kr::destination::XyzDestination;
 use kr::error::KrillaError;
 use kr::geom::{Path, PathBuilder, Point, Rect, Transform};
 use kr::num::NormalizedF32;
 use kr::optional_content::OcgId;
+use kr::outline::{Outline, OutlineNode};
 use kr::page::{PageLabel, PageSettings};
 use kr::paint::{Fill, FillRule, LineCap, LineJoin, Stroke};
 use kr::surface::Surface;
@@ -101,6 +104,11 @@ pub struct PdfOptions {
     /// Plot objects with their transparency (PDF alpha). `None` = the page setup's "Plot
     /// transparency" (off for model space).
     pub plot_transparency: Option<bool>,
+    /// A flat outline with one bookmark per page. `None`: on when the file has several pages.
+    pub bookmarks: Option<bool>,
+    /// A page's label (layout name, `Model` for model space) and the title its bookmark adds
+    /// after that label.
+    pub page_titles: Vec<(String, String)>,
 }
 
 impl Default for PdfOptions {
@@ -125,6 +133,8 @@ impl Default for PdfOptions {
             margins: None,
             hyperlinks: true,
             plot_transparency: None,
+            bookmarks: None,
+            page_titles: Vec::new(),
         }
     }
 }
@@ -132,7 +142,7 @@ impl Default for PdfOptions {
 impl PdfOptions {
     /// Parse `{paper?, width?, height?, landscape?, fit?, scale?, center?, offset?: [x,y] mm,
     /// lineweights?, compress?, title?, window?: [[x1, y1], [x2, y2]], margins?: [l, b, r, t] (mm),
-    /// hyperlinks?: bool, plotTransparency?: bool}`.
+    /// hyperlinks?: bool, plotTransparency?: bool, bookmarks?: bool, pageTitles?: {layout: title}}`.
     pub fn from_json(v: &Value) -> PdfOptions {
         let num = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite());
         let paper_mm = match (num("width"), num("height")) {
@@ -161,6 +171,8 @@ impl PdfOptions {
             margins: margins(v.get("margins")),
             hyperlinks: v.get("hyperlinks").and_then(Value::as_bool).unwrap_or(true),
             plot_transparency: v.get("plotTransparency").and_then(Value::as_bool),
+            bookmarks: v.get("bookmarks").and_then(Value::as_bool),
+            page_titles: page_titles(v.get("pageTitles")),
         }
     }
 }
@@ -201,6 +213,12 @@ pub(crate) fn margins(v: Option<&Value>) -> Option<[f64; 4]> {
         [l, b, r, t] if a.iter().all(|x| x.is_finite() && (0.0..=1000.0).contains(x)) => Some([l, b, r, t]),
         _ => None,
     }
+}
+
+/// `{layout: title}` → (layout, title) pairs, at most one per page; other values are skipped.
+fn page_titles(v: Option<&Value>) -> Vec<(String, String)> {
+    let Some(m) = v.and_then(Value::as_object) else { return Vec::new() };
+    m.iter().filter_map(|(k, t)| Some((k.clone(), t.as_str()?.to_owned()))).take(MAX_PAGES).collect()
 }
 
 /// A plot window from `[[x1, y1], [x2, y2]]`: finite corners and a positive size, else `None`.
@@ -463,8 +481,25 @@ fn write_pdf(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions, text_as
         if items.len() == 1 && !groups.ids.is_empty() {
             writer.document_mut().set_optional_content_page_mode(true);
         }
+        if o.bookmarks.unwrap_or(items.len() > 1) {
+            writer.document_mut().set_outline(outline(items, o));
+        }
         Ok(writer.finish()?)
     })
+}
+
+/// One bookmark per page, in page order, going to the page's top-left corner.
+fn outline(items: &[(Space, PdfOptions)], o: &PdfOptions) -> Outline {
+    let mut outline = Outline::new();
+    for (i, (space, _)) in items.iter().enumerate() {
+        let label = sheet_name(space);
+        let title = o.page_titles.iter().find(|(l, _)| l.eq_ignore_ascii_case(&label)).map_or("", |(_, t)| t.trim());
+        let text = if title.is_empty() { label } else { format!("{label} {title}") };
+        // The writer's page coordinates run down from the top-left corner.
+        let top_left = XyzDestination::new(i, Point::from_xy(0.0, 0.0));
+        outline.push_child(OutlineNode::new(text.chars().take(MAX_TEXT).collect(), top_left));
+    }
+    outline
 }
 
 /// The PDF layers (optional content groups) of a file: one per drawing layer used, shared by

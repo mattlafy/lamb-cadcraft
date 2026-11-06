@@ -30,7 +30,7 @@
 //! `sheetset {pdf?}` (`sset`) returns `{sheets: [{layout, group, viewIds}], alreadyOnSheets,
 //! refit: [{layout, view, scale}], pdf?, message}`, `group` being `list` or `bom` for a table made
 //! or updated, with no `viewIds`.
-//! With `pdf`, every set sheet in tab order is plotted to that one PDF, a page
+//! With `pdf`, every set sheet in tab order is plotted to that one PDF, a page and a bookmark
 //! per sheet, whether or not this run placed anything, and `proposedLines` counts the unaccepted
 //! AI lines in the views those sheets show: a plot ignores their ghost transparency, so the
 //! message says they plot as drawn. Nothing is hidden. The session's observers run on a changed
@@ -153,11 +153,29 @@ fn refresh_list(d: &mut Drawing) -> Result<Option<Refreshed>> {
     }
     bom::ensure_sheet_layout(d, LIST_SHEET)?;
     order_tabs(d);
+    let rows: Vec<Vec<String>> = set_titles(d)?.into_iter().map(|(n, t)| vec![n, t]).collect();
+    bom::refresh_table(d, LIST_SHEET, LIST_TITLE, &|at| bom::schedule_table(LIST_TITLE, &["Sheet", "Title"], &LIST_COL_WIDTHS, &rows, at))
+}
+
+/// Every set sheet in tab order, with its title.
+fn set_titles(d: &Drawing) -> Result<Vec<(String, String)>> {
     let doc = read_document(d).map_err(other)?;
     // The list's own row names the table being written, which a new sheet does not hold yet.
     let title = |n: &str| if n == LIST_SHEET { LIST_TITLE.to_owned() } else { sheet_title(d, &doc, n) };
-    let rows: Vec<Vec<String>> = set_sheets(d).into_iter().map(|n| vec![n.clone(), title(&n)]).collect();
-    bom::refresh_table(d, LIST_SHEET, LIST_TITLE, &|at| bom::schedule_table(LIST_TITLE, &["Sheet", "Title"], &LIST_COL_WIDTHS, &rows, at))
+    Ok(set_sheets(d)
+        .into_iter()
+        .map(|n| {
+            let t = title(&n);
+            (n, t)
+        })
+        .collect())
+}
+
+/// The plot's `pageTitles`: each set sheet with a title of its own (a sheet with nothing to name
+/// it is titled with its own name, which its bookmark already reads).
+fn page_titles(d: &Drawing) -> Result<Value> {
+    let titled = set_titles(d)?.into_iter().filter(|(n, t)| n != t).map(|(n, t)| (n, Value::String(t)));
+    Ok(Value::Object(titled.collect()))
 }
 
 /// A table's part of the message and its `sheets` entry.
@@ -352,7 +370,8 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
                 f(s, &before);
             }
         }
-        let r = s.execute("plot", &json!({ "layouts": names, "path": path }))?;
+        let titles = page_titles(s.doc()?)?;
+        let r = s.execute("plot", &json!({ "layouts": names, "pageTitles": titles, "path": path }))?;
         let pages = r["pages"].as_u64().unwrap_or_default();
         let proposed = proposed_lines(s.doc()?)?;
         let warning = match proposed {
@@ -736,6 +755,21 @@ mod tests {
         Ok(())
     }
 
+    /// The titles of a PDF's top-level bookmarks, in order.
+    fn bookmarks(bytes: &[u8]) -> T<Vec<String>> {
+        use craft_pdf::syntax::object::{Dict, String as PdfString};
+        let pdf = craft_pdf::open_slice(bytes, None).map_err(|e| format!("the PDF opens: {e:?}"))?;
+        let catalog = pdf.xref().get::<Dict<'_>>(pdf.xref().root_id()).ok_or("a catalog")?;
+        let mut at = catalog.get::<Dict<'_>>(b"Outlines").and_then(|o| o.get::<Dict<'_>>(b"First"));
+        let mut out = Vec::new();
+        while let Some(item) = at {
+            let title = item.get::<PdfString<'_>>(b"Title").ok_or("a bookmark's title")?;
+            out.push(String::from_utf8_lossy(title.as_bytes()).into_owned());
+            at = item.get::<Dict<'_>>(b"Next");
+        }
+        Ok(out)
+    }
+
     #[test]
     fn the_pdf_has_a_page_per_set_sheet() -> R {
         set_io(IoHooks {
@@ -753,6 +787,15 @@ mod tests {
         let bytes = std::fs::read(&path)?;
         let pdf = craft_pdf::open_slice(&bytes, None).map_err(|e| format!("the PDF opens: {e:?}"))?;
         assert_eq!(pdf.pages().len(), 7, "the framing and list sheets are pages");
+        let marks = bookmarks(&bytes)?;
+        assert_eq!(marks.len(), 7, "{marks:?}");
+        assert_eq!(marks.first().map(String::as_str), Some("A001 Drawing List"), "{marks:?}");
+        let d = s.doc()?;
+        let doc = read_document(d)?;
+        let plan = set_sheets(d).into_iter().find(|n| n.starts_with("A1")).ok_or("a plan's sheet")?;
+        let title = sheet_title(d, &doc, &plan);
+        assert_ne!(title, plan, "the plan's sheet has a title");
+        assert!(marks.contains(&format!("{plan} {title}")), "{plan} {title} in {marks:?}");
         for page in pdf.pages().iter() {
             let m = page.media_box();
             let size = ((m.x1 - m.x0).abs() / 72.0 * 25.4, (m.y1 - m.y0).abs() / 72.0 * 25.4);
