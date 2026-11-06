@@ -398,7 +398,13 @@ impl Drawing {
     /// Effective visibility of an entity (its own flag, its layer on/thawed, not hidden by object
     /// isolation).
     pub fn is_visible(&self, e: &Entity) -> bool {
-        e.common.visible && self.layer(&e.common.layer).is_none_or(Layer::visible) && !self.is_hidden_object(e.handle)
+        e.common.visible && self.layer(&e.common.layer).is_none_or(Layer::visible) && !self.is_hidden_object(e.handle) && !self.is_model_hidden(e)
+    }
+
+    /// Whether the registered [`ModelHidden`] hook keeps `e` off the Model tab (LAMB fork). False
+    /// with none registered.
+    pub fn is_model_hidden(&self, e: &Entity) -> bool {
+        MODEL_HIDDEN.get().is_some_and(|hidden| hidden(self, e))
     }
 
     /// Whether ISOLATEOBJECTS / HIDEOBJECTS hid `h` for this session.
@@ -409,7 +415,7 @@ impl Drawing {
     /// Whether an entity counts in the extents: as AutoCAD 2024 counts it for ZOOM Extents and
     /// EXTMIN/EXTMAX, on a layer that is off too, but not on a frozen one.
     pub fn in_extents(&self, e: &Entity) -> bool {
-        e.common.visible && self.layer(&e.common.layer).is_none_or(|l| !l.frozen) && !self.is_hidden_object(e.handle)
+        e.common.visible && self.layer(&e.common.layer).is_none_or(|l| !l.frozen) && !self.is_hidden_object(e.handle) && !self.is_model_hidden(e)
     }
 
     /// Bounds of the entities in a space that count in its extents ([`Drawing::in_extents`]).
@@ -448,6 +454,18 @@ impl Drawing {
 
 mod anno;
 pub use anno::*;
+
+/// An entity kept off the Model tab while staying in the drawing (LAMB fork: a view's reference,
+/// which sheets and DWG/DXF still use). It is not drawn, picked, selected, snapped to or counted in
+/// the extents there; a viewport still draws it.
+pub type ModelHidden = fn(&Drawing, &Entity) -> bool;
+
+static MODEL_HIDDEN: std::sync::OnceLock<ModelHidden> = std::sync::OnceLock::new();
+
+/// Register the process-global [`ModelHidden`] hook. Once per process; a second call is an error.
+pub fn register_model_hidden(f: ModelHidden) -> std::result::Result<(), &'static str> {
+    MODEL_HIDDEN.set(f).map_err(|_| "a model-hidden hook is already registered")
+}
 
 #[cfg(test)]
 mod tests;

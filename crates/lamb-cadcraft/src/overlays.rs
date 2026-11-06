@@ -216,6 +216,7 @@ pub fn register_providers() -> Result<(), &'static str> {
         crate::panes::register()?;
         crate::viewpick::register()?;
         crate::fillet::register()?;
-        crate::rounding::register()
+        crate::rounding::register()?;
+        cadcraft_doc::register_model_hidden(crate::views::model_hidden)
     })
 }

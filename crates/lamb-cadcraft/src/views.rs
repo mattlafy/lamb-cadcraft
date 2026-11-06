@@ -203,10 +203,25 @@ pub fn internal_layer(d: &Drawing, name: &str) -> bool {
     id.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())) && d.block(name).is_some()
 }
 
+/// Whether `e` is LAMB's own model-space reference to a view, assembly, annotation or hole block
+/// (any case): the Model tab leaves it out, while sheets and DWG/DXF keep it (registered as the
+/// fork's model-hidden hook). A loose reference to any other block stays.
+pub fn model_hidden(d: &Drawing, e: &Entity) -> bool {
+    const PREFIXES: [&str; 4] = ["LAMB_VIEW_", "LAMB_ASSEMBLY_", "LAMB_ANNO_", "LAMB_HOLE_"];
+    let EntityKind::Insert(insert) = &e.kind else {
+        return false;
+    };
+    let name = insert.block.as_str();
+    PREFIXES.iter().any(|p| name.get(..p.len()).is_some_and(|head| head.eq_ignore_ascii_case(p)))
+        && d.block(name).is_some()
+        && d.model.get(e.handle).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cadcraft_engine::Session;
+    use cadcraft_geom::Vec2;
     use serde_json::json;
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -439,6 +454,107 @@ mod tests {
         let r = rows(&s)?;
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].label, "Model");
+        Ok(())
+    }
+
+    /// A plan with its assembly block and detail, a second plan and a section, each holding a line;
+    /// then back on the Model tab with a loose line far from them all.
+    fn all_views() -> std::result::Result<(Session, Vec<Id>, Handle), Box<dyn std::error::Error>> {
+        let (mut s, plan) = crate::assembly::tests::room_with("exterior_face", true, 200.0)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let second = Id(s.execute("newplan", &json!({ "name": "First" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": second.0 }))?;
+        crate::assembly::tests::line(&mut s, [100.0, 100.0], [900.0, 100.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let r = s.execute(
+            "newsectionline",
+            &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 2000}, "cutTo": {"x": 5000, "y": 2000} }),
+        )?;
+        let sec = Id(r["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        crate::assembly::tests::line(&mut s, [100.0, 100.0], [900.0, 100.0])?;
+        s.execute("editview", &json!({}))?;
+        let loose = crate::assembly::tests::line(&mut s, [-90000.0, -90000.0], [-89000.0, -90000.0])?;
+        Ok((s, vec![plan, second, sec], loose))
+    }
+
+    #[test]
+    fn the_model_tab_draws_picks_frames_and_selects_only_loose_geometry() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, views, loose) = all_views()?;
+        let d = s.doc()?;
+        let hidden = d.model.iter().filter(|e| d.is_model_hidden(e)).count();
+        assert!(hidden >= 5, "{hidden}");
+        assert_eq!(d.model.iter().filter(|e| !d.is_model_hidden(e)).count(), 1);
+        let list = cadcraft_render::build(d, &Space::Model, &cadcraft_render::Options::default());
+        assert_eq!(list.prims.len(), 1);
+        assert!(list.verts.iter().all(|p| p.y == -90000.0), "{:?}", list.verts);
+        let ext = d.extents(&Space::Model);
+        assert_eq!((ext.min.x, ext.min.y, ext.max.x, ext.max.y), (-90000.0, -90000.0, -89000.0, -90000.0));
+        s.zoom_extents()?;
+        let view = s.state()?.view();
+        assert!((view.center.x + 89500.0).abs() < 1.0 && (view.center.y + 90000.0).abs() < 1.0 && view.height < 2000.0, "{view:?}");
+        assert!(cadcraft_engine::cmd::curves::pick_at(&s, Vec2::new(-89500.0, -90000.0)) == Some(loose));
+        assert!(cadcraft_engine::cmd::curves::pick_at(&s, Vec2::new(2500.0, 0.0)).is_none());
+        s.execute("selectall", &json!({}))?;
+        assert_eq!(s.state()?.selection, [loose]);
+        // The Model tab's choice stops there: editing a view draws and picks its block as before.
+        for v in &views {
+            let list = cadcraft_render::build(s.doc()?, &Space::Block(view_block_name(*v)), &cadcraft_render::Options::default());
+            assert!(!list.prims.is_empty(), "{v:?}");
+        }
+        s.execute("editview", &json!({ "viewId": views[0].0 }))?;
+        assert!(cadcraft_engine::cmd::curves::pick_at(&s, Vec2::new(2500.0, 0.0)).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_large_model_tab_built_on_all_cores_leaves_the_views_out_too() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, _, _) = all_views()?;
+        for i in 0..600 {
+            let y = -90000.0 - f64::from(i);
+            crate::assembly::tests::line(&mut s, [-90000.0, y], [-89000.0, y])?;
+        }
+        let list = cadcraft_render::build(s.doc()?, &Space::Model, &cadcraft_render::Options::default());
+        assert_eq!(list.prims.len(), 601);
+        assert!(list.verts.iter().all(|p| p.y <= -90000.0));
+        Ok(())
+    }
+
+    /// The prims a sheet's plot loses when the drawing's references to `block` go.
+    fn plot_of_block(d: &Drawing, sheet: &Space, block: &str) -> usize {
+        let opts = cadcraft_render::Options::default();
+        let mut bare = d.clone();
+        let refs: Vec<Handle> =
+            bare.model.iter().filter(|e| matches!(&e.kind, EntityKind::Insert(i) if i.block == block)).map(|e| e.handle).collect();
+        for h in refs {
+            bare.remove_entity(h);
+        }
+        cadcraft_render::build_plot(d, sheet, &opts).prims.len().saturating_sub(cadcraft_render::build_plot(&bare, sheet, &opts).prims.len())
+    }
+
+    #[test]
+    fn sheets_still_show_each_view_also_after_a_dxf_round_trip() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, views, _) = all_views()?;
+        let mut sheets = Vec::new();
+        for (i, v) in views.iter().enumerate() {
+            let name = format!("A30{i}");
+            s.execute("newsheet", &json!({ "name": name, "viewIds": [v.0] }))?;
+            sheets.push((Space::Paper(name), *v));
+        }
+        s.execute("newsheet", &json!({ "name": "A310", "assemblyIds": [views[0].0] }))?;
+        let d = s.doc()?;
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(d).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        for drawing in [d, &back] {
+            assert!(drawing.model.iter().filter(|e| drawing.is_model_hidden(e)).count() >= 5);
+            for (sheet, v) in &sheets {
+                assert!(plot_of_block(drawing, sheet, &view_block_name(*v)) > 0, "{v:?} on {sheet:?}");
+            }
+            let assembly = crate::schema::assembly_block_name(views[0]);
+            assert!(plot_of_block(drawing, &Space::Paper("A310".into()), &assembly) > 0, "the assembly viewport");
+        }
         Ok(())
     }
 }

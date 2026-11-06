@@ -169,7 +169,11 @@ fn build_space(d: &Drawing, space: &Space, opts: &Options, plotting: bool) -> Di
             return b.list;
         }
         let mut viewports = 0usize;
+        let model = matches!(space, Space::Model);
         for e in store.iter() {
+            if model && d.is_model_hidden(e) {
+                continue;
+            }
             if let Some(w) = &b.cull
                 && !cull::entity_reaches(d, e, w)
             {
@@ -224,6 +228,9 @@ fn build_parallel(b: &mut Builder, d: &Drawing, store: &cadcraft_doc::EntityStor
                 cull: window,
             };
             for e in chunk {
+                if d.is_model_hidden(e) {
+                    continue;
+                }
                 if let Some(w) = &window
                     && !cull::entity_reaches(d, e, w)
                 {
