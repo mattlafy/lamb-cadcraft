@@ -21,9 +21,10 @@
 //! one erased; and the drawing is written back only when something changed, so the change lands in
 //! the command's own undo step.
 //!
-//! `titleblock {project?, client?, address?, drawnBy?, date?}` (`tblock`) sets the given ones in one
-//! undo step and returns all five. Typed, `Enter an option [Project/Client/Address/Drawnby/Date]:`
-//! then the text, looping until Enter.
+//! `titleblock {project?, client?, address?, drawnBy?, date?, north?}` (`tblock`) sets the given ones
+//! in one undo step and returns all six. `north` is project north, degrees clockwise from the
+//! project's global +Y, and turns the arrows of plan drawing titles ([`crate::vptitles`]). Typed,
+//! `Enter an option [Project/Client/Address/Drawnby/Date/North]:` then the value, looping until Enter.
 
 use std::sync::Arc;
 
@@ -398,7 +399,7 @@ pub fn titleblock_observer(s: &mut Session, _before: &Arc<Drawing>) {
 }
 
 fn info_json(info: &SheetInfo) -> Value {
-    json!({ "project": info.project, "client": info.client, "address": info.address, "drawnBy": info.drawn_by, "date": info.date })
+    json!({ "project": info.project, "client": info.client, "address": info.address, "drawnBy": info.drawn_by, "date": info.date, "north": info.north_deg })
 }
 
 pub(crate) fn titleblock(s: &mut Session, p: &Value) -> Result<Value> {
@@ -418,6 +419,10 @@ pub(crate) fn titleblock(s: &mut Session, p: &Value) -> Result<Value> {
             text.trim().clone_into(slot);
         }
     }
+    if let Some(v) = p.get("north").filter(|v| !v.is_null()) {
+        let deg = v.as_f64().ok_or_else(|| bad(CMD, "`north` must be a number"))?;
+        info.north_deg = deg.rem_euclid(360.0);
+    }
     if info != old {
         doc.sheet_info = Some(info.clone());
         write_document(s.doc_mut()?, &doc).map_err(other)?;
@@ -426,12 +431,13 @@ pub(crate) fn titleblock(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// (keyword, parameter, prompt).
-const FIELDS: [(&str, &str, &str); 5] = [
+const FIELDS: [(&str, &str, &str); 6] = [
     ("Project", "project", "Enter project"),
     ("Client", "client", "Enter client"),
     ("Address", "address", "Enter address"),
     ("Drawnby", "drawnBy", "Enter drawn by"),
     ("Date", "date", "Enter date"),
+    ("North", "north", "Enter project north, degrees clockwise from +Y"),
 ];
 
 /// TITLEBLOCK at the command line: the option, then its text, looping until Enter.
@@ -444,7 +450,11 @@ fn stored(s: &Session, key: &str) -> String {
     s.doc()
         .ok()
         .and_then(|d| read_document(d).ok())
-        .and_then(|doc| info_json(&doc.sheet_info.unwrap_or_default()).get(key).and_then(Value::as_str).map(str::to_owned))
+        .and_then(|doc| {
+            let info = info_json(&doc.sheet_info.unwrap_or_default());
+            let v = info.get(key)?;
+            v.as_str().map(str::to_owned).or_else(|| v.as_f64().map(|n| n.to_string()))
+        })
         .unwrap_or_default()
 }
 
@@ -479,10 +489,19 @@ impl Interactive for TitleBlock {
         let now = stored(s, key);
         let Some(text) = name_input(i, &now) else { return Ok(Step::Continue) };
         self.field = None;
-        if text != now
-            && let Err(e) = titleblock(s, &json!({ key: text }))
-        {
-            s.echo(e.to_string());
+        if text != now {
+            let done = if key == "north" {
+                text.parse::<f64>()
+                    .ok()
+                    .filter(|n| n.is_finite())
+                    .ok_or_else(|| other("Requires a number."))
+                    .and_then(|n| titleblock(s, &json!({ key: n })))
+            } else {
+                titleblock(s, &json!({ key: text }))
+            };
+            if let Err(e) = done {
+                s.echo(e.to_string());
+            }
         }
         Ok(Step::Continue)
     }
@@ -667,7 +686,7 @@ mod tests {
         let n = undo_len(&s)?;
         let r = s.execute("titleblock", &json!({ "client": " X " }))?;
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
-        assert_eq!(r, json!({ "project": "", "client": "X", "address": "", "drawnBy": "", "date": "" }));
+        assert_eq!(r, json!({ "project": "", "client": "X", "address": "", "drawnBy": "", "date": "", "north": 0.0 }));
         let handle = frames(&s, "A101")?[0].0;
         for name in ["A101", "A102"] {
             assert_eq!(val(&frames(&s, name)?[0].1, "CLIENT"), "X", "{name}");
@@ -677,6 +696,7 @@ mod tests {
         s.execute("titleblock", &json!({ "client": "X" }))?;
         assert_eq!(undo_len(&s)?, n + 1, "no undo step");
         assert!(s.execute("titleblock", &json!({ "client": 3 })).is_err());
+        assert!(s.execute("titleblock", &json!({ "north": "up" })).is_err());
 
         s.execute("titleblock", &json!({ "project": "P", "address": "A", "drawnBy": "D", "date": "2026-11-05" }))?;
         let i = frames(&s, "A102")?.remove(0).1;
@@ -739,10 +759,10 @@ mod tests {
         let mut s = two_plans()?;
         s.execute("sheetset", &json!({}))?;
         s.start("tblock")?;
-        assert_eq!(s.current_prompt().map(|p| p.keywords.len()), Some(5));
+        assert_eq!(s.current_prompt().map(|p| p.keywords.len()), Some(6));
         s.input(Input::Text("cl".into()))?;
         s.input(Input::Text("Acme".into()))?;
-        assert_eq!(s.current_prompt().map(|p| p.keywords.len()), Some(5), "back at the options");
+        assert_eq!(s.current_prompt().map(|p| p.keywords.len()), Some(6), "back at the options");
         s.input(Input::Text("Da".into()))?;
         s.input(Input::Enter)?;
         s.input(Input::Enter)?;
@@ -752,6 +772,15 @@ mod tests {
         s.start("titleblock")?;
         s.input(Input::Text("Client".into()))?;
         assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("Acme"));
+        s.input(Input::Enter)?;
+        s.input(Input::Text("North".into()))?;
+        assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("0"));
+        s.input(Input::Text("-30".into()))?;
+        s.input(Input::Text("North".into()))?;
+        assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("330"), "stored 0..360");
+        s.input(Input::Text("up".into()))?;
+        s.input(Input::Text("North".into()))?;
+        assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("330"), "not a number changes nothing");
         Ok(())
     }
 }

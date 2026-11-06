@@ -102,8 +102,9 @@ pub struct LambDocument {
     pub sheet_info: Option<SheetInfo>,
 }
 
-/// A project's title-block text; empty until set. An empty `project` shows the document's name.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A project's title-block text, empty until set, and project north. An empty `project` shows the
+/// document's name.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SheetInfo {
     pub project: String,
@@ -111,6 +112,8 @@ pub struct SheetInfo {
     pub address: String,
     pub drawn_by: String,
     pub date: String,
+    /// Project north, degrees clockwise from the project's global +Y.
+    pub north_deg: f64,
 }
 
 impl LambDocument {

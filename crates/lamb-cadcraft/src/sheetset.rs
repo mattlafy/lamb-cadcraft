@@ -749,7 +749,7 @@ mod tests {
         Ok(l.entities
             .iter()
             .filter_map(|e| match &e.kind {
-                EntityKind::Insert(i) if i.block == crate::vptitles::TITLE_BLOCK => {
+                EntityKind::Insert(i) if crate::vptitles::is_title_block(&i.block) => {
                     let v = |t: &str| i.attribs.iter().find(|a| a.tag == t).map_or_else(String::new, |a| a.text.value.clone());
                     Some((v("NUM"), v("NAME"), v("SCALE")))
                 }

@@ -21,8 +21,8 @@
 //!   off — see [`crate::autodim`].
 //! - `sheetsize {paper}` (`ssize`): the paper new sheets are made on, ARCH D landscape until set;
 //!   existing sheets keep their size — see [`crate::sheetset`].
-//! - `titleblock {project?, client?, address?, drawnBy?, date?}` (`tblock`): the text every sheet's
-//!   title block shows, in one undo step — see [`crate::titleblock`].
+//! - `titleblock {project?, client?, address?, drawnBy?, date?, north?}` (`tblock`): the text every
+//!   sheet's title block shows and project north, in one undo step — see [`crate::titleblock`].
 //! - `bomtable {layout?, at?}` (`bom`): the framing BOM — repeat copies and placed corner and jamb
 //!   details counted per level — as a table on layout `BOM` — see [`crate::bom`].
 //! - `openingschedule {layout?, at?}` (`osch`): the door and window schedule, marks computed in row
@@ -870,7 +870,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .interactive(crate::sheetset::sheetsize_machine),
         CommandSpec::new("titleblock", "Title Block", crate::titleblock::titleblock)
             .alias(&["tblock"])
-            .params("{project?, client?, address?, drawnBy?, date?} → {project, client, address, drawnBy, date}")
+            .params("{project?, client?, address?, drawnBy?, date?, north?} → {project, client, address, drawnBy, date, north}")
             .interactive(crate::titleblock::titleblock_machine),
         CommandSpec::new("bomtable", "Framing BOM", crate::bom::bomtable)
             .alias(&["bom"])
