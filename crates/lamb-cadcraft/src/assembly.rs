@@ -43,18 +43,23 @@
 //! end — head, sill — resolves and places on its own (LAMB T505, lamb-core's [`place_opening_end`]).
 //! In a plan, a wall's free end whose termination tag resolves (LAMB T617) takes its detail as one
 //! jamb ([`end_assembly`], lamb-core's [`place_run_end`]) and trims its run the same way. The block
-//! holds the run lines, then the corners', then the openings', then the free ends'.
+//! holds the run lines, then the corners', then the openings', then the free ends', then one
+//! non-associative HATCH per [`BandHatch`] (LAMB T642): a detail's hatch with one straight-edged loop
+//! spanning two bands, laid as a strip between those bands' final, trimmed lines on each straight
+//! run. Hatches are not members: nothing counts them as lines. Not carried: a hatch that does not
+//! reach two bands (the reference line is not a band), has several loops or a curved edge, is a repeat
+//! member, or belongs to a corner, jamb or end detail; and none on an arc run.
 //! Not the AI-line sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
 
-use cadcraft_doc::{Arc as ArcEntity, Block, Common, Drawing, Entity, EntityKind, Insert, Line, Space};
+use cadcraft_doc::{Arc as ArcEntity, Block, Common, Drawing, Entity, EntityKind, Hatch, HatchLoop, Insert, Line, Space};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result as EngineResult, Session, Step};
-use cadcraft_geom::{Vec2, Vec3};
+use cadcraft_geom::{PolyVertex, Vec2, Vec3, norm_angle};
 use lamb_core::derivation::assembly::{
-    AssemblyLine, FaceRef, WidthConflict, arc_delta, arc_end, arm_direction, corner_arc_reach, corner_reach, detail_bands, detail_frame,
-    end_on_circle, jamb_arc_reach, jamb_reach, junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner, place_corner_x, place_opening,
-    place_opening_end, place_run_end, tee_butt, tee_face_circle, trim_to_reach, width_conflict, x_corner, x_quadrant,
+    AssemblyLine, Band, DetailFrame, FaceRef, WidthConflict, arc_delta, arc_end, arm_direction, corner_arc_reach, corner_reach, detail_bands,
+    detail_frame, end_on_circle, jamb_arc_reach, jamb_reach, junction_bisector, lay_bands, lay_repeat, mitre_end, place_corner, place_corner_x,
+    place_opening, place_opening_end, place_run_end, tee_butt, tee_face_circle, trim_to_reach, width_conflict, x_corner, x_quadrant,
 };
 use lamb_core::derivation::detail_tags::{EndLevel, RunDetail};
 use lamb_core::derivation::issues::{Issue, IssueKind};
@@ -97,6 +102,87 @@ pub struct RunAssembly {
     pub conflict: Option<WidthConflict>,
     /// The run face the detail was laid from; `None` when the run was skipped.
     pub face: Option<FaceRef>,
+    /// The detail's hatches between two bands, laid along this run; none on an arc run.
+    pub hatches: Vec<BandHatch>,
+}
+
+/// A detail's hatch laid along a run as a strip between two of its bands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BandHatch {
+    /// Indexes into the run's `lines[..bands]`.
+    pub from_band: usize,
+    pub to_band: usize,
+    pub layer: String,
+    /// The pattern, with its angle and origin mapped onto the run. `loops` is empty: [`laid_hatch`]
+    /// fills it from the bands' final lines.
+    pub hatch: Hatch,
+}
+
+/// The hatches in `detail`'s block, outside repeat members, with one loop of straight edges whose
+/// extent along `frame.into` runs between two `bands`' offsets (each within
+/// `TOLERANCE.coincidence_mm`). `angle` turns by the rotation from `frame.along` to straight `run`'s
+/// direction and `origin` becomes the point of the run where `frame.origin` lands.
+fn band_hatches(
+    d: &Drawing,
+    detail: Id,
+    run: &WallRun,
+    sides: &lamb_core::derivation::wall_spaces::RunSides,
+    face: FaceRef,
+    frame: &DetailFrame,
+    bands: &[Band],
+) -> Result<Vec<BandHatch>, String> {
+    let Some(block) = d.block(&view_block_name(detail)) else { return Ok(Vec::new()) };
+    let repeated = repeat_members(d, detail)?;
+    let band_at = |offset: f64| bands.iter().position(|b| (b.offset - offset).abs() <= TOLERANCE.coincidence_mm);
+    let mut mapped_frame = None;
+    let mut out = Vec::new();
+    for e in block.entities.iter().filter(|e| !repeated.contains(&e.handle)) {
+        let EntityKind::Hatch(h) = &e.kind else { continue };
+        let [only] = h.loops.as_slice() else { continue };
+        if only.vertices.iter().any(|v| v.bulge != 0.0) {
+            continue;
+        }
+        let offset = |v: &PolyVertex| (v.p.x - frame.origin.x) * frame.into.x + (v.p.y - frame.origin.y) * frame.into.y;
+        let low = only.vertices.iter().map(offset).fold(f64::INFINITY, f64::min);
+        let high = only.vertices.iter().map(offset).fold(f64::NEG_INFINITY, f64::max);
+        let (Some(from_band), Some(to_band)) = (band_at(low), band_at(high)) else { continue };
+        if from_band == to_band {
+            continue;
+        }
+        if mapped_frame.is_none() {
+            mapped_frame = lay_bands(run, sides, face, &[Band { offset: 0.0, layer: String::new() }])?.into_iter().next();
+        }
+        let Some(mapped) = &mapped_frame else { continue };
+        let turn = (mapped.to.y - mapped.from.y).atan2(mapped.to.x - mapped.from.x) - frame.along.y.atan2(frame.along.x);
+        out.push(BandHatch {
+            from_band,
+            to_band,
+            layer: e.common.layer.clone(),
+            hatch: Hatch {
+                loops: Vec::new(),
+                associative: false,
+                angle: norm_angle(h.angle + turn),
+                origin: Vec2::new(mapped.from.x, mapped.from.y),
+                ..h.clone()
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// The HATCH `h` is written as: one loop around its two bands' final `lines`, in an order that does
+/// not self-cross when the bands point opposite ways. `None` when an index is out of range.
+fn laid_hatch(lines: &[AssemblyLine], h: &BandHatch) -> Option<Hatch> {
+    let (a, b) = (lines.get(h.from_band)?, lines.get(h.to_band)?);
+    let same_way = (a.to.x - a.from.x) * (b.to.x - b.from.x) + (a.to.y - a.from.y) * (b.to.y - b.from.y) >= 0.0;
+    let (c, e) = if same_way { (b.to, b.from) } else { (b.from, b.to) };
+    let vertices = [a.from, a.to, c, e].iter().map(|p| PolyVertex::new(Vec2::new(p.x, p.y))).collect();
+    Some(Hatch { loops: vec![HatchLoop { vertices, outer: true, sources: Vec::new() }], ..h.hatch.clone() })
+}
+
+/// Every hatch written to a view's assembly block, in write order, with its layer.
+fn block_hatches_of(runs: &[RunAssembly]) -> impl Iterator<Item = (&str, Hatch)> {
+    runs.iter().flat_map(|r| r.hatches.iter().filter_map(|h| Some((h.layer.as_str(), laid_hatch(r.lines.get(..r.bands)?, h)?))))
 }
 
 /// Every entity in `detail`'s block except `reference` and repeat members ([`crate::repeats`]) that
@@ -297,14 +383,16 @@ fn laid_reference(
 }
 
 /// One run's lines from `detail` (bands, then each repeat's copies), how many of them are bands, the
-/// line count of each copy, its width conflict and the face it was laid from, or why not.
+/// line count of each copy, its width conflict, the face it was laid from and its band hatches, or
+/// why not.
+#[allow(clippy::type_complexity)]
 fn run_lines(
     d: &Drawing,
     view: Id,
     detail: Id,
     run: &lamb_core::derivation::walls::WallRun,
     sides: &lamb_core::derivation::wall_spaces::RunSides,
-) -> Result<(Vec<AssemblyLine>, usize, Vec<usize>, Option<WidthConflict>, FaceRef), String> {
+) -> Result<(Vec<AssemblyLine>, usize, Vec<usize>, Option<WidthConflict>, FaceRef, Vec<BandHatch>), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let lines = detail_lines(d, detail, r.handle)?;
     let (reference, face) = laid_reference(d, view, run, sides, &r, &lines)?;
@@ -323,7 +411,11 @@ fn run_lines(
         laid.extend(copy);
     }
     move_studs(&mut laid[n..], &copies, run, &crate::studgrid::stud_moves(d, view, run));
-    Ok((laid, n, copies, width_conflict(run, face, &bands), face))
+    let hatches = match run.centreline {
+        RunCurve::Arc { .. } => Vec::new(),
+        RunCurve::Line { .. } => band_hatches(d, detail, run, sides, face, &frame, &bands)?,
+    };
+    Ok((laid, n, copies, width_conflict(run, face, &bands), face, hatches))
 }
 
 /// LAMB T464: each stud-move point, in order, shifts the not-yet-moved repeat copy whose centre
@@ -390,6 +482,7 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
                 skipped: Some(why.into()),
                 conflict: None,
                 face: None,
+                hatches: Vec::new(),
             };
             let id = match resolved {
                 RunDetail::Tagged(id) | RunDetail::Spread(id) | RunDetail::Gap(id) => id,
@@ -398,8 +491,8 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             };
             let Ok(detail) = id.parse::<u64>().map(Id) else { return skip("detail id is not a number", None) };
             match run_lines(d, plan, detail, run, side) {
-                Ok((lines, bands, copies, conflict, face)) => {
-                    RunAssembly { run: i, detail: Some(detail), lines, bands, copies, skipped: None, conflict, face: Some(face) }
+                Ok((lines, bands, copies, conflict, face, hatches)) => {
+                    RunAssembly { run: i, detail: Some(detail), lines, bands, copies, skipped: None, conflict, face: Some(face), hatches }
                 }
                 Err(e) => skip(&e, Some(detail)),
             }
@@ -490,13 +583,27 @@ fn trim_jamb(runs: &mut [RunAssembly], graph_runs: &[WallRun], (i, end): (usize,
 }
 
 /// Clips `r`'s band lines to `reach` along `u` from `node` ([`trim_to_reach`], dropping those wholly
-/// inside) and drops every repeat copy with a line end inside it.
+/// inside, with any hatch between them) and drops every repeat copy with a line end inside it.
 fn trim_run(r: &mut RunAssembly, node: Point2, u: Point2, reach: f64) {
     let limit = reach - TOLERANCE.coincidence_mm;
     let inside = |p: Point2| (p.x - node.x) * u.x + (p.y - node.y) * u.y < limit;
     let mut rest = r.lines.split_off(r.bands);
-    r.lines.retain_mut(|l| trim_to_reach(l, node, u, reach));
+    let mut kept = Vec::with_capacity(r.lines.len());
+    r.lines.retain_mut(|l| {
+        let keep = trim_to_reach(l, node, u, reach);
+        kept.push(keep);
+        keep
+    });
     r.bands = r.lines.len();
+    let kept_index = |band: usize| kept.get(band).copied().unwrap_or(false).then(|| kept.iter().take(band).filter(|k| **k).count());
+    r.hatches.retain_mut(|h| match (kept_index(h.from_band), kept_index(h.to_band)) {
+        (Some(from), Some(to)) => {
+            h.from_band = from;
+            h.to_band = to;
+            true
+        }
+        _ => false,
+    });
     let mut copies = Vec::new();
     for n in std::mem::take(&mut r.copies) {
         let copy: Vec<AssemblyLine> = rest.drain(..n.min(rest.len())).collect();
@@ -993,7 +1100,8 @@ fn line_entity(l: &AssemblyLine) -> EntityKind {
 }
 
 /// Replaces the block [`assembly_block_name`]`(plan)` with one LINE or ARC ([`line_entity`]) per
-/// line of `runs`, then of `corners`, then of `openings`, then of `ends`.
+/// line of `runs`, then of `corners`, then of `openings`, then of `ends`, then one HATCH per
+/// [`BandHatch`] of `runs`.
 fn replace_block(
     d: &mut Drawing,
     plan: Id,
@@ -1008,6 +1116,10 @@ fn replace_block(
     for l in block_lines_of(runs, corners, openings, ends) {
         let common = Common { layer: l.layer.clone(), ..Common::default() };
         d.add(&space, common, line_entity(l)).map_err(|e| e.to_string())?;
+    }
+    for (layer, hatch) in block_hatches_of(runs) {
+        let common = Common { layer: layer.to_string(), ..Common::default() };
+        d.add(&space, common, EntityKind::Hatch(hatch)).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1059,7 +1171,9 @@ pub fn write_assembly_block(
 /// `true` when `block` holds exactly the lines of `runs`, `corners`, `openings` then `ends`, in write order: same count, each pair on
 /// the same layer and of the same kind ([`line_entity`]) — a LINE's ends within
 /// [`TOLERANCE`]`.coincidence_mm`; an ARC's centre and radius within that, its start and end angles
-/// within `TOLERANCE.angle_deg`.
+/// within `TOLERANCE.angle_deg` — then the runs' hatches: each on the same layer with the same pattern,
+/// solidity and scale, its angle within `TOLERANCE.angle_deg` and its loop vertices within
+/// `coincidence_mm`.
 fn block_matches(block: &Block, runs: &[RunAssembly], corners: &[CornerAssembly], openings: &[OpeningAssembly], ends: &[EndAssembly]) -> bool {
     let tol = TOLERANCE.coincidence_mm;
     let near = |p: cadcraft_geom::Vec3, q: cadcraft_geom::Vec3| (p.x - q.x).hypot(p.y - q.y) <= tol;
@@ -1067,9 +1181,9 @@ fn block_matches(block: &Block, runs: &[RunAssembly], corners: &[CornerAssembly]
         let d = (a - b).rem_euclid(std::f64::consts::TAU);
         d.min(std::f64::consts::TAU - d) <= TOLERANCE.angle_deg.to_radians()
     };
-    let mut want = block_lines_of(runs, corners, openings, ends);
-    for e in block.entities.iter() {
-        let Some(l) = want.next() else { return false };
+    let mut got = block.entities.iter();
+    for l in block_lines_of(runs, corners, openings, ends) {
+        let Some(e) = got.next() else { return false };
         if e.common.layer != l.layer {
             return false;
         }
@@ -1084,7 +1198,24 @@ fn block_matches(block: &Block, runs: &[RunAssembly], corners: &[CornerAssembly]
             return false;
         }
     }
-    want.next().is_none()
+    for (layer, w) in block_hatches_of(runs) {
+        let Some(e) = got.next() else { return false };
+        let EntityKind::Hatch(h) = &e.kind else { return false };
+        let same_loops = h.loops.len() == w.loops.len()
+            && h.loops.iter().zip(&w.loops).all(|(a, b)| {
+                a.vertices.len() == b.vertices.len() && a.vertices.iter().zip(&b.vertices).all(|(p, q)| (p.p.x - q.p.x).hypot(p.p.y - q.p.y) <= tol)
+            });
+        if e.common.layer != layer
+            || h.pattern != w.pattern
+            || h.solid != w.solid
+            || h.scale != w.scale
+            || !same_angle(h.angle, w.angle)
+            || !same_loops
+        {
+            return false;
+        }
+    }
+    got.next().is_none()
 }
 
 /// `true` when `view`'s assembly block exists and equals its derivation ([`assembly_lines`] then
@@ -2079,6 +2210,7 @@ pub(crate) mod tests {
             skipped: None,
             conflict: None,
             face: None,
+            hatches: vec![],
         };
         let mut block = Block::new("X");
         block.entities.push(Entity {
@@ -3990,6 +4122,282 @@ pub(crate) mod tests {
         };
         assert!(of_width(200).iter().all(|x| matches!(x, RunDetail::Tagged(_) | RunDetail::Spread(_))), "{ends:?}");
         assert!(of_width(90).len() == 2 && of_width(90).iter().all(|x| **x == RunDetail::Untyped), "{ends:?}");
+        Ok(())
+    }
+
+    /// Into `view`: bands at y = `y0` and `y1` on `FACE`, and on `INSUL` a rectangle x 100..400 between
+    /// `h0` and `h1` hatched `ANSI31` at `angle` degrees. Back in `plan`. Returns the hatch's handle.
+    fn strip_in(s: &mut Session, view: Id, plan: Id, (y0, y1): (f64, f64), (h0, h1): (f64, f64), angle: f64) -> T<String> {
+        s.execute("editview", &json!({ "viewId": view.0 }))?;
+        s.execute("layer.new", &json!({ "name": "FACE", "current": true }))?;
+        line(s, [0.0, y0], [1000.0, y0])?;
+        line(s, [0.0, y1], [1000.0, y1])?;
+        s.execute("layer.new", &json!({ "name": "INSUL", "current": true }))?;
+        let before = all_handles(s)?;
+        s.execute("pline", &json!({ "vertices": [[100.0, h0], [400.0, h0], [400.0, h1], [100.0, h1]], "closed": true }))?;
+        let edge = all_handles(s)?.into_iter().find(|h| !before.contains(h)).ok_or("no boundary")?;
+        let r = s.execute("hatch", &json!({ "handles": [edge.hex()], "pattern": "ANSI31", "angle": angle }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        Ok(r["handle"].as_str().ok_or("no hatch")?.to_string())
+    }
+
+    /// [`strip_in`] the first detail: bands at 0 and 100, hatched between them.
+    fn strip(s: &mut Session, plan: Id, angle: f64) -> T<String> {
+        let detail = detail_id(s)?;
+        strip_in(s, detail, plan, (0.0, 100.0), (0.0, 100.0), angle)
+    }
+
+    /// The assembly block's hatches, with their layers.
+    fn block_hatches(s: &Session, name: &str) -> T<Vec<(String, Hatch)>> {
+        let b = s.doc()?.block(name).ok_or("no block")?;
+        Ok(b.entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Hatch(h) => Some((e.common.layer.clone(), h.clone())),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn loop_points(h: &Hatch) -> Vec<(f64, f64)> {
+        h.loops.iter().flat_map(|l| &l.vertices).map(|v| (r6(v.p.x), r6(v.p.y))).collect()
+    }
+
+    /// The hatches lying wholly within y 0..100: the bottom wall's strips.
+    fn bottom_strips(s: &Session, name: &str) -> T<Vec<Vec<(f64, f64)>>> {
+        Ok(block_hatches(s, name)?.iter().map(|(_, h)| loop_points(h)).filter(|p| p.iter().all(|q| (0.0..=100.0).contains(&q.1))).collect())
+    }
+
+    fn straight_runs(s: &Session, plan: Id) -> T<Vec<(Point2, Point2, RunAssembly)>> {
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        let mut out = Vec::new();
+        for r in assembly_lines(d, plan)? {
+            if let RunCurve::Line { from, to } = graph.runs[r.run].centreline {
+                out.push((from, to, r));
+            }
+        }
+        Ok(out)
+    }
+
+    fn hatch_defaults() -> Hatch {
+        Hatch {
+            pattern: String::new(),
+            solid: false,
+            loops: vec![],
+            scale: 1.0,
+            angle: 0.0,
+            associative: false,
+            style: 0,
+            elevation: 0.0,
+            gradient: None,
+            origin: Vec2::new(0.0, 0.0),
+            background: None,
+            pattern_lines: vec![],
+        }
+    }
+
+    #[test]
+    fn a_hatch_between_two_bands_is_laid_as_a_strip_on_each_run_between_the_mitred_ends() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        strip(&mut s, plan, 0.0)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0, "mitre": true }))?;
+        let name = assembly_block_name(plan);
+        let hatches = block_hatches(&s, &name)?;
+        assert_eq!(hatches.len(), 4, "one per run");
+        for (layer, h) in &hatches {
+            assert_eq!((layer.as_str(), h.pattern.as_str(), h.solid, h.associative), ("INSUL", "ANSI31", false, false));
+            assert_eq!(h.loops.len(), 1);
+            assert_eq!(h.loops[0].vertices.len(), 4);
+            assert!(h.loops[0].outer && h.loops[0].sources.is_empty());
+        }
+        let bottom = bottom_strips(&s, &name)?;
+        assert_eq!(bottom.len(), 1, "{bottom:?}");
+        let mut got = bottom[0].clone();
+        got.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        assert_eq!(got, [(0.0, 0.0), (100.0, 100.0), (4900.0, 100.0), (5000.0, 0.0)], "on the mitres");
+        // Around the strip, not across it: the bands' ends in loop order.
+        let p = &bottom[0];
+        assert!(p[0].1 == p[1].1 && p[2].1 == p[3].1 && (p[1].0 - p[2].0).abs() == 100.0, "{p:?}");
+        // The lines come first.
+        let b = s.doc()?.block(&name).ok_or("no block")?;
+        let kinds: Vec<bool> = b.entities.iter().map(|e| matches!(e.kind, EntityKind::Hatch(_))).collect();
+        assert_eq!(kinds.iter().filter(|h| !**h).count(), 20, "5 bands on 4 runs");
+        assert!(kinds[..20].iter().all(|h| !*h));
+        Ok(())
+    }
+
+    #[test]
+    fn a_strip_ends_on_the_bands_trimmed_at_a_corner_detail() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        strip(&mut s, plan, 0.0)?;
+        let d1 = detail_id(&s)?;
+        s.execute(
+            "detailtag",
+            &json!({ "detailViewId": d1.0, "corner": true, "tip": {"x": 0.0, "y": 0.0}, "bubble": {"x": -1000.0, "y": -1000.0} }),
+        )?;
+        without_assembly(&mut s)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let name = assembly_block_name(plan);
+        assert_eq!(block_hatches(&s, &name)?.len(), 4);
+        let bottom = bottom_strips(&s, &name)?;
+        assert_eq!(bottom.len(), 1, "{bottom:?}");
+        let (_, _, run) = straight_runs(&s, plan)?
+            .into_iter()
+            .find(|(from, to, _)| (from.y - 100.0).abs() < 1.0 && (to.y - 100.0).abs() < 1.0)
+            .ok_or("no bottom run")?;
+        let (f, t) = (run.hatches[0].from_band, run.hatches[0].to_band);
+        let (a, b) = (&run.lines[f], &run.lines[t]);
+        let want = [a.from, a.to, b.to, b.from].map(|p| (r6(p.x), r6(p.y)));
+        assert_eq!(bottom[0], want);
+        let left = bottom[0].iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        assert!(left > 100.0, "trimmed past the untrimmed end: {:?}", bottom[0]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_band_a_trim_drops_takes_its_strip_with_it_and_the_rest_keep_their_bands() {
+        let band = |x: f64, y: f64| AssemblyLine { from: Point2 { x: 0.0, y }, to: Point2 { x, y }, layer: "A".into(), arc: None };
+        let hatch = |from_band, to_band| BandHatch { from_band, to_band, layer: "H".into(), hatch: hatch_defaults() };
+        let mut r = RunAssembly {
+            run: 0,
+            detail: None,
+            lines: vec![band(50.0, 0.0), band(500.0, 10.0), band(500.0, 20.0)],
+            bands: 3,
+            copies: vec![],
+            skipped: None,
+            conflict: None,
+            face: None,
+            hatches: vec![hatch(0, 1), hatch(1, 2)],
+        };
+        trim_run(&mut r, Point2 { x: 0.0, y: 0.0 }, Point2 { x: 1.0, y: 0.0 }, 100.0);
+        assert_eq!(r.bands, 2);
+        assert_eq!(r.hatches.iter().map(|h| (h.from_band, h.to_band)).collect::<Vec<_>>(), [(0, 1)]);
+    }
+
+    #[test]
+    fn opposed_bands_are_looped_without_crossing() {
+        let a = AssemblyLine { from: Point2 { x: 0.0, y: 0.0 }, to: Point2 { x: 10.0, y: 0.0 }, layer: "A".into(), arc: None };
+        let b = AssemblyLine { from: Point2 { x: 10.0, y: 5.0 }, to: Point2 { x: 0.0, y: 5.0 }, layer: "A".into(), arc: None };
+        let h = BandHatch { from_band: 0, to_band: 1, layer: "H".into(), hatch: hatch_defaults() };
+        let laid = laid_hatch(&[a, b], &h).expect("both bands exist");
+        assert_eq!(loop_points(&laid), [(0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)]);
+        assert_eq!(laid_hatch(&[], &h), None);
+    }
+
+    #[test]
+    fn each_piece_of_a_wall_split_by_an_opening_gets_its_own_strip() -> R {
+        for opening_tag in [false, true] {
+            let (mut s, plan) = window_room(false, opening_tag)?;
+            let doc = read_document(s.doc()?)?;
+            let d1 = doc.views.iter().find(|v| v.name() == "D1").ok_or("no D1")?.id();
+            strip_in(&mut s, d1, plan, (0.0, 100.0), (0.0, 100.0), 0.0)?;
+            s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+            let bottom = bottom_strips(&s, &assembly_block_name(plan))?;
+            assert_eq!(bottom.len(), 2, "{bottom:?}");
+            for p in &bottom {
+                let (lo, hi) = (p.iter().map(|q| q.0).fold(f64::INFINITY, f64::min), p.iter().map(|q| q.0).fold(f64::NEG_INFINITY, f64::max));
+                assert!(hi <= 2000.0 || lo >= 3000.0, "across the opening: {p:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_strip_s_pattern_turns_with_the_wall() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        strip(&mut s, plan, 30.0)?;
+        let angle_of = |dir: fn(Point2, Point2) -> bool, s: &Session| -> T<f64> {
+            let (_, _, r) = straight_runs(s, plan)?.into_iter().find(|(f, t, _)| dir(*f, *t)).ok_or("no such run")?;
+            Ok(r.hatches.first().ok_or("no hatch")?.hatch.angle)
+        };
+        let x = angle_of(|f, t| (f.y - t.y).abs() < 1.0, &s)?;
+        let y = angle_of(|f, t| (f.x - t.x).abs() < 1.0, &s)?;
+        let mod_half_turn = |a: f64| r6(a.rem_euclid(std::f64::consts::PI).to_degrees());
+        assert_eq!(mod_half_turn(x), 30.0);
+        assert_eq!(mod_half_turn(y), 120.0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_hatch_short_of_two_bands_is_not_carried() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        let detail = detail_id(&s)?;
+        strip_in(&mut s, detail, plan, (0.0, 100.0), (100.0, 150.0), 0.0)?;
+        assert!(straight_runs(&s, plan)?.iter().all(|(_, _, r)| r.skipped.is_none() && r.hatches.is_empty()));
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert!(block_hatches(&s, &assembly_block_name(plan))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_arc_run_carries_no_strip_and_its_straight_runs_do() -> R {
+        let (mut s, plan) = d_room()?;
+        let detail = detail_id(&s)?;
+        strip_in(&mut s, detail, plan, (0.0, 100.0), (0.0, 100.0), 0.0)?;
+        let d = s.doc()?;
+        let p = DrawingProject::new(d)?;
+        let (graph, _) = graph_and_sides(&p, plan);
+        let mut arcs = 0;
+        for r in &assembly_lines(d, plan)? {
+            if matches!(graph.runs[r.run].centreline, RunCurve::Arc { .. }) {
+                arcs += 1;
+                assert!(r.hatches.is_empty(), "{r:?}");
+            } else {
+                assert_eq!(r.hatches.len(), 1, "{r:?}");
+            }
+        }
+        assert_eq!(arcs, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_section_s_cut_wall_gets_the_strip_too() -> R {
+        let (mut s, sec) = section_wall(300.0)?;
+        let doc = read_document(s.doc()?)?;
+        let sd = doc.views.iter().find(|v| v.name() == "SD").ok_or("no SD")?.id();
+        strip_in(&mut s, sd, sec, (10.0, 100.0), (10.0, 100.0), 0.0)?;
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let got = block_hatches(&s, &assembly_block_name(sec))?;
+        assert!(!got.is_empty());
+        assert!(got.iter().all(|(l, h)| l == "INSUL" && h.loops[0].vertices.len() == 4));
+        assert_eq!(got.len(), assembly_lines(s.doc()?, sec)?.iter().map(|r| r.hatches.len()).sum::<usize>());
+        Ok(())
+    }
+
+    #[test]
+    fn the_block_s_strips_follow_the_detail_and_nothing_else_rewrites_them() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        crate::maintain::install(&mut s);
+        let hatch = strip(&mut s, plan, 0.0)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let name = assembly_block_name(plan);
+        assert!(block_matches_view(s.doc()?, plan));
+
+        // An unrelated command leaves the block, and so its handles, alone.
+        let block = s.doc()?.block(&name).ok_or("no block")?.clone();
+        s.execute("editview", &json!({ "viewId": null }))?;
+        s.execute("layer.new", &json!({ "name": "NOTES", "current": true }))?;
+        line(&mut s, [90_000.0, 90_000.0], [91_000.0, 90_000.0])?;
+        assert!(Arc::ptr_eq(&block, s.doc()?.block(&name).ok_or("no block")?), "unrelated command left the block untouched");
+
+        // DXF leaves nothing to rewrite.
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes())?;
+        assert!(block_matches_view(&back, plan), "DXF round trip");
+
+        // Editing the detail's hatch reaches the block in that step.
+        let detail = detail_id(&s)?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let n = undo_len(&s)?;
+        s.execute("hatchedit", &json!({ "handles": [hatch.clone()], "pattern": "ANSI37" }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert!(block_hatches(&s, &name)?.iter().all(|(_, h)| h.pattern == "ANSI37"));
+        s.execute("hatchedit", &json!({ "handles": [hatch], "scale": 3 }))?;
+        assert!(block_hatches(&s, &name)?.iter().all(|(_, h)| h.scale == 3.0));
+        s.undo()?;
+        s.undo()?;
+        assert!(block_hatches(&s, &name)?.iter().all(|(_, h)| h.pattern == "ANSI31"), "regeneration rode the edit's step");
         Ok(())
     }
 }
