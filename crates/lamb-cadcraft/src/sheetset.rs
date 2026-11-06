@@ -30,7 +30,8 @@
 //! a view no longer placed or no longer in the project stays as it is and the message names it.
 //!
 //! `sheetset {pdf?}` (`sset`) returns `{sheets: [{layout, group, viewIds}], alreadyOnSheets,
-//! refit: [{layout, view, scale}], pdf?, message}`, `group` being `list`, `bom` or `schedule` for a table made
+//! refit: [{layout, view, scale}], weighted, pdf?, message}`, `weighted` counting the lines this run
+//! stamped with a lineweight and `group` being `list`, `bom` or `schedule` for a table made
 //! or updated, with no `viewIds`.
 //! With `pdf`, every set sheet in tab order is plotted to that one PDF, a page and a bookmark
 //! per sheet, whether or not this run placed anything, and `proposedLines` counts the unaccepted
@@ -42,14 +43,26 @@
 //! view or an assembly that is still on layer `0` moves to [`VPORT_LAYER`], and a set sheet with
 //! no plot style table takes monochrome. A table a user chose stays, a foreign viewport stays.
 //!
+//! The sheets plot in black, so weight is what separates a cut wall from what lies beyond (LAMB
+//! T646). In the same undo step, each entity in the view block of a placed plan or vertical takes a
+//! lineweight from its resolved role: `Cut` 0.50 mm, `Annotation` 0.18 mm, `Datum` and `Reference`
+//! 0.13 mm, and `Seen` and anything else none, which plots at the default 0.25 mm. The weight is
+//! stamped on the entity, since one layer holds different roles in different views, and stays
+//! visible in DXF, DWG and Properties. Only an entity that is ByLayer on a layer whose lineweight is
+//! `Default` takes one (layer `0` plots through the view's own layer, so that layer decides): a
+//! weight chosen on the entity or the layer stands. Details, assembly blocks, generated annotation
+//! and paper space are not stamped. A stamp is not revisited: an entity whose role changes later
+//! keeps its weight until it is set back to ByLayer.
+//!
 //! SHEETSIZE (LAMB T633): `sheetsize {paper}` (`ssize`) sets the one project setting new sheets
 //! take their paper from ([`crate::sheets::sheet_page`]), in one undo step, and returns
 //! `{paper, widthMm, heightMm, message}` with the landscape sheet size. Existing sheets are never
 //! resized or re-flowed.
 
-use cadcraft_doc::{Drawing, EntityKind, MONOCHROME_CTB, Space};
+use cadcraft_doc::{Drawing, EntityKind, Handle, Lineweight, MONOCHROME_CTB, Space};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use lamb_core::derivation::read::ProjectRead;
+use lamb_core::model::entities::LineRole;
 use lamb_core::model::{AnyView, Id, VerticalIntent};
 use serde_json::{Value, json};
 
@@ -58,7 +71,7 @@ use crate::commands::{bad, name_input, other};
 use crate::detailsheets::{lay_detail_sheets, next_sheet_name};
 use crate::project::DrawingProject;
 use crate::schedule::{self, OPENING_TITLE, refresh_opening_schedule};
-use crate::schema::{assembly_block_name, read_document, read_entity_data, write_document};
+use crate::schema::{assembly_block_name, read_document, read_entity_data, view_block_name, write_document};
 use crate::sheets::{
     DEFAULT_SHEET_PAPER, VPORT_LAYER, create_sheet, ensure_vport_layer, refit_viewport, sheet_paper_size, view_placed, view_sheet_ref, viewport_scale,
 };
@@ -223,6 +236,48 @@ fn update_for_plotting(d: &mut Drawing) -> Result<usize> {
     Ok(updated.len())
 }
 
+/// The lineweight a view line plots at for its role; `None` keeps the default.
+fn role_lineweight(role: LineRole) -> Option<Lineweight> {
+    match role {
+        LineRole::Cut => Some(Lineweight::Mm100(50)),
+        LineRole::Annotation => Some(Lineweight::Mm100(18)),
+        LineRole::Datum | LineRole::Reference => Some(Lineweight::Mm100(13)),
+        _ => None,
+    }
+}
+
+/// Stamps each entity in the view block of a placed plan or vertical with its role's lineweight,
+/// unless the entity or its layer has a weight chosen. Returns how many were stamped.
+fn stamp_lineweights(d: &mut Drawing) -> Result<usize> {
+    let mut stamps: Vec<(Handle, Lineweight)> = Vec::new();
+    {
+        let project = DrawingProject::new(d).map_err(other)?;
+        for (group, _, views) in set_views(d)? {
+            if group == FRAMING_GROUP {
+                continue; // The same views again, for their assembly blocks.
+            }
+            for (view, _) in views {
+                let block = view_block_name(view);
+                for e in project.entities(view) {
+                    let Some(weight) = role_lineweight(project.role_of(&e)) else { continue };
+                    let handle = Handle(e.id.0);
+                    // Layer 0 inside a block plots through the layer of the block's reference.
+                    let layer = if e.layer_id == "0" { block.as_str() } else { e.layer_id };
+                    if d.entity(handle).is_some_and(|x| x.common.lineweight == Lineweight::ByLayer)
+                        && d.layer(layer).is_none_or(|l| l.lineweight == Lineweight::Default)
+                    {
+                        stamps.push((handle, weight));
+                    }
+                }
+            }
+        }
+    }
+    for (handle, weight) in &stamps {
+        d.modify_entity(*handle, |e| e.common.lineweight = *weight).map_err(other)?;
+    }
+    Ok(stamps.len())
+}
+
 /// The unaccepted AI lines in the views the set sheets show.
 fn proposed_lines(d: &Drawing) -> Result<usize> {
     let mut views: Vec<Id> = Vec::new();
@@ -289,6 +344,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     // Build every sheet on a copy and assign it back once: one undo step.
     let mut d = s.doc()?.clone();
     let updated = update_for_plotting(&mut d)?;
+    let weighted = stamp_lineweights(&mut d)?;
     let mut sheets: Vec<Value> = Vec::new();
     let mut parts: Vec<String> = Vec::new();
     let mut already = 0usize;
@@ -342,7 +398,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     let before = s.state()?.doc.clone();
-    let changed = updated > 0 || !sheets.is_empty() || !refit.is_empty();
+    let changed = updated > 0 || weighted > 0 || !sheets.is_empty() || !refit.is_empty();
     if changed {
         order_tabs(&mut d);
         *s.doc_mut()? = d;
@@ -355,6 +411,9 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     if updated > 0 {
         message.push_str(&format!("; {updated} sheet{} updated for plotting", if updated == 1 { "" } else { "s" }));
     }
+    if weighted > 0 {
+        message.push_str(&format!("; {weighted} line{} weighted by role", if weighted == 1 { "" } else { "s" }));
+    }
     if !refit.is_empty() {
         let n = refit.len();
         message.push_str(&format!("; {n} viewport{} refit ({})", if n == 1 { "" } else { "s" }, refit_labels.join(", ")));
@@ -366,7 +425,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         message.push_str(&format!("; {} runs off the sheet", off_sheet.join(" and ")));
     }
     message.push('.');
-    let mut out = json!({ "sheets": sheets, "alreadyOnSheets": already, "refit": refit, "message": message });
+    let mut out = json!({ "sheets": sheets, "alreadyOnSheets": already, "refit": refit, "weighted": weighted, "message": message });
     if let Some(path) = pdf {
         let names = set_sheets(s.doc()?);
         if names.is_empty() {
@@ -448,7 +507,6 @@ pub(crate) fn sheetsize_machine(s: &Session) -> Result<Box<dyn Interactive>> {
 mod tests {
     use super::*;
     use crate::bom::tests::{new_handle, stud_room};
-    use crate::schema::view_block_name;
     use cadcraft_doc::EntityKind;
     use cadcraft_engine::cmd::file::{IoHooks, set_io};
 
@@ -549,7 +607,7 @@ mod tests {
         assert_eq!(laid(&r), want, "{r}");
         assert_eq!(
             r["message"],
-            "Sheet set: A001 Drawing List, A101 Ground Floor, A102 First, A201 North, A301 Section A, A401 Ground Floor framing, A501 (2 details)."
+            "Sheet set: A001 Drawing List, A101 Ground Floor, A102 First, A201 North, A301 Section A, A401 Ground Floor framing, A501 (2 details); 8 lines weighted by role."
         );
         assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
         let mut want_tabs: Vec<String> = ["A001", "A101", "A102", "A201", "A301", "A401", "A501"].map(String::from).to_vec();
@@ -758,7 +816,7 @@ mod tests {
         let names: Vec<String> = laid(&r).into_iter().map(|(l, _, _)| l).collect();
         assert_eq!(names, ["A001", "A101", "A102", "A301", "A401", "A501"], "{r}");
         assert_eq!(r["alreadyOnSheets"], 1);
-        assert!(r["message"].as_str().unwrap_or_default().ends_with("; 1 already on sheets."), "{r}");
+        assert!(r["message"].as_str().unwrap_or_default().contains("; 1 already on sheets;"), "{r}");
         assert_eq!(view_sheet_ref(s.doc()?, elev), Some((1, "Mine".to_owned())));
         Ok(())
     }
@@ -1459,6 +1517,221 @@ mod tests {
         let (vp, _) = only_viewport(&s, "A301")?;
         assert_eq!((vp.view_center, vp.view_height), (old_sec.view_center, old_sec.view_height));
         assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
+        Ok(())
+    }
+
+    /// A line of `length` drawn along y = `y` in the view being edited, on the current layer.
+    fn line_of(s: &mut Session, y: f64, length: f64) -> T<String> {
+        new_handle(s, "line", json!({ "points": [[0, y], [length, y]] }))
+    }
+
+    /// [`line_of`] in `view`, whose block alone is searched: drawing in a vertical view can add
+    /// generated entities to other blocks.
+    fn line_in(s: &mut Session, view: Id, y: f64, length: f64) -> T<String> {
+        let all = |s: &Session| -> T<Vec<Handle>> {
+            Ok(s.doc()?.block(&view_block_name(view)).ok_or("no block")?.entities.iter().map(|e| e.handle).collect())
+        };
+        let before = all(s)?;
+        s.execute("line", &json!({ "points": [[0, y], [length, y]] }))?;
+        let h = all(s)?.into_iter().find(|h| !before.contains(h)).ok_or("nothing added")?;
+        Ok(format!("{:X}", h.0))
+    }
+
+    /// The width (mm) `layout` plots the line of `length` (model mm) with, in monochrome.
+    fn plotted_width(d: &Drawing, layout: &str, length: f64) -> T<f32> {
+        let table = cadcraft_doc::plot_style_table(d, MONOCHROME_CTB).ok_or("no table")?;
+        let opts = cadcraft_render::Options { lineweights: true, plot_style_table: Some(std::sync::Arc::new(table)), ..Default::default() };
+        let space = Space::Paper(layout.into());
+        let list = cadcraft_render::build_plot(d, &space, &opts);
+        let port = d.space(&space).ok_or("no sheet")?.iter().find_map(|e| match &e.kind {
+            EntityKind::Viewport(v) if read_entity_data(&e.common).is_ok_and(|x| x.view_id.is_some()) => Some(v.clone()),
+            _ => None,
+        });
+        let want = length / crate::sheets::viewport_scale(&port.ok_or("no viewport")?);
+        let widths: Vec<f32> = list
+            .prims
+            .iter()
+            .filter(|p| matches!(p.kind, cadcraft_render::Kind::Polyline) && p.len == 2)
+            .filter(|p| {
+                let v = &list.verts[p.start as usize..(p.start + p.len) as usize];
+                ((v[1].x - v[0].x).hypot(v[1].y - v[0].y) - want).abs() < 1e-6
+            })
+            .map(|p| p.lw)
+            .collect();
+        match widths.as_slice() {
+            [w] => Ok(*w),
+            found => Err(format!("{layout}: a line {length} long plots as {found:?}").into()),
+        }
+    }
+
+    /// The widths (hundredths of a mm) a sheet's PDF strokes with.
+    fn pdf_widths(d: &Drawing, sheet: &str) -> T<Vec<i64>> {
+        let bytes = cadcraft_io::plot(d, &Space::Paper(sheet.into()), &json!({ "compress": false }))?;
+        let pdf = craft_pdf::open_slice(&bytes, None).map_err(|e| format!("the PDF opens: {e:?}"))?;
+        let pages = pdf.pages();
+        let page = pages.iter().next().ok_or("no page")?;
+        let content = String::from_utf8_lossy(page.page_stream().ok_or("no content")?).into_owned();
+        let tokens: Vec<&str> = content.split_whitespace().collect();
+        let mut out: Vec<i64> = Vec::new();
+        for w in tokens.windows(2).filter(|w| w[1] == "w") {
+            let hundredths = (w[0].parse::<f64>()? * 25.4 / 72.0 * 100.0).round() as i64;
+            if !out.contains(&hundredths) {
+                out.push(hundredths);
+            }
+        }
+        Ok(out)
+    }
+
+    fn weight_of(s: &Session, handle: &str) -> T<Lineweight> {
+        let h = Handle::parse_hex(handle).ok_or("not a handle")?;
+        Ok(s.doc()?.entity(h).ok_or("no entity")?.common.lineweight)
+    }
+
+    #[test]
+    fn a_plans_cut_lines_plot_heavier_than_its_seen_lines_in_one_undo_step() -> R {
+        let (mut s, [ground, ..]) = set()?;
+        s.execute("editview", &json!({ "viewId": ground.0 }))?;
+        s.execute("layer.new", &json!({ "name": "MIXED", "current": true }))?;
+        let cut = line_of(&mut s, 1000.0, 3100.0)?;
+        let seen = line_of(&mut s, 1500.0, 2100.0)?;
+        let grid = line_of(&mut s, 2000.0, 2300.0)?;
+        let note = line_of(&mut s, 2500.0, 2700.0)?;
+        for (h, role) in [(&seen, "seen"), (&grid, "datum"), (&note, "annotation")] {
+            s.execute("setrole", &json!({ "handles": [h], "role": role }))?;
+        }
+        s.execute("editview", &json!({}))?;
+
+        let n = undo_len(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step: {r}");
+        let d = s.doc()?;
+        let w = |len| plotted_width(d, "A101", len);
+        assert_eq!((w(3100.0)?, w(2100.0)?, w(2300.0)?, w(2700.0)?), (0.5, 0.25, 0.13, 0.18), "{r}");
+        assert_eq!(weight_of(&s, &seen)?, Lineweight::ByLayer, "seen stays at the default");
+        // On paper, in the monochrome PDF.
+        let widths = pdf_widths(d, "A101")?;
+        assert!(widths.contains(&50) && widths.contains(&25), "{widths:?}");
+        let weighted = r["weighted"].as_u64().ok_or("no count")?;
+        assert!(weighted >= 3, "{r}");
+        assert!(r["message"].as_str().ok_or("no message")?.contains(&format!("; {weighted} lines weighted by role")), "{r}");
+
+        // A rerun stamps nothing and adds no undo step.
+        let again = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "no undo step: {again}");
+        assert_eq!(again["weighted"], 0, "{again}");
+        assert!(!again["message"].as_str().ok_or("no message")?.contains("weighted"), "{again}");
+
+        // One new line is one line, in the singular.
+        s.execute("editview", &json!({ "viewId": ground.0 }))?;
+        let later = line_of(&mut s, 3000.0, 3300.0)?;
+        s.execute("editview", &json!({}))?;
+        let one = s.execute("sheetset", &json!({}))?;
+        assert_eq!(one["weighted"], 1, "{one}");
+        assert!(one["message"].as_str().ok_or("no message")?.contains("; 1 line weighted by role"), "{one}");
+        s.execute("undo", &json!({}))?;
+        assert_eq!(weight_of(&s, &later)?, Lineweight::ByLayer, "undone");
+        assert_eq!(weight_of(&s, &cut)?, Lineweight::Mm100(50), "the earlier stamp stays");
+
+        // Undoing back past the first run restores every stamp along with the sheets.
+        while undo_len(&s)? > n {
+            s.execute("undo", &json!({}))?;
+        }
+        assert_eq!(weight_of(&s, &cut)?, Lineweight::ByLayer, "undone");
+        assert!(s.doc()?.layout("A101").is_none(), "the sheets go with it");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rerun_writes_the_same_pdf() -> R {
+        set_io(IoHooks {
+            read: |b, n| cadcraft_io::read(b, n).map_err(|e| e.to_string()),
+            write: |d, n| cadcraft_io::write(d, n).map_err(|e| e.to_string()),
+            plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+        });
+        let (mut s, _) = set()?;
+        let dir = std::env::temp_dir().join(format!("lamb-sheetset-weights-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("set.pdf");
+        let path_s = path.to_string_lossy().into_owned();
+        s.execute("sheetset", &json!({ "pdf": path_s }))?;
+        let first = std::fs::read(&path)?;
+        let n = undo_len(&s)?;
+        let again = s.execute("sheetset", &json!({ "pdf": path_s }))?;
+        let second = std::fs::read(&path)?;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(again["weighted"], 0, "{again}");
+        assert_eq!(undo_len(&s)?, n, "{again}");
+        assert!(first == second, "the PDF bytes are unchanged: {} and {} long", first.len(), second.len());
+        Ok(())
+    }
+
+    #[test]
+    fn a_vertical_views_lines_are_weighted_by_their_own_role() -> R {
+        let (mut s, [_, _, elev, _]) = set()?;
+        s.execute("editview", &json!({ "viewId": elev.0 }))?;
+        s.execute("layer.new", &json!({ "name": "BEYOND", "current": true }))?;
+        let seen = line_in(&mut s, elev, 500.0, 1000.0)?; // A cut-default layer stamps seen in a vertical.
+        let cut = line_in(&mut s, elev, 900.0, 1200.0)?;
+        s.execute("setrole", &json!({ "handles": [&cut], "role": "cut" }))?;
+        s.execute("editview", &json!({}))?;
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(weight_of(&s, &seen)?, Lineweight::ByLayer);
+        assert_eq!(weight_of(&s, &cut)?, Lineweight::Mm100(50));
+        Ok(())
+    }
+
+    #[test]
+    fn a_chosen_weight_stands_and_layer_0_goes_by_the_views_layer() -> R {
+        let (mut s, [ground, first, ..]) = set()?;
+        s.execute("editview", &json!({ "viewId": ground.0 }))?;
+        s.execute("layer.new", &json!({ "name": "CHOSEN", "current": true }))?;
+        let on_chosen = line_of(&mut s, 1000.0, 3100.0)?;
+        s.execute("layer.new", &json!({ "name": "PLAIN", "current": true }))?;
+        let own = line_of(&mut s, 1500.0, 2100.0)?;
+        let by_block = line_of(&mut s, 1700.0, 2200.0)?;
+        let on_zero = line_of(&mut s, 2000.0, 2300.0)?;
+        s.execute("editview", &json!({ "viewId": first.0 }))?;
+        let zero_chosen = line_of(&mut s, 500.0, 2400.0)?;
+        s.execute("editview", &json!({}))?;
+        let at = |h: &str| Handle::parse_hex(h).ok_or("not a handle");
+        let d = s.doc_mut()?;
+        d.layer_mut("CHOSEN").ok_or("no layer")?.lineweight = Lineweight::Mm100(70);
+        d.layer_mut(&view_block_name(first)).ok_or("no view layer")?.lineweight = Lineweight::Mm100(35);
+        d.modify_entity(at(&own)?, |e| e.common.lineweight = Lineweight::Mm100(35))?;
+        d.modify_entity(at(&by_block)?, |e| e.common.lineweight = Lineweight::ByBlock)?;
+        d.modify_entity(at(&on_zero)?, |e| e.common.layer = "0".to_owned())?;
+        d.modify_entity(at(&zero_chosen)?, |e| e.common.layer = "0".to_owned())?;
+
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(weight_of(&s, &on_chosen)?, Lineweight::ByLayer, "the layer's weight stands");
+        assert_eq!(weight_of(&s, &own)?, Lineweight::Mm100(35), "the entity's weight stands");
+        assert_eq!(weight_of(&s, &by_block)?, Lineweight::ByBlock, "so does ByBlock");
+        assert_eq!(weight_of(&s, &on_zero)?, Lineweight::Mm100(50), "layer 0 goes by the view's plain layer");
+        assert_eq!(weight_of(&s, &zero_chosen)?, Lineweight::ByLayer, "this view's layer has a weight chosen");
+        let d = s.doc()?;
+        let sheet = view_sheet_ref(d, ground).ok_or("no sheet")?.1;
+        assert_eq!(plotted_width(d, &sheet, 2300.0)?, 0.5, "the renderer agrees about layer 0");
+        assert_eq!(plotted_width(d, &sheet, 3100.0)?, 0.7, "the layer's weight plots");
+        let sheet = view_sheet_ref(d, first).ok_or("no sheet")?.1;
+        assert_eq!(plotted_width(d, &sheet, 2400.0)?, 0.35, "layer 0 plots at the view layer's weight");
+        Ok(())
+    }
+
+    #[test]
+    fn details_and_assembly_blocks_are_not_stamped() -> R {
+        let (mut s, plan) = stud_room()?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        s.execute("editview", &json!({}))?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert!(r["weighted"].as_u64().ok_or("no count")? > 0, "{r}");
+        let d = s.doc()?;
+        let doc = read_document(d)?;
+        let detail = doc.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        for name in [view_block_name(detail), assembly_block_name(plan)] {
+            let b = d.block(&name).ok_or_else(|| format!("no block {name}"))?;
+            assert!(b.entities.iter().next().is_some(), "{name} has lines");
+            assert!(b.entities.iter().all(|e| e.common.lineweight == Lineweight::ByLayer), "{name}");
+        }
         Ok(())
     }
 
