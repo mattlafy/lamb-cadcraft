@@ -1,7 +1,12 @@
-//! RESOLVE — LAMB ▸ Walls & Framing ▸ Review Issues — (LAMB T351, TS `resolveCommand.ts`, T158): step through lamb-core's [`find_issues`]
-//! list followed by the assembly plans' own gaps ([`wall_issues`], LAMB T393: width conflicts and
-//! junctions with no corner detail, then runs with no detail (LAMB T471), for plans that have an
-//! assembly block). Each step edits the issue's view, centres the camera on its location (block coordinates
+//! RESOLVE — LAMB ▸ Walls & Framing ▸ Review Issues — (LAMB T351, TS `resolveCommand.ts`, T158): step through
+//! conflicting data in the drawing, then the gaps in its drawing set. Reported: lamb-core's
+//! [`find_issues`] conflicts and stale links, each plan polyline whose linked lines disagree on its
+//! height ([`polyline_height_conflict`], which takes a sloped line as a plane), then the assembly
+//! plans' own gaps ([`wall_issues`], LAMB T393: width conflicts and junctions with no corner
+//! detail, then runs with no detail (LAMB T471), for plans that have an assembly block). Not
+//! reported: a segment with no height of its own, whether defaulted or between two crossings: one
+//! vertical reference sets a whole polyline's height, and none is a working default rather than a
+//! conflict. Each step edits the issue's view, centres the camera on its location (block coordinates
 //! are the view's local coordinates, so no transform), names it on the command line and haloes its
 //! entities ([`crate::overlays::halo`]). The list is snapshotted when the command starts and never
 //! re-derived mid-command; `Next`/`Previous` (or a typed `>`/`<`) step, clamped at both ends;
@@ -13,7 +18,10 @@
 use cadcraft_doc::{Handle, Space};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step, View};
 use cadcraft_geom::Vec2;
-use lamb_core::derivation::issues::{Issue, find_issues};
+use lamb_core::derivation::issues::{Issue, IssueKind, find_issues};
+use lamb_core::derivation::read::{ProjectRead, ViewKind};
+use lamb_core::derivation::resolve::polyline_height_conflict;
+use lamb_core::model::LineRole;
 use serde_json::{Value, json};
 
 use crate::assembly::wall_issues;
@@ -26,11 +34,41 @@ fn issues(s: &Session) -> Result<Vec<Issue>> {
     let d = s.doc()?;
     let dp = DrawingProject::new(d).map_err(other)?;
     let mut list = find_issues(&dp).map_err(other)?;
+    list.retain(|i| !matches!(i.kind, IssueKind::DefaultedExtent | IssueKind::AmbiguousExtent));
+    let conflicts = polyline_conflicts(&dp, &list)?;
+    list.extend(conflicts);
+    list.sort_by_key(|i| i.priority);
     list.extend(wall_issues(d).map_err(other)?);
     Ok(list)
 }
 
-/// RESOLVE `{}`: the project's issues in `find_issues` order, then [`wall_issues`].
+/// One issue per plan polyline whose linked lines disagree on its height, leaving out a polyline
+/// `listed` already holds a same-point conflict for.
+fn polyline_conflicts(dp: &DrawingProject<'_>, listed: &[Issue]) -> Result<Vec<Issue>> {
+    let mut found = Vec::new();
+    for view in dp.views().filter(|v| v.kind == ViewKind::Plan && v.placement.is_some()) {
+        for entity in dp.entities(view.id).filter(|e| dp.role_of(e) == LineRole::Cut) {
+            let same_point = format!("conflicted_extent:{}:", entity.id);
+            if listed.iter().any(|i| i.id.starts_with(&same_point)) {
+                continue;
+            }
+            let Some((location, note)) = polyline_height_conflict(dp, &entity).map_err(other)? else { continue };
+            let kind = IssueKind::ConflictedExtent;
+            found.push(Issue {
+                id: format!("conflicted_extent:polyline:{}", entity.id),
+                kind,
+                view_id: view.id,
+                location,
+                entity_ids: vec![entity.id],
+                priority: kind.priority(),
+                note,
+            });
+        }
+    }
+    Ok(found)
+}
+
+/// RESOLVE `{}`: the project's conflicts and stale links by priority, then [`wall_issues`].
 pub(crate) fn resolve(s: &mut Session, _p: &Value) -> Result<Value> {
     let list: Vec<Value> = issues(s)?
         .iter()
@@ -130,25 +168,91 @@ mod tests {
     use super::*;
     use crate::overlays::halo::{ATTENTION_COLOR, current_attention};
     use crate::overlays::lamb_overlay;
+    use crate::schema::{read_document, write_document};
     use cadcraft_render::Options;
-    use lamb_core::model::Id;
+    use lamb_core::model::{Actor, Id, LinkAnchor, LinkOrigin, LinkRecord};
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
     type E = Box<dyn std::error::Error>;
 
-    /// Ground Floor and an offset plan, both placed, with one uncrossed cut line each: one
-    /// defaulted-extent issue per plan.
-    fn two_plans() -> std::result::Result<(Session, Id, Id), E> {
+    /// The entity `cmd` adds to `view`.
+    fn draw(s: &mut Session, view: Id, cmd: &str, args: Value) -> std::result::Result<Id, E> {
+        let block = view_block_name(view);
+        s.execute("editview", &json!({ "viewId": view.0 }))?;
+        let before: Vec<Handle> = s.doc()?.block(&block).map(|b| b.entities.iter().map(|e| e.handle).collect()).unwrap_or_default();
+        s.execute(cmd, &args)?;
+        let b = s.doc()?.block(&block).ok_or("no block")?;
+        let h = b.entities.iter().map(|e| e.handle).find(|h| !before.contains(h)).ok_or("line not drawn")?;
+        Ok(Id(h.0))
+    }
+
+    fn new_line(s: &mut Session, view: Id, points: Value) -> std::result::Result<Id, E> {
+        draw(s, view, "line", json!({ "points": points }))
+    }
+
+    fn new_pline(s: &mut Session, view: Id, vertices: Value, closed: bool) -> std::result::Result<Id, E> {
+        draw(s, view, "pline", json!({ "vertices": vertices, "closed": closed }))
+    }
+
+    /// A section of `plan` cut along `from`–`to`.
+    fn new_section(s: &mut Session, plan: Id, name: &str, from: [f64; 2], to: [f64; 2]) -> std::result::Result<Id, E> {
+        let r = s.execute(
+            "newsectionline",
+            &json!({ "name": name, "hostViewId": plan.0, "cutFrom": {"x": from[0], "y": from[1]}, "cutTo": {"x": to[0], "y": to[1]} }),
+        )?;
+        Ok(Id(r["viewId"].as_u64().ok_or("no section")?))
+    }
+
+    /// A link written straight to the document: the LINK command only takes lines through a marker
+    /// at the plan's cut elevation, and these heights are the point of the tests.
+    fn link(s: &mut Session, a: (Id, usize, f64), b: (Id, f64)) -> std::result::Result<(), E> {
+        let d = s.doc_mut()?;
+        let mut doc = read_document(d)?;
+        let id = Id(d.new_handle().0);
+        doc.links.push(LinkRecord {
+            id,
+            a: LinkAnchor { entity_id: a.0, segment_index: a.1, segment_param: a.2 },
+            b: LinkAnchor { entity_id: b.0, segment_index: 0, segment_param: b.1 },
+            origin: LinkOrigin::Explicit,
+            created_at: String::new(),
+            created_by: Actor::User { user_id: "local".into() },
+            stale: None,
+        });
+        write_document(d, &doc)?;
+        Ok(())
+    }
+
+    fn new_project() -> std::result::Result<(Session, Id), E> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);
-        let a = Id(s.execute("lambproject", &json!({}))?["viewId"].as_u64().ok_or("no plan")?);
+        let plan = Id(s.execute("lambproject", &json!({}))?["viewId"].as_u64().ok_or("no plan")?);
+        Ok((s, plan))
+    }
+
+    /// A vertical section line through the crossing at u = 5000, from z = 0 to `top`.
+    fn wall_line(s: &mut Session, section: Id, top: f64) -> std::result::Result<Id, E> {
+        new_line(s, section, json!([[5000, 0], [5000, top]]))
+    }
+
+    /// A plan line along y, crossed at x = 3000 and x = 7000 by section lines 2700 and 3000 tall.
+    fn conflicted_line(s: &mut Session, plan: Id, y: f64) -> std::result::Result<Id, E> {
+        let line = new_line(s, plan, json!([[0, y], [10000, y]]))?;
+        for (name, x, top) in [("a", 3000.0, 2700.0), ("b", 7000.0, 3000.0)] {
+            let section = new_section(s, plan, &format!("{name}{}", plan.0), [x, y - 5000.0], [x, y + 5000.0])?;
+            let upright = wall_line(s, section, top)?;
+            link(s, (line, 0, x / 10000.0), (upright, 0.5))?;
+        }
+        Ok(line)
+    }
+
+    /// Ground Floor and an offset plan, each with one polyline whose linked lines disagree.
+    fn two_plans() -> std::result::Result<(Session, Id, Id), E> {
+        let (mut s, a) = new_project()?;
         let r = s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": a.0, "floorToFloorMm": 3000 }))?;
         let b = Id(r["viewId"].as_u64().ok_or("no plan B")?);
-        s.execute("editview", &json!({ "viewId": b.0 }))?;
-        s.execute("line", &json!({ "points": [[0, 0], [1000, 0]] }))?;
-        s.execute("editview", &json!({ "viewId": a.0 }))?;
-        s.execute("line", &json!({ "points": [[-3000, -3000], [-2000, -3000]] }))?;
+        conflicted_line(&mut s, b, 0.0)?;
+        conflicted_line(&mut s, a, -3000.0)?;
         Ok((s, a, b))
     }
 
@@ -167,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn the_json_form_lists_issues_in_find_issues_order() -> R {
+    fn the_json_form_lists_each_polylines_conflict() -> R {
         let _g = crate::overlays::underlay::tests::lock();
         let (mut s, a, b) = two_plans()?;
         let found = issues(&s)?;
@@ -179,7 +283,7 @@ mod tests {
         assert_eq!(got.len(), 2);
         for (g, i) in got.iter().zip(&found) {
             assert_eq!(g["id"], json!(i.id));
-            assert_eq!(g["kind"], json!("defaulted_extent"));
+            assert_eq!(g["kind"], json!("conflicted_extent"));
             assert_eq!(g["viewId"], json!(i.view_id.0));
             assert_eq!(g["location"], json!({ "x": i.location.x, "y": i.location.y }));
             assert_eq!(g["entityIds"], json!(i.entity_ids.iter().map(|e| e.0).collect::<Vec<_>>()));
@@ -282,6 +386,93 @@ mod tests {
         assert_eq!(block, view_block_name(plan));
         assert_eq!(handles, first.entity_ids.iter().map(|e| Handle(e.0)).collect::<Vec<_>>());
         s.input(Input::Cancel)?;
+        Ok(())
+    }
+
+    /// A three-segment plan polyline; section A crosses its first segment at (3000, 0), u = 5000.
+    fn three_segments(top: Option<f64>) -> std::result::Result<(Session, Id, Id), E> {
+        let (mut s, plan) = new_project()?;
+        let line = new_pline(&mut s, plan, json!([[0, 0], [6000, 0], [6000, 4000], [9000, 4000]]), false)?;
+        if let Some(top) = top {
+            let section = new_section(&mut s, plan, "A-A", [3000.0, -5000.0], [3000.0, 5000.0])?;
+            let upright = wall_line(&mut s, section, top)?;
+            link(&mut s, (line, 0, 0.5), (upright, 0.5))?;
+        }
+        Ok((s, plan, line))
+    }
+
+    #[test]
+    fn one_vertical_reference_sets_the_whole_polyline_in_the_review_and_in_3d() -> R {
+        let (mut s, _plan, line) = three_segments(Some(2700.0))?;
+        let r = s.execute("resolve", &json!({}))?;
+        assert_eq!(r["issues"], json!([]));
+
+        let surfaces = lamb_core::derivation::synthesis::synthesize(&DrawingProject::new(s.doc()?)?)?.surfaces;
+        for segment in 0..3 {
+            let surface = surfaces.iter().find(|f| f.entity_id == line && f.segment_index == segment).ok_or("no surface")?;
+            assert_eq!(surface.provenance, lamb_core::derivation::resolve::ProvenanceKind::Authored, "segment {segment}");
+            let (low, high) = surface.triangles.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), p| (l.min(p.z), h.max(p.z)));
+            assert_eq!((low, high), (0.0, 2700.0), "segment {segment}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_polyline_with_no_section_reports_nothing() -> R {
+        let (mut s, _plan, _line) = three_segments(None)?;
+        assert_eq!(s.execute("resolve", &json!({}))?["issues"], json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn two_segments_at_different_heights_report_once_at_the_second() -> R {
+        let (mut s, plan, line) = three_segments(Some(2700.0))?;
+        let section = new_section(&mut s, plan, "B-B", [7500.0, -1000.0], [7500.0, 9000.0])?;
+        let upright = wall_line(&mut s, section, 3000.0)?;
+        link(&mut s, (line, 2, 0.5), (upright, 0.5))?;
+        let r = s.execute("resolve", &json!({}))?;
+        let got = r["issues"].as_array().ok_or("no issues")?;
+        assert_eq!(got.len(), 1, "{r}");
+        assert_eq!(got[0]["id"], json!(format!("conflicted_extent:polyline:{line}")));
+        assert_eq!(got[0]["kind"], json!("conflicted_extent"));
+        assert_eq!(got[0]["viewId"], json!(plan.0));
+        assert_eq!(got[0]["location"], json!({ "x": 7500.0, "y": 4000.0 }));
+        assert_eq!(got[0]["entityIds"], json!([line.0]));
+        assert_eq!(got[0]["note"], json!("This polyline's linked lines disagree on its height."));
+        Ok(())
+    }
+
+    /// An 8000 x 5000 ceiling: a diagonal in section A rising 0.2 per mm of y (z = 2800 at y =
+    /// 2000), a horizontal at `z` in perpendicular section B.
+    fn sloped_ceiling(z: f64) -> std::result::Result<Session, E> {
+        let (mut s, plan) = new_project()?;
+        let ceiling = new_pline(&mut s, plan, json!([[0, 0], [8000, 0], [8000, 5000], [0, 5000]]), true)?;
+        let a = new_section(&mut s, plan, "A-A", [3000.0, -1000.0], [3000.0, 6000.0])?;
+        let diagonal = new_line(&mut s, a, json!([[1000, 2400], [6000, 3400]]))?;
+        link(&mut s, (ceiling, 0, 0.375), (diagonal, 0.0))?;
+        link(&mut s, (ceiling, 2, 0.625), (diagonal, 1.0))?;
+        let b = new_section(&mut s, plan, "B-B", [-1000.0, 2000.0], [9000.0, 2000.0])?;
+        let flat = new_line(&mut s, b, json!([[500, z], [9500, z]]))?;
+        link(&mut s, (ceiling, 1, 0.4), (flat, 8500.0 / 9000.0))?;
+        Ok(s)
+    }
+
+    #[test]
+    fn a_horizontal_cut_on_the_diagonals_plane_is_fully_specified() -> R {
+        let mut s = sloped_ceiling(2800.0)?;
+        let r = s.execute("resolve", &json!({}))?;
+        assert_eq!(r["issues"], json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_horizontal_cut_off_the_diagonals_plane_conflicts() -> R {
+        let mut s = sloped_ceiling(3000.0)?;
+        let r = s.execute("resolve", &json!({}))?;
+        let got = r["issues"].as_array().ok_or("no issues")?;
+        assert_eq!(got.len(), 1, "{r}");
+        assert_eq!(got[0]["kind"], json!("conflicted_extent"));
+        assert_eq!(got[0]["location"], json!({ "x": 8000.0, "y": 2000.0 }));
         Ok(())
     }
 

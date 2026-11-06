@@ -4,11 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::projection::{vertical_basis, vertical_local_to_uz};
+use super::projection::{plan_local_to_global_xy, vertical_basis, vertical_local_to_uz};
 use super::read::{EntityRef, ProjectRead, ViewKind, ViewRef};
 use super::tilt::signed_tilt_deg;
 use crate::geometry::intersect::crossing_angle_deg;
-use crate::geometry::polyline::{resolved_segments, tangent_at_param};
+use crate::geometry::polyline::{point_at_param, resolved_segments, tangent_at_param};
 use crate::geometry::tolerance::TOLERANCE;
 use crate::geometry::{Point2, Point3, ResolvedSegment};
 use crate::model::{Id, Placement};
@@ -208,6 +208,105 @@ pub fn resolve_cut_segment(project: &impl ProjectRead, entity: &EntityRef<'_>, s
     ])
 }
 
+/// [`resolve_cut_segment`], with one vertical reference setting the height of a whole polyline: a
+/// segment with no crossing of its own takes the extent the polyline's other segments agree on.
+/// Any disagreement among them, or a conflicted or ambiguous span, leaves the segment defaulted.
+pub fn resolve_cut_segment_inherited(project: &impl ProjectRead, entity: &EntityRef<'_>, segment_index: usize) -> Result<Vec<ResolvedSpan>, String> {
+    let own = resolve_cut_segment(project, entity, segment_index)?;
+    let bare_default = matches!(own.as_slice(), [span] if span.provenance == ProvenanceKind::Defaulted && span.extent.is_none());
+    if !bare_default {
+        return Ok(own);
+    }
+    let Some(poly) = entity.polyline.as_deref() else { return Ok(own) };
+
+    let mut sources: Vec<(VerticalExtent, ProvenanceKind)> = Vec::new();
+    for seg in resolved_segments(poly) {
+        if seg.index == segment_index {
+            continue;
+        }
+        for span in resolve_cut_segment(project, entity, seg.index)? {
+            match (span.provenance, span.extent) {
+                (ProvenanceKind::Defaulted, _) => {}
+                (ProvenanceKind::Authored | ProvenanceKind::Proposed, Some(extent)) => sources.push((extent, span.provenance)),
+                _ => return Ok(own),
+            }
+        }
+    }
+    let Some(&(extent, _)) = sources.first() else { return Ok(own) };
+    if !sources.iter().all(|(e, _)| extents_agree(e, &extent)) {
+        return Ok(own);
+    }
+    let all_proposed = sources.iter().all(|(_, p)| *p == ProvenanceKind::Proposed);
+    Ok(vec![ResolvedSpan::with_extent(0.0, 1.0, authored_or_proposed(all_proposed), extent, 0.0)])
+}
+
+/// Where a linked vertical-view line crosses a plan polyline.
+struct PolylineCrossing {
+    /// Plan-local.
+    location: Point2,
+    global_xy: Point2,
+    c_hat: Point2,
+    extent: VerticalExtent,
+    /// `dz/du` along `c_hat`, when the vertical line slopes.
+    slope: Option<f64>,
+    /// A sloped line's z at the crossing; any other line's top.
+    height: f64,
+}
+
+/// Every linked vertical line's crossing with this polyline, by segment, then along the segment.
+fn polyline_crossings(project: &impl ProjectRead, entity: &EntityRef<'_>) -> Result<Vec<PolylineCrossing>, String> {
+    let mut crossings = Vec::new();
+    let Some(view) = project.view(entity.view_id).filter(|v| v.kind == ViewKind::Plan && v.placement.is_some()) else { return Ok(crossings) };
+    let Some(poly) = entity.polyline.as_deref() else { return Ok(crossings) };
+    for seg in resolved_segments(poly) {
+        let mut links = project.links_for_segment(entity.id, seg.index);
+        links.sort_by(|a, b| a.mine.segment_param.total_cmp(&b.mine.segment_param));
+        for l in links {
+            let Some((vert_view, vert_seg, _)) = linked_vertical_segment(project, l.other.entity_id, l.other.segment_index) else { continue };
+            let Some(host_view) = vert_view.host_view_id().and_then(|h| project.view(h)) else { continue };
+            let basis = vertical_basis(&vert_view, &host_view)?;
+            let from = vertical_local_to_uz(&vert_view, vert_seg.from);
+            let to = vertical_local_to_uz(&vert_view, vert_seg.to);
+            let (du, dz) = (to.u - from.u, to.z - from.z);
+            let sloped = du.abs() > TOLERANCE.coincidence_mm && dz.abs() > TOLERANCE.height_agreement_mm;
+            let location = point_at_param(&seg, l.mine.segment_param);
+            let global_xy = plan_local_to_global_xy(&view, location)?;
+            // By the crossing's u, not the link's anchor param: only one end of a link has to lie on its marker.
+            let u = (global_xy.x - basis.origin_xy.x) * basis.c_hat.x + (global_xy.y - basis.origin_xy.y) * basis.c_hat.y;
+            let height = if sloped { from.z + dz / du * (u - from.u) } else { from.z.max(to.z) };
+            crossings.push(PolylineCrossing {
+                location,
+                global_xy,
+                c_hat: basis.c_hat,
+                extent: VerticalExtent { top: from.z.max(to.z), bottom: from.z.min(to.z) },
+                slope: sloped.then(|| dz / du),
+                height,
+            });
+        }
+    }
+    Ok(crossings)
+}
+
+/// A plan polyline whose linked vertical lines disagree on its height: the plan-local location of
+/// the first crossing that disagrees, and a note. Flat and vertical lines must give one extent. A
+/// sloped line defines a plane rising along its view's cut line, and every other crossing's height
+/// must lie on that plane at its own XY, so a horizontal line in a perpendicular section agrees
+/// with a diagonal wherever it meets the diagonal's plane.
+pub fn polyline_height_conflict(project: &impl ProjectRead, entity: &EntityRef<'_>) -> Result<Option<(Point2, String)>, String> {
+    let crossings = polyline_crossings(project, entity)?;
+    let plane = crossings.iter().find_map(|c| c.slope.map(|slope| (c, slope)));
+    let failing = if let Some((origin, slope)) = plane {
+        crossings.iter().find(|c| {
+            let (dx, dy) = (c.global_xy.x - origin.global_xy.x, c.global_xy.y - origin.global_xy.y);
+            let on_plane = origin.height + slope * (dx * origin.c_hat.x + dy * origin.c_hat.y);
+            (c.height - on_plane).abs() > TOLERANCE.height_agreement_mm
+        })
+    } else {
+        crossings.first().and_then(|first| crossings.iter().find(|c| !extents_agree(&c.extent, &first.extent)))
+    };
+    Ok(failing.map(|c| (c.location, "This polyline's linked lines disagree on its height.".to_owned())))
+}
+
 fn contribution_from_crossing<P: ProjectRead>(
     project: &P,
     plan_view: &ViewRef<'_>,
@@ -249,4 +348,127 @@ pub fn crossing_theta_deg(project: &impl ProjectRead, plan_seg_global_dir: Point
 
 pub fn point3(x: f64, y: f64, z: f64) -> Point3 {
     Point3 { x, y, z }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::transform2d::IDENTITY_TRANSFORM;
+    use crate::geometry::{PolySegment, Polyline2};
+    use crate::model::{
+        Actor, AnyView, DrawingEntity, EntityGeometry, LineRole, LinkAnchor, LinkOrigin, LinkRecord, PlanView, Project, VerticalIntent, VerticalView,
+        empty_project,
+    };
+
+    const PLAN: Id = Id(100);
+    /// Cut line x = 3000, u = y + 1000.
+    const SECTION_A: Id = Id(200);
+    /// Cut line y = 2000, u = x + 1000.
+    const SECTION_B: Id = Id(300);
+    const CEILING: Id = Id(1);
+
+    fn poly(points: &[(f64, f64)]) -> Polyline2 {
+        let to = |&(x, y): &(f64, f64)| PolySegment { to: Point2 { x, y }, bulge: 0.0, corner_at_to: None };
+        Polyline2 { start: Point2 { x: points[0].0, y: points[0].1 }, segments: points[1..].iter().map(to).collect(), closed: false }
+    }
+
+    fn ent(id: Id, view: Id, geometry: Polyline2) -> DrawingEntity {
+        DrawingEntity {
+            id,
+            view_id: view,
+            role: LineRole::Cut,
+            layer_id: "layer-0".into(),
+            geometry: EntityGeometry::Polyline { geometry },
+            color_override: None,
+            lineweight_override: None,
+            ai_origin: None,
+        }
+    }
+
+    fn section(id: Id, cut: &[(f64, f64)], entities: Vec<DrawingEntity>) -> AnyView {
+        let placement = Placement::Vertical { cut_line: poly(cut), host_view_id: PLAN, transform: IDENTITY_TRANSFORM, flipped: None };
+        AnyView::Vertical(VerticalView { id, name: format!("s{}", id.0), intent: VerticalIntent::Section, entities, placement: Some(placement) })
+    }
+
+    fn link(id: u64, seg: usize, param: f64, other: Id, other_param: f64) -> LinkRecord {
+        LinkRecord {
+            id: Id(id),
+            a: LinkAnchor { entity_id: CEILING, segment_index: seg, segment_param: param },
+            b: LinkAnchor { entity_id: other, segment_index: 0, segment_param: other_param },
+            origin: LinkOrigin::Explicit,
+            created_at: String::new(),
+            created_by: Actor::User { user_id: "u".into() },
+            stale: None,
+        }
+    }
+
+    /// An 8000 x 5000 rectangle drawn open, with lines 11 and 12 in section A, 21 in section B.
+    fn project(a: [(f64, f64); 2], a2: [(f64, f64); 2], b: [(f64, f64); 2], links: Vec<LinkRecord>) -> Project {
+        let mut p = empty_project(None);
+        let placement = Placement::Plan { level_id: Id(1), cut_elevation: 1000.0, transform: IDENTITY_TRANSFORM };
+        let ceiling = ent(CEILING, PLAN, poly(&[(0.0, 0.0), (8000.0, 0.0), (8000.0, 5000.0), (0.0, 5000.0)]));
+        p.views.push(AnyView::Plan(PlanView { id: PLAN, name: "plan".into(), entities: vec![ceiling], placement: Some(placement) }));
+        let (e11, e12, e21) = (ent(Id(11), SECTION_A, poly(&a)), ent(Id(12), SECTION_A, poly(&a2)), ent(Id(21), SECTION_B, poly(&b)));
+        p.views.push(section(SECTION_A, &[(3000.0, -1000.0), (3000.0, 6000.0)], vec![e11, e12]));
+        p.views.push(section(SECTION_B, &[(-1000.0, 2000.0), (9000.0, 2000.0)], vec![e21]));
+        p.links = links;
+        p
+    }
+
+    const FLAT_2700: [(f64, f64); 2] = [(0.0, 2700.0), (7000.0, 2700.0)];
+    /// z = 2400 at y = 0, z = 3400 at y = 5000: rises 0.2 per mm of y.
+    const DIAGONAL: [(f64, f64); 2] = [(1000.0, 2400.0), (6000.0, 3400.0)];
+
+    fn ceiling(p: &Project) -> EntityRef<'_> {
+        p.entity(CEILING).expect("ceiling")
+    }
+
+    #[test]
+    fn a_segment_with_no_crossing_inherits_the_polylines_one_height() {
+        let p = project(FLAT_2700, FLAT_2700, FLAT_2700, vec![link(1, 0, 0.375, Id(11), 0.5)]);
+        assert_eq!(resolve_cut_segment(&p, &ceiling(&p), 1).expect("own")[0].provenance, ProvenanceKind::Defaulted);
+        let spans = resolve_cut_segment_inherited(&p, &ceiling(&p), 1).expect("inherited");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].provenance, ProvenanceKind::Authored);
+        assert_eq!((spans[0].from_t, spans[0].to_t), (0.0, 1.0));
+        assert_eq!(spans[0].extent, Some(VerticalExtent { bottom: 2700.0, top: 2700.0 }));
+        assert_eq!(spans[0].tilt_deg, Some(0.0));
+        assert_eq!(polyline_height_conflict(&p, &ceiling(&p)).expect("conflict"), None);
+    }
+
+    #[test]
+    fn disagreeing_segments_or_no_reference_leave_the_default_alone() {
+        let flat_3000 = [(0.0, 3000.0), (7000.0, 3000.0)];
+        let p = project(FLAT_2700, flat_3000, FLAT_2700, vec![link(1, 0, 0.375, Id(11), 0.5), link(2, 2, 0.625, Id(12), 0.5)]);
+        assert_eq!(resolve_cut_segment_inherited(&p, &ceiling(&p), 1).expect("inherited")[0].provenance, ProvenanceKind::Defaulted);
+        let (at, note) = polyline_height_conflict(&p, &ceiling(&p)).expect("conflict").expect("reported");
+        assert_eq!((at.x, at.y), (3000.0, 5000.0), "the second segment's crossing");
+        assert_eq!(note, "This polyline's linked lines disagree on its height.");
+
+        let p = project(FLAT_2700, flat_3000, FLAT_2700, vec![]);
+        assert_eq!(resolve_cut_segment_inherited(&p, &ceiling(&p), 1).expect("inherited")[0].provenance, ProvenanceKind::Defaulted);
+        assert_eq!(polyline_height_conflict(&p, &ceiling(&p)).expect("conflict"), None);
+    }
+
+    /// Section B's flat line at `z` crosses segment 1 at (8000, 2000); the diagonal's plane is 2800
+    /// at y = 2000.
+    fn ceiling_with_perpendicular_flat(z: f64) -> Project {
+        let flat = [(500.0, z), (9500.0, z)];
+        project(
+            DIAGONAL,
+            FLAT_2700,
+            flat,
+            vec![link(1, 0, 0.375, Id(11), 0.0), link(2, 2, 0.625, Id(11), 1.0), link(3, 1, 0.4, Id(21), 8500.0 / 9000.0)],
+        )
+    }
+
+    #[test]
+    fn a_flat_line_on_the_diagonals_plane_agrees_and_one_off_it_conflicts() {
+        let p = ceiling_with_perpendicular_flat(2800.0);
+        assert_eq!(polyline_height_conflict(&p, &ceiling(&p)).expect("conflict"), None);
+
+        let p = ceiling_with_perpendicular_flat(3000.0);
+        let (at, _) = polyline_height_conflict(&p, &ceiling(&p)).expect("conflict").expect("reported");
+        assert_eq!((at.x, at.y), (8000.0, 2000.0));
+    }
 }

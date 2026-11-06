@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::markers::SOLID_CUT_PROPOSAL_PREFIX;
 use super::projection::plan_local_to_global_xy;
 use super::read::{EntityRef, ProjectRead, ViewKind, ViewRef};
-use super::resolve::{ProvenanceKind, ResolvedSpan, VerticalExtent, resolve_cut_segment, resolve_seen_z};
+use super::resolve::{ProvenanceKind, ResolvedSpan, VerticalExtent, resolve_cut_segment, resolve_cut_segment_inherited, resolve_seen_z};
 use super::solids::{SolidForm, SynthesizedSolid, intersect_solids, most_doubtful, prism_half_spaces, prism_with_holes, vertical_prism};
 use crate::geometry::polyline::{is_arc, point_at_param, resolved_segments, tangent_at_param};
 use crate::geometry::tolerance::{TOLERANCE, deg_to_rad};
@@ -141,7 +141,7 @@ pub fn synthesize(doc: &impl ProjectRead) -> Result<SynthesisResult, String> {
                 // A loop that failed to close because its own spans disagree ghosts every segment.
                 let forced_conflict = conflicted_entity_ids.contains(&entity.id);
                 for seg in resolved_segments(poly) {
-                    let spans = resolve_cut_segment(doc, &entity, seg.index)?;
+                    let spans = resolve_cut_segment_inherited(doc, &entity, seg.index)?;
                     for (span_index, span) in spans.iter().enumerate() {
                         if span.provenance == ProvenanceKind::NotThreeD {
                             continue;
