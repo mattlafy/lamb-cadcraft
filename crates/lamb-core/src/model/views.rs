@@ -25,7 +25,10 @@ pub enum Placement {
         transform: Transform2D,
     },
     Vertical {
+        /// In the local coordinates of the plan `host_view_id`; `vertical_basis` takes it to
+        /// project-global XY, the one frame every view shares.
         cut_line: Polyline2,
+        /// The plan whose local coordinates `cut_line`'s numbers are in, and nothing more.
         host_view_id: Id,
         transform: Transform2D,
         /// Reverses which way the view looks, nothing else. Absent means not flipped.

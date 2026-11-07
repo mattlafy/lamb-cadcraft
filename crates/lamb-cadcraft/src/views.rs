@@ -113,7 +113,7 @@ fn cell(on: bool, tip: String, command: &str, params: serde_json::Value) -> Opti
 }
 
 /// The Views palette for `d` while editing `edit`: `Model`, then each view in document order as
-/// [`view_label`] (its level and floor, its host plan, or `(unplaced)`), the edited one active, each running
+/// [`view_label`] (a plan's level and floor, or `(unplaced)`), the edited one active, each running
 /// `editview`; a drawing with no views offers `Start LAMB project` (LAMBPROJECT). Each view row has
 /// two cells ([`BROWSER_COLUMNS`]), `None` unless the mode is valid for it while editing a view:
 /// **Ref** for the edited view's eligible reference views — on for the one the shown pane displays
@@ -174,8 +174,8 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
 }
 
 /// A placed plan `"<name> — Plan · <level> <floor>"` (floor in signed mm, `+0`, `+3000`, `-450`);
-/// a placed section or elevation `"<name> — Section · on <host plan>"`; an unplaced plan, section or
-/// elevation `"<name> — <kind> (unplaced)"`; a detail `"<name> — Detail"`. A level or host that
+/// a placed section or elevation `"<name> — Section"` / `"<name> — Elevation"`; an unplaced plan,
+/// section or elevation `"<name> — <kind> (unplaced)"`; a detail `"<name> — Detail"`. A level that
 /// cannot be found leaves just `"<name> — <kind>"`.
 fn view_label(doc: &LambDocument, v: &AnyView) -> String {
     let kind = crate::commands::kind_word(v);
@@ -185,12 +185,8 @@ fn view_label(doc: &LambDocument, v: &AnyView) -> String {
             Some(l) => format!("{base} · {} {:+}", l.name, l.floor_elevation.value.round() as i64),
             None => base,
         },
-        Some(Placement::Vertical { host_view_id, .. }) => match doc.views.iter().find(|h| h.id() == *host_view_id) {
-            Some(h) => format!("{base} · on {}", h.name()),
-            None => base,
-        },
         None if matches!(v, AnyView::Plan(_) | AnyView::Vertical(_)) => format!("{base} (unplaced)"),
-        None => base,
+        Some(Placement::Vertical { .. }) | None => base,
     }
 }
 
@@ -316,7 +312,7 @@ mod tests {
         let (mut s, plan, a, b) = crate::refpane::tests::project()?;
         let r = rows(&s)?;
         assert!(!r.iter().any(|r| r.heading), "no heading rows: {r:?}");
-        let (gf, aa, bb) = ("Ground Floor — Plan · Level 1 +0", "A-A — Section · on Ground Floor", "B-B — Section · on Ground Floor");
+        let (gf, aa, bb) = ("Ground Floor — Plan · Level 1 +0", "A-A — Section", "B-B — Section");
         assert_eq!(cells(&r), [(gf, None, None), (aa, Some(false), None), (bb, Some(false), None)], "the edited plan has no cells");
         let c = r[3].cells[0].as_ref().ok_or("no B-B Ref cell")?;
         assert_eq!(c.command, ("refpane".into(), json!({ "viewId": b.0 })));
@@ -348,6 +344,22 @@ mod tests {
         Ok(())
     }
 
+    /// LAMB T604: a section or an elevation is named for what it is, never for a plan.
+    #[test]
+    fn vertical_rows_name_no_plan() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, _plan, a, b) = crate::refpane::tests::project()?;
+        s.execute("viewprops", &json!({ "mode": "rename", "viewId": b.0, "name": "North" }))?;
+        s.execute("viewprops", &json!({ "mode": "intent", "viewId": b.0, "intent": "elevation" }))?;
+        s.execute("editview", &json!({ "viewId": a.0 }))?;
+        let r = rows(&s)?;
+        assert_eq!(r[2].label, "A-A — Section");
+        assert_eq!(r[3].label, "North — Elevation");
+        assert_eq!(r[3].cells[0].as_ref().map(|c| c.tip.as_str()), Some("Show North — Elevation in the reference pane"));
+        assert_eq!(r[3].cells[1].as_ref().map(|c| c.tip.as_str()), Some("Underlay North — Elevation"));
+        Ok(())
+    }
+
     #[test]
     fn underlay_cells_mark_mirroring_and_toggle_several() -> R {
         let _g = crate::overlays::underlay::tests::lock();
@@ -361,12 +373,9 @@ mod tests {
         s.execute("editview", &json!({ "viewId": a.0 }))?;
         let r = rows(&s)?;
         let u = |r: &BrowserRow| r.cells[1].clone();
-        assert_eq!(u(&r[3]).map(|c| c.tip), Some("Underlay B-B — Section · on Ground Floor".into()));
+        assert_eq!(u(&r[3]).map(|c| c.tip), Some("Underlay B-B — Section".into()));
         let cc = u(&r[4]).ok_or("no C-C underlay cell")?;
-        assert_eq!(
-            (cc.tip.as_str(), cc.command),
-            ("Underlay C-C — Section · on Ground Floor (mirrored)", ("underlay".into(), json!({ "viewId": c })))
-        );
+        assert_eq!((cc.tip.as_str(), cc.command), ("Underlay C-C — Section (mirrored)", ("underlay".into(), json!({ "viewId": c }))));
 
         click(&mut s, &r[3], 1)?;
         let r = rows(&s)?;
@@ -441,9 +450,9 @@ mod tests {
         s.execute("editview", &json!({ "viewId": a.0 }))?;
         let r = rows(&s)?;
         let bb = r.iter().find(|r| r.command == Some(("editview".into(), json!({ "viewId": b.0 })))).ok_or("no B-B")?;
-        assert!(bb.label.starts_with("B-B — Section · on Ground Floor · "), "{}", bb.label);
-        assert_eq!(bb.cells[0].as_ref().map(|c| c.tip.as_str()), Some("Show B-B — Section · on Ground Floor in the reference pane"));
-        assert_eq!(bb.cells[1].as_ref().map(|c| c.tip.as_str()), Some("Underlay B-B — Section · on Ground Floor"));
+        assert!(bb.label.starts_with("B-B — Section · "), "{}", bb.label);
+        assert_eq!(bb.cells[0].as_ref().map(|c| c.tip.as_str()), Some("Show B-B — Section in the reference pane"));
+        assert_eq!(bb.cells[1].as_ref().map(|c| c.tip.as_str()), Some("Underlay B-B — Section"));
         Ok(())
     }
 

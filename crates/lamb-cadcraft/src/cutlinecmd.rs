@@ -9,7 +9,7 @@
 //!   cursor at step 2.
 //! - In a placed plan (T499, `link-maintenance.md` "Move a vertical view's cut line"): `Select
 //!   section or elevation cut line:` (nearest cut-line overlay within the aperture by
-//!   point-to-segment distance; one hosted in another plan is refused there), then `Specify new
+//!   point-to-segment distance; every placed plan draws every cut line, T604), then `Specify new
 //!   position:` — a point (its signed perpendicular distance from the picked line, positive = left
 //!   of the cut's own direction) or a typed signed offset in mm. The cut line moves parallel to
 //!   itself; the view's linework stays put, and `maintain.rs` step 2 flags any link whose crossing
@@ -75,16 +75,6 @@ fn hit_cut_line(s: &Session, view: Id, p: Vec2, tolerance: f64) -> Option<CutLin
         .map(|(_, o)| o)
 }
 
-/// The name of the plan hosting `o`'s cut line, when that is not `plan`.
-fn hosted_elsewhere(s: &Session, plan: Id, o: &CutLineOverlay) -> Option<String> {
-    let proj = DrawingProject::new(s.doc().ok()?).ok()?;
-    let host = proj.view(o.source_view_id)?.host_view_id()?;
-    if host == plan {
-        return None;
-    }
-    Some(proj.view(host).map_or_else(|| host.to_string(), |h| h.name.to_owned()))
-}
-
 /// The unit CCW perpendicular of the overlay's from→to direction (`offsetviews` convention).
 fn left_normal(o: &CutLineOverlay) -> Option<(f64, f64)> {
     let (dx, dy) = (o.to.x - o.from.x, o.to.y - o.from.y);
@@ -125,10 +115,7 @@ impl CutLine {
         let Some(o) = &self.picked_cut else {
             let Input::Point(p) = i else { return Ok(Step::Continue) };
             match hit_cut_line(s, plan, p, pick_aperture(s)) {
-                Some(o) => match hosted_elsewhere(s, plan, &o) {
-                    Some(host) => s.echo(format!("That cut line is drawn in {host}; edit it there.")),
-                    None => self.picked_cut = Some(o),
-                },
+                Some(o) => self.picked_cut = Some(o),
                 None => s.echo("No section or elevation cut line there."),
             }
             return Ok(Step::Continue);
@@ -233,11 +220,15 @@ mod tests {
     use super::*;
     use crate::commands::install_app;
     use crate::import::project_to_drawing;
+    use crate::schema::write_document;
     use lamb_core::derivation::datums::{DatumLineOverlay, compute_datum_lines_for_view};
     use lamb_core::derivation::markers::compute_markers_for_view;
+    use lamb_core::geometry::transform2d::{local_to_world2, world_to_local2};
+    use lamb_core::geometry::{IDENTITY_TRANSFORM, Transform2D};
     use lamb_core::model::{LinkRecord, Placement, PlanView, Project};
     use lamb_core::persistence::files_to_project;
     use std::collections::BTreeMap;
+    use std::f64::consts::FRAC_PI_2;
     use std::path::Path;
 
     type E<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -451,6 +442,95 @@ mod tests {
         s.input(Input::Point(Vec2::new(3000.0, 2000.0)))?;
         assert!(s.log.iter().any(|l| l == "No change."), "{:?}", s.log);
         assert_eq!(s.state()?.undo.len(), undo);
+        Ok(())
+    }
+
+    /// T604: a new plan `Upper` placed at `upper`, being edited, and `P` placed at `host`. Returns
+    /// `Upper` and the `Crossbar` section, whose cut line `P` hosts (local x = 5000, y -1000 → 3000).
+    fn editing_upper(host: Transform2D, upper: Transform2D) -> E<(Session, Id, Id)> {
+        let (mut s, plan, crossbar) = editing_plan()?;
+        let id = s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": plan.0, "floorToFloorMm": 3000, "name": "Upper" }))?;
+        let id = Id(id["viewId"].as_u64().ok_or("no id")?);
+        let d = s.doc_mut()?;
+        let mut doc = read_document(d)?;
+        for v in &mut doc.views {
+            if let AnyView::Plan(PlanView { id: this, placement: Some(Placement::Plan { transform, .. }), .. }) = v {
+                *transform = if *this == id { upper } else { host };
+            }
+        }
+        write_document(d, &doc)?;
+        Ok((s, id, crossbar))
+    }
+
+    /// The crossing parameter of `Crossbar`'s marker on wall-u's base.
+    fn crossing(s: &Session, crossbar: Id) -> E<f64> {
+        let proj = DrawingProject::new(s.doc()?)?;
+        let markers = compute_markers_for_view(&proj, crossbar)?;
+        Ok(markers.iter().find(|m| m.source_segment_index == 1).ok_or("no marker on the wall's base")?.source_segment_param)
+    }
+
+    /// T604: the frame is global, so a section hosted in `P` moves from `Upper`, a quarter turn away
+    /// and elsewhere. `Upper` local (x, y) is global (20000 - y, 7000 + x), so the cut (global x = 5000,
+    /// running +Y) runs along `Upper`'s y = 15000; the two clicks are not symmetric about it.
+    #[test]
+    fn a_cut_line_moves_from_a_plan_that_does_not_host_it() -> E<()> {
+        let upper = Transform2D { origin_x: 20000.0, origin_y: 7000.0, rotation: FRAC_PI_2 };
+        let (mut s, id, crossbar) = editing_upper(IDENTITY_TRANSFORM, upper)?;
+        let start = cut_start(&s, crossbar)?;
+        let param = crossing(&s, crossbar)?;
+        let ap = pick_aperture(&s);
+
+        for (click_y, global_x, moved, new_param) in [(14500.0, 5500.0, "Crossbar moved -500", 0.55), (15300.0, 4700.0, "Crossbar moved +300", 0.47)]
+        {
+            let undo = s.state()?.undo.len();
+            s.start("cutline")?;
+            s.input(Input::Point(Vec2::new(-6000.0, 15000.0 + 0.4 * ap)))?;
+            assert_eq!(prompt(&s).as_deref(), Some("Specify new position"), "picked from Upper: {:?}", s.log);
+            let pv = s.running.as_ref().ok_or("not running")?.machine.preview(&s, Vec2::new(-5000.0, click_y));
+            assert_eq!(pv.len(), 1);
+            let EntityKind::Line(l) = &pv[0] else { return Err("not a line".into()) };
+            assert!((l.a.y - click_y).abs() < 1e-6 && (l.b.y - click_y).abs() < 1e-6, "the preview runs through the cursor: {pv:?}");
+            s.input(Input::Point(Vec2::new(-5000.0, click_y)))?;
+            assert!(s.running.is_none(), "done");
+            assert!(near(cut_start(&s, crossbar)?, Point2 { x: global_x, y: -1000.0 }), "{:?}", cut_start(&s, crossbar)?);
+            assert!(s.log.iter().any(|l| l == moved), "{:?}", s.log);
+            assert_eq!(s.state()?.undo.len(), undo + 1, "one undo step");
+            assert!((crossing(&s, crossbar)? - new_param).abs() < 1e-9, "the marker follows: {}", crossing(&s, crossbar)?);
+
+            let proj = DrawingProject::new(s.doc()?)?;
+            let o = compute_cut_lines_for_view(&proj, id)?.into_iter().find(|o| o.source_view_id == crossbar).ok_or("no overlay")?;
+            assert!((o.from.y - click_y).abs() < 1e-6 && (o.to.y - click_y).abs() < 1e-6, "the symbol lands on the click: {o:?}");
+            drop(proj);
+
+            s.undo()?;
+            assert_eq!(cut_start(&s, crossbar)?, start, "undo restores it");
+            assert_eq!(crossing(&s, crossbar)?.to_bits(), param.to_bits(), "and the marker");
+        }
+        Ok(())
+    }
+
+    /// T604: both plans turned and moved, by different amounts: the cut line lands where the click
+    /// is in global XY, and a typed offset is still to the cut's own left.
+    #[test]
+    fn a_click_in_any_plan_is_the_same_place_in_global_xy() -> E<()> {
+        let host = Transform2D { origin_x: 1000.0, origin_y: 500.0, rotation: 0.25 };
+        let upper = Transform2D { origin_x: -3000.0, origin_y: 8000.0, rotation: 2.0 };
+        let (mut s, _, crossbar) = editing_upper(host, upper)?;
+        let in_upper = |local: Point2| {
+            let p = world_to_local2(&upper, local_to_world2(&host, local));
+            Vec2::new(p.x, p.y)
+        };
+
+        s.start("cutline")?;
+        s.input(Input::Point(in_upper(Point2 { x: 5000.0, y: 500.0 })))?;
+        s.input(Input::Point(in_upper(Point2 { x: 5800.0, y: 2000.0 })))?;
+        assert!(near(cut_start(&s, crossbar)?, Point2 { x: 5800.0, y: -1000.0 }), "{:?}", cut_start(&s, crossbar)?);
+        s.undo()?;
+
+        s.start("cutline")?;
+        s.input(Input::Point(in_upper(Point2 { x: 5000.0, y: 500.0 })))?;
+        s.input(Input::Text("750".into()))?;
+        assert!(near(cut_start(&s, crossbar)?, Point2 { x: 4250.0, y: -1000.0 }), "+750 to the left of a +Y cut");
         Ok(())
     }
 
