@@ -35,7 +35,7 @@
 //! 1. drops every link with an anchor whose entity is no longer in any view block (ERASE) — the
 //!    partner in the other view stays, its marker hollow (LAMB T514: erasing a line never erases its
 //!    partner) — and every remembered unlink with an end on such an entity;
-//! 2. re-checks every link with an anchor on a touched entity (new, or a different polyline) or in
+//! 2. re-checks every link with an anchor on a touched entity (new, a different polyline or a different layer) or in
 //!    a touched view (its document entry, or its host's, changed) with lamb-core's
 //!    `link_still_coincides`: a link whose lines no longer cross is dropped — a link exists only
 //!    where its lines cross (LAMB T514); a holding link still carrying an old `stale` flag has it
@@ -53,6 +53,10 @@
 //!    line moved, stretched or trimmed onto a marker or a cut line moved onto a line needs no LINK.
 //!    A filled marker is left as it is, and an unaccepted AI line on either end forms no link: it
 //!    links through `proposals`, and an explicit link is what accepts it;
+//!    3c. sweeps the markers the command changed the company of ([`sweep_markers`]): one whose source
+//!    was touched, or that a touched or removed line used to pass through, links the one line left
+//!    there, so moving or erasing the extra line of a crowded marker links the pair it leaves, and a
+//!    source moved or relayered onto a line links it;
 //! 4. relayers: an entity whose layer the command changed carries its automatic-link component to
 //!    the new layer, stopping at explicit links (TS SETLAYER, [`crate::relayer`]).
 //!
@@ -145,6 +149,11 @@ pub(crate) fn entity_map(p: &DrawingProject<'_>) -> EntityMap {
         }
     }
     out
+}
+
+/// Entity id → layer over every view block.
+fn entity_layers(p: &DrawingProject<'_>) -> BTreeMap<Id, String> {
+    p.views().flat_map(|v| p.entities(v.id).map(|e| (e.id, e.layer_id.to_owned())).collect::<Vec<_>>()).collect()
 }
 
 fn host_of(v: &AnyView) -> Option<Id> {
@@ -458,12 +467,17 @@ fn already_joined(links: &[LinkRecord], r: &LinkRecord) -> bool {
     })
 }
 
+/// How far a line may miss a marker and still meet it: `find_auto_links`' slack.
+fn marker_reach() -> f64 {
+    TOLERANCE.coincidence_mm + 2.0
+}
+
 /// The same-layer lines of `view` passing through marker `m`, the candidates for its link: one
 /// `(entity, nearest segment)` per line (a corner on the marker is one line). A `Reference` line is
 /// no candidate, and neither is an unaccepted AI line: it is a proposal, which drawing over erases.
 pub(crate) fn lines_at_marker(p: &DrawingProject<'_>, view: Id, m: &Marker) -> Vec<(Id, usize)> {
     let Some(layer) = p.entity(m.source_entity_id).map(|e| e.layer_id.to_owned()) else { return Vec::new() };
-    let reach = TOLERANCE.coincidence_mm + 2.0;
+    let reach = marker_reach();
     p.entities(view)
         .filter(|e| e.layer_id == layer && !is_proposal(e) && resolve_entity_role(p.layers(), e.role, e.layer_id) != LineRole::Reference)
         .filter_map(|e| {
@@ -477,7 +491,7 @@ pub(crate) fn lines_at_marker(p: &DrawingProject<'_>, view: Id, m: &Marker) -> V
 }
 
 /// An unaccepted AI line.
-fn is_proposal(e: &EntityRef<'_>) -> bool {
+pub(crate) fn is_proposal(e: &EntityRef<'_>) -> bool {
     e.ai_origin.is_some_and(|o| !o.accepted)
 }
 
@@ -492,7 +506,7 @@ fn marker_of<'m>(markers: &'m [Marker], b: &LinkAnchor) -> Option<&'m Marker> {
 /// same-layer line of its source view crossing at the same point. A line of a different source view
 /// is not a rival: one plan line can meet two sections where their cut lines cross.
 fn ambiguous(p: &DrawingProject<'_>, view: Id, markers: &[Marker], m: &Marker) -> bool {
-    let reach = TOLERANCE.coincidence_mm + 2.0;
+    let reach = marker_reach();
     let layer = p.entity(m.source_entity_id).map(|e| e.layer_id.to_owned());
     lines_at_marker(p, view, m).len() > 1
         || markers.iter().any(|o| {
@@ -507,6 +521,11 @@ fn ambiguous(p: &DrawingProject<'_>, view: Id, markers: &[Marker], m: &Marker) -
 /// of that entity. A corner makes one crossing a marker on each of its segments, and unlinking one
 /// unlinks the crossing.
 pub(crate) fn unlink_covers(p: &DrawingProject<'_>, u: &UnlinkedPair, r: &LinkRecord) -> bool {
+    unlink_covers_ends(p, u, &r.a, &r.b)
+}
+
+/// [`unlink_covers`] for a link that does not exist: its two ends.
+pub(crate) fn unlink_covers_ends(p: &DrawingProject<'_>, u: &UnlinkedPair, a: &LinkAnchor, b: &LinkAnchor) -> bool {
     let on = |(id, index): (Id, usize), end: &LinkAnchor| {
         if id != end.entity_id {
             return false;
@@ -518,7 +537,7 @@ pub(crate) fn unlink_covers(p: &DrawingProject<'_>, u: &UnlinkedPair, r: &LinkRe
         let (Some(held), Some(own)) = (segments.get(index), segments.get(end.segment_index)) else { return false };
         closest_point_on_segment(held, point_at_param(own, end.segment_param)).distance <= TOLERANCE.coincidence_mm
     };
-    (on(u.a, &r.a) && on(u.b, &r.b)) || (on(u.a, &r.b) && on(u.b, &r.a))
+    (on(u.a, a) && on(u.b, b)) || (on(u.a, b) && on(u.b, a))
 }
 
 /// Steps 3 and 3b for one entity: appends the links it forms through its view's markers. `widened`
@@ -562,6 +581,54 @@ fn auto_link(after: &mut Drawing, id: Id, now: &str, widened: bool, report: &mut
     write_document(after, &doc)
 }
 
+/// Step 3c: [`auto_link`], as step 3b, for the one line left at each hollow marker the command
+/// changed the company of. A marker qualifies when its source is in `touched`, or when it lies within
+/// reach of where a touched or removed entity of its view was. Nothing to do when the command touched
+/// and removed nothing that existed before.
+fn sweep_markers(
+    before_entities: &EntityMap,
+    after: &mut Drawing,
+    touched: &[Id],
+    now: &str,
+    report: &mut MaintenanceReport,
+) -> Result<(), SchemaError> {
+    let lines: BTreeSet<Id> = {
+        let p = DrawingProject::new(after)?;
+        let after_entities = entity_map(&p);
+        let changed: Vec<(Id, Vec<ResolvedSegment>)> = before_entities
+            .iter()
+            .filter(|(id, _)| touched.contains(id) || !after_entities.contains_key(id))
+            .map(|(_, (view, poly))| (*view, poly.as_ref().map(resolved_segments).unwrap_or_default()))
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let mut lines = BTreeSet::new();
+        for view in p.views() {
+            for m in compute_markers_for_view(&p, view.id).map_err(derivation_error)? {
+                let was_there = || {
+                    changed
+                        .iter()
+                        .filter(|(v, _)| *v == view.id)
+                        .flat_map(|(_, segments)| segments)
+                        .any(|seg| closest_point_on_segment(seg, m.position).distance <= marker_reach())
+                };
+                if m.filled || !(touched.contains(&m.source_entity_id) || was_there()) {
+                    continue;
+                }
+                if let [(line, _)] = lines_at_marker(&p, view.id, &m)[..] {
+                    lines.insert(line);
+                }
+            }
+        }
+        lines
+    };
+    for line in lines {
+        auto_link(after, line, now, true, report)?;
+    }
+    Ok(())
+}
+
 /// Keeps `after`'s links true to its geometry, given the drawing `before` the command ran and the
 /// selection's travel set (`travel`: the only links step 0 may travel). Writes `after`'s LAMB document once per step that changed it; when nothing changes, `after` is
 /// left untouched.
@@ -571,6 +638,7 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
     let before_entities = entity_map(&before_project);
     let before_views = before_project.document().views.clone();
     let before_links = before_project.document().links.clone();
+    let before_layers = entity_layers(&before_project);
     drop(before_project);
 
     // 0: travel, before anything reads `after`.
@@ -592,10 +660,15 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
     let (new_entities, touched_entities, links, unlinked) = {
         let p = DrawingProject::new(after)?;
         let after_entities = entity_map(&p);
+        let after_layers = entity_layers(&p);
         let touched_views = touched_views(&before_views, &p.document().views);
         let touched = |id: Id| match after_entities.get(&id) {
             None => false,
-            Some((view, poly)) => touched_views.contains(view) || before_entities.get(&id).is_none_or(|(bv, bp)| bv != view || bp != poly),
+            Some((view, poly)) => {
+                touched_views.contains(view)
+                    || before_entities.get(&id).is_none_or(|(bv, bp)| bv != view || bp != poly)
+                    || before_layers.get(&id).is_some_and(|layer| after_layers.get(&id) != Some(layer))
+            }
         };
         let mut links = Vec::with_capacity(p.document().links.len());
         let mut changed = false;
@@ -647,9 +720,11 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
         auto_link(after, id, now, false, &mut report)?;
     }
     // 3b: then each entity the command touched, so a line that came to meet a marker links too.
-    for id in touched_entities {
+    for &id in &touched_entities {
         auto_link(after, id, now, true, &mut report)?;
     }
+    // 3c: then the lines left at a marker the command changed the company of.
+    sweep_markers(&before_entities, after, &touched_entities, now, &mut report)?;
 
     // 4: a layer change carries the entity's automatic-link component with it.
     report.relayered = crate::relayer::cascade_layers(before, after)?;

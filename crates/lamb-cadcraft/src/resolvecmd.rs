@@ -1,7 +1,8 @@
 //! RESOLVE — LAMB ▸ Walls & Framing ▸ Review Issues — (LAMB T351, TS `resolveCommand.ts`, T158): step through
 //! conflicting data in the drawing, then the gaps in its drawing set. Reported: lamb-core's
 //! [`find_issues`] conflicts and stale links, each plan polyline whose linked lines disagree on its
-//! height ([`polyline_height_conflict`], which takes a sloped line as a plane), then the assembly
+//! height ([`polyline_height_conflict`], which takes a sloped line as a plane), each marker with more
+//! than one same-layer line through it ([`crowded_marker_issues`], LAMB T650), then the assembly
 //! plans' own gaps ([`wall_issues`], LAMB T393: width conflicts and junctions with no corner
 //! detail, then runs with no detail (LAMB T471), for plans that have an assembly block). Not
 //! reported: a segment with no height of its own, whether defaulted or between two crossings: one
@@ -26,6 +27,7 @@ use serde_json::{Value, json};
 
 use crate::assembly::wall_issues;
 use crate::commands::{enter_space, other};
+use crate::linkcmds::crowded_marker_issues;
 use crate::overlays::halo::set_attention;
 use crate::project::DrawingProject;
 use crate::schema::view_block_name;
@@ -37,6 +39,7 @@ fn issues(s: &Session) -> Result<Vec<Issue>> {
     list.retain(|i| !matches!(i.kind, IssueKind::DefaultedExtent | IssueKind::AmbiguousExtent));
     let conflicts = polyline_conflicts(&dp, &list)?;
     list.extend(conflicts);
+    list.extend(crowded_marker_issues(d).map_err(other)?);
     list.sort_by_key(|i| i.priority);
     list.extend(wall_issues(d).map_err(other)?);
     Ok(list)

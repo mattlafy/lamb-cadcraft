@@ -31,6 +31,9 @@ pub enum IssueKind {
     /// A wall run of an assembly plan that got no detail. Adapter-only, like
     /// [`IssueKind::WidthConflict`].
     UndetailedRun,
+    /// A marker with more than one same-layer line through it, a drawing error that leaves it
+    /// unlinked. Adapter-only, like [`IssueKind::WidthConflict`].
+    CrowdedMarker,
 }
 
 impl IssueKind {
@@ -41,7 +44,7 @@ impl IssueKind {
             IssueKind::ConflictedExtent => 0,
             IssueKind::ConflictedSeenZ => 1,
             IssueKind::AmbiguousExtent => 2,
-            IssueKind::StaleLink => 3,
+            IssueKind::StaleLink | IssueKind::CrowdedMarker => 3,
             IssueKind::DefaultedExtent => 4,
             IssueKind::WidthConflict => 5,
             IssueKind::UndetailedCorner | IssueKind::UndetailedOpening => 6,

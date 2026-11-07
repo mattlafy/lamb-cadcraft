@@ -4,7 +4,7 @@
 //! a rigidly moved linked segment carries its partner across views (travel) only when the link is
 //! in the selection's travel set — seeded by an idle crossing box, emptied by a window box or Esc —
 //! and is dropped otherwise, erasing a line never erases its partner, a marker fills in both views
-//! whichever segment of its source the link names, each in the command's own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`), and same-layer lines that come to meet at a marker link themselves unless unlinked or stacked (LAMB T598).
+//! whichever segment of its source the link names, each in the command's own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`), and same-layer lines that come to meet at a marker link themselves unless unlinked or stacked (LAMB T598), and whatever an edit leaves alone at a marker links too (LAMB T650).
 //!
 //! The command registry is process-global, so registration goes through one `Once`.
 
@@ -1623,5 +1623,145 @@ fn an_unaccepted_ai_line_gets_no_link_from_an_edit() -> R {
     stretch_onto(&mut m.s)?;
     assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "no link from an AI line");
     assert!(!accepted(&m.s, plan_line)?, "and it stays unaccepted");
+    Ok(())
+}
+
+/// The height of the Crossbar section's first marker, which `m.line` is drawn around.
+fn section_y(m: &Meeting) -> Result<f64, Box<dyn std::error::Error>> {
+    let p = DrawingProject::new(m.s.doc()?)?;
+    Ok(compute_markers_for_view(&p, m.section)?.first().ok_or("no section marker")?.position.y)
+}
+
+/// T650's stage: `m.line` and the returned diagonal, same-layer section lines through the point where
+/// the returned same-layer plan line crosses the cut, none of them linked.
+fn crowded() -> Result<(Meeting, Handle, Handle), Box<dyn std::error::Error>> {
+    let mut m = meeting()?;
+    let y = section_y(&m)?;
+    let extra = draw_on(&mut m.s, m.section, "WALL-EXT", [1000.0, y - 1000.0], [3000.0, y + 1000.0])?;
+    let plan_line = draw_on(&mut m.s, m.plan, "WALL-EXT", [4000.0, 1000.0], [6000.0, 1000.0])?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty() && pair_links(&m.s, plan_line, extra)?.is_empty(), "stacked: no link");
+    Ok((m, extra, plan_line))
+}
+
+fn crowded_issues(s: &mut Session) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let r = s.execute("resolve", &json!({}))?;
+    Ok(r["issues"].as_array().ok_or("no issues")?.iter().filter(|i| i["kind"] == "crowded_marker").cloned().collect())
+}
+
+/// T650: moving the extra line off a crowded circle clears the issue and links the pair it leaves, in
+/// that undo step.
+#[test]
+fn moving_the_extra_line_off_a_crowded_marker_links_the_pair() -> R {
+    let (mut m, extra, plan_line) = crowded()?;
+    assert_eq!(crowded_issues(&mut m.s)?.len(), 1);
+    let geometry = poly(m.s.doc()?, Id(extra.0))?;
+
+    m.s.execute("editview", &json!({"viewId": m.section.0}))?;
+    m.s.execute("move", &json!({"handles": [extra.hex()], "delta": [500, 0]}))?;
+    assert_eq!(pair_links(&m.s, plan_line, m.line)?.len(), 1, "the pair left links");
+    assert!(pair_links(&m.s, plan_line, extra)?.is_empty());
+    assert!(crowded_issues(&mut m.s)?.is_empty(), "the issue clears");
+
+    m.s.undo()?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "one undo removes the link");
+    assert_eq!(poly(m.s.doc()?, Id(extra.0))?, geometry, "and the move");
+    assert_eq!(crowded_issues(&mut m.s)?.len(), 1, "and the issue is back");
+    Ok(())
+}
+
+/// T650: erasing the extra line does the same, and from the plan side too.
+#[test]
+fn erasing_the_extra_line_of_a_crowded_marker_links_the_pair() -> R {
+    let (mut m, extra, plan_line) = crowded()?;
+    m.s.execute("editview", &json!({"viewId": m.section.0}))?;
+    m.s.execute("erase", &json!({"handles": [extra.hex()]}))?;
+    assert_eq!(pair_links(&m.s, plan_line, m.line)?.len(), 1, "the pair left links");
+    assert!(crowded_issues(&mut m.s)?.is_empty());
+    m.s.undo()?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "one undo removes the link");
+
+    // Two plan lines through the plan circle of a section line 3000 along the cut, at (5000, 2000).
+    let mut m = meeting()?;
+    let y = section_y(&m)?;
+    let first = draw_on(&mut m.s, m.plan, "WALL-EXT", [4000.0, 2000.0], [6000.0, 2000.0])?;
+    let second = draw_on(&mut m.s, m.plan, "WALL-EXT", [4000.0, 1000.0], [6000.0, 3000.0])?;
+    let upright = draw_on(&mut m.s, m.section, "WALL-EXT", [3000.0, y - 1000.0], [3000.0, y + 1000.0])?;
+    assert!(pair_links(&m.s, first, upright)?.is_empty() && pair_links(&m.s, second, upright)?.is_empty(), "stacked: no link");
+    let list = crowded_issues(&mut m.s)?;
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert_eq!(list[0]["viewId"], json!(m.plan.0), "named in the plan");
+    m.s.execute("editview", &json!({"viewId": m.plan.0}))?;
+    m.s.execute("erase", &json!({"handles": [second.hex()]}))?;
+    assert_eq!(pair_links(&m.s, first, upright)?.len(), 1, "the plan line left links");
+    Ok(())
+}
+
+/// T650: changing the extra line to another layer takes it out of the count, and the pair it leaves links.
+#[test]
+fn the_extra_line_on_another_layer_does_not_count() -> R {
+    let (mut m, extra, plan_line) = crowded()?;
+    m.s.execute("properties.set", &json!({"handles": [extra.hex()], "layer": "0"}))?;
+    assert!(crowded_issues(&mut m.s)?.is_empty());
+    assert_eq!(pair_links(&m.s, plan_line, m.line)?.len(), 1, "the pair left links");
+    Ok(())
+}
+
+/// T650: the sweep keeps step 3b's filters: a remembered unlink is not relinked, and the line it
+/// remembers no longer counts toward a crowded marker.
+#[test]
+fn the_sweep_does_not_relink_a_remembered_pair() -> R {
+    let mut m = meeting()?;
+    let plan_line = draw_on(&mut m.s, m.plan, "WALL-EXT", [4000.0, 1000.0], [6000.0, 1000.0])?;
+    let id = pair_links(&m.s, plan_line, m.line)?.first().ok_or("no link")?.id;
+    m.s.execute("unlink", &json!({"linkId": id.0}))?;
+
+    let y = section_y(&m)?;
+    let extra = draw_on(&mut m.s, m.section, "WALL-EXT", [1000.0, y - 1000.0], [3000.0, y + 1000.0])?;
+    assert!(crowded_issues(&mut m.s)?.is_empty(), "the unlinked line does not count");
+    m.s.execute("move", &json!({"handles": [extra.hex()], "delta": [500, 0]}))?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "the remembered pair stays apart");
+    assert_eq!(unlinked(&m.s)?, 1);
+    Ok(())
+}
+
+/// T650: a Seen-role plan line stretched onto a section line's marker links in that step.
+#[test]
+fn a_seen_line_stretched_onto_a_section_lines_marker_links() -> R {
+    let mut m = meeting()?;
+    let plan_line = beside_marker(&mut m, "WALL-EXT")?;
+    m.s.execute("setrole", &json!({"handles": [plan_line.hex()], "role": "seen"}))?;
+    stretch_onto(&mut m.s)?;
+    assert_eq!(pair_links(&m.s, plan_line, m.line)?.len(), 1);
+    m.s.undo()?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "one undo removes the link");
+    Ok(())
+}
+
+/// T650: a line changed onto the layer of the source of the marker it sits at links in that step;
+/// so does a source changed onto the layer of the line at its marker.
+#[test]
+fn a_line_changed_onto_its_partners_layer_links() -> R {
+    let mut m = meeting()?;
+    let plan_line = draw_on(&mut m.s, m.plan, "0", [4000.0, 1000.0], [6000.0, 1000.0])?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "another layer: no link");
+    m.s.execute("properties.set", &json!({"handles": [plan_line.hex()], "layer": "WALL-EXT"}))?;
+    assert_eq!(pair_links(&m.s, plan_line, m.line)?.len(), 1, "the line relayered");
+    m.s.undo()?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "one undo removes the link");
+
+    m.s.execute("editview", &json!({"viewId": m.section.0}))?;
+    m.s.execute("properties.set", &json!({"handles": [m.line.hex()], "layer": "0"}))?;
+    assert_eq!(pair_links(&m.s, plan_line, m.line)?.len(), 1, "the source relayered");
+    Ok(())
+}
+
+/// T650: a command touching nothing near a marker adds no link, even with a hollow one elsewhere.
+#[test]
+fn an_edit_away_from_a_marker_adds_no_link() -> R {
+    let (mut m, _extra, _plan_line) = crowded()?;
+    let far = draw_on(&mut m.s, m.plan, "WALL-EXT", [20000.0, 20000.0], [21000.0, 20000.0])?;
+    let before = links(&m.s)?;
+    m.s.execute("move", &json!({"handles": [far.hex()], "delta": [0, 500]}))?;
+    assert_eq!(links(&m.s)?, before);
     Ok(())
 }

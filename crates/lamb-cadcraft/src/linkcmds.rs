@@ -13,21 +13,25 @@
 //!
 //! A link only exists where two lines cross, which is where a marker is drawn, so LINK never leaves
 //! the edited view: the marker names the far end, the clicked line the near one. Crossings stacked
-//! at one marker position are a drawing error and are refused, never resolved by choosing one.
+//! at one marker position are a drawing error and are refused, never resolved by choosing one;
+//! [`crowded_marker_issues`] names them in Review Issues.
 
+use cadcraft_doc::Drawing;
 use cadcraft_engine::cmd::curves::{pick_aperture, pick_at};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::Vec2;
+use lamb_core::derivation::issues::{Issue, IssueKind};
 use lamb_core::derivation::linking::find_link_for_marker;
 use lamb_core::derivation::markers::{Marker, compute_markers_for_view, is_near_marker};
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::geometry::Point2;
 use lamb_core::geometry::polyline::{closest_point_on_segment, resolved_segments};
 use lamb_core::geometry::tolerance::TOLERANCE;
-use lamb_core::model::Id;
+use lamb_core::model::{Id, LinkAnchor};
 use serde_json::{Value, json};
 
 use crate::commands::{edited_view, other};
+use crate::maintain::{is_proposal, lines_at_marker, unlink_covers_ends};
 use crate::project::DrawingProject;
 
 /// One end of a link as picked: the entity, its nearest segment and the parameter along it.
@@ -205,6 +209,57 @@ impl Interactive for Unlink {
 
 pub(crate) fn unlink_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::new(Unlink))
+}
+
+/// `line`, on its segment `index`, is one the drafter unlinked from `m`'s source at `m`.
+fn unlinked_from_source(p: &DrawingProject<'_>, m: &Marker, line: Id, index: usize) -> bool {
+    let Some(segment) = p.entity(line).and_then(|e| e.polyline.as_deref().map(resolved_segments)).and_then(|s| s.into_iter().nth(index)) else {
+        return false;
+    };
+    let near = LinkAnchor { entity_id: line, segment_index: index, segment_param: closest_point_on_segment(&segment, m.position).t };
+    let far = LinkAnchor { entity_id: m.source_entity_id, segment_index: m.source_segment_index, segment_param: m.source_segment_param };
+    p.document().unlinked.iter().any(|u| unlink_covers_ends(p, u, &near, &far))
+}
+
+/// One issue per crowded marker: more than one same-layer line through it, leaving out a line the
+/// drafter unlinked from the marker's source and a marker whose source is an unaccepted AI line. A
+/// source's corner on the circle, one marker per segment, reports once.
+pub(crate) fn crowded_marker_issues(d: &Drawing) -> std::result::Result<Vec<Issue>, String> {
+    let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
+    let mut issues = Vec::new();
+    for view in p.views() {
+        let mut reported: Vec<(Id, Point2)> = Vec::new();
+        for m in compute_markers_for_view(&p, view.id)? {
+            if p.entity(m.source_entity_id).is_none_or(|e| is_proposal(&e)) {
+                continue;
+            }
+            let lines: Vec<Id> = lines_at_marker(&p, view.id, &m)
+                .into_iter()
+                .filter(|&(line, index)| !unlinked_from_source(&p, &m, line, index))
+                .map(|(line, _)| line)
+                .collect();
+            let at = m.position;
+            let same = |(source, q): &(Id, Point2)| *source == m.source_entity_id && (q.x - at.x).hypot(q.y - at.y) <= TOLERANCE.coincidence_mm;
+            if lines.len() < 2 || reported.iter().any(same) {
+                continue;
+            }
+            reported.push((m.source_entity_id, at));
+            let kind = IssueKind::CrowdedMarker;
+            let note = format!("{} lines on this layer meet this circle; move or unlink all but one.", lines.len());
+            let mut entity_ids = lines;
+            entity_ids.push(m.source_entity_id);
+            issues.push(Issue {
+                id: format!("crowded_marker:{}", m.id),
+                kind,
+                view_id: view.id,
+                location: at,
+                entity_ids,
+                priority: kind.priority(),
+                note,
+            });
+        }
+    }
+    Ok(issues)
 }
 
 #[cfg(test)]
@@ -411,6 +466,91 @@ mod tests {
         s.start("unlink")?;
         assert!(s.running.is_none());
         assert!(s.log.iter().any(|l| l == "Edit a view first"), "{:?}", s.log);
+        Ok(())
+    }
+
+    /// `fixture` plus, on one new layer, two section lines through the plan line's marker and a plan
+    /// line along the same crossing, so nothing links at it. Returns that plan line and the upright.
+    fn crowded() -> E<(Fixture, Id, Id)> {
+        let mut f = fixture()?;
+        let s = &mut f.s;
+        s.execute("layer.new", &json!({ "name": "W" }))?;
+        s.execute("layer.current", &json!({ "name": "W" }))?;
+        enter_space(s, Space::Block(view_block_name(f.section)))?;
+        let at = marker_at(s, f.section, f.plan_line)?;
+        let (x, y) = (at.x, at.y);
+        let upright = new_entity(s, f.section, json!([[x, y - 1000.0], [x, y + 1000.0]]))?;
+        new_entity(s, f.section, json!([[x - 1000.0, y - 1000.0], [x + 1000.0, y + 1000.0]]))?;
+        enter_space(s, Space::Block(view_block_name(f.plan)))?;
+        let plan_line = new_entity(s, f.plan, json!([[0, 0], [10000, 0]]))?;
+        Ok((f, plan_line, upright))
+    }
+
+    fn crowded_list(s: &Session) -> E<Vec<Issue>> {
+        Ok(crowded_marker_issues(s.doc()?)?)
+    }
+
+    #[test]
+    fn a_crowded_marker_is_one_issue_in_its_view_naming_every_line() -> R {
+        let (mut f, plan_line, upright) = crowded()?;
+        let at = marker_at(&f.s, f.section, plan_line)?;
+        let list = crowded_list(&f.s)?;
+        assert_eq!(list.len(), 1, "{list:?}");
+        let i = &list[0];
+        assert_eq!(i.kind, IssueKind::CrowdedMarker);
+        assert_eq!(i.view_id, f.section);
+        assert!((i.location.x - at.x).abs() < 1e-6 && (i.location.y - at.y).abs() < 1e-6);
+        assert_eq!(i.entity_ids.len(), 3);
+        assert_eq!(i.entity_ids.last(), Some(&plan_line));
+        assert!(i.entity_ids.contains(&upright));
+        assert!(i.id.starts_with(&format!("crowded_marker:{}:{}:", f.section, plan_line)), "{}", i.id);
+        assert_eq!(i.note, "2 lines on this layer meet this circle; move or unlink all but one.");
+
+        // Listed by the JSON form, stepped to by the interactive one, with no link made.
+        let links_before = links(&f.s)?;
+        let r = f.s.execute("resolve", &json!({}))?;
+        let got = r["issues"].as_array().ok_or("no issues")?;
+        let index = got.iter().position(|x| x["kind"] == "crowded_marker").ok_or("not listed")?;
+        assert_eq!(got.iter().filter(|x| x["kind"] == "crowded_marker").count(), 1, "{r}");
+        assert_eq!(got[index]["id"], json!(i.id));
+        f.s.start("resolve")?;
+        for _ in 0..index {
+            f.s.input(Input::Keyword("Next".into()))?;
+        }
+        assert_eq!(f.s.state()?.space, Space::Block(view_block_name(f.section)));
+        assert!(f.s.state()?.view().center.dist(at) < 1e-6, "centred on the marker");
+        f.s.input(Input::Cancel)?;
+        assert_eq!(links(&f.s)?, links_before, "no link");
+        assert!(!filled(&f.s, f.section, plan_line)?, "hollow");
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_corner_on_the_circle_is_still_one_issue() -> R {
+        let (mut f, plan_line, _) = crowded()?;
+        let s = &mut f.s;
+        s.execute("erase", &json!({ "handles": [cadcraft_doc::Handle(plan_line.0).hex()] }))?;
+        // The corner sits on the cut line at the erased line's crossing: one marker per segment.
+        let block = view_block_name(f.plan);
+        let before: Vec<_> = s.doc()?.block(&block).map(|b| b.entities.iter().map(|e| e.handle).collect()).unwrap_or_default();
+        s.execute("pline", &json!({ "points": [[0, 0], [3000, 0], [6000, 3000]] }))?;
+        let corner = s.doc()?.block(&block).and_then(|b| b.entities.iter().map(|e| e.handle).find(|h| !before.contains(h))).ok_or("no pline")?;
+        let markers = compute_markers_for_view(&DrawingProject::new(s.doc()?)?, f.section)?;
+        assert_eq!(markers.iter().filter(|m| m.source_entity_id == Id(corner.0)).count(), 2, "one marker per segment");
+        let list = crowded_list(s)?;
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].entity_ids.last(), Some(&Id(corner.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn another_layer_does_not_count_toward_a_crowded_marker() -> R {
+        let (mut f, _, upright) = crowded()?;
+        let s = &mut f.s;
+        s.execute("layer.new", &json!({ "name": "X" }))?;
+        s.execute("properties.set", &json!({ "handles": [cadcraft_doc::Handle(upright.0).hex()], "layer": "X" }))?;
+        let list = crowded_list(s)?;
+        assert!(list.is_empty(), "{list:?}");
         Ok(())
     }
 }
