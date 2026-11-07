@@ -100,12 +100,14 @@ pub struct BrowserRow {
     pub label: String,
     pub active: bool,
     pub heading: bool,
+    /// A sheet row: its two cells are move up and move down, not [`BROWSER_COLUMNS`].
+    pub sheet: bool,
     pub command: Option<(String, serde_json::Value)>,
     pub cells: Vec<Option<BrowserCell>>,
 }
 
 fn row(label: String, active: bool, command: &str, params: serde_json::Value) -> BrowserRow {
-    BrowserRow { label, active, heading: false, command: Some((command.to_owned(), params)), cells: Vec::new() }
+    BrowserRow { label, active, heading: false, sheet: false, command: Some((command.to_owned(), params)), cells: Vec::new() }
 }
 
 fn cell(on: bool, tip: String, command: &str, params: serde_json::Value) -> Option<BrowserCell> {
@@ -123,7 +125,9 @@ fn cell(on: bool, tip: String, command: &str, params: serde_json::Value) -> Opti
 /// The edited view's own row has neither. A view shown on a sheet appends ` · <layout>` to its row's
 /// label (the cell tips keep the bare label). When any LAMB sheet exists, the views are followed by a
 /// `Sheets` heading and one `"<layout> — <title>"` row per sheet in tab order, which is plot order,
-/// the current one active, each running `layout set`. An unreadable LAMB slot gives just the Model row.
+/// the current one active, each running `layout set`, with two cells that run `sheetorder` by a step:
+/// move up, `None` on the first, and move down, `None` on the last. An unreadable LAMB slot gives
+/// just the Model row.
 pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     let mut rows = vec![row("Model".into(), *edit == Space::Model, "editview", serde_json::json!({}))];
     let Ok(doc) = read_document(d) else { return rows };
@@ -163,12 +167,18 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     let mut sheets: Vec<_> = d.layouts.iter().filter(|l| crate::titleblock::is_lamb_sheet(l)).collect();
     sheets.sort_by_key(|l| l.tab_order);
     if !sheets.is_empty() {
-        rows.push(BrowserRow { label: "Sheets".into(), active: false, heading: true, command: None, cells: Vec::new() });
+        rows.push(BrowserRow { label: "Sheets".into(), active: false, heading: true, sheet: false, command: None, cells: Vec::new() });
     }
-    for l in sheets {
+    let last = sheets.len().saturating_sub(1);
+    for (k, l) in sheets.into_iter().enumerate() {
         let label = format!("{} — {}", l.name, crate::titleblock::sheet_title(d, &doc, &l.name));
         let active = matches!(edit, Space::Paper(name) if *name == l.name);
-        rows.push(row(label, active, "layout", serde_json::json!({ "option": "set", "name": l.name })));
+        let mut r = row(label, active, "layout", serde_json::json!({ "option": "set", "name": l.name }));
+        let step = |tip: &str, by: i32| cell(true, tip.to_owned(), "sheetorder", serde_json::json!({ "layout": l.name, "step": by }));
+        r.sheet = true;
+        r.cells =
+            vec![if k == 0 { None } else { step("Move up in plot order", -1) }, if k == last { None } else { step("Move down in plot order", 1) }];
+        rows.push(r);
     }
     rows
 }
@@ -425,7 +435,20 @@ mod tests {
             "the unplaced plan is on no sheet, and the Notes layout is off the list"
         );
         assert!(r[4].heading && r[4].command.is_none() && r[4].cells.is_empty());
-        assert!(r[5..].iter().all(|r| r.cells.is_empty() && !r.heading));
+        assert!(r[5..].iter().all(|r| r.sheet && !r.heading));
+        assert!(r[..5].iter().all(|r| !r.sheet), "view rows and the heading are not sheet rows");
+        let has = |r: &BrowserRow, col: usize| r.cells[col].is_some();
+        assert_eq!(
+            r[5..].iter().map(|r| (has(r, 0), has(r, 1))).collect::<Vec<_>>(),
+            [(false, true), (true, true), (true, false)],
+            "no way off either end"
+        );
+        let up = r[6].cells[0].as_ref().ok_or("no up cell")?;
+        assert!(up.on && up.tip == "Move up in plot order");
+        assert_eq!(up.command, ("sheetorder".into(), json!({ "layout": "A101", "step": -1 })));
+        let down = r[6].cells[1].as_ref().ok_or("no down cell")?;
+        assert!(down.on && down.tip == "Move down in plot order");
+        assert_eq!(down.command, ("sheetorder".into(), json!({ "layout": "A101", "step": 1 })));
         assert_eq!(r[1].command, Some(("editview".into(), json!({ "viewId": ground }))), "the suffix changes only the label");
 
         let mut tabs: Vec<_> = s.doc()?.layouts.iter().map(|l| (l.tab_order, l.name.clone())).collect();
@@ -438,6 +461,11 @@ mod tests {
         assert_eq!(s.state()?.space, Space::Paper("A102".into()));
         let r = rows(&s)?;
         assert_eq!(r.iter().filter(|r| r.active).map(|r| r.label.as_str()).collect::<Vec<_>>(), ["A102 — First"], "the sheet alone");
+
+        // A cell moves the sheet and leaves the row's own command alone: A102 stays the current sheet.
+        click(&mut s, &r[7], 0)?;
+        assert_eq!(s.state()?.space, Space::Paper("A102".into()));
+        assert_eq!(labels(&rows(&s)?)[5..], ["A001 — Drawing List", "A102 — First", "A101 — Ground Floor"]);
         Ok(())
     }
 

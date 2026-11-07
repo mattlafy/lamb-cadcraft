@@ -17,6 +17,8 @@
 //! - `sheetset {pdf?}` (`sset`): every placed plan, elevation and section on no sheet yet on its own
 //!   sheet (`A1nn`, `A2nn`, `A3nn`), the unplaced assigned details on `A5nn`, tabs in set order,
 //!   optionally plotted to one PDF — see [`crate::sheetset`].
+//! - `sheetorder {layout, step?, before?, after?}` (`sord`): moves a sheet in plot order, by one LAMB
+//!   sheet or next to a named layout — see [`crate::sheetset`].
 //! - `autodim {view?, off?}` (`adim`): a placed plan's generated exterior dimension strings, on or
 //!   off — see [`crate::autodim`].
 //! - `sheetsize {paper}` (`ssize`): the paper new sheets are made on, ARCH D landscape until set;
@@ -860,6 +862,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{prefix?, perSheet?}")
             .interactive(crate::detailsheets::detailsheets_machine),
         CommandSpec::new("sheetset", "Sheet Set", crate::sheetset::sheetset).alias(&["sset"]).params("{pdf?}"),
+        CommandSpec::new("sheetorder", "Sheet Order", crate::sheetset::sheetorder)
+            .alias(&["sord"])
+            .params("{layout, step?, before?, after?} → {order, message}")
+            .interactive(crate::sheetset::sheetorder_machine),
         CommandSpec::new("autodim", "Dimension Plan", crate::autodim::autodim)
             .alias(&["adim"])
             .params("{view?, off?} → {view, dimensions, message}")

@@ -328,11 +328,13 @@ fn lamb_view_rows(d: &cadcraft_engine::doc::Drawing, edit: &cadcraft_engine::doc
         .into_iter()
         .map(|r| {
             use cadcraft_ui_egui::{icons::Icon, viewlist};
-            // The columns of `lamb_cadcraft::views::BROWSER_COLUMNS`: Ref (a split pane), Underlay.
+            // The columns of `lamb_cadcraft::views::BROWSER_COLUMNS`: Ref (a split pane), Underlay; a
+            // sheet row's two cells move it in plot order.
+            let icons = if r.sheet { [Icon::MoveUp, Icon::MoveDown] } else { [Icon::Workspace, Icon::Layers] };
             let cells = r
                 .cells
                 .into_iter()
-                .zip([Icon::Workspace, Icon::Layers])
+                .zip(icons)
                 .map(|(c, icon)| c.map(|c| viewlist::Cell { icon, on: c.on, tip: c.tip, command: c.command }))
                 .collect();
             viewlist::Row { label: r.label, active: r.active, heading: r.heading, command: r.command, cells }

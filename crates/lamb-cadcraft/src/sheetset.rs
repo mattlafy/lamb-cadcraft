@@ -11,9 +11,11 @@
 //! verticals in document order, each showing only that block. SHEETSET does not generate
 //! assemblies, so no block means no framing sheet. Floating plans, unplaced vertical views and
 //! untagged details are left alone; a view already on a sheet, or an assembly already in a
-//! viewport, is skipped and counted. The set's layouts (prefix + two digits) then lead the layout tabs in
-//! name order, every other layout after them in its previous order, so PLOT `layouts: "all"` and
-//! PUBLISH run in set order.
+//! viewport, is skipped and counted. The set's layouts (prefix + two digits) then lead the layout tabs,
+//! every other layout after them in its previous order, so PLOT `layouts: "all"` and PUBLISH run in
+//! set order. Sheets that existed before the run keep their relative order, however SHEETORDER left
+//! it; each new one goes straight after the last set sheet whose name sorts below it, so a set never
+//! reordered stays in name order.
 //!
 //! The set opens on a drawing list and ends on the BOM (LAMB T636), both rewritten by this command
 //! alone, so a sheet renamed by hand shows at the next run. `A001` holds a `Drawing List` table
@@ -61,6 +63,13 @@
 //! take their paper from ([`crate::sheets::sheet_page`]), in one undo step, and returns
 //! `{paper, widthMm, heightMm, message}` with the landscape sheet size. Existing sheets are never
 //! resized or re-flowed.
+//!
+//! SHEETORDER (LAMB T651): `sheetorder {layout, step?, before?, after?}` (`sord`) changes the plot
+//! order, which is `Layout.tab_order`, in one undo step, and returns `{order, message}` with the
+//! layout names in tab order. `step` (-1 or 1) swaps with the previous or next LAMB sheet, other
+//! layouts keeping their tab numbers, and changes nothing at either end. `before` or `after` puts
+//! `layout` next to the named layout and renumbers every layout from the same base. Exactly one of
+//! the three is required. `A001`'s Drawing List follows at the next SHEETSET.
 
 use cadcraft_doc::{Drawing, EntityKind, Handle, Lineweight, MONOCHROME_CTB, Space};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
@@ -79,7 +88,7 @@ use crate::sheets::{
     DEFAULT_SHEET_PAPER, VPORT_LAYER, create_packed_sheet, create_sheet, ensure_vport_layer, pack_verticals, refit_viewport, sheet_paper_size,
     view_drawn, view_placed, view_sheet_ref, viewport_scale,
 };
-use crate::titleblock::sheet_title;
+use crate::titleblock::{is_lamb_sheet, sheet_title};
 use crate::vptitles::scale_label;
 
 const PLAN_PREFIX: &str = "A1";
@@ -146,18 +155,36 @@ fn assembly_on_sheet(d: &Drawing, view: Id) -> bool {
         .any(|e| matches!(e.kind, EntityKind::Viewport(_)) && read_entity_data(&e.common).is_ok_and(|data| data.assembly_of == Some(view)))
 }
 
-/// Renumbers the layout tabs: set sheets first by name, every other layout after them in its
-/// previous relative order.
-fn order_tabs(d: &mut Drawing) {
+/// Every layout's name in tab order.
+fn tab_names(d: &Drawing) -> Vec<String> {
+    let mut ls: Vec<_> = d.layouts.iter().collect();
+    ls.sort_by_key(|l| l.tab_order);
+    ls.into_iter().map(|l| l.name.clone()).collect()
+}
+
+/// Numbers the layouts in `order` up from the lowest tab number they have now.
+fn renumber_tabs(d: &mut Drawing, order: &[String]) {
     let base = d.layouts.iter().map(|l| l.tab_order).min().unwrap_or(0);
-    let mut order: Vec<(bool, String, u32, usize)> =
-        d.layouts.iter().enumerate().map(|(i, l)| (!is_set_name(&l.name), l.name.clone(), l.tab_order, i)).collect();
-    order.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| if a.0 { a.2.cmp(&b.2) } else { a.1.cmp(&b.1) }));
-    for (k, (_, _, _, i)) in order.into_iter().enumerate() {
-        if let Some(l) = d.layouts.get_mut(i) {
+    for (k, name) in order.iter().enumerate() {
+        if let Some(l) = d.layouts.iter_mut().find(|l| l.name == *name) {
             l.tab_order = base + k as u32;
         }
     }
+}
+
+/// Renumbers the layout tabs: set sheets first, every other layout after them in its previous
+/// relative order. The set sheets named in `known` keep their relative order; each other one, in
+/// name order, goes straight after the last set sheet whose name sorts below it, or to the front.
+fn order_tabs(d: &mut Drawing, known: &[String]) {
+    let (set, others): (Vec<String>, Vec<String>) = tab_names(d).into_iter().partition(|n| is_set_name(n));
+    let (mut order, mut new): (Vec<String>, Vec<String>) = set.into_iter().partition(|n| known.contains(n));
+    new.sort();
+    for name in new {
+        let at = order.iter().rposition(|o| *o < name).map_or(0, |k| k + 1);
+        order.insert(at, name);
+    }
+    order.extend(others);
+    renumber_tabs(d, &order);
 }
 
 /// The set sheets in tab order.
@@ -167,14 +194,14 @@ fn set_sheets(d: &Drawing) -> Vec<String> {
     ls.into_iter().map(|l| l.name.clone()).collect()
 }
 
-/// Brings `A001`'s list up to the set sheets, once there is another to list. Sorts the tabs first,
-/// since the list follows them.
-fn refresh_list(d: &mut Drawing) -> Result<Option<Refreshed>> {
+/// Brings `A001`'s list up to the set sheets, once there is another to list. Orders the tabs first,
+/// since the list follows them; `known` is as for [`order_tabs`].
+fn refresh_list(d: &mut Drawing, known: &[String]) -> Result<Option<Refreshed>> {
     if set_sheets(d).iter().all(|n| n == LIST_SHEET) {
         return Ok(None);
     }
     bom::ensure_sheet_layout(d, LIST_SHEET)?;
-    order_tabs(d);
+    order_tabs(d, known);
     let rows: Vec<Vec<String>> = set_titles(d)?.into_iter().map(|(n, t)| vec![n, t]).collect();
     bom::refresh_table(d, LIST_SHEET, LIST_TITLE, &|at| bom::schedule_table(LIST_TITLE, &["Sheet", "Title"], &LIST_COL_WIDTHS, &rows, at))
 }
@@ -393,6 +420,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     };
     // Build every sheet on a copy and assign it back once: one undo step.
     let mut d = s.doc()?.clone();
+    let known: Vec<String> = d.layouts.iter().map(|l| l.name.clone()).collect();
     let updated = update_for_plotting(&mut d)?;
     let weighted = stamp_lineweights(&mut d)?;
     let mut sheets: Vec<Value> = Vec::new();
@@ -417,7 +445,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         parts.push(part);
         sheets.push(sheet);
     }
-    if let Some(change) = refresh_list(&mut d)? {
+    if let Some(change) = refresh_list(&mut d, &known)? {
         let (part, sheet) = table_report(LIST_SHEET, "list", LIST_TITLE, change);
         parts.insert(0, part);
         sheets.insert(0, sheet);
@@ -431,7 +459,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
     let before = s.state()?.doc.clone();
     let changed = updated > 0 || weighted > 0 || !sheets.is_empty() || !refit.is_empty();
     if changed {
-        order_tabs(&mut d);
+        order_tabs(&mut d, &known);
         *s.doc_mut()? = d;
     }
 
@@ -532,6 +560,119 @@ pub(crate) fn sheetsize_machine(s: &Session) -> Result<Box<dyn Interactive>> {
     let doc = read_document(s.doc()?).map_err(other)?;
     let current = sheet_paper_size(&doc).map_or(DEFAULT_SHEET_PAPER, short_name).to_owned();
     Ok(Box::new(SheetSize { current }))
+}
+
+/// `name`'s spelling in the drawing, or a refusal naming it.
+fn known_layout(d: &Drawing, name: &str) -> Result<String> {
+    d.layout(name).map(|l| l.name.clone()).ok_or_else(|| bad("sheetorder", &format!("Unknown layout \"{name}\"")))
+}
+
+/// The LAMB sheets in tab order, with their tab numbers.
+fn lamb_sheets(d: &Drawing) -> Vec<(String, u32)> {
+    let mut ls: Vec<_> = d.layouts.iter().filter(|l| is_lamb_sheet(l)).collect();
+    ls.sort_by_key(|l| l.tab_order);
+    ls.into_iter().map(|l| (l.name.clone(), l.tab_order)).collect()
+}
+
+/// `sheetorder` with `step`: swaps `name` with its neighbouring LAMB sheet. Returns the message.
+fn step_sheet(s: &mut Session, name: &str, step: &Value) -> Result<String> {
+    let up = match step.as_i64() {
+        Some(-1) => true,
+        Some(1) => false,
+        _ => return Err(bad("sheetorder", "`step` must be -1 or 1")),
+    };
+    let sheets = lamb_sheets(s.doc()?);
+    let at = sheets.iter().position(|(n, _)| n == name).ok_or_else(|| bad("sheetorder", &format!("{name} is not a sheet")))?;
+    let (end, word) = if up { ("first", "up") } else { ("last", "down") };
+    let neighbour = if up { at.checked_sub(1) } else { at.checked_add(1) }.and_then(|k| sheets.get(k));
+    let (Some((other, other_tab)), Some((_, tab))) = (neighbour, sheets.get(at)) else {
+        return Ok(format!("{name} is already {end} in plot order."));
+    };
+    for l in &mut s.doc_mut()?.layouts {
+        if l.name == name {
+            l.tab_order = *other_tab;
+        } else if l.name == *other {
+            l.tab_order = *tab;
+        }
+    }
+    Ok(format!("{name} moved {word} in plot order."))
+}
+
+/// `sheetorder` with `before` or `after`: puts `name` next to `target`. Returns the message.
+fn move_sheet(s: &mut Session, name: &str, target: &Value, after: bool) -> Result<String> {
+    let word = if after { "after" } else { "before" };
+    let target = target.as_str().ok_or_else(|| bad("sheetorder", &format!("`{word}` must be a layout name")))?;
+    let target = known_layout(s.doc()?, target)?;
+    let current = tab_names(s.doc()?);
+    let mut order: Vec<String> = current.iter().filter(|n| *n != name).cloned().collect();
+    if let Some(k) = order.iter().position(|n| *n == target) {
+        order.insert(if after { k + 1 } else { k }, name.to_owned());
+    }
+    if target == name || order == current {
+        return Ok(format!("{name} is already there in plot order."));
+    }
+    renumber_tabs(s.doc_mut()?, &order);
+    Ok(format!("{name} moved {word} {target} in plot order."))
+}
+
+pub(crate) fn sheetorder(s: &mut Session, p: &Value) -> Result<Value> {
+    let given = |key: &str| p.get(key).filter(|v| !v.is_null());
+    if ["step", "before", "after"].iter().filter(|k| given(k).is_some()).count() != 1 {
+        return Err(bad("sheetorder", "Give exactly one of `step`, `before` or `after`"));
+    }
+    let name = p.get("layout").and_then(Value::as_str).ok_or_else(|| bad("sheetorder", "`layout` must be a layout name"))?;
+    let name = known_layout(s.doc()?, name)?;
+    let message = match (given("step"), given("before")) {
+        (Some(step), _) => step_sheet(s, &name, step)?,
+        (_, Some(target)) => move_sheet(s, &name, target, false)?,
+        _ => move_sheet(s, &name, given("after").unwrap_or(&Value::Null), true)?,
+    };
+    Ok(json!({ "order": tab_names(s.doc()?), "message": message }))
+}
+
+/// SHEETORDER: `Sheet to move:` then `Move before which sheet (or Last):`. Enter at either ends it.
+struct SheetOrder {
+    layout: Option<String>,
+}
+
+impl Interactive for SheetOrder {
+    fn name(&self) -> &'static str {
+        "sheetorder"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new(if self.layout.is_some() { "Move before which sheet (or Last)" } else { "Sheet to move" }, Accept::TEXT)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let Some(typed) = name_input(i, "") else { return Ok(Step::Continue) };
+        if typed.is_empty() {
+            return Ok(Step::Done);
+        }
+        let Some(layout) = self.layout.clone() else {
+            match known_layout(s.doc()?, &typed) {
+                Ok(name) => self.layout = Some(name),
+                Err(e) => s.echo(e.to_string()),
+            }
+            return Ok(Step::Continue);
+        };
+        let params = if s.doc()?.layout(&typed).is_none() && typed.eq_ignore_ascii_case("last") {
+            let last = lamb_sheets(s.doc()?).pop().map_or_else(|| layout.clone(), |(n, _)| n);
+            json!({ "layout": layout, "after": last })
+        } else {
+            json!({ "layout": layout, "before": typed })
+        };
+        match sheetorder(s, &params) {
+            Ok(r) => s.echo(r["message"].as_str().unwrap_or_default().to_owned()),
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn sheetorder_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(SheetOrder { layout: None }))
 }
 
 #[cfg(test)]
@@ -1982,6 +2123,176 @@ mod tests {
         assert_eq!(r["pdf"]["pages"], 3, "{r}");
         assert_eq!(craft_pdf::open_slice(&std::fs::read(&path)?, None).map_err(|e| format!("{e:?}"))?.pages().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// The sheets `A001`'s Drawing List names, in its order.
+    fn listed(s: &Session) -> T<Vec<String>> {
+        Ok(body(&table(s, "A001", "Drawing List")?).into_iter().filter_map(|r| r.into_iter().next()).collect())
+    }
+
+    #[test]
+    fn sheetorder_moves_a_sheet_in_one_undo_step_through_the_list_palette_and_pdf() -> R {
+        set_io(IoHooks {
+            read: |b, n| cadcraft_io::read(b, n).map_err(|e| e.to_string()),
+            write: |d, n| cadcraft_io::write(d, n).map_err(|e| e.to_string()),
+            plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
+        });
+        let (mut s, _) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let before = tabs(&s)?;
+        let n = undo_len(&s)?;
+
+        let r = s.execute("sheetorder", &json!({ "layout": "a301", "before": "A101" }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!(r["message"], "A301 moved before A101 in plot order.");
+        assert_eq!(r["order"], json!(tabs(&s)?));
+        let names = set_sheets(s.doc()?);
+        let at = |n: &str| names.iter().position(|x| x == n);
+        assert_eq!(at("A301").map(|k| k + 1), at("A101"), "{names:?}");
+        s.undo()?;
+        assert_eq!(tabs(&s)?, before, "undo restores it");
+        s.execute("sheetorder", &json!({ "layout": "A301", "before": "A101" }))?;
+
+        let list = s.execute("layout", &json!({ "option": "list" }))?;
+        let list: Vec<&str> = list.as_array().ok_or("no list")?.iter().filter_map(|l| l["name"].as_str()).collect();
+        assert_eq!(list, tabs(&s)?, "layout list");
+        let rows = crate::views::browser_rows(s.doc()?, &s.state()?.space);
+        let row_names: Vec<&str> = rows.iter().filter(|r| r.sheet).filter_map(|r| r.label.split(" — ").next()).collect();
+        assert_eq!(row_names, names, "palette rows");
+
+        // SHEETORDER leaves the Drawing List to the next SHEETSET, and that run keeps the order.
+        assert_ne!(listed(&s)?, names, "the list waits");
+        let dir = std::env::temp_dir().join(format!("lamb-sheetorder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("set.pdf");
+        s.execute("sheetset", &json!({ "pdf": path.to_string_lossy() }))?;
+        assert_eq!(set_sheets(s.doc()?), names, "a rerun keeps the order");
+        assert_eq!(listed(&s)?, names, "the list follows it");
+        let marks = bookmarks(&std::fs::read(&path)?)?;
+        let marked: Vec<&str> = marks.iter().filter_map(|m| m.split(' ').next()).collect();
+        assert_eq!(marked, names, "bookmarks");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_sheet_lands_after_the_last_lower_name_and_an_untouched_set_stays_in_name_order() -> R {
+        let (mut s, [ground, ..]) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let untouched = set_sheets(s.doc()?);
+        let mut sorted = untouched.clone();
+        sorted.sort();
+        assert_eq!(untouched, sorted, "an untouched set stays in name order");
+
+        s.execute("sheetorder", &json!({ "layout": "A301", "before": "A102" }))?;
+        s.execute("layout", &json!({ "option": "new", "name": "Notes" }))?;
+        let second =
+            id(&s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": ground.0, "floorToFloorMm": 6000, "name": "Second" }))?)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert!(laid(&r).iter().any(|(l, _, ids)| l == "A103" && *ids == [second.0]), "{r}");
+        let mut want: Vec<String> = untouched.iter().filter(|n| *n != "A301").cloned().collect();
+        let at = want.iter().position(|n| n == "A102").ok_or("no A102")?;
+        want.insert(at, "A301".to_owned());
+        want.insert(at + 2, "A103".to_owned());
+        assert_eq!(set_sheets(s.doc()?), want, "A103 goes right after A102, the set's last lower name");
+        assert_eq!(tabs(&s)?.last().map(String::as_str), Some("Notes"), "other layouts follow");
+        Ok(())
+    }
+
+    #[test]
+    fn sheetorder_step_swaps_neighbours_and_is_a_no_op_at_the_ends() -> R {
+        let (mut s, _) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        s.execute("layout", &json!({ "option": "new", "name": "Notes" }))?;
+        s.execute("sheetorder", &json!({ "layout": "Notes", "before": "A102" }))?;
+        let tab = |s: &Session, n: &str| s.doc().ok().and_then(|d| d.layout(n).map(|l| l.tab_order));
+        let notes = tab(&s, "Notes");
+        let names = set_sheets(s.doc()?);
+
+        // A101 and A102 with Notes between them: the swap passes over it and leaves its number.
+        let r = s.execute("sheetorder", &json!({ "layout": "A102", "step": -1 }))?;
+        assert_eq!(r["message"], "A102 moved up in plot order.");
+        assert_eq!(tab(&s, "Notes"), notes, "a non-sheet keeps its tab number");
+        let moved = set_sheets(s.doc()?);
+        let at = |n: &str| moved.iter().position(|x| x == n);
+        assert_eq!(at("A102").map(|k| k + 1), at("A101"), "{moved:?}");
+
+        let n = undo_len(&s)?;
+        let first = lamb_sheets(s.doc()?).first().ok_or("no first")?.0.clone();
+        let r = s.execute("sheetorder", &json!({ "layout": first, "step": -1 }))?;
+        assert!(r["message"].as_str().ok_or("no message")?.contains("already first"), "{r}");
+        let last = lamb_sheets(s.doc()?).pop().ok_or("no last")?.0;
+        let r = s.execute("sheetorder", &json!({ "layout": last, "step": 1 }))?;
+        assert!(r["message"].as_str().ok_or("no message")?.contains("already last"), "{r}");
+        assert_eq!(undo_len(&s)?, n, "no undo step at the ends");
+        assert_eq!(set_sheets(s.doc()?), moved);
+
+        s.execute("sheetorder", &json!({ "layout": "A102", "step": 1 }))?;
+        assert_eq!(set_sheets(s.doc()?), names, "a step back restores it");
+        Ok(())
+    }
+
+    #[test]
+    fn sheetorder_refuses_what_it_cannot_do_and_changes_nothing() -> R {
+        let (mut s, _) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        s.execute("layout", &json!({ "option": "new", "name": "Notes" }))?;
+        let n = undo_len(&s)?;
+        let order = tabs(&s)?;
+        for p in [
+            json!({ "layout": "A101" }),
+            json!({ "layout": "A101", "step": 1, "before": "A102" }),
+            json!({ "layout": "A101", "before": "A102", "after": "A102" }),
+        ] {
+            let e = s.execute("sheetorder", &p).err().ok_or("accepted")?.to_string();
+            assert!(e.contains("`step`") && e.contains("`before`") && e.contains("`after`"), "{e}");
+        }
+        for (p, word) in [
+            (json!({ "layout": "Z999", "step": 1 }), "Z999"),
+            (json!({ "layout": "A101", "before": "Z999" }), "Z999"),
+            (json!({ "layout": "A101", "after": "Z999" }), "Z999"),
+            (json!({ "layout": "A101", "step": 2 }), "-1 or 1"),
+            (json!({ "layout": "Notes", "step": 1 }), "not a sheet"),
+            (json!({ "before": "A101" }), "`layout`"),
+        ] {
+            let e = s.execute("sheetorder", &p).err().ok_or("accepted")?.to_string();
+            assert!(e.contains(word), "{e}");
+        }
+        s.execute("sheetorder", &json!({ "layout": "A101", "before": "A101" }))?;
+        assert_eq!(undo_len(&s)?, n, "no undo step");
+        assert_eq!(tabs(&s)?, order);
+        Ok(())
+    }
+
+    #[test]
+    fn sheetorder_prompts_for_the_sheet_then_its_place_or_last() -> R {
+        let (mut s, _) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        let n = undo_len(&s)?;
+        s.start("sord")?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Sheet to move"));
+        s.input(Input::Text("nope".into()))?;
+        assert!(s.log.iter().any(|l| l.contains("Unknown layout") && l.contains("nope")), "{:?}", s.log);
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Sheet to move"), "it asks again");
+        s.input(Input::Text("a101".into()))?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Move before which sheet (or Last)"));
+        s.input(Input::Text("last".into()))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!(set_sheets(s.doc()?).last().map(String::as_str), Some("A101"));
+
+        s.start("sheetorder")?;
+        s.input(Input::Text("A101".into()))?;
+        s.input(Input::Text("A102".into()))?;
+        let names = set_sheets(s.doc()?);
+        let at = |n: &str| names.iter().position(|x| x == n);
+        assert_eq!(at("A101").map(|k| k + 1), at("A102"), "{names:?}");
+
+        let n = undo_len(&s)?;
+        s.start("sheetorder")?;
+        s.input(Input::Enter)?;
+        assert_eq!(undo_len(&s)?, n, "Enter ends it");
+        assert!(s.current_prompt().is_none(), "ended");
         Ok(())
     }
 
