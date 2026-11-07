@@ -7,6 +7,10 @@
 //! `unlink.apply` with [`Session::execute`], which records one step per call (an undoable
 //! interactive spec would fold the whole run into one step when it ends).
 //!
+//! Two same-layer lines meeting at a marker are linked by themselves ([`crate::maintain`] step 3b),
+//! so LINK is for what that does not do: lines on different layers, a pair it left alone because
+//! other lines meet at the same marker, and a pair UNLINK told it to leave, whose memory LINK clears.
+//!
 //! A link only exists where two lines cross, which is where a marker is drawn, so LINK never leaves
 //! the edited view: the marker names the far end, the clicked line the near one. Crossings stacked
 //! at one marker position are a drawing error and are refused, never resolved by choosing one.

@@ -64,7 +64,6 @@ const CUT_LINE: IconDef = &[
 ];
 
 // Links.
-const LINK: IconDef = &[b(Circle(9.0, 12.0, 5.5)), a(Circle(15.0, 12.0, 5.5))];
 const UNLINK: IconDef = &[b(Circle(6.5, 12.0, 4.5)), b(Circle(17.5, 12.0, 4.5)), a(Line(&[(10.0, 21.0), (14.0, 3.0)]))];
 const SHOW_LINKS: IconDef = &[
     b(Circle(9.0, 14.0, 4.5)),
@@ -251,12 +250,7 @@ pub const LAMB_TAB: ExtTab = ExtTab {
         },
         ExtGroup {
             name: "Links",
-            large: &[
-                tool(LINK, "link", "Link"),
-                tool(UNLINK, "unlink", "Unlink"),
-                tool(SHOW_LINKS, "showlinks", "Show Links"),
-                tool(RESOLVE, "resolve", "Review Issues"),
-            ],
+            large: &[tool(UNLINK, "unlink", "Unlink"), tool(SHOW_LINKS, "showlinks", "Show Links"), tool(RESOLVE, "resolve", "Review Issues")],
             small: &[
                 tool(ACCEPT, "accept", "Accept AI Line"),
                 tool(SET_ROLE, "setrole", "Set Role"),

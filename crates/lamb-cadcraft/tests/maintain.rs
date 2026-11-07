@@ -4,7 +4,7 @@
 //! a rigidly moved linked segment carries its partner across views (travel) only when the link is
 //! in the selection's travel set — seeded by an idle crossing box, emptied by a window box or Esc —
 //! and is dropped otherwise, erasing a line never erases its partner, a marker fills in both views
-//! whichever segment of its source the link names, each in the command's own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`).
+//! whichever segment of its source the link names, each in the command's own undo step — and a FILLET's virtual corner tag follows a PEDIT vertex insert (`corners`), and same-layer lines that come to meet at a marker link themselves unless unlinked or stacked (LAMB T598).
 //!
 //! The command registry is process-global, so registration goes through one `Once`.
 
@@ -897,8 +897,8 @@ fn vertex_edits_keep_links_on_their_segments() -> R {
     let before_drop = links(&s)?;
     pedit(&mut s, json!({"action": "straighten", "index": 1, "index2": 3}))?;
     let after = links(&s)?;
-    assert_eq!(after.len(), 2, "the link at the removed vertex dropped: {after:?}");
-    assert!(after.iter().all(|l| l.id != original[0].id), "it is the crossbar's");
+    assert_eq!(after.len(), 3, "the lines still meet at the marker, so a new link replaces it: {after:?}");
+    assert!(after.iter().all(|l| l.id != original[0].id), "the removed vertex's link is the crossbar's");
     holds(&s)?;
     s.undo()?;
     assert_eq!(links(&s)?, before_drop, "undo restores the dropped link");
@@ -1393,5 +1393,235 @@ fn a_wall_leaving_or_entering_the_cut_loses_or_gains_its_crossing() -> R {
     }
     let kept = read_document(&after)?.links.into_iter().find(|l| l.id == link.id).ok_or("the link survives")?;
     assert!(link_still_coincides(&DrawingProject::new(&after)?, &kept)?, "and holds");
+    Ok(())
+}
+
+/// T598's stage: wall-u with the `Crossbar` section, cut along x = 5000 running +Y from y = -1000.
+/// A section line `s` on `WALL-EXT`, 2000 along that cut, puts a plan marker at (5000, 1000).
+struct Meeting {
+    s: Session,
+    plan: Id,
+    section: Id,
+    line: Handle,
+}
+
+fn meeting() -> Result<Meeting, Box<dyn std::error::Error>> {
+    register();
+    let (d, _, _) = project_to_drawing(&load("u-wall-two-sections")?)?;
+    let doc = read_document(&d)?;
+    let plan = doc.views.iter().find(|v| matches!(v, AnyView::Plan(_))).ok_or("no plan")?.id();
+    let section = doc.views.iter().find(|v| v.name() == "Crossbar").ok_or("no Crossbar")?.id();
+    let y = {
+        let p = DrawingProject::new(&d)?;
+        compute_markers_for_view(&p, section)?.first().ok_or("no section marker")?.position.y
+    };
+    let mut s = Session::new();
+    s.open_drawing(d, "u-wall", None);
+    install_link_maintenance(&mut s);
+    let line = draw_on(&mut s, section, "WALL-EXT", [2000.0, y - 1000.0], [2000.0, y + 1000.0])?;
+    Ok(Meeting { s, plan, section, line })
+}
+
+/// A plan line beside the marker; [`stretch_onto`] swings its top end through it.
+fn beside_marker(m: &mut Meeting, layer: &str) -> Result<Handle, Box<dyn std::error::Error>> {
+    draw_on(&mut m.s, m.plan, layer, [4000.0, 600.0], [4000.0, 1400.0])
+}
+
+fn stretch_onto(s: &mut Session) -> R {
+    s.execute("stretch", &json!({"window": [[3950, 1350], [4050, 1450]], "delta": [2000, 0]}))?;
+    Ok(())
+}
+
+fn pair_links(s: &Session, x: Handle, y: Handle) -> Result<Vec<LinkRecord>, Box<dyn std::error::Error>> {
+    Ok(links(s)?.into_iter().filter(|l| joins(l, Id(x.0), Id(y.0))).collect())
+}
+
+fn unlinked(s: &Session) -> Result<usize, Box<dyn std::error::Error>> {
+    Ok(read_document(s.doc()?)?.unlinked.len())
+}
+
+/// T598: a line stretched onto a same-layer marker is linked by that command, one undo takes both;
+/// on another layer nothing links.
+#[test]
+fn stretching_a_line_onto_a_marker_links_it() -> R {
+    let mut m = meeting()?;
+    let plan_line = beside_marker(&mut m, "WALL-EXT")?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "not crossing yet");
+    let geometry = poly(m.s.doc()?, Id(plan_line.0))?;
+
+    stretch_onto(&mut m.s)?;
+    let found = pair_links(&m.s, plan_line, m.line)?;
+    assert_eq!(found.len(), 1, "stretched onto the marker: {found:?}");
+    assert_eq!(found[0].origin, lamb_core::model::LinkOrigin::Automatic);
+    {
+        let p = DrawingProject::new(m.s.doc()?)?;
+        assert!(compute_markers_for_view(&p, m.plan)?.iter().any(|x| x.source_entity_id == Id(m.line.0) && x.filled), "the circle fills");
+    }
+    m.s.undo()?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "one undo removes the link");
+    assert_eq!(poly(m.s.doc()?, Id(plan_line.0))?, geometry, "and the stretch");
+
+    let other = draw_on(&mut m.s, m.plan, "0", [4000.0, 600.0], [4000.0, 1400.0])?;
+    m.s.execute("erase", &json!({"handles": [plan_line.hex()]}))?;
+    stretch_onto(&mut m.s)?;
+    assert!(pair_links(&m.s, other, m.line)?.is_empty(), "different layers: no link");
+    Ok(())
+}
+
+/// T598: a section's cut line moved through a same-layer plan line links the section line it now
+/// meets, in the CUTLINE's undo step; the same plan line on another layer stays unlinked.
+#[test]
+fn moving_a_cut_line_through_a_line_links_it() -> R {
+    let mut m = meeting()?;
+    let plan_line = draw_on(&mut m.s, m.plan, "WALL-EXT", [3500.0, 1000.0], [4500.0, 1000.0])?;
+    let other_layer = draw_on(&mut m.s, m.plan, "0", [3500.0, 1000.0], [4500.0, 1000.0])?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "the cut misses it at x = 5000");
+
+    m.s.execute("cutline", &json!({"viewId": m.section.0, "offsetMm": 1000}))?;
+    assert_eq!(pair_links(&m.s, plan_line, m.line)?.len(), 1, "the cut at x = 4000 crosses it at the section line");
+    assert!(pair_links(&m.s, other_layer, m.line)?.is_empty(), "another layer never links");
+    m.s.undo()?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "one undo removes the link");
+    Ok(())
+}
+
+/// T598: UNLINK is remembered through edits that keep the crossing and through a save and reopen;
+/// an explicit LINK works and clears the memory, and erasing either line clears it too.
+#[test]
+fn an_unlink_is_remembered() -> R {
+    let mut m = meeting()?;
+    let plan_line = beside_marker(&mut m, "WALL-EXT")?;
+    stretch_onto(&mut m.s)?;
+    let id = pair_links(&m.s, plan_line, m.line)?.first().ok_or("no link")?.id;
+    m.s.execute("unlink", &json!({"linkId": id.0}))?;
+    assert_eq!(unlinked(&m.s)?, 1);
+
+    // Extend the plan line along itself: still through the marker.
+    let extend = json!({"window": [[3950, 550], [4050, 650]], "delta": [-1000, -400]});
+    m.s.execute("stretch", &extend)?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "the edit does not relink");
+
+    // Save and reopen; the memory survives it and still holds.
+    let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(m.s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+    let mut s = Session::new();
+    s.open_drawing(back, "u-wall", None);
+    install_link_maintenance(&mut s);
+    assert_eq!(unlinked(&s)?, 1, "saved and reopened");
+    s.execute("editview", &json!({"viewId": m.plan.0}))?;
+    s.execute("stretch", &json!({"window": [[2950, 150], [3050, 250]], "delta": [-1000, -400]}))?;
+    assert!(pair_links(&s, plan_line, m.line)?.is_empty(), "no relink after reopening");
+
+    // An explicit LINK of the pair works and forgets.
+    let (t_plan, t_section) = {
+        let p = DrawingProject::new(s.doc()?)?;
+        let marker = compute_markers_for_view(&p, m.plan)?.into_iter().find(|x| x.source_entity_id == Id(m.line.0)).ok_or("no marker")?;
+        let geometry = poly(s.doc()?, Id(plan_line.0))?;
+        (lamb_core::geometry::polyline::closest_point_on_segment(&resolved_segments(&geometry)[0], marker.position).t, marker.source_segment_param)
+    };
+    let anchor = |h: Handle, t: f64| json!({"entityId": h.0, "segmentIndex": 0, "segmentParam": t});
+    let r = s.execute("link", &json!({"a": anchor(plan_line, t_plan), "b": anchor(m.line, t_section)}))?;
+    assert_eq!(unlinked(&s)?, 0, "LINK clears the memory");
+    assert_eq!(pair_links(&s, plan_line, m.line)?.len(), 1);
+
+    // UNLINK again, then erase either line: the entry goes with it, undo brings it back.
+    s.execute("unlink", &json!({"linkId": r["linkId"]}))?;
+    assert_eq!(unlinked(&s)?, 1);
+    s.execute("erase", &json!({"handles": [plan_line.hex()]}))?;
+    assert_eq!(unlinked(&s)?, 0, "erasing a line clears its entry");
+    s.undo()?;
+    assert_eq!(unlinked(&s)?, 1, "one undo restores it");
+    Ok(())
+}
+
+/// T598: unlinking one segment of a corner on a marker unlinks the crossing, so the marker its other
+/// segment makes there does not relink.
+#[test]
+fn an_unlink_at_a_corner_covers_both_segments() -> R {
+    let mut m = meeting()?;
+    m.s.execute("editview", &json!({"viewId": m.plan.0}))?;
+    m.s.execute("layer.current", &json!({"name": "WALL-EXT"}))?;
+    let before = block_handles(m.s.doc()?, m.plan);
+    m.s.execute("pline", &json!({"points": [[4000, 1000], [5000, 1000], [5000, 2000]]}))?;
+    let plan_line = block_handles(m.s.doc()?, m.plan).into_iter().find(|h| !before.contains(h)).ok_or("no polyline")?;
+    let found = pair_links(&m.s, plan_line, m.line)?;
+    assert!(!found.is_empty(), "the corner sits on the marker");
+    for l in &found {
+        m.s.execute("unlink", &json!({"linkId": l.id.0}))?;
+    }
+    m.s.execute("stretch", &json!({"window": [[3950, 950], [4050, 1050]], "delta": [-500, 0]}))?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "neither segment relinks");
+    Ok(())
+}
+
+/// T598: more than one same-layer line at a circle is a drawing error: the link already there stays
+/// and nothing new forms, however the second line arrived, from either side of the crossing.
+#[test]
+fn two_lines_at_one_circle_form_no_new_link() -> R {
+    let mut m = meeting()?;
+    let first = beside_marker(&mut m, "WALL-EXT")?;
+    stretch_onto(&mut m.s)?;
+    let held = pair_links(&m.s, first, m.line)?;
+    assert_eq!(held.len(), 1);
+
+    // Stretched onto the circle.
+    let second = draw_on(&mut m.s, m.plan, "WALL-EXT", [6000.0, 800.0], [6000.0, 1200.0])?;
+    m.s.execute("stretch", &json!({"window": [[5950, 1150], [6050, 1250]], "delta": [-2000, 0]}))?;
+    assert!(pair_links(&m.s, second, m.line)?.is_empty(), "a second line stretched there");
+    // Drawn through the circle.
+    let third = draw_on(&mut m.s, m.plan, "WALL-EXT", [5000.0, 500.0], [5000.0, 1500.0])?;
+    assert!(pair_links(&m.s, third, m.line)?.is_empty(), "a line drawn there");
+    assert_eq!(pair_links(&m.s, first, m.line)?, held, "the link already there stays");
+
+    // From the section side: a new section line through the point where several plan lines cross
+    // the cut links none of them, and the old one's link went with it.
+    m.s.execute("editview", &json!({"viewId": m.section.0}))?;
+    m.s.execute("erase", &json!({"handles": [m.line.hex()]}))?;
+    let y = {
+        let p = DrawingProject::new(m.s.doc()?)?;
+        compute_markers_for_view(&p, m.section)?.first().ok_or("no section marker")?.position.y
+    };
+    let again = draw_on(&mut m.s, m.section, "WALL-EXT", [2000.0, y - 1000.0], [2000.0, y + 1000.0])?;
+    for line in [first, second, third] {
+        assert!(pair_links(&m.s, line, again)?.is_empty(), "stacked markers form no link");
+    }
+    Ok(())
+}
+
+/// T598: an unaccepted AI line is left to `proposals`: step 3b links neither to it nor from it, and
+/// it stays unaccepted.
+#[test]
+fn an_unaccepted_ai_line_gets_no_link_from_an_edit() -> R {
+    let set_proposal = |s: &mut Session, h: Handle| -> R {
+        let mut err = None;
+        s.doc_mut()?.modify_entity(h, |e| {
+            err = lamb_cadcraft::read_entity_data(&e.common)
+                .and_then(|mut data| {
+                    data.ai_origin = Some(serde_json::from_value(json!({"proposalId": "t598", "accepted": false})).expect("origin"));
+                    lamb_cadcraft::set_entity_data(&mut e.common, &data)
+                })
+                .err();
+        })?;
+        Ok(err.map_or(Ok(()), Err)?)
+    };
+    let accepted = |s: &Session, h: Handle| -> Result<bool, Box<dyn std::error::Error>> {
+        let e = s.doc()?.entity(h).ok_or("entity missing")?;
+        Ok(lamb_cadcraft::read_entity_data(&e.common)?.ai_origin.ok_or("no origin")?.accepted)
+    };
+
+    // The marker's source is the AI line.
+    let mut m = meeting()?;
+    let plan_line = beside_marker(&mut m, "WALL-EXT")?;
+    set_proposal(&mut m.s, m.line)?;
+    stretch_onto(&mut m.s)?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "no link to an AI line");
+    assert!(!accepted(&m.s, m.line)?, "and it stays unaccepted");
+
+    // The touched line is the AI line.
+    let mut m = meeting()?;
+    let plan_line = beside_marker(&mut m, "WALL-EXT")?;
+    set_proposal(&mut m.s, plan_line)?;
+    stretch_onto(&mut m.s)?;
+    assert!(pair_links(&m.s, plan_line, m.line)?.is_empty(), "no link from an AI line");
+    assert!(!accepted(&m.s, plan_line)?, "and it stays unaccepted");
     Ok(())
 }

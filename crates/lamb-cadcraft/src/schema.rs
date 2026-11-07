@@ -86,6 +86,10 @@ pub struct LambDocument {
     pub links: Vec<LinkRecord>,
     #[serde(default)]
     pub suppressed_proposals: Vec<String>,
+    /// Crossings the user unlinked, which same-layer meeting does not link again; an explicit LINK
+    /// of the pair forgets one, and so does either line leaving every view block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unlinked: Vec<UnlinkedPair>,
     /// Plan views whose assembly mitres band ends at undetailed two-arm junctions
     /// ([`crate::assembly`], `assemblyplan {mitre}`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -100,6 +104,13 @@ pub struct LambDocument {
     /// What the sheets' title blocks say about the project (`titleblock`, [`crate::titleblock`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sheet_info: Option<SheetInfo>,
+}
+
+/// Two segments the user unlinked, each `(entity, segment index)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UnlinkedPair {
+    pub a: (Id, usize),
+    pub b: (Id, usize),
 }
 
 /// A project's title-block text, empty until set, and project north. An empty `project` shows the
@@ -128,6 +139,7 @@ impl LambDocument {
             views: Vec::new(),
             links: Vec::new(),
             suppressed_proposals: Vec::new(),
+            unlinked: Vec::new(),
             mitre_plans: Vec::new(),
             auto_dim_plans: Vec::new(),
             sheet_paper: None,

@@ -354,7 +354,7 @@ fn anchor_range(p: &DrawingProject<'_>, end: &str, a: &RawAnchor) -> Result<Link
 
 fn link(s: &mut Session, p: &Value) -> Result<Value> {
     let (ra, rb) = (raw_anchor(p, "a")?, raw_anchor(p, "b")?);
-    let record = {
+    let (record, unlinked) = {
         let proj = DrawingProject::new(s.doc()?).map_err(other)?;
         let (a, b) = (anchor_range(&proj, "a", &ra)?, anchor_range(&proj, "b", &rb)?);
         let (va, vb) = (proj.entity_view_id(a.entity_id), proj.entity_view_id(b.entity_id));
@@ -375,12 +375,14 @@ fn link(s: &mut Session, p: &Value) -> Result<Value> {
         if !link_still_coincides(&proj, &probe).map_err(other)? {
             return Err(other("Those lines do not cross at a marker"));
         }
-        probe
+        let unlinked = proj.document().unlinked.iter().filter(|u| !crate::maintain::unlink_covers(&proj, u, &probe)).cloned().collect();
+        (probe, unlinked)
     };
     let d = s.doc_mut()?;
     let mut doc = read_document(d).map_err(other)?;
     let id = Id(d.new_handle().0);
     doc.links.push(LinkRecord { id, created_at: now(), ..record });
+    doc.unlinked = unlinked;
     write_document(d, &doc).map_err(other)?;
     Ok(json!({ "linkId": id.0 }))
 }
@@ -398,11 +400,9 @@ fn unlink_json(s: &mut Session, p: &Value) -> Result<Value> {
 fn unlink(s: &mut Session, p: &Value) -> Result<Value> {
     let id = p.get("linkId").and_then(id_value).ok_or_else(|| bad("unlink", "`linkId` is required"))?;
     let mut doc = read_document(s.doc()?).map_err(other)?;
-    let n = doc.links.len();
-    doc.links.retain(|l| l.id != id);
-    if doc.links.len() == n {
-        return Err(other("No such link"));
-    }
+    let Some(gone) = doc.links.iter().position(|l| l.id == id) else { return Err(other("No such link")) };
+    let gone = doc.links.remove(gone);
+    doc.unlinked.push(crate::schema::UnlinkedPair { a: (gone.a.entity_id, gone.a.segment_index), b: (gone.b.entity_id, gone.b.segment_index) });
     write_document(s.doc_mut()?, &doc).map_err(other)?;
     Ok(Value::Null)
 }

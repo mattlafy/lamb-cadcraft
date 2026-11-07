@@ -117,7 +117,8 @@ pub use scene::{
     without_ghosts,
 };
 pub use schema::{
-    EXT_KEY, EntityData, LambDocument, LayerData, SchemaError, read_document, read_entity_data, set_entity_data, view_block_name, write_document,
+    EXT_KEY, EntityData, LambDocument, LayerData, SchemaError, UnlinkedPair, read_document, read_entity_data, set_entity_data, view_block_name,
+    write_document,
 };
 pub use sheets::{SheetError, create_sheet};
 pub use sweeps::{run_sweeps, sweep_observer};
