@@ -1,6 +1,6 @@
 //! VIEWPROPS (LAMB T347): a view's own properties — rename, a placed plan's cut elevation, a
 //! vertical view's intent (section / elevation) and flip, and (LAMB T499, fork-only) `cutOffset`: a
-//! placed vertical view's cut line moved parallel to itself — CUTLINE in its host plan. The backend is the TS command engine's
+//! placed vertical view's cut line moved parallel to itself — CUTLINE from any plan. The backend is the TS command engine's
 //! `applyViewProps` (`packages/command-engine/src/commands/viewEdits.ts`) case for case, refusals
 //! word for word; undo is the engine's snapshot of the LAMB slot, so no inverse is written here.
 //!
