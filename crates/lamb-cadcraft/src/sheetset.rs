@@ -23,7 +23,7 @@
 //! [`crate::titleblock::sheet_title`]; it is made once another set sheet exists. `A601` holds the
 //! [`crate::bom`] table when there is framing to count; with none an existing one is left alone.
 //! `A602` holds the [`crate::schedule`] opening schedule (LAMB T639) likewise, when a placed plan has
-//! openings.
+//! openings, and `A603` the [`crate::rooms`] room schedule (LAMB T657) when a plan has named rooms.
 //! Each table is compared with what it would become and replaced, at its own corner, only when its
 //! text differs. A table taller than the sheet is written whole and the message says it runs off.
 //! All of it is one undo step; nothing to change changes nothing.
@@ -95,6 +95,7 @@ use crate::bom::{self, BOM_TITLE, Refreshed};
 use crate::commands::{bad, edited_view, id_value, name_input, other, point_param};
 use crate::detailsheets::{lay_detail_sheets, next_sheet_name};
 use crate::project::DrawingProject;
+use crate::rooms::{self, ROOM_TITLE, refresh_room_schedule};
 use crate::schedule::{self, OPENING_TITLE, refresh_opening_schedule};
 use crate::schema::{LambDocument, assembly_block_name, read_document, read_entity_data, view_block_name, write_document};
 use crate::sheets::{
@@ -457,13 +458,20 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         parts.push(part);
         sheets.push(sheet);
     }
+    if let Some(change) = refresh_room_schedule(&mut d)? {
+        let (part, sheet) = table_report(rooms::DEFAULT_LAYOUT, "schedule", ROOM_TITLE, change);
+        parts.push(part);
+        sheets.push(sheet);
+    }
     if let Some(change) = refresh_list(&mut d, &known)? {
         let (part, sheet) = table_report(LIST_SHEET, "list", LIST_TITLE, change);
         parts.insert(0, part);
         sheets.insert(0, sheet);
     }
     let mut off_sheet: Vec<String> = Vec::new();
-    for (layout, title) in [(LIST_SHEET, LIST_TITLE), (bom::DEFAULT_LAYOUT, BOM_TITLE), (schedule::DEFAULT_LAYOUT, OPENING_TITLE)] {
+    for (layout, title) in
+        [(LIST_SHEET, LIST_TITLE), (bom::DEFAULT_LAYOUT, BOM_TITLE), (schedule::DEFAULT_LAYOUT, OPENING_TITLE), (rooms::DEFAULT_LAYOUT, ROOM_TITLE)]
+    {
         if bom::table_runs_off(&d, layout, title)? {
             off_sheet.push(format!("{layout} {title}"));
         }

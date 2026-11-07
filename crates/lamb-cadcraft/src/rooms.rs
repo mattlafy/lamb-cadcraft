@@ -16,6 +16,14 @@
 //! [`crate::annotations`] writes each [`room_tags`] entry into its plan's annotation block: name,
 //! number and area (`18.2 m²`), centred on `at`; a room whose point is no longer in a space shows
 //! `—` for its area and stays.
+//!
+//! `roomschedule {layout?, at?}` (`rsch`, LAMB T657): the `Room Schedule` table (`Number | Name |
+//! Level | Area (m²)`) on layout `layout` (default `A603`, its sheet in the set ([`crate::sheetset`]),
+//! created without viewports when absent) at paper point `at`, placed and replaced as
+//! [`crate::schedule`]'s opening schedule is. Rows by level (floor elevation, then order; an unplaced
+//! plan's rooms last, level `—`), then number (numerically where both parse, else as text), then a
+//! `Total` row summing the known areas. One undo step; no rooms is refused, nothing changed. Returns
+//! `{layout, handle, rows: [{number, name, level, area_m2}], message}`.
 
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use lamb_core::derivation::wall_spaces::{WallSides, inner_area_mm2, space_contains};
@@ -23,9 +31,13 @@ use lamb_core::geometry::Point2;
 use lamb_core::model::{AnyView, Id, Placement};
 use serde_json::{Value, json};
 
+use cadcraft_doc::Table;
+
+use crate::bom::{self, Refreshed};
 use crate::commands::{bad, edited_view, id_value, name_input, other, point_param};
 use crate::detailtags::graph_and_sides;
 use crate::project::DrawingProject;
+use crate::schedule::write_schedule;
 use crate::schema::{LambDocument, RoomRecord, read_document, write_document};
 use cadcraft_doc::Drawing;
 
@@ -268,6 +280,107 @@ pub(crate) fn room_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::<RoomM>::default())
 }
 
+pub const ROOM_TITLE: &str = "Room Schedule";
+pub(crate) const DEFAULT_LAYOUT: &str = "A603";
+const HEADER: [&str; 4] = ["Number", "Name", "Level", "Area (m²)"];
+const COL_WIDTHS: [f64; 4] = [20.0, 50.0, 30.0, 25.0];
+
+/// One room of the schedule; `area_m2` as [`RoomTag`]'s.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoomRow {
+    pub number: String,
+    pub name: String,
+    pub level: String,
+    pub area_m2: Option<f64>,
+}
+
+/// Room numbers in schedule order: numerically when both parse, else as text.
+fn by_number(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.total_cmp(&y).then_with(|| a.cmp(b)),
+        _ => a.cmp(b),
+    }
+}
+
+/// Every room, by level then number. An unreadable drawing has none.
+pub fn room_rows(d: &Drawing) -> Vec<RoomRow> {
+    let tags = room_tags(d);
+    if tags.is_empty() {
+        return Vec::new();
+    }
+    let Ok(doc) = read_document(d) else { return Vec::new() };
+    let mut levels: Vec<_> = doc.levels.iter().collect();
+    levels.sort_by(|a, b| a.floor_elevation.value.total_cmp(&b.floor_elevation.value).then(a.order.total_cmp(&b.order)));
+    let mut rows: Vec<(usize, RoomRow)> = tags
+        .into_iter()
+        .map(|t| {
+            let at = level_of(&doc, t.plan).and_then(|id| levels.iter().position(|l| l.id == id));
+            let level = at.and_then(|i| levels.get(i)).map_or_else(|| "—".to_owned(), |l| l.name.clone());
+            (at.unwrap_or(usize::MAX), RoomRow { number: t.number, name: t.name, level, area_m2: t.area_m2 })
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| by_number(&a.1.number, &b.1.number)));
+    rows.into_iter().map(|(_, r)| r).collect()
+}
+
+/// The room schedule with its top-left corner at `at` (paper mm): a row per room, then the total.
+pub fn room_table(rows: &[RoomRow], at: Point2) -> Table {
+    let area = |a: Option<f64>| a.map_or_else(|| "—".to_owned(), |a| format!("{a:.1}"));
+    let mut cells: Vec<Vec<String>> = rows.iter().map(|r| vec![r.number.clone(), r.name.clone(), r.level.clone(), area(r.area_m2)]).collect();
+    let known: Vec<f64> = rows.iter().filter_map(|r| r.area_m2).collect();
+    let total = (!known.is_empty()).then(|| known.iter().sum::<f64>());
+    cells.push(vec![String::new(), "Total".to_owned(), String::new(), area(total)]);
+    bom::schedule_table(ROOM_TITLE, &HEADER, &COL_WIDTHS, &cells, at)
+}
+
+/// Refreshes the Room Schedule on its set sheet from [`room_rows`]; no rooms touches nothing.
+pub(crate) fn refresh_room_schedule(d: &mut Drawing) -> Result<Option<Refreshed>> {
+    let rows = room_rows(d);
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    bom::refresh_table(d, DEFAULT_LAYOUT, ROOM_TITLE, &|at| room_table(&rows, at))
+}
+
+/// ROOMSCHEDULE `{layout?, at?}`. See the module doc.
+pub(crate) fn roomschedule(s: &mut Session, p: &Value) -> Result<Value> {
+    let rows = room_rows(s.doc()?);
+    if rows.is_empty() {
+        return Err(other("No rooms: name a plan's rooms with ROOM first"));
+    }
+    let (layout, handle) = write_schedule(s, "roomschedule", p, DEFAULT_LAYOUT, ROOM_TITLE, &|at| room_table(&rows, at))?;
+    let message = format!("{ROOM_TITLE} on \"{layout}\": {} room{}.", rows.len(), if rows.len() == 1 { "" } else { "s" });
+    let rows: Vec<Value> = rows.iter().map(|r| json!({ "number": r.number, "name": r.name, "level": r.level, "area_m2": r.area_m2 })).collect();
+    Ok(json!({ "layout": layout, "handle": format!("{:X}", handle.0), "rows": rows, "message": message }))
+}
+
+/// ROOMSCHEDULE: `Enter layout for the room schedule <A603>:`.
+struct RoomSchedule;
+
+impl Interactive for RoomSchedule {
+    fn name(&self) -> &'static str {
+        "roomschedule"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Enter layout for the room schedule", Accept::TEXT).default(DEFAULT_LAYOUT.to_owned())
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let Some(layout) = name_input(i, DEFAULT_LAYOUT) else { return Ok(Step::Continue) };
+        match roomschedule(s, &json!({ "layout": layout })) {
+            Ok(r) => s.echo(r["message"].as_str().unwrap_or_default().to_owned()),
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn roomschedule_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(RoomSchedule))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +531,128 @@ mod tests {
         assert!(crate::annotations::settled(&back)?, "the observer would change nothing after a round trip");
         assert_eq!(read_document(&back)?.rooms, read_document(s.doc()?)?.rooms);
         assert_eq!(room_tags(&back).first().map(|t| area_text(t.area_m2)).as_deref(), Some("18.2 m²"));
+        Ok(())
+    }
+
+    /// Every cell of the A603 table below its header row.
+    fn schedule_body(s: &Session) -> T<Vec<Vec<String>>> {
+        let (_, t) = crate::schedule::titled_on(s.doc()?, DEFAULT_LAYOUT, ROOM_TITLE).ok_or("no schedule")?;
+        Ok(t.cells[2..].iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect())
+    }
+
+    /// Ground: 102 Bed (x 6000) named before 101 Living; `First` at 3000: 201 Study. Ground edited.
+    fn two_levels() -> T<(Session, Id)> {
+        let (mut s, plan) = project()?;
+        walls(&mut s, 6000.0)?;
+        s.execute("room", &json!({ "at": {"x": 8500, "y": 2000}, "name": "Bed", "number": "102" }))?;
+        s.execute("room", &json!({ "at": {"x": 2500, "y": 2000}, "name": "Living", "number": "101" }))?;
+        let first = id(&s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": plan.0, "floorToFloorMm": 3000, "name": "First" }))?)?;
+        s.execute("editview", &json!({ "viewId": first.0 }))?;
+        walls(&mut s, 0.0)?;
+        s.execute("room", &json!({ "at": {"x": 2500, "y": 2000}, "name": "Study" }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        Ok((s, plan))
+    }
+
+    fn tables_on(s: &Session, layout: &str) -> T<usize> {
+        let l = s.doc()?.layout(layout).ok_or("no layout")?;
+        Ok(l.entities.iter().filter(|e| matches!(e.kind, cadcraft_doc::EntityKind::Table(_))).count())
+    }
+
+    #[test]
+    fn the_schedule_runs_by_level_then_number_with_a_total_and_reruns_in_place() -> R {
+        let (mut s, _plan) = two_levels()?;
+        let n = undo_len(&s)?;
+        let r = s.execute("roomschedule", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!((r["layout"].as_str(), r["rows"][0]["number"].as_str()), (Some("A603"), Some("101")));
+        assert_eq!(r["message"], "Room Schedule on \"A603\": 3 rooms.");
+        assert_eq!(
+            schedule_body(&s)?,
+            [["101", "Living", "Level 1", "18.2"], ["102", "Bed", "Level 1", "18.2"], ["201", "Study", "First", "18.2"], ["", "Total", "", "54.7"],]
+        );
+        let (_, t) = crate::schedule::titled_on(s.doc()?, DEFAULT_LAYOUT, ROOM_TITLE).ok_or("no schedule")?;
+        assert_eq!(t.cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), HEADER);
+
+        let n = undo_len(&s)?;
+        s.execute("roomschedule", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n, "an unchanged rerun changes nothing");
+        s.execute("room", &json!({ "at": {"x": 2500, "y": 2000}, "name": "Lounge" }))?;
+        s.execute("roomschedule", &json!({ "at": {"x": 50, "y": 100} }))?;
+        assert_eq!(schedule_body(&s)?[0][1], "Lounge");
+        assert_eq!(tables_on(&s, DEFAULT_LAYOUT)?, 1, "replaced, not added");
+        let (_, t) = crate::schedule::titled_on(s.doc()?, DEFAULT_LAYOUT, ROOM_TITLE).ok_or("no schedule")?;
+        assert_eq!((t.insert.x, t.insert.y), (50.0, 100.0));
+        s.undo()?;
+        assert_eq!(schedule_body(&s)?[0][1], "Living", "one undo takes the rerun back");
+        Ok(())
+    }
+
+    #[test]
+    fn no_rooms_is_refused_and_one_undo_removes_a_new_schedule() -> R {
+        let (mut s, _plan) = project()?;
+        let n = undo_len(&s)?;
+        assert!(s.execute("roomschedule", &json!({})).is_err(), "nothing to schedule");
+        assert_eq!(undo_len(&s)?, n);
+        s.execute("sheetset", &json!({}))?;
+        assert!(s.doc()?.layout(DEFAULT_LAYOUT).is_none(), "SHEETSET makes no A603");
+        s.execute("room", &json!({ "at": {"x": 2500, "y": 2000}, "name": "Living" }))?;
+        s.execute("roomschedule", &json!({}))?;
+        assert!(s.doc()?.layout(DEFAULT_LAYOUT).is_some());
+        s.undo()?;
+        assert!(s.doc()?.layout(DEFAULT_LAYOUT).is_none(), "one undo removes it");
+        Ok(())
+    }
+
+    #[test]
+    fn sheetset_writes_a603_after_a602_lists_it_and_follows_a_rename() -> R {
+        let (mut s, _plan) = two_levels()?;
+        // A third ground room, unnamed, with a window in a gap of its south wall: the set's A602.
+        for (a, b) in [(-100.0, 5100.0), (100.0, 4900.0)] {
+            let (x0, x1, y0, y1) = (a + 12000.0, b + 12000.0, a, b - 1000.0);
+            s.execute("pline", &json!({ "vertices": [[13000.0, y0], [x0, y0], [x0, y1], [x1, y1], [x1, y0], [14000.0, y0]] }))?;
+        }
+        s.execute("layer.new", &json!({ "name": "WINDOW", "current": true }))?;
+        s.execute("line", &json!({ "points": [[13000, 0], [14000, 0]] }))?;
+        assert_eq!(crate::schedule::opening_rows(s.doc()?).len(), 1);
+        let r = s.execute("sheetset", &json!({}))?;
+        let laid: Vec<(&str, &str)> = r["sheets"]
+            .as_array()
+            .ok_or("no sheets")?
+            .iter()
+            .map(|x| (x["layout"].as_str().unwrap_or(""), x["group"].as_str().unwrap_or("")))
+            .collect();
+        assert!(laid.contains(&("A603", "schedule")), "{r}");
+        assert!(r["message"].as_str().is_some_and(|m| m.contains("A603 Room Schedule")), "{r}");
+        assert_eq!(schedule_body(&s)?.len(), 4);
+        let mut tabs: Vec<_> = s.doc()?.layouts.iter().map(|l| (l.tab_order, l.name.clone())).collect();
+        tabs.sort();
+        let names: Vec<&str> = tabs.iter().map(|(_, n)| n.as_str()).collect();
+        let (a602, a603) = (names.iter().position(|n| *n == "A602"), names.iter().position(|n| *n == "A603"));
+        assert!(a602.is_some() && a603 == a602.map(|i| i + 1), "{names:?}");
+        let l = s.doc()?.layout("A001").ok_or("no list")?;
+        let list = l
+            .entities
+            .iter()
+            .find_map(|e| if let cadcraft_doc::EntityKind::Table(t) = &e.kind { Some(t.clone()) } else { None })
+            .ok_or("no table")?;
+        assert!(list.cells.iter().any(|r| r[0].text == "A603" && r[1].text == ROOM_TITLE), "{list:?}");
+
+        s.execute("room", &json!({ "at": {"x": 8500, "y": 2000}, "name": "Bedroom" }))?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert!(r["message"].as_str().is_some_and(|m| m.contains("A603 Room Schedule updated")), "{r}");
+        assert_eq!(schedule_body(&s)?[1], ["102", "Bedroom", "Level 1", "18.2"]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_form_prompts_for_its_sheet() -> R {
+        let (mut s, _plan) = project()?;
+        s.execute("room", &json!({ "at": {"x": 2500, "y": 2000}, "name": "Living" }))?;
+        s.start("rsch")?;
+        assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("A603"));
+        s.input(Input::Text("Rooms".into()))?;
+        assert!(s.doc()?.layout("Rooms").is_some());
         Ok(())
     }
 }

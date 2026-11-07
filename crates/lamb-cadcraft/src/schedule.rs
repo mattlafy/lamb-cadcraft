@@ -261,34 +261,44 @@ pub(crate) fn refresh_opening_schedule(d: &mut Drawing) -> Result<Option<Refresh
     bom::refresh_table(d, DEFAULT_LAYOUT, OPENING_TITLE, &|at| opening_table(&rows, at))
 }
 
-/// The handle of the schedule on `layout`, and its table.
+/// The handle of the opening schedule on `layout`, and its table.
+#[cfg(test)]
 fn schedule_on(d: &Drawing, layout: &str) -> Option<(Handle, Table)> {
+    titled_on(d, layout, OPENING_TITLE)
+}
+
+/// The handle of the table titled `title` on `layout`, and the table.
+pub(crate) fn titled_on(d: &Drawing, layout: &str, title: &str) -> Option<(Handle, Table)> {
     d.layout(layout)?.entities.iter().find_map(|e| match &e.kind {
-        EntityKind::Table(t) if t.cells.first().and_then(|r| r.first()).is_some_and(|c| c.text == OPENING_TITLE) => Some((e.handle, t.clone())),
+        EntityKind::Table(t) if t.cells.first().and_then(|r| r.first()).is_some_and(|c| c.text == title) => Some((e.handle, t.clone())),
         _ => None,
     })
 }
 
-pub(crate) fn openingschedule(s: &mut Session, p: &Value) -> Result<Value> {
+/// A schedule command's `{layout?, at?}`: writes the table `make` builds, titled `title`, on
+/// `layout` (default `default_layout`) at `at` (default where it stands, else the sheet's usable
+/// top-left), replacing one of that title. One undo step, none when nothing changes. Returns the
+/// layout and the table's handle.
+pub(crate) fn write_schedule(
+    s: &mut Session,
+    cmd: &str,
+    p: &Value,
+    default_layout: &str,
+    title: &str,
+    make: &dyn Fn(Point2) -> Table,
+) -> Result<(String, Handle)> {
     let layout = match p.get("layout").filter(|v| !v.is_null()) {
-        None => DEFAULT_LAYOUT.to_owned(),
-        Some(v) => {
-            v.as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad("openingschedule", "`layout` must be a layout name"))?.to_owned()
-        }
+        None => default_layout.to_owned(),
+        Some(v) => v.as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(cmd, "`layout` must be a layout name"))?.to_owned(),
     };
     let at = match p.get("at").filter(|v| !v.is_null()) {
         None => None,
-        Some(_) => Some(point_param("openingschedule", p, "at")?),
+        Some(_) => Some(point_param(cmd, p, "at")?),
     };
-    let d0 = s.doc()?;
-    let rows = opening_rows(d0);
-    if rows.is_empty() {
-        return Err(other("No openings: no placed plan has a door or window spanning a wall gap"));
-    }
     // Build on a copy and assign it back once: one undo step, and none when nothing changes.
-    let mut d = d0.clone();
-    let mut changed = bom::refresh_table(&mut d, &layout, OPENING_TITLE, &|at| opening_table(&rows, at))?.is_some();
-    let (handle, table) = schedule_on(&d, &layout).ok_or_else(|| other("The schedule was not written"))?;
+    let mut d = s.doc()?.clone();
+    let mut changed = bom::refresh_table(&mut d, &layout, title, make)?.is_some();
+    let (handle, table) = titled_on(&d, &layout, title).ok_or_else(|| other("The schedule was not written"))?;
     if let Some(at) = at.filter(|at| (table.insert.x, table.insert.y) != (at.x, at.y)) {
         let l = d.layouts.iter_mut().find(|l| l.name == layout).ok_or_else(|| other("The schedule's layout is gone"))?;
         l.entities.modify(handle, |e| {
@@ -301,6 +311,15 @@ pub(crate) fn openingschedule(s: &mut Session, p: &Value) -> Result<Value> {
     if changed {
         *s.doc_mut()? = d;
     }
+    Ok((layout, handle))
+}
+
+pub(crate) fn openingschedule(s: &mut Session, p: &Value) -> Result<Value> {
+    let rows = opening_rows(s.doc()?);
+    if rows.is_empty() {
+        return Err(other("No openings: no placed plan has a door or window spanning a wall gap"));
+    }
+    let (layout, handle) = write_schedule(s, "openingschedule", p, DEFAULT_LAYOUT, OPENING_TITLE, &|at| opening_table(&rows, at))?;
     let message = format!("{OPENING_TITLE} on \"{layout}\": {} openings.", rows.len());
     let rows: Vec<Value> = rows
         .iter()

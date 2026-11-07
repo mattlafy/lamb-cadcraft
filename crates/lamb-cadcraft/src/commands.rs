@@ -34,6 +34,8 @@
 //!   order, as a table on layout `A602` — see [`crate::schedule`].
 //! - `room {viewId?, at, name, number?}` (`rm`): names the space of a placed plan containing `at`; its
 //!   tag shows name, number and the area inside the inner faces — see [`crate::rooms`].
+//! - `roomschedule {layout?, at?}` (`rsch`): the room schedule, by level then number with a total,
+//!   as a table on layout `A603` — see [`crate::rooms`].
 //! - `vpview {handle, viewId | null}`: binds a layout viewport to a view — its `view_id`, every other
 //!   view's layer frozen in it, zoomed to the view; `null` unbinds it. One undo step; the
 //!   Properties palette's View row runs it ([`crate::props`]).
@@ -899,6 +901,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["rm"])
             .params("{viewId?, at, name, number?} → {id, name, number, area_m2, message}")
             .interactive(crate::rooms::room_machine),
+        CommandSpec::new("roomschedule", "Room Schedule", crate::rooms::roomschedule)
+            .alias(&["rsch"])
+            .params("{layout?, at?} → {layout, handle, rows: [{number, name, level, area_m2}], message}")
+            .interactive(crate::rooms::roomschedule_machine),
         CommandSpec::new("vpview", "Viewport View", vpview).params("{handle, viewId | null} → {handle, viewId}"),
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU_VIEW_SETUP).interactive(editview_machine),
         CommandSpec::new("viewprops", "View Properties", crate::viewprops::viewprops)
