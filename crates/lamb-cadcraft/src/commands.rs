@@ -19,6 +19,9 @@
 //!   optionally plotted to one PDF — see [`crate::sheetset`].
 //! - `sheetorder {layout, step?, before?, after?}` (`sord`): moves a sheet in plot order, by one LAMB
 //!   sheet or next to a named layout — see [`crate::sheetset`].
+//! - `enlargedsheet {viewId, from, to, scale?, show?}` (`esheet`): a chosen area of a plan, section or
+//!   elevation on a new sheet at a larger scale, plotted after the view's own sheet — see
+//!   [`crate::sheetset`].
 //! - `autodim {view?, off?}` (`adim`): a placed plan's generated exterior dimension strings, on or
 //!   off — see [`crate::autodim`].
 //! - `sheetsize {paper}` (`ssize`): the paper new sheets are made on, ARCH D landscape until set;
@@ -866,6 +869,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["sord"])
             .params("{layout, step?, before?, after?} → {order, message}")
             .interactive(crate::sheetset::sheetorder_machine),
+        CommandSpec::new("enlargedsheet", "Enlarged Sheet", crate::sheetset::enlargedsheet)
+            .alias(&["esheet"])
+            .params("{viewId, from, to, scale?, show?} → {layout, viewId, scale, show, viewport, message}")
+            .interactive(crate::sheetset::enlargedsheet_machine),
         CommandSpec::new("autodim", "Dimension Plan", crate::autodim::autodim)
             .alias(&["adim"])
             .params("{view?, off?} → {view, dimensions, message}")

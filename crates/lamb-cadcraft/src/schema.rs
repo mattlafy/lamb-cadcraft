@@ -186,6 +186,10 @@ pub struct EntityData {
     /// On a sheet's assembly viewport: the plan whose assembly block it shows ([`crate::sheets`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assembly_of: Option<Id>,
+    /// On a sheet's viewport: it shows a chosen area of its view larger than the view's own sheet
+    /// does, so its content overruns its window on purpose ([`crate::sheets::create_enlarged_sheet`]).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enlarged: bool,
     /// LAMB virtual corners (`PolySegment.corner_at_to`) as (vertex index, tag) pairs; the vertex
     /// indices are the entity's `LwPolyline` vertex indices (closed: the wrap corner is vertex 0).
     /// Re-applied by [`crate::convert::apply_corners`]; an index that is no longer a corner is
@@ -298,6 +302,7 @@ impl Default for EntityData {
             ai_origin: None,
             view_id: None,
             assembly_of: None,
+            enlarged: false,
             corners: Vec::new(),
             detail_tag: None,
             detail_ref: None,

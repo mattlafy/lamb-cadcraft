@@ -70,23 +70,36 @@
 //! layouts keeping their tab numbers, and changes nothing at either end. `before` or `after` puts
 //! `layout` next to the named layout and renumbers every layout from the same base. Exactly one of
 //! the three is required. `A001`'s Drawing List follows at the next SHEETSET.
+//!
+//! ENLARGEDSHEET (LAMB T654): `enlargedsheet {viewId, from, to, scale?, show?}` (`esheet`) puts the
+//! view-local window `from`..`to` of a placed plan, section or elevation on a new sheet in the view's
+//! group, in one undo step, and returns `{layout, viewId, scale, show, viewport, message}`. `show` is
+//! `assembly` or `view`, by default `assembly` when the view has an assembly block. Without `scale`
+//! it is the smallest standard denominator, not below 1:5, at which the window fits the sheet above
+//! the drawing title; a given one that does not fit refuses and names the one that does. The viewport
+//! is the window at that scale ([`crate::sheets::create_enlarged_sheet`]) and SHEETSET never refits
+//! it. Annotation stays sized for the view's own sheet, so it reads larger here. The sheet plots
+//! straight after the sheet showing the view, its framing sheet for `assembly`, and after any
+//! enlargements of that view already there; with no such sheet, at the end of the set.
 
-use cadcraft_doc::{Drawing, EntityKind, Handle, Lineweight, MONOCHROME_CTB, Space};
+use cadcraft_doc::{Drawing, EntityKind, Handle, Lineweight, LwPolyline, MONOCHROME_CTB, Space};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
+use cadcraft_geom::{Bounds2, PolyVertex, Vec2};
 use lamb_core::derivation::read::ProjectRead;
+use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::entities::LineRole;
 use lamb_core::model::{AnyView, Id, VerticalIntent};
 use serde_json::{Value, json};
 
 use crate::bom::{self, BOM_TITLE, Refreshed};
-use crate::commands::{bad, name_input, other};
+use crate::commands::{bad, edited_view, id_value, name_input, other, point_param};
 use crate::detailsheets::{lay_detail_sheets, next_sheet_name};
 use crate::project::DrawingProject;
 use crate::schedule::{self, OPENING_TITLE, refresh_opening_schedule};
-use crate::schema::{assembly_block_name, read_document, read_entity_data, view_block_name, write_document};
+use crate::schema::{LambDocument, assembly_block_name, read_document, read_entity_data, view_block_name, write_document};
 use crate::sheets::{
-    DEFAULT_SHEET_PAPER, VPORT_LAYER, create_packed_sheet, create_sheet, ensure_vport_layer, pack_verticals, refit_viewport, sheet_paper_size,
-    view_drawn, view_placed, view_sheet_ref, viewport_scale,
+    DEFAULT_SHEET_PAPER, VPORT_LAYER, create_enlarged_sheet, create_packed_sheet, create_sheet, enlarged_area, enlarged_scale, ensure_vport_layer,
+    pack_verticals, refit_viewport, sheet_paper_size, view_drawn, view_placed, view_sheet_ref, viewport_scale, window_fits,
 };
 use crate::titleblock::{is_lamb_sheet, sheet_title};
 use crate::vptitles::scale_label;
@@ -149,10 +162,9 @@ fn set_views(d: &Drawing) -> Result<Vec<(&'static str, &'static str, Vec<(Id, St
 
 /// Whether some viewport on some layout shows `view`'s assembly block.
 fn assembly_on_sheet(d: &Drawing, view: Id) -> bool {
-    d.layouts
-        .iter()
-        .flat_map(|l| l.entities.iter())
-        .any(|e| matches!(e.kind, EntityKind::Viewport(_)) && read_entity_data(&e.common).is_ok_and(|data| data.assembly_of == Some(view)))
+    d.layouts.iter().flat_map(|l| l.entities.iter()).any(|e| {
+        matches!(e.kind, EntityKind::Viewport(_)) && read_entity_data(&e.common).is_ok_and(|data| !data.enlarged && data.assembly_of == Some(view))
+    })
 }
 
 /// Every layout's name in tab order.
@@ -673,6 +685,221 @@ impl Interactive for SheetOrder {
 
 pub(crate) fn sheetorder_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::new(SheetOrder { layout: None }))
+}
+
+/// The prefix of an enlarged sheet of `view`, or why that view cannot have one.
+fn enlargeable(doc: &LambDocument, view: Id) -> std::result::Result<&'static str, String> {
+    let v = doc.views.iter().find(|v| v.id() == view).ok_or_else(|| format!("No such view {}", view.0))?;
+    let prefix = match v {
+        AnyView::Detail(_) => return Err(format!("{} is a detail: the detail sheets size those", v.name())),
+        AnyView::Plan(_) => PLAN_PREFIX,
+        AnyView::Vertical(x) if x.intent == VerticalIntent::Elevation => ELEVATION_PREFIX,
+        AnyView::Vertical(_) => SECTION_PREFIX,
+    };
+    if view_placed(doc, view) { Ok(prefix) } else { Err(format!("{} is not placed", v.name())) }
+}
+
+/// The window with corners `a` and `b`, or a refusal when it has no size.
+fn enlarged_window(a: Vec2, b: Vec2) -> std::result::Result<Bounds2, String> {
+    let window = Bounds2::new(Vec2::new(a.x.min(b.x), a.y.min(b.y)), Vec2::new(a.x.max(b.x), a.y.max(b.y)));
+    if window.width() <= TOLERANCE.coincidence_mm || window.height() <= TOLERANCE.coincidence_mm {
+        return Err("The area to enlarge has no size".to_owned());
+    }
+    Ok(window)
+}
+
+/// The automatic scale of `window`, or a refusal when no standard scale fits it on a sheet.
+fn automatic_enlarged_scale(doc: &LambDocument, window: &Bounds2) -> std::result::Result<f64, String> {
+    enlarged_scale(window, &enlarged_area(doc)).ok_or_else(|| "The area to enlarge does not fit a sheet at any standard scale".to_owned())
+}
+
+/// The layout an enlarged sheet of `view` follows: its framing sheet for `assembly`, else its own.
+fn enlarged_anchor(d: &Drawing, view: Id, assembly: bool) -> Option<String> {
+    let framing = || {
+        let mut ls: Vec<_> = d.layouts.iter().collect();
+        ls.sort_by_key(|l| l.tab_order);
+        let on = |l: &cadcraft_doc::Layout| {
+            l.entities.iter().any(|e| {
+                matches!(e.kind, EntityKind::Viewport(_)) && read_entity_data(&e.common).is_ok_and(|x| !x.enlarged && x.assembly_of == Some(view))
+            })
+        };
+        ls.into_iter().find(|l| on(l)).map(|l| l.name.clone())
+    };
+    assembly.then(framing).flatten().or_else(|| view_sheet_ref(d, view).map(|(_, layout)| layout))
+}
+
+/// Whether layout `name` is an enlarged sheet of `view`.
+fn enlarges(d: &Drawing, name: &str, view: Id) -> bool {
+    d.layout(name).is_some_and(|l| {
+        l.entities.iter().any(|e| {
+            matches!(e.kind, EntityKind::Viewport(_))
+                && read_entity_data(&e.common).is_ok_and(|x| x.enlarged && x.view_id.or(x.assembly_of) == Some(view))
+        })
+    })
+}
+
+/// Puts new sheet `name` straight after `anchor` and any enlargements of `view` following it, or
+/// with no anchor at the end of the set.
+fn place_enlarged_tab(d: &mut Drawing, name: &str, view: Id, anchor: Option<&str>) {
+    let mut order: Vec<String> = tab_names(d).into_iter().filter(|n| n != name).collect();
+    let at = match anchor.and_then(|a| order.iter().position(|n| n == a)) {
+        Some(k) => (k + 1..order.len()).find(|j| !order.get(*j).is_some_and(|n| enlarges(d, n, view))).unwrap_or(order.len()),
+        None => order.iter().rposition(|n| is_set_name(n)).map_or(0, |k| k + 1),
+    };
+    order.insert(at, name.to_owned());
+    renumber_tabs(d, &order);
+}
+
+pub(crate) fn enlargedsheet(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "enlargedsheet";
+    let view = p.get("viewId").and_then(id_value).ok_or_else(|| bad(CMD, "`viewId` must be a view id"))?;
+    let (from, to) = (point_param(CMD, p, "from")?, point_param(CMD, p, "to")?);
+    let mut d = s.doc()?.clone();
+    let doc = read_document(&d).map_err(other)?;
+    let prefix = enlargeable(&doc, view).map_err(|e| bad(CMD, &e))?;
+    let name = doc.views.iter().find(|v| v.id() == view).map_or("", |v| v.name()).to_owned();
+    let has_block = d.block(&assembly_block_name(view)).is_some();
+    let assembly = match p.get("show").filter(|v| !v.is_null()) {
+        None => has_block,
+        Some(v) => match v.as_str() {
+            Some("assembly") if has_block => true,
+            Some("assembly") => return Err(bad(CMD, &format!("{name} has no assembly block: run ASSEMBLYPLAN"))),
+            Some("view") => false,
+            _ => return Err(bad(CMD, "`show` must be `assembly` or `view`")),
+        },
+    };
+    let window = enlarged_window(Vec2::new(from.x, from.y), Vec2::new(to.x, to.y)).map_err(|e| bad(CMD, &e))?;
+    let automatic = automatic_enlarged_scale(&doc, &window).map_err(|e| bad(CMD, &e))?;
+    let n = match p.get("scale").filter(|v| !v.is_null()) {
+        None => automatic,
+        Some(v) => {
+            let n = v.as_f64().filter(|n| n.is_finite() && *n > 0.0).ok_or_else(|| bad(CMD, "`scale` must be a positive number"))?;
+            if !window_fits(&window, n, &enlarged_area(&doc)) {
+                return Err(bad(CMD, &format!("The area does not fit a sheet at {}; {} does", scale_label(n), scale_label(automatic))));
+            }
+            n
+        }
+    };
+    let anchor = enlarged_anchor(&d, view, assembly);
+    let layout = next_sheet_name(&d, prefix);
+    let viewport = create_enlarged_sheet(&mut d, &layout, view, assembly, window, n).map_err(other)?;
+    place_enlarged_tab(&mut d, &layout, view, anchor.as_deref());
+    *s.doc_mut()? = d;
+    let show = if assembly { "assembly" } else { "view" };
+    let message = format!("{layout} shows {name}, enlarged, at {}.", scale_label(n));
+    Ok(json!({ "layout": layout, "viewId": view.0, "scale": n, "show": show, "viewport": format!("{:X}", viewport.0), "message": message }))
+}
+
+/// ENLARGEDSHEET in the edited view: `First corner of the area to enlarge:`, `Opposite corner:`,
+/// then `Scale 1:n [View/Assembly] <5>:`, the keywords only when the view has an assembly block.
+struct EnlargedSheet {
+    view: Id,
+    has_block: bool,
+    assembly: bool,
+    first: Option<Vec2>,
+    /// The second corner and the automatic scale for the two.
+    second: Option<(Vec2, f64)>,
+}
+
+impl EnlargedSheet {
+    fn take_corner(&mut self, s: &mut Session, a: Vec2, b: Vec2) -> Result<()> {
+        let doc = read_document(s.doc()?).map_err(other)?;
+        match enlarged_window(a, b).and_then(|w| automatic_enlarged_scale(&doc, &w)) {
+            Ok(n) => self.second = Some((b, n)),
+            Err(e) => s.echo(e),
+        }
+        Ok(())
+    }
+}
+
+impl Interactive for EnlargedSheet {
+    fn name(&self) -> &'static str {
+        "enlargedsheet"
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        let doc = read_document(s.doc()?).map_err(other)?;
+        let Some(view) = edited_view(s).filter(|v| !doc.views.iter().any(|x| x.id() == *v && matches!(x, AnyView::Detail(_)))) else {
+            s.echo("Open a plan, section or elevation first");
+            return Ok(Step::Done);
+        };
+        if let Err(e) = enlargeable(&doc, view) {
+            s.echo(e);
+            return Ok(Step::Done);
+        }
+        self.view = view;
+        self.has_block = s.doc()?.block(&assembly_block_name(view)).is_some();
+        self.assembly = self.has_block;
+        Ok(Step::Continue)
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        match (self.first, self.second) {
+            (None, _) => Prompt::new("First corner of the area to enlarge", Accept::POINT),
+            (Some(a), None) => Prompt::new("Opposite corner", Accept::POINT).corner(a),
+            (Some(_), Some((_, n))) => {
+                let prompt = Prompt::new("Scale 1:n", Accept::TEXT).default(n.to_string());
+                if self.has_block { prompt.kw(&["View", "Assembly"]) } else { prompt }
+            }
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let Some(a) = self.first else {
+            return Ok(match i {
+                Input::Point(p) => {
+                    self.first = Some(p);
+                    Step::Continue
+                }
+                Input::Enter => Step::Cancel,
+                _ => Step::Continue,
+            });
+        };
+        let Some((b, automatic)) = self.second else {
+            return Ok(match i {
+                Input::Point(p) => {
+                    self.take_corner(s, a, p)?;
+                    Step::Continue
+                }
+                Input::Enter => Step::Cancel,
+                _ => Step::Continue,
+            });
+        };
+        let Some(typed) = name_input(i, &automatic.to_string()) else { return Ok(Step::Continue) };
+        if self.has_block && (typed.eq_ignore_ascii_case("view") || typed.eq_ignore_ascii_case("assembly")) {
+            self.assembly = typed.eq_ignore_ascii_case("assembly");
+            s.echo(if self.assembly { "Showing the assembly." } else { "Showing the view's lines." });
+            return Ok(Step::Continue);
+        }
+        let Ok(n) = typed.strip_prefix("1:").unwrap_or(&typed).trim().parse::<f64>() else {
+            s.echo("Requires a scale, such as 20 or 1:20.");
+            return Ok(Step::Continue);
+        };
+        let show = if self.assembly { "assembly" } else { "view" };
+        let params = json!({ "viewId": self.view.0, "from": {"x": a.x, "y": a.y}, "to": {"x": b.x, "y": b.y}, "scale": n, "show": show });
+        match enlargedsheet(s, &params) {
+            Ok(r) => {
+                s.echo(r["message"].as_str().unwrap_or_default().to_owned());
+                Ok(Step::Done)
+            }
+            Err(e) => {
+                s.echo(e.to_string());
+                Ok(Step::Continue)
+            }
+        }
+    }
+    fn preview(&self, _s: &Session, cursor: Vec2) -> Vec<EntityKind> {
+        let (Some(a), None) = (self.first, self.second) else { return Vec::new() };
+        let vertices = [(a.x, a.y), (cursor.x, a.y), (cursor.x, cursor.y), (a.x, cursor.y)]
+            .iter()
+            .map(|&(x, y)| PolyVertex { p: Vec2::new(x, y), bulge: 0.0, start_width: 0.0, end_width: 0.0 })
+            .collect();
+        vec![EntityKind::LwPolyline(LwPolyline { vertices, closed: true, const_width: 0.0, elevation: 0.0, plinegen: false })]
+    }
+}
+
+pub(crate) fn enlargedsheet_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(EnlargedSheet { view: Id(0), has_block: false, assembly: false, first: None, second: None }))
 }
 
 #[cfg(test)]
@@ -2293,6 +2520,217 @@ mod tests {
         s.input(Input::Enter)?;
         assert_eq!(undo_len(&s)?, n, "Enter ends it");
         assert!(s.current_prompt().is_none(), "ended");
+        Ok(())
+    }
+
+    /// The enlarged viewport on layout `name`, with its `EntityData`.
+    fn enlarged_vp(s: &Session, name: &str) -> T<(cadcraft_doc::Viewport, crate::schema::EntityData)> {
+        let l = s.doc()?.layout(name).ok_or_else(|| format!("no layout {name}"))?;
+        for e in l.entities.iter() {
+            if let EntityKind::Viewport(vp) = &e.kind
+                && read_entity_data(&e.common)?.enlarged
+            {
+                return Ok((vp.clone(), read_entity_data(&e.common)?));
+            }
+        }
+        Err("no enlarged viewport".into())
+    }
+
+    /// [`set`] with Ground grown to a 10 m square of walls.
+    fn ten_metres() -> T<(Session, [Id; 4])> {
+        let (mut s, ids) = set()?;
+        s.execute("editview", &json!({ "viewId": ids[0].0 }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [10000, 0], [10000, 10000], [0, 10000]], "closed": true }))?;
+        s.execute("editview", &json!({}))?;
+        Ok((s, ids))
+    }
+
+    #[test]
+    fn enlargedsheet_shows_the_window_at_its_scale_next_after_the_views_sheet() -> R {
+        let (mut s, [ground, ..]) = ten_metres()?;
+        s.execute("sheetset", &json!({}))?;
+        let n = undo_len(&s)?;
+        let before = s.doc()?.layouts.len();
+        let r = s.execute(
+            "enlargedsheet",
+            &json!({ "viewId": ground.0, "from": {"x": 8000, "y": 10000}, "to": {"x": 10000, "y": 8000}, "show": "view" }),
+        )?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!((r["layout"].as_str(), r["scale"].as_f64(), r["show"].as_str()), (Some("A103"), Some(5.0), Some("view")), "{r}");
+        let check = |d: &Drawing| -> R {
+            let l = d.layout("A103").ok_or("no A103")?;
+            let (vp, data) = l
+                .entities
+                .iter()
+                .find_map(|e| match &e.kind {
+                    EntityKind::Viewport(vp) => read_entity_data(&e.common).ok().filter(|x| x.enlarged).map(|x| (vp.clone(), x)),
+                    _ => None,
+                })
+                .ok_or("no enlarged viewport")?;
+            assert_eq!((data.view_id, data.assembly_of), (Some(ground), None));
+            assert_eq!((vp.view_center.x, vp.view_center.y, vp.view_height), (9000.0, 9000.0, 2000.0));
+            assert_eq!((vp.width, vp.height, viewport_scale(&vp)), (400.0, 400.0, 5.0));
+            assert!(!vp.frozen_layers.contains(&view_block_name(ground)), "{:?}", vp.frozen_layers);
+            assert!(vp.frozen_layers.contains(&assembly_block_name(ground)), "{:?}", vp.frozen_layers);
+            Ok(())
+        };
+        check(s.doc()?)?;
+        let t = tabs(&s)?;
+        let at = |n: &str| t.iter().position(|x| x == n);
+        assert_eq!(at("A101").map(|k| k + 1), at("A103"), "next after the plan's sheet: {t:?}");
+        let doc = read_document(s.doc()?)?;
+        assert_eq!(sheet_title(s.doc()?, &doc, "A103"), "Ground Floor, enlarged");
+        assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
+
+        // It survives a DXF round trip, as data.
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes())?;
+        check(&back)?;
+
+        s.undo()?;
+        assert!(s.doc()?.layout("A103").is_none());
+        assert_eq!(s.doc()?.layouts.len(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn sheetset_leaves_an_enlarged_window_alone_and_its_view_keeps_its_own_references() -> R {
+        let (mut s, [ground, _, _, sec]) = ten_metres()?;
+        // Before the section has a sheet: an enlargement alone is no reference, and takes A301.
+        let area = json!({ "viewId": sec.0, "from": {"x": 0, "y": 0}, "to": {"x": 1000, "y": 1000} });
+        assert_eq!(s.execute("enlargedsheet", &area)?["layout"], "A301");
+        assert_eq!(view_sheet_ref(s.doc()?, sec), None);
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(view_sheet_ref(s.doc()?, sec), Some((1, "A302".to_owned())), "SHEETSET still gives it a sheet: {r}");
+        let plan_marks = s.doc()?.block(&annotation_block_name(ground)).map(|b| format!("{:?}", b.entities)).unwrap_or_default();
+        assert!(plan_marks.contains("1/A302") && !plan_marks.contains("A301"), "the section mark names its own sheet: {plan_marks}");
+
+        // A window deep inside its content: nothing to refit.
+        let made =
+            s.execute("enlargedsheet", &json!({ "viewId": ground.0, "from": {"x": 0, "y": 0}, "to": {"x": 2000, "y": 2000}, "show": "view" }))?;
+        let (vp, _) = enlarged_vp(&s, "A103")?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(r["refit"], json!([]), "{r}");
+        let (after, _) = enlarged_vp(&s, "A103")?;
+        assert_eq!((after.view_center.x, after.view_height), (vp.view_center.x, vp.view_height));
+
+        // VPVIEW fits the whole view again, so it is no longer an enlargement.
+        s.execute("vpview", &json!({ "handle": made["viewport"], "viewId": ground.0 }))?;
+        assert!(enlarged_vp(&s, "A103").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_view_shown_only_enlarged_in_its_assembly_still_gets_its_framing_sheet() -> R {
+        let (mut s, [ground, ..]) = ten_metres()?;
+        let r = s.execute("enlargedsheet", &json!({ "viewId": ground.0, "from": {"x": 0, "y": 0}, "to": {"x": 2000, "y": 2000} }))?;
+        assert_eq!((r["layout"].as_str(), r["show"].as_str()), (Some("A101"), Some("assembly")), "the block by default: {r}");
+        let (vp, data) = enlarged_vp(&s, "A101")?;
+        assert_eq!((data.view_id, data.assembly_of), (None, Some(ground)));
+        assert!(
+            vp.frozen_layers.contains(&view_block_name(ground)) && !vp.frozen_layers.contains(&assembly_block_name(ground)),
+            "{:?}",
+            vp.frozen_layers
+        );
+        let doc = read_document(s.doc()?)?;
+        assert_eq!(sheet_title(s.doc()?, &doc, "A101"), "Ground Floor, enlarged");
+        let t = laid(&s.execute("sheetset", &json!({}))?);
+        assert!(t.iter().any(|(l, g, v)| l == "A401" && g == "framing" && *v == [ground.0]), "{t:?}");
+        assert!(t.iter().any(|(_, g, v)| g == "plan" && *v == [ground.0]), "{t:?}");
+
+        // A second assembly enlargement follows the framing sheet; a third, the second.
+        let window = json!({ "viewId": ground.0, "from": {"x": 0, "y": 0}, "to": {"x": 1000, "y": 1000} });
+        let second = s.execute("enlargedsheet", &window)?["layout"].as_str().ok_or("no layout")?.to_owned();
+        let third = s.execute("enlargedsheet", &window)?["layout"].as_str().ok_or("no layout")?.to_owned();
+        let names = tabs(&s)?;
+        let at = |n: &str| names.iter().position(|x| x == n).ok_or("missing");
+        assert_eq!((at(&second)?, at(&third)?), (at("A401")? + 1, at("A401")? + 2), "{names:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn enlargedsheet_refuses_what_it_cannot_show() -> R {
+        let (mut s, [ground, first, ..]) = ten_metres()?;
+        let doc = read_document(s.doc()?)?;
+        let view = |name: &str| doc.views.iter().find(|v| v.name() == name).map(|v| v.id().0).ok_or("no view");
+        let (detail, loose) = (view("D1")?, view("Loose")?);
+        let corners = |v: u64, w: f64| json!({ "viewId": v, "from": {"x": 0.0, "y": 0.0}, "to": {"x": w, "y": w} });
+        let n = undo_len(&s)?;
+        let refused = |s: &mut Session, p: Value, want: &str| -> R {
+            let e = s.execute("enlargedsheet", &p).err().ok_or("accepted")?;
+            assert!(e.to_string().contains(want), "{e}");
+            Ok(())
+        };
+        refused(&mut s, corners(detail, 500.0), "is a detail")?;
+        refused(&mut s, corners(loose, 500.0), "is not placed")?;
+        refused(&mut s, corners(ground.0, 0.0), "no size")?;
+        let mut flat = corners(ground.0, 500.0);
+        flat["to"]["y"] = json!(0.0);
+        refused(&mut s, flat, "no size")?;
+        let mut none = corners(first.0, 500.0);
+        none["show"] = json!("assembly");
+        refused(&mut s, none, "no assembly block")?;
+        let mut big = corners(ground.0, 10000.0);
+        big["scale"] = json!(5.0);
+        refused(&mut s, big.clone(), "at 1:5; 1:20 does")?;
+        big["scale"] = json!(-2.0);
+        refused(&mut s, big, "positive")?;
+        assert_eq!(undo_len(&s)?, n, "nothing changed");
+        Ok(())
+    }
+
+    #[test]
+    fn enlargedsheet_prompts_for_the_corners_then_the_scale_with_the_rectangle_previewed() -> R {
+        let (mut s, [ground, first, ..]) = ten_metres()?;
+        s.start("enlargedsheet")?;
+        assert!(s.current_prompt().is_none());
+        assert!(s.log.iter().any(|l| l.contains("Open a plan, section or elevation first")), "{:?}", s.log);
+
+        let msg = |s: &Session| s.current_prompt().map(|p| p.message);
+        s.execute("editview", &json!({ "viewId": ground.0 }))?;
+        let n = undo_len(&s)?;
+        s.start("esheet")?;
+        assert_eq!(msg(&s).as_deref(), Some("First corner of the area to enlarge"));
+        s.input(Input::Point(Vec2::new(8000.0, 8000.0)))?;
+        assert_eq!(msg(&s).as_deref(), Some("Opposite corner"));
+        let pv = s.running.as_ref().ok_or("not running")?.machine.preview(&s, Vec2::new(10000.0, 10000.0));
+        let [EntityKind::LwPolyline(rect)] = pv.as_slice() else { return Err(format!("{pv:?}").into()) };
+        assert!(rect.closed);
+        assert_eq!((rect.vertices[0].p, rect.vertices[2].p), (Vec2::new(8000.0, 8000.0), Vec2::new(10000.0, 10000.0)));
+        s.input(Input::Point(Vec2::new(8000.0, 8000.0)))?;
+        assert_eq!(msg(&s).as_deref(), Some("Opposite corner"), "a window with no size asks again");
+        s.input(Input::Point(Vec2::new(10000.0, 10000.0)))?;
+        let p = s.current_prompt().ok_or("no prompt")?;
+        assert_eq!((p.message.as_str(), p.default.as_deref()), ("Scale 1:n", Some("5")));
+        assert_eq!(p.keywords, ["View", "Assembly"], "Ground has a block");
+        s.input(Input::Keyword("View".into()))?;
+        s.input(Input::Text("x".into()))?;
+        assert!(s.current_prompt().is_some(), "a bad scale asks again");
+        s.input(Input::Enter)?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let (vp, data) = enlarged_vp(&s, "A101")?;
+        assert_eq!(data.view_id, Some(ground));
+        assert_eq!((vp.view_center.x, vp.view_height, viewport_scale(&vp)), (9000.0, 2000.0, 5.0));
+
+        // No block, no keywords; a given scale that does not fit asks again, then 1:50 is taken.
+        s.execute("editview", &json!({ "viewId": first.0 }))?;
+        s.start("esheet")?;
+        s.input(Input::Point(Vec2::new(0.0, 0.0)))?;
+        s.input(Input::Point(Vec2::new(10000.0, 10000.0)))?;
+        let p = s.current_prompt().ok_or("no prompt")?;
+        assert_eq!((p.keywords.len(), p.default.as_deref()), (0, Some("20")));
+        s.input(Input::Text("1:5".into()))?;
+        assert!(s.current_prompt().is_some(), "{:?}", s.log);
+        s.input(Input::Text("1:50".into()))?;
+        assert!(s.current_prompt().is_none());
+        assert_eq!(viewport_scale(&enlarged_vp(&s, "A102")?.0), 50.0);
+
+        // A detail being edited is refused at once.
+        let detail = read_document(s.doc()?)?.views.iter().find(|v| v.name() == "D1").map(|v| v.id()).ok_or("no D1")?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.log.clear();
+        s.start("esheet")?;
+        assert!(s.current_prompt().is_none());
+        assert!(s.log.iter().any(|l| l.contains("Open a plan, section or elevation first")), "{:?}", s.log);
         Ok(())
     }
 

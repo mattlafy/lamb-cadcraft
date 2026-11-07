@@ -43,6 +43,11 @@
 //! tall and at most the area. An undrawn view ([`view_drawn`]) has no size to pack: it keeps a sheet
 //! of its own through [`create_sheet`], whose viewport has room for what is drawn later.
 //!
+//! An enlarged viewport (LAMB T654, [`create_enlarged_sheet`]) shows a chosen model window, not the
+//! whole view, so [`refit_viewport`] leaves it alone. [`sheet_refs`] and [`view_scale`] skip it: a
+//! view's references and annotation size follow its own sheet. [`numbered_viewports`] keeps it, so it
+//! has a drawing title and a scale bar.
+//!
 //! A sheet plots as a drawing (LAMB T645): its viewports sit on the no-plot [`VPORT_LAYER`], so a
 //! border shows on screen and not on paper while the contents still plot, and its page setup
 //! starts on the monochrome plot style table, which a user can change. Screen colours stay.
@@ -231,6 +236,9 @@ pub(crate) fn refit_viewport(d: &Drawing, doc: &LambDocument, vp: Handle) -> Res
     let Some(e) = d.entity(vp) else { return Ok(None) };
     let EntityKind::Viewport(port) = &e.kind else { return Ok(None) };
     let data = read_entity_data(&e.common)?;
+    if data.enlarged {
+        return Ok(None);
+    }
     let (view, block, over) = match (data.assembly_of, data.view_id) {
         (Some(plan), _) => (plan, assembly_block_name(plan), Overhang::default()),
         (None, Some(v)) => {
@@ -271,7 +279,8 @@ pub(crate) fn refit_viewport(d: &Drawing, doc: &LambDocument, vp: Handle) -> Res
 pub(crate) fn view_scale(d: &Drawing, doc: &LambDocument, view: Id) -> f64 {
     let usable = |n: &f64| n.is_finite() && *n > 0.0;
     numbered_viewports(d, &[(view, view_block_name(view))])
-        .first()
+        .iter()
+        .find(|(_, _, _, h)| !is_enlarged(d, *h))
         .and_then(|(_, _, _, h)| match &d.entity(*h)?.kind {
             EntityKind::Viewport(vp) => Some(viewport_scale(vp)),
             _ => None,
@@ -320,6 +329,7 @@ pub fn set_viewport_view(d: &mut Drawing, vp: Handle, view: Option<Id>) -> Resul
     let mut data = read_entity_data(&common)?;
     data.view_id = view;
     data.assembly_of = None;
+    data.enlarged = false;
     set_entity_data(&mut common, &data)?;
     match view {
         Some(v) => {
@@ -386,6 +396,8 @@ pub(crate) fn usable_area(sheet: &Sheet) -> Bounds2 {
     Bounds2::new(Vec2::new(p.min.x + inset, p.min.y + inset), Vec2::new(p.max.x - frame_strip_width(sheet) - inset, p.max.y - inset))
 }
 
+/// What an enlarged sheet keeps clear at the bottom of the area for the drawing title.
+const ENLARGED_TITLE_MM: f64 = 25.0;
 /// A packed viewport is at least this wide, so a drawing title stays within it.
 const MIN_VP_WIDTH_MM: f64 = 95.0;
 /// A packed viewport is at least this tall.
@@ -612,6 +624,61 @@ pub(crate) fn create_packed_sheet(d: &mut Drawing, name: &str, placed: &[(Id, Pa
     add_viewports(d, name, viewports)
 }
 
+/// Whether the entity at `h` is an enlarged viewport.
+pub(crate) fn is_enlarged(d: &Drawing, h: Handle) -> bool {
+    d.entity(h).is_some_and(|e| matches!(e.kind, EntityKind::Viewport(_)) && read_entity_data(&e.common).is_ok_and(|x| x.enlarged))
+}
+
+/// Where an enlarged viewport goes on a new sheet of `doc`'s paper: the [`usable_area`] less
+/// [`ENLARGED_TITLE_MM`] at the bottom.
+pub(crate) fn enlarged_area(doc: &LambDocument) -> Bounds2 {
+    let area = usable_area(&Sheet::from_page(&sheet_page(doc), 1.0));
+    Bounds2::new(Vec2::new(area.min.x, area.min.y + ENLARGED_TITLE_MM), area.max)
+}
+
+/// Whether model `window` fits `area` at 1:`n`.
+pub(crate) fn window_fits(window: &Bounds2, n: f64, area: &Bounds2) -> bool {
+    fits(window, n, area.width(), area.height())
+}
+
+/// The automatic scale of an enlarged `window`: the smallest [`STANDARD_SCALES`] denominator not
+/// below [`DETAIL_MIN_SCALE`] at which it fits `area`, `None` when none does.
+pub(crate) fn enlarged_scale(window: &Bounds2, area: &Bounds2) -> Option<f64> {
+    STANDARD_SCALES.iter().copied().filter(|n| *n >= DETAIL_MIN_SCALE).find(|n| window_fits(window, *n, area))
+}
+
+/// Creates layout `name` with one enlarged viewport showing model `window` of `view` at 1:`n`, the
+/// view's block or, with `assembly`, its assembly block, centred on [`enlarged_area`]. Returns the
+/// viewport's handle. Nothing is changed on error.
+pub(crate) fn create_enlarged_sheet(d: &mut Drawing, name: &str, view: Id, assembly: bool, window: Bounds2, n: f64) -> Result<Handle, SheetError> {
+    let doc = read_document(d)?;
+    if d.layout(name).is_some() {
+        return Err(SheetError::LayoutExists(name.to_owned()));
+    }
+    if !doc.views.iter().any(|v| v.id() == view) {
+        return Err(SheetError::NoSuchView(view));
+    }
+    let block = if assembly { assembly_block_name(view) } else { view_block_name(view) };
+    if assembly && d.block(&block).is_none() {
+        return Err(SheetError::NoAssembly(view));
+    }
+    let mut common = Common::default();
+    let (view_id, assembly_of) = if assembly { (None, Some(view)) } else { (Some(view), None) };
+    set_entity_data(&mut common, &EntityData { view_id, assembly_of, enlarged: true, ..EntityData::default() })?;
+    let view_layers: Vec<String> = doc.views.iter().map(|v| view_block_name(v.id())).collect();
+    let packed = Packed {
+        center: enlarged_area(&doc).center(),
+        width: window.width() / n,
+        height: window.height() / n,
+        view_center: window.center(),
+        view_height: window.height(),
+    };
+    let vp = packed.viewport(next_viewport_id(d), frozen_except(&view_layers, &assembly_layers(d), &block));
+    push_sheet_layout(d, &doc, name);
+    let handles = add_viewports(d, name, vec![(common, vp)])?;
+    handles.first().copied().ok_or(SheetError::NotAViewport)
+}
+
 /// Creates layout `name` with one viewport per view in `views`, then one per plan or placed
 /// vertical in `assemblies` showing that view's assembly block (every view in document order when both are empty). Each
 /// viewport freezes every other LAMB view's layer and every assembly layer but its own. Returns
@@ -753,11 +820,12 @@ pub fn sheet_freeze_observer(s: &mut Session, _before: &Arc<Drawing>) {
 /// viewport shows, `n` that viewport's 1-based position (by viewport `id`) among its layout's
 /// single-view viewports, the first layout by name winning. `view_blocks` is every LAMB view with
 /// its block name. A single-view viewport is one whose `EntityData.view_id` names one of those
-/// views, whatever it freezes; assembly viewports name no view and take no number.
+/// views, whatever it freezes; assembly viewports name no view and take no number, and an enlarged
+/// viewport is no reference.
 pub fn sheet_refs(d: &Drawing, view_blocks: &[(Id, String)]) -> Vec<(Id, usize, String)> {
     let mut out: Vec<(Id, usize, String)> = Vec::new();
-    for (view, n, layout, _) in numbered_viewports(d, view_blocks) {
-        if !out.iter().any(|(v, _, _)| *v == view) {
+    for (view, n, layout, h) in numbered_viewports(d, view_blocks) {
+        if !is_enlarged(d, h) && !out.iter().any(|(v, _, _)| *v == view) {
             out.push((view, n, layout));
         }
     }

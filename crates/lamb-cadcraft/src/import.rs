@@ -392,6 +392,7 @@ pub fn project_to_drawing(project: &Project) -> Result<(Drawing, IdMap, ImportRe
             ai_origin: e.ai_origin.clone(),
             view_id: None,
             assembly_of: None,
+            enlarged: false,
             corners,
             detail_tag: None,
             detail_ref: None,

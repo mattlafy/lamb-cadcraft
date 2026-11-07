@@ -220,7 +220,7 @@ pub(crate) fn is_lamb_sheet(l: &Layout) -> bool {
 }
 
 /// What a sheet is called in its title block: one view viewport gives the view's name; one assembly
-/// viewport `<view name> framing`; several viewports all showing details `Details`, otherwise
+/// viewport `<view name> framing`; one enlarged viewport `<view name>, enlarged`; several viewports all showing details `Details`, otherwise
 /// `Views`; no viewports the title cell of the layout's first table, else the layout's name.
 pub(crate) fn sheet_title(d: &Drawing, doc: &LambDocument, layout: &str) -> String {
     let Some(l) = d.layout(layout) else { return layout.to_owned() };
@@ -236,6 +236,7 @@ pub(crate) fn sheet_title(d: &Drawing, doc: &LambDocument, layout: &str) -> Stri
             (None, None) => None,
         })
         .collect();
+    let enlarged = l.entities.iter().any(|e| named(e).is_some() && read_entity_data(&e.common).is_ok_and(|x| x.enlarged));
     match shown.as_slice() {
         [] => l
             .entities
@@ -247,6 +248,7 @@ pub(crate) fn sheet_title(d: &Drawing, doc: &LambDocument, layout: &str) -> Stri
             .filter(|t| !t.is_empty())
             .unwrap_or(&l.name)
             .to_owned(),
+        [(v, _)] if enlarged => format!("{}, enlarged", v.name()),
         [(v, false)] => v.name().to_owned(),
         [(v, true)] => format!("{} framing", v.name()),
         many if many.iter().all(|(v, assembly)| !assembly && matches!(v, AnyView::Detail(_))) => "Details".to_owned(),
