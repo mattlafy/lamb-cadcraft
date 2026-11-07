@@ -124,6 +124,80 @@ pub struct Space {
     pub area_mm2: f64,
     /// Runs on its boundary, sorted, deduped.
     pub runs: Vec<usize>,
+    /// The traced loop of centreline (and bridge) edges, in order, with the space on their left.
+    pub boundary: Vec<BoundaryEdge>,
+}
+
+/// One edge of a [`Space`]'s boundary: a run's or a bridge's centreline, traversed with the space
+/// on its left.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundaryEdge {
+    /// Tail to head; an arc as its sampled points.
+    pub points: Vec<Point2>,
+    /// Half the wall's width: a run's `width / 2`, a bridge's that of its run `a`.
+    pub half_width: f64,
+    /// `Some(run)` for a run's edge, `None` for a bridge.
+    pub run: Option<usize>,
+}
+
+/// The space's centreline loop as one polygon (the space on its left).
+pub fn boundary_points(space: &Space) -> Vec<Point2> {
+    let mut poly = Vec::new();
+    for e in &space.boundary {
+        for &q in &e.points {
+            push_point(&mut poly, q);
+        }
+    }
+    if poly.len() > 1 && dist2(poly[0], poly[poly.len() - 1]) <= TOLERANCE.coincidence_mm {
+        poly.pop();
+    }
+    poly
+}
+
+/// Whether `pt` lies inside the space's centreline loop.
+pub fn space_contains(space: &Space, pt: Point2) -> bool {
+    point_in_loop(&boundary_points(space), pt)
+}
+
+/// The area inside the walls' inner faces, mm²: every boundary segment offset left (into the space)
+/// by its edge's `half_width`, consecutive offset segments joined at their lines' intersection
+/// (parallel neighbours joined straight), then the polygon's signed area. An arc is offset as its
+/// sampled points. Zero for a boundary of fewer than three segments.
+pub fn inner_area_mm2(space: &Space) -> f64 {
+    let mut segs: Vec<(Point2, Point2, f64)> = Vec::new();
+    for e in &space.boundary {
+        for w in e.points.windows(2) {
+            if dist2(w[0], w[1]) > TOLERANCE.coincidence_mm {
+                segs.push((w[0], w[1], e.half_width));
+            }
+        }
+    }
+    if segs.len() < 3 {
+        return 0.0;
+    }
+    let off: Vec<(Point2, Point2)> = segs
+        .iter()
+        .map(|&(a, b, h)| {
+            let len = dist2(a, b);
+            let n = Point2 { x: -(b.y - a.y) / len * h, y: (b.x - a.x) / len * h };
+            (Point2 { x: a.x + n.x, y: a.y + n.y }, Point2 { x: b.x + n.x, y: b.y + n.y })
+        })
+        .collect();
+    let sin_tol = TOLERANCE.angle_deg.to_radians().sin();
+    let mut poly = Vec::new();
+    for (i, &(a0, a1)) in off.iter().enumerate() {
+        let (b0, b1) = off[(i + 1) % off.len()];
+        let (da, db) = (sub2(a1, a0), sub2(b1, b0));
+        let denom = cross2(da, db);
+        if denom.abs() <= sin_tol * dist2(a0, a1) * dist2(b0, b1) {
+            push_point(&mut poly, a1);
+            push_point(&mut poly, b0);
+        } else {
+            let t = cross2(sub2(b0, a0), db) / denom;
+            push_point(&mut poly, Point2 { x: a0.x + da.x * t, y: a0.y + da.y * t });
+        }
+    }
+    polygon_area_signed(&poly)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +253,7 @@ struct HalfEdge {
     path: Vec<Point2>,
     /// `Some(run)` for a run's half-edge.
     run: Option<usize>,
+    half_width: f64,
 }
 
 /// Each run's left and right side and whether it is exterior, plus the spaces. See the module doc.
@@ -219,14 +294,16 @@ pub fn wall_sides(p: &impl ProjectRead, graph: &WallGraph, params: &SideParams) 
         let into = |end| angle_of2(scale2(end_info(r, end).outward, -1.0));
         let mut back = path.clone();
         back.reverse();
-        half.push(HalfEdge { tail: vs, head: ve, dir: norm(into(RunEnd::Start)), path, run: Some(r) });
-        half.push(HalfEdge { tail: ve, head: vs, dir: norm(into(RunEnd::End)), path: back, run: Some(r) });
+        let half_width = run.width / 2.0;
+        half.push(HalfEdge { tail: vs, head: ve, dir: norm(into(RunEnd::Start)), path, run: Some(r), half_width });
+        half.push(HalfEdge { tail: ve, head: vs, dir: norm(into(RunEnd::End)), path: back, run: Some(r), half_width });
     }
     for b in &graph.bridges {
         let (va, vb) = (vert(b.a), vert(b.b));
         let (pa, pb) = (vpoint[va], vpoint[vb]);
-        half.push(HalfEdge { tail: va, head: vb, dir: norm(angle_of2(sub2(pb, pa))), path: vec![pa, pb], run: None });
-        half.push(HalfEdge { tail: vb, head: va, dir: norm(angle_of2(sub2(pa, pb))), path: vec![pb, pa], run: None });
+        let half_width = runs.get(b.a.0).map_or(0.0, |r| r.width / 2.0);
+        half.push(HalfEdge { tail: va, head: vb, dir: norm(angle_of2(sub2(pb, pa))), path: vec![pa, pb], run: None, half_width });
+        half.push(HalfEdge { tail: vb, head: va, dir: norm(angle_of2(sub2(pa, pb))), path: vec![pb, pa], run: None, half_width });
     }
 
     // Outgoing half-edges per vertex, CCW by direction.
@@ -269,6 +346,7 @@ pub fn wall_sides(p: &impl ProjectRead, graph: &WallGraph, params: &SideParams) 
         area: f64,
         runs: Vec<usize>,
         component: usize,
+        boundary: Vec<BoundaryEdge>,
     }
     let mut face_of = vec![usize::MAX; half.len()];
     let mut faces: Vec<Face> = Vec::new();
@@ -279,9 +357,11 @@ pub fn wall_sides(p: &impl ProjectRead, graph: &WallGraph, params: &SideParams) 
         let f = faces.len();
         let mut poly = Vec::new();
         let mut face_runs = Vec::new();
+        let mut boundary = Vec::new();
         let mut h = start;
         while face_of[h] == usize::MAX {
             face_of[h] = f;
+            boundary.push(BoundaryEdge { points: half[h].path.clone(), half_width: half[h].half_width, run: half[h].run });
             for &q in &half[h].path {
                 push_point(&mut poly, q);
             }
@@ -295,7 +375,7 @@ pub fn wall_sides(p: &impl ProjectRead, graph: &WallGraph, params: &SideParams) 
         face_runs.dedup();
         let area = polygon_area_signed(&poly);
         let component = find(&mut parent, half[start].tail);
-        faces.push(Face { poly, area, runs: face_runs, component });
+        faces.push(Face { poly, area, runs: face_runs, component, boundary });
     }
 
     // Outer face per component: the smallest signed area (first on a tie).
@@ -329,7 +409,8 @@ pub fn wall_sides(p: &impl ProjectRead, graph: &WallGraph, params: &SideParams) 
     for (i, &f) in space_faces.iter().enumerate() {
         kind[f] = SideKind::Space(i);
     }
-    let spaces = space_faces.iter().map(|&f| Space { area_mm2: faces[f].area, runs: faces[f].runs.clone() }).collect();
+    let spaces =
+        space_faces.iter().map(|&f| Space { area_mm2: faces[f].area, runs: faces[f].runs.clone(), boundary: faces[f].boundary.clone() }).collect();
 
     let on_exterior_layer = |r: usize| {
         runs[r].faces.iter().any(|face| p.entity(face.from.entity_id).is_some_and(|e| params.exterior_layer_ids.iter().any(|l| l == e.layer_id)))
@@ -351,4 +432,58 @@ pub fn wall_sides(p: &impl ProjectRead, graph: &WallGraph, params: &SideParams) 
         })
         .collect();
     WallSides { runs: run_sides, spaces }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pt(x: f64, y: f64) -> Point2 {
+        Point2 { x, y }
+    }
+
+    /// A space traced CCW through `corners`, edge `i` (from corner `i`) `widths[i]` thick.
+    fn space(corners: &[(f64, f64)], widths: &[f64]) -> Space {
+        let n = corners.len();
+        let boundary = (0..n)
+            .map(|i| {
+                let (a, b) = (corners[i], corners[(i + 1) % n]);
+                BoundaryEdge { points: vec![pt(a.0, a.1), pt(b.0, b.1)], half_width: widths[i] / 2.0, run: Some(i) }
+            })
+            .collect();
+        Space { area_mm2: 0.0, runs: (0..n).collect(), boundary }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-6 * b.abs().max(1.0)
+    }
+
+    #[test]
+    fn a_rectangle_of_200_walls_is_measured_inside_its_faces() {
+        let s = space(&[(0.0, 0.0), (5000.0, 0.0), (5000.0, 4000.0), (0.0, 4000.0)], &[200.0; 4]);
+        assert!(close(inner_area_mm2(&s), 4800.0 * 3800.0), "{}", inner_area_mm2(&s));
+        assert!(space_contains(&s, pt(2500.0, 2000.0)) && !space_contains(&s, pt(6000.0, 2000.0)));
+    }
+
+    #[test]
+    fn one_300_wall_and_three_200_walls_each_take_their_own_half_width() {
+        // South wall 300: inside y 150..3900, x 100..4900.
+        let s = space(&[(0.0, 0.0), (5000.0, 0.0), (5000.0, 4000.0), (0.0, 4000.0)], &[300.0, 200.0, 200.0, 200.0]);
+        assert!(close(inner_area_mm2(&s), 4800.0 * 3750.0), "{}", inner_area_mm2(&s));
+    }
+
+    #[test]
+    fn an_l_shaped_room_is_measured_inside_its_faces() {
+        // 6000 × 4000 less its 3000 × 2000 top-right corner, 200 walls: inside x 100..5900 up to
+        // y 1900, then x 100..2900 from 1900 to 3900.
+        let s = space(&[(0.0, 0.0), (6000.0, 0.0), (6000.0, 2000.0), (3000.0, 2000.0), (3000.0, 4000.0), (0.0, 4000.0)], &[200.0; 6]);
+        let want = 5800.0 * 1800.0 + 2800.0 * 2000.0;
+        assert!(close(inner_area_mm2(&s), want), "{} vs {want}", inner_area_mm2(&s));
+    }
+
+    #[test]
+    fn a_collinear_split_edge_joins_straight() {
+        let s = space(&[(0.0, 0.0), (2500.0, 0.0), (5000.0, 0.0), (5000.0, 4000.0), (0.0, 4000.0)], &[200.0; 5]);
+        assert!(close(inner_area_mm2(&s), 4800.0 * 3800.0), "{}", inner_area_mm2(&s));
+    }
 }

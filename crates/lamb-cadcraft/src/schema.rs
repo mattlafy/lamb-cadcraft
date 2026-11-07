@@ -104,6 +104,19 @@ pub struct LambDocument {
     /// What the sheets' title blocks say about the project (`titleblock`, [`crate::titleblock`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sheet_info: Option<SheetInfo>,
+    /// The named rooms of the plans ([`crate::rooms`], `room`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rooms: Vec<RoomRecord>,
+}
+
+/// A named room: the space of plan `plan` containing `at` (plan-local).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoomRecord {
+    pub id: Id,
+    pub plan: Id,
+    pub at: lamb_core::geometry::Point2,
+    pub name: String,
+    pub number: String,
 }
 
 /// Two segments the user unlinked, each `(entity, segment index)`.
@@ -144,6 +157,7 @@ impl LambDocument {
             auto_dim_plans: Vec::new(),
             sheet_paper: None,
             sheet_info: None,
+            rooms: Vec::new(),
         }
     }
 }

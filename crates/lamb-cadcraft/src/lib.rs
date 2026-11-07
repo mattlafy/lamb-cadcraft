@@ -74,6 +74,7 @@ mod relayer;
 pub mod repeats;
 mod resolvecmd;
 mod revertex;
+pub mod rooms;
 pub mod rounding;
 pub mod scene;
 pub mod schedule;

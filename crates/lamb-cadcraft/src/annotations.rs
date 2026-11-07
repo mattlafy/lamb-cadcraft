@@ -38,6 +38,7 @@ use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id};
 
 use crate::project::DrawingProject;
+use crate::rooms::{RoomTag, area_text, room_tags};
 use crate::schedule::{PlanMark, plan_marks};
 use crate::schema::{annotation_block_name, read_document, view_block_name};
 use crate::sheets::{enlarged_windows, sheet_refs, view_scale};
@@ -104,9 +105,9 @@ fn enlarged_boxes(d: &Drawing, id: Id, scale: f64) -> Vec<Item> {
     out
 }
 
-/// What view `id` wants, in write order: a plan its cut symbols and opening marks, a vertical view
+/// What view `id` wants, in write order: a plan its cut symbols, opening marks and room tags, a vertical view
 /// its level lines, and either the box of each enlarged area; nothing for an unplaced view.
-fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>, marks: &[PlanMark]) -> Result<Vec<Item>, String> {
+fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>, marks: &[PlanMark], rooms: &[RoomTag]) -> Result<Vec<Item>, String> {
     let dp = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let Some(view) = dp.view(id).filter(|v| v.placement.is_some()) else { return Ok(Vec::new()) };
     let scale = view_scale(d, dp.document(), id);
@@ -144,6 +145,13 @@ fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>, marks: &
     for m in marks.iter().filter(|m| m.plan == plan) {
         let off = MARK_OFFSET_MM * f;
         out.push(Item::Text(v(m.at.x + m.out.x * off, m.at.y + m.out.y * off), m.mark.clone(), height));
+    }
+    // Each room: name, number and area, centred on its point, 0.35 × height apart.
+    for r in rooms.iter().filter(|r| r.plan == plan) {
+        let step = 1.35 * height;
+        out.push(Item::Text(v(r.at.x, r.at.y + step), r.name.clone(), height));
+        out.push(Item::Text(v(r.at.x, r.at.y), r.number.clone(), height));
+        out.push(Item::Text(v(r.at.x, r.at.y - step), area_text(r.area_m2), height));
     }
     if dp.document().auto_dim_plans.contains(&plan) {
         let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
@@ -335,9 +343,10 @@ fn plan_changes(d: &Drawing) -> Result<Vec<(Id, Vec<Item>)>, String> {
     let refs = sheet_refs(d, &blocks);
     let sheet_of = |id: Id| refs.iter().find(|(v, _, _)| *v == id).map(|(_, n, l)| format!("{n}/{l}"));
     let marks = plan_marks(d);
+    let rooms = room_tags(d);
     let mut out = Vec::new();
     for p in doc.views.iter().map(AnyView::id) {
-        let want = wanted(d, p, &sheet_of, &marks)?;
+        let want = wanted(d, p, &sheet_of, &marks, &rooms)?;
         let changed = match d.block(&annotation_block_name(p)) {
             Some(b) => !block_matches(b, &want),
             None => !want.is_empty(),
