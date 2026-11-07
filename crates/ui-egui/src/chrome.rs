@@ -470,7 +470,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             }
             crate::shortcut_menus::attach(app, &resp, |app| crate::shortcut_menus::layout_tab_entries(app, name));
             x += w + 2.0;
-            if i == 0 && !views.is_empty() {
+            if i == 0 && views_w > 0.0 {
                 views_button = Some(views_tab_button(ui, &p, pos2(x, r.top() + 5.0)));
                 x += 22.0;
             }
@@ -622,14 +622,15 @@ pub fn start_page(app: &mut CadApp, ui: &mut egui::Ui) {
     }
 }
 
-/// Fork (LAMB T525): the rows the views popup lists — every clickable row but Model and headings.
+/// Fork (LAMB T525, T606): the rows the views popup lists — every clickable row, Model included.
 fn view_choices(rows: Vec<crate::viewlist::Row>) -> Vec<crate::viewlist::Row> {
-    rows.into_iter().filter(|r| !r.heading && r.label != "Model" && r.command.is_some()).collect()
+    rows.into_iter().filter(|r| !r.heading && r.command.is_some()).collect()
 }
 
-/// Fork (LAMB T525): the room the views button takes right of the Model tab.
+/// Fork (LAMB T525): the room the views button takes right of the Model tab: none when Model is
+/// all there is to list, so no views source (or an unreadable project) shows no button.
 fn views_width(views: &[crate::viewlist::Row]) -> f32 {
-    if views.is_empty() { 0.0 } else { 22.0 }
+    if views.iter().any(|r| r.label != "Model") { 22.0 } else { 0.0 }
 }
 
 /// Fork (LAMB T525): the views button at `at`, right of the Model tab.
@@ -690,10 +691,12 @@ mod tests {
     fn the_views_popup_lists_views_and_returns_the_clicked_command() {
         let rows = vec![row("Plans", true, false), row("Model", false, true), row("Level 1", false, false), row("Section A", false, true)];
         let views = view_choices(rows);
-        assert_eq!(views.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["Level 1", "Section A"]);
+        assert_eq!(views.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["Model", "Level 1", "Section A"]);
+        assert!(views_width(&views) > 0.0);
         // No source (no rows) or only Model and headings: no button.
         assert!(view_choices(vec![]).is_empty());
-        assert!(view_choices(vec![row("Model", false, true), row("Views", true, false)]).is_empty());
+        assert_eq!(views_width(&view_choices(vec![])), 0.0);
+        assert_eq!(views_width(&view_choices(vec![row("Model", false, true), row("Views", true, false)])), 0.0);
         type State = (Vec<crate::viewlist::Row>, Option<(String, serde_json::Value)>);
         let mut h = egui_kittest::Harness::builder().with_size(vec2(240.0, 200.0)).build_ui_state(
             |ui, st: &mut State| {
@@ -705,7 +708,7 @@ mod tests {
         );
         h.run();
         use egui_kittest::kittest::Queryable;
-        assert!(h.query_by_label("Model").is_none());
+        assert!(h.query_by_label("Model").is_some());
         h.get_by_label("Section A").click();
         h.run();
         assert_eq!(h.state().1, Some(("editview".to_string(), json!({ "view": "Section A" }))));

@@ -1,7 +1,7 @@
 //! The LAMB tab of the Tool Sets palette (fork, LAMB T465): its groups, tools and icons, handed to
 //! ui-egui's Tool Sets slot. Icons are 24×24-grid strokes; accent strokes mark the action part.
 //! Motifs: a square is a plan, a bold horizontal line a cut, a circle a detail bubble, two
-//! rings a link, a folder or page the project.
+//! rings a link, a page or sheet the drawing set.
 
 use cadcraft_ui_egui::icons::{IconDef, IconPath, IconPath::*, IconStroke};
 use cadcraft_ui_egui::palettes::{ExtGroup, ExtTab, ExtTool};
@@ -25,22 +25,12 @@ const NEW_SECTION_LINE: IconDef = &[
     a(Line(&[(2.0, 12.0), (2.0, 17.0)])),
     a(Line(&[(22.0, 12.0), (22.0, 17.0)])),
 ];
-const PLAN_HERE: IconDef = &[b(Loop(&[(4.0, 21.0), (4.0, 10.0), (12.0, 3.0), (20.0, 10.0), (20.0, 21.0)])), a(Line(&[(1.0, 14.0), (23.0, 14.0)]))];
-const EDIT_VIEW: IconDef =
-    &[b(Loop(&[(2.0, 4.0), (16.0, 4.0), (16.0, 18.0), (2.0, 18.0)])), a(Loop(&[(9.0, 21.0), (9.0, 17.0), (18.0, 8.0), (22.0, 12.0), (13.0, 21.0)]))];
-const NEW_OFFSET_PLAN: IconDef = &[
-    b(Loop(&[(2.0, 15.0), (15.0, 15.0), (22.0, 20.0), (9.0, 20.0)])),
-    a(Loop(&[(2.0, 4.0), (15.0, 4.0), (22.0, 9.0), (9.0, 9.0)])),
-    a(Line(&[(12.0, 9.0), (12.0, 15.0)])),
-];
 const NEW_ELEVATION_LINE: IconDef = &[
     b(Loop(&[(5.0, 3.0), (19.0, 3.0), (19.0, 14.0), (5.0, 14.0)])),
     a(Line(&[(3.0, 21.0), (21.0, 21.0)])),
     a(Line(&[(8.0, 21.0), (12.0, 17.0), (16.0, 21.0)])),
 ];
 const NEW_DETAIL: IconDef = &[b(Loop(&[(2.0, 2.0), (16.0, 2.0), (16.0, 16.0), (2.0, 16.0)])), a(Circle(15.0, 15.0, 6.5))];
-const DUPLICATE_VIEW: IconDef =
-    &[b(Loop(&[(2.0, 2.0), (14.0, 2.0), (14.0, 14.0), (2.0, 14.0)])), a(Loop(&[(9.0, 9.0), (22.0, 9.0), (22.0, 22.0), (9.0, 22.0)]))];
 const UNPLACE_VIEW: IconDef =
     &[b(Loop(&[(2.0, 2.0), (16.0, 2.0), (16.0, 16.0), (2.0, 16.0)])), a(Line(&[(14.0, 14.0), (22.0, 22.0)])), a(Line(&[(22.0, 14.0), (14.0, 22.0)]))];
 const VIEW_PROPS: IconDef = &[
@@ -65,13 +55,6 @@ const CUT_LINE: IconDef = &[
 
 // Links.
 const UNLINK: IconDef = &[b(Circle(6.5, 12.0, 4.5)), b(Circle(17.5, 12.0, 4.5)), a(Line(&[(10.0, 21.0), (14.0, 3.0)]))];
-const SHOW_LINKS: IconDef = &[
-    b(Circle(9.0, 14.0, 4.5)),
-    b(Circle(15.0, 14.0, 4.5)),
-    a(Line(&[(12.0, 2.0), (12.0, 6.0)])),
-    a(Line(&[(4.0, 4.5), (6.5, 7.5)])),
-    a(Line(&[(20.0, 4.5), (17.5, 7.5)])),
-];
 const RESOLVE: IconDef = &[b(Circle(6.0, 9.0, 4.0)), b(Circle(12.0, 9.0, 4.0)), a(Line(&[(11.0, 17.0), (14.5, 21.0), (22.0, 12.0)]))];
 const ACCEPT: IconDef = &[
     b(Line(&[(2.0, 18.0), (5.0, 15.0)])),
@@ -79,37 +62,6 @@ const ACCEPT: IconDef = &[
     b(Line(&[(12.0, 8.0), (15.0, 5.0)])),
     a(Line(&[(11.0, 17.0), (14.5, 21.0), (22.0, 11.0)])),
 ];
-const SET_ROLE: IconDef = &[
-    b(Line(&[(3.0, 20.0), (19.0, 4.0)])),
-    a(Loop(&[(12.0, 13.0), (18.0, 13.0), (22.0, 17.0), (18.0, 21.0), (12.0, 21.0)])),
-    a(Dot(14.5, 17.0, 1.2)),
-];
-const LAYER_ROLE: IconDef = &[
-    b(Loop(&[(2.0, 7.0), (11.0, 3.0), (20.0, 7.0), (11.0, 11.0)])),
-    b(Line(&[(2.0, 11.0), (11.0, 15.0), (20.0, 11.0)])),
-    a(Loop(&[(13.0, 16.0), (18.0, 16.0), (22.0, 19.0), (18.0, 22.0), (13.0, 22.0)])),
-];
-
-// Panes.
-const REF_PANE: IconDef = &[
-    b(Loop(&[(2.0, 4.0), (22.0, 4.0), (22.0, 20.0), (2.0, 20.0)])),
-    b(Line(&[(12.0, 4.0), (12.0, 20.0)])),
-    a(Loop(&[(15.0, 9.0), (19.0, 9.0), (19.0, 15.0), (15.0, 15.0)])),
-];
-const UNDERLAY: IconDef = &[
-    b(Loop(&[(4.0, 4.0), (20.0, 4.0), (20.0, 20.0), (4.0, 20.0)])),
-    a(Line(&[(4.0, 14.0), (14.0, 4.0)])),
-    a(Line(&[(4.0, 20.0), (20.0, 4.0)])),
-    a(Line(&[(10.0, 20.0), (20.0, 10.0)])),
-];
-const PANE_LOCK: IconDef = &[
-    b(Loop(&[(2.0, 3.0), (22.0, 3.0), (22.0, 21.0), (2.0, 21.0)])),
-    b(Line(&[(12.0, 3.0), (12.0, 8.0)])),
-    a(Loop(&[(8.5, 12.0), (15.5, 12.0), (15.5, 18.0), (8.5, 18.0)])),
-    a(Arc(12.0, 12.0, 2.5, 0.0, 180.0)),
-];
-const UCS_ALIGN: IconDef =
-    &[b(Line(&[(3.0, 3.0), (3.0, 21.0), (21.0, 21.0)])), a(Line(&[(5.0, 6.0), (10.0, 19.0), (22.0, 14.0)])), a(Dot(10.0, 19.0, 1.4))];
 
 // Details.
 const DETAIL_TAG: IconDef = &[b(Circle(15.0, 9.0, 6.5)), b(Line(&[(8.5, 9.0), (21.5, 9.0)])), a(Line(&[(10.5, 14.0), (3.0, 21.0)]))];
@@ -173,9 +125,7 @@ const STUD_MOVE: IconDef = &[
     a(Line(&[(14.0, 10.0), (16.0, 12.0), (14.0, 14.0)])),
 ];
 
-// Project.
-const FOLDER: &[(f32, f32)] = &[(2.0, 5.0), (9.0, 5.0), (11.0, 7.0), (22.0, 7.0), (22.0, 20.0), (2.0, 20.0)];
-const START_PROJECT: IconDef = &[b(Loop(FOLDER)), a(Line(&[(12.0, 10.0), (12.0, 17.0)])), a(Line(&[(8.5, 13.5), (15.5, 13.5)]))];
+// Sheets.
 const DXF_IMPORT: IconDef = &[
     b(Loop(&[(6.0, 2.0), (16.0, 2.0), (20.0, 6.0), (20.0, 22.0), (6.0, 22.0)])),
     a(Line(&[(1.0, 14.0), (12.0, 14.0)])),
@@ -235,17 +185,10 @@ pub const LAMB_TAB: ExtTab = ExtTab {
     groups: &[
         ExtGroup {
             name: "Views",
-            large: &[
-                tool(NEW_PLAN, "newplan", "New Plan"),
-                tool(NEW_SECTION_LINE, "newsectionline", "New Section Line"),
-                tool(PLAN_HERE, "newplanline", "Plan Here"),
-                tool(EDIT_VIEW, "editview", "Edit View"),
-            ],
+            large: &[tool(NEW_PLAN, "newplan", "New Plan"), tool(NEW_SECTION_LINE, "newsectionline", "New Section Line")],
             small: &[
-                tool(NEW_OFFSET_PLAN, "newoffsetplan", "New Offset Plan"),
                 tool(NEW_ELEVATION_LINE, "newelevationline", "New Elevation Line"),
                 tool(NEW_DETAIL, "newdetail", "New Detail"),
-                tool(DUPLICATE_VIEW, "duplicateview", "Duplicate View"),
                 tool(UNPLACE_VIEW, "unplaceview", "Unplace View"),
                 tool(VIEW_PROPS, "viewprops", "View Properties"),
                 tool(LEVEL, "level", "Level"),
@@ -254,17 +197,8 @@ pub const LAMB_TAB: ExtTab = ExtTab {
         },
         ExtGroup {
             name: "Links",
-            large: &[tool(UNLINK, "unlink", "Unlink"), tool(SHOW_LINKS, "showlinks", "Show Links"), tool(RESOLVE, "resolve", "Review Issues")],
-            small: &[
-                tool(ACCEPT, "accept", "Accept AI Line"),
-                tool(SET_ROLE, "setrole", "Set Role"),
-                tool(LAYER_ROLE, "layerrole", "Layer Default Role"),
-            ],
-        },
-        ExtGroup {
-            name: "Panes",
-            large: &[tool(REF_PANE, "refpane", "Reference Pane"), tool(UNDERLAY, "underlay", "Underlay"), tool(PANE_LOCK, "panelock", "Pane Lock")],
-            small: &[tool(UCS_ALIGN, "ucsalign", "UCS Align")],
+            large: &[tool(UNLINK, "unlink", "Unlink"), tool(RESOLVE, "resolve", "Review Issues")],
+            small: &[tool(ACCEPT, "accept", "Accept AI Line")],
         },
         ExtGroup {
             name: "Details",
@@ -290,13 +224,12 @@ pub const LAMB_TAB: ExtTab = ExtTab {
             ],
         },
         ExtGroup {
-            name: "Project",
-            large: &[tool(START_PROJECT, "lambproject", "Start Project")],
+            name: "Sheets",
+            large: &[tool(SHEET_SET, "sheetset", "Sheet Set")],
             small: &[
                 tool(DXF_IMPORT, "dxfimport", "Import DXF as View"),
                 tool(NEW_SHEET, "newsheet", "New Sheet"),
                 tool(DETAIL_SHEETS, "detailsheets", "Detail Sheets"),
-                tool(SHEET_SET, "sheetset", "Sheet Set"),
                 tool(ENLARGED_SHEET, "enlargedsheet", "Enlarged Sheet"),
                 tool(DIMENSION_PLAN, "autodim", "Dimension Plan"),
                 tool(TITLE_BLOCK, "titleblock", "Title Block"),
@@ -349,6 +282,31 @@ mod tests {
         for t in tools() {
             assert!(!["lambopen", "lambsave"].contains(&t.command), "{} is typed-only", t.command);
         }
+    }
+
+    /// These stay typed and in the LAMB menu; only their buttons are gone.
+    #[test]
+    fn duplicates_of_the_views_palette_properties_and_layers_have_no_button_but_still_run() {
+        assert!(lamb_cadcraft::commands::install_app().is_ok());
+        for c in [
+            "editview",
+            "newoffsetplan",
+            "duplicateview",
+            "newplanline",
+            "showlinks",
+            "setrole",
+            "layerrole",
+            "refpane",
+            "underlay",
+            "panelock",
+            "ucsalign",
+            "lambproject",
+        ] {
+            assert!(tools().all(|t| t.command != c), "{c} still has a button");
+            assert!(cadcraft_engine::find_command(c).is_some(), "{c} is no longer a command");
+        }
+        let names: Vec<&str> = LAMB_TAB.groups.iter().map(|g| g.name).collect();
+        assert_eq!(names, ["Views", "Links", "Details", "Assembly", "Sheets"]);
     }
 
     #[test]

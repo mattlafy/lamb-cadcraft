@@ -72,6 +72,11 @@ pub fn rows(app: &CadApp) -> Vec<Row> {
     }
 }
 
+/// The rows the palette draws: all but Model, which the status bar's views popup offers (LAMB T606).
+pub fn palette_rows(rows: Vec<Row>) -> Vec<Row> {
+    rows.into_iter().filter(|r| r.label != "Model").collect()
+}
+
 /// Run a row's command, as a click does. `None` for a heading or a row without a command.
 pub fn activate(app: &mut CadApp, row: &Row) -> Option<Result<Value, String>> {
     if row.heading {
@@ -89,7 +94,7 @@ pub fn activate_cell(app: &mut CadApp, row: &Row, col: usize) -> Option<Result<V
 
 pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
-    let rows = rows(app);
+    let rows = palette_rows(rows(app));
     ui.add_space(4.0);
     if rows.is_empty() {
         ui.horizontal(|ui| {
@@ -193,6 +198,20 @@ mod tests {
         assert!(activate(&mut app, &layout).is_some_and(|r| r.is_ok()));
         assert_ne!(app.session.state().unwrap().space, Space::Model, "the edit space changed");
         assert!(!self::rows(&app)[1].active);
+    }
+
+    #[test]
+    fn the_palette_draws_every_row_but_model() {
+        let row = |label: &str, heading| Row { label: label.into(), active: false, heading, command: None, cells: vec![] };
+        let kept = palette_rows(vec![row("Model", false), row("Level 1", false), row("Sheets", true)]);
+        assert_eq!(kept.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["Level 1", "Sheets"]);
+
+        let _ = register_row_source(source);
+        let app = CadApp::new(Session::default(), crate::Services::default());
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(240.0, 300.0)).build_ui_state(|ui, app: &mut CadApp| show(app, ui), app);
+        h.run();
+        use egui_kittest::kittest::Queryable;
+        assert!(h.query_by_label("Model").is_none());
     }
 
     #[test]

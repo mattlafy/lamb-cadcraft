@@ -351,8 +351,12 @@ pub(crate) fn newoffsetplan_machine(_s: &Session) -> Result<Box<dyn Interactive>
     Ok(Box::new(NewOffsetPlan { name: "newoffsetplan", from: None, mode: None }))
 }
 
-/// Interactive NEWPLAN (LAMB T507): the TS app's New Plan, placed by default.
-pub(crate) fn newplan_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+/// Interactive NEWPLAN (LAMB T507): the TS app's New Plan, placed by default. From an edited
+/// section or elevation it is the one-point NEWPLANLINE flow (LAMB T606).
+pub(crate) fn newplan_machine(s: &Session) -> Result<Box<dyn Interactive>> {
+    if edited_view(s).is_some_and(|id| is_vertical(s, id)) {
+        return newplanline_machine(s);
+    }
     Ok(Box::new(NewOffsetPlan { name: "newplan", from: None, mode: None }))
 }
 
@@ -606,6 +610,26 @@ mod tests {
 
         let e = s.execute("newplanline", &json!({ "fromVerticalViewId": plan.0, "localPoint": {"x": 0, "y": 0} }));
         assert!(e.is_err_and(|e| e.to_string().contains("fromVerticalViewId must be a section or elevation")));
+        Ok(())
+    }
+
+    #[test]
+    fn newplan_from_a_section_takes_one_point_and_from_a_plan_prompts_as_before() -> R {
+        let (mut s, plan) = project()?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.start("newplan")?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("New plan"));
+        s.input(Input::Cancel)?;
+
+        let section = with_section(&mut s, plan)?;
+        s.start("newplan")?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Click a point to place a plan at that elevation"));
+        s.input(Input::Point(Vec2::new(4000.0, 2700.0)))?;
+        assert!(s.running.is_none());
+        let doc = read_document(s.doc()?)?;
+        let view = doc.views.iter().find(|v| v.name() == "Level 2").ok_or("no plan")?.id();
+        assert_eq!(level_of(&s, view)?.0.floor_elevation.value, 2700.0);
+        assert_eq!(space(&s)?, Space::Block(view_block_name(section)), "stays in the section, as newplanline does");
         Ok(())
     }
 
