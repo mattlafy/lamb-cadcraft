@@ -11,6 +11,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(target_arch = "wasm32")]
+mod api;
+#[cfg(target_arch = "wasm32")]
 pub mod download;
 #[cfg(target_arch = "wasm32")]
 mod host;
@@ -345,6 +347,11 @@ mod web {
         web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
     }
 
+    /// One query-string parameter of the page URL.
+    fn query_param(key: &str) -> Option<String> {
+        web_sys::UrlSearchParams::new_with_str(&query()).ok()?.get(key)
+    }
+
     /// The app's canvas: the one element `index.html` and every embedding page must provide,
     /// with the id the app looks up.
     fn app_canvas() -> Option<web_sys::HtmlCanvasElement> {
@@ -413,7 +420,8 @@ mod web {
                         cc.egui_ctx.data_mut(|d| {
                             d.insert_temp(egui::Id::unique("cadcraft-mobile-mode"), query_param("mobile").as_deref() == Some("1"));
                         });
-                        let mut app = CadApp::new(session, services());
+                        let control = crate::api::install(cc.egui_ctx.clone());
+                        let mut app = CadApp::new(session, services()).with_control(control);
                         register_mobile_commands(&cc.egui_ctx);
                         register_mobile_live_input(&cc.egui_ctx);
                         register_mobile_control_keys(&cc.egui_ctx);
