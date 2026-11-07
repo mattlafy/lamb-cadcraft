@@ -8,6 +8,8 @@
 //! pair of consecutive levels by elevation (LAMB T500). Plan cut elevations stay overlay-only. A
 //! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641),
 //! and every placed plan a text of each opening's schedule mark outside it ([`crate::schedule`], LAMB T639).
+//! A placed plan, section or elevation with an enlarged sheet gets a box around each enlarged area and
+//! `<n>/<layout>` above its top-left corner ([`crate::sheets::enlarged_windows`], LAMB T655).
 //!
 //! The annotation lives in its own block per view, [`annotation_block_name`]`(view)`, never in the
 //! view block, so derivation, the wall graph, links and LAMBSAVE never see them. The block's one
@@ -38,7 +40,7 @@ use lamb_core::model::{AnyView, Id};
 use crate::project::DrawingProject;
 use crate::schedule::{PlanMark, plan_marks};
 use crate::schema::{annotation_block_name, read_document, view_block_name};
-use crate::sheets::{sheet_refs, view_scale};
+use crate::sheets::{enlarged_windows, sheet_refs, view_scale};
 
 /// The scale every length constant below is the value at.
 const BASE_SCALE: f64 = 50.0;
@@ -90,14 +92,28 @@ fn near(a: Vec3, b: Vec3) -> bool {
     (a.x - b.x).hypot(a.y - b.y) <= TOLERANCE.coincidence_mm
 }
 
+/// The box around each enlarged area of view `id` and the sheet it is on, at 1:`scale`.
+fn enlarged_boxes(d: &Drawing, id: Id, scale: f64) -> Vec<Item> {
+    let height = CUT_TEXT_MM * k(scale);
+    let mut out = Vec::new();
+    for (w, sheet) in enlarged_windows(d, id) {
+        let (a, b, c, e) = (v(w.min.x, w.min.y), v(w.max.x, w.min.y), v(w.max.x, w.max.y), v(w.min.x, w.max.y));
+        out.extend([Item::Line(a, b), Item::Line(b, c), Item::Line(c, e), Item::Line(e, a)]);
+        out.push(Item::Label(v(w.min.x, w.max.y + 0.5 * height), sheet, height));
+    }
+    out
+}
+
 /// What view `id` wants, in write order: a plan its cut symbols and opening marks, a vertical view
-/// its level lines; nothing for an unplaced view.
+/// its level lines, and either the box of each enlarged area; nothing for an unplaced view.
 fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>, marks: &[PlanMark]) -> Result<Vec<Item>, String> {
     let dp = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let Some(view) = dp.view(id).filter(|v| v.placement.is_some()) else { return Ok(Vec::new()) };
     let scale = view_scale(d, dp.document(), id);
     if view.kind == ViewKind::Vertical {
-        return Ok(level_lines(d, &dp, id, scale));
+        let mut out = level_lines(d, &dp, id, scale);
+        out.extend(enlarged_boxes(d, id, scale));
+        return Ok(out);
     }
     let plan = id;
     let f = k(scale);
@@ -133,6 +149,7 @@ fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>, marks: &
         let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
         out.extend(crate::autodim::strings(&dp, plan, f).into_iter().map(|d| Item::Dim(at(d.a), at(d.b), d.rotation, at(d.line_at), scale)));
     }
+    out.extend(enlarged_boxes(d, id, scale));
     Ok(out)
 }
 
@@ -902,6 +919,106 @@ pub(crate) mod tests {
             window.min.x <= shown.min.x && window.min.y <= shown.min.y && window.max.x >= shown.max.x && window.max.y >= shown.max.y,
             "{window:?} holds {shown:?}"
         );
+        Ok(())
+    }
+
+    /// The four box lines and label an enlarged area from `min` to `max` wants at 1:50.
+    fn box_of(min: (f64, f64), max: (f64, f64), label: &str) -> Vec<Item> {
+        let (a, b, c, e) = (v(min.0, min.1), v(max.0, min.1), v(max.0, max.1), v(min.0, max.1));
+        let at = v(min.0, max.1 + 0.5 * CUT_TEXT_MM);
+        vec![Item::Line(a, b), Item::Line(b, c), Item::Line(c, e), Item::Line(e, a), Item::Label(at, label.to_owned(), CUT_TEXT_MM)]
+    }
+
+    fn enlarge(s: &mut Session, view: Id, from: (f64, f64), to: (f64, f64)) -> T<(String, cadcraft_doc::Handle)> {
+        let r = s.execute(
+            "enlargedsheet",
+            &json!({ "viewId": view.0, "from": {"x": from.0, "y": from.1}, "to": {"x": to.0, "y": to.1}, "scale": 10, "show": "view" }),
+        )?;
+        let h = cadcraft_doc::Handle::parse_hex(r["viewport"].as_str().ok_or("no viewport")?).ok_or("bad handle")?;
+        Ok((r["layout"].as_str().ok_or("no layout")?.to_owned(), h))
+    }
+
+    #[test]
+    fn an_enlarged_area_of_a_plan_gets_a_box_naming_its_sheet_in_the_same_undo_step() -> R {
+        let (mut s, plan, _sec) = fixture()?;
+        let bare = items(&s, plan)?;
+        let n = undo_len(&s)?;
+        let (layout, _) = enlarge(&mut s, plan, (1000.0, 500.0), (3000.0, 2000.0))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        let got = items(&s, plan)?;
+        let want = box_of((1000.0, 500.0), (3000.0, 2000.0), &format!("1/{layout}"));
+        assert_eq!(got[..bare.len()], bare[..], "what was there stays first");
+        assert_eq!(got[bare.len()..], want[..]);
+        assert!(plan_changes(s.doc()?)?.is_empty(), "settled");
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert!(plan_changes(&back)?.is_empty(), "the box survives a DXF round trip unchanged");
+        s.undo()?;
+        assert_eq!(items(&s, plan)?, bare, "undo removes it");
+        Ok(())
+    }
+
+    #[test]
+    fn an_enlarged_area_of_a_section_gets_the_same_box_after_its_level_lines() -> R {
+        let (mut s, plan, sec, _l1, _l2) = levelled()?;
+        let (bare, marks) = (items(&s, sec)?, items(&s, plan)?);
+        let (layout, _) = enlarge(&mut s, sec, (500.0, 200.0), (2500.0, 1700.0))?;
+        let got = items(&s, sec)?;
+        assert_eq!(got[..bare.len()], bare[..]);
+        assert_eq!(got[bare.len()..], box_of((500.0, 200.0), (2500.0, 1700.0), &format!("1/{layout}"))[..]);
+        assert_eq!(items(&s, plan)?, marks, "the plan shows no box for a section's area");
+        Ok(())
+    }
+
+    #[test]
+    fn the_box_follows_its_viewport_and_goes_when_it_is_erased() -> R {
+        let (mut s, plan, _sec) = fixture()?;
+        let bare = items(&s, plan)?;
+        let (layout, h) = enlarge(&mut s, plan, (1000.0, 500.0), (3000.0, 2000.0))?;
+        let label = format!("1/{layout}");
+        s.doc_mut()?.modify_entity(h, |e| {
+            if let EntityKind::Viewport(vp) = &mut e.kind {
+                vp.view_center += Vec2::new(500.0, -300.0);
+            }
+        })?;
+        s.execute("line", &json!({ "points": [[100, 100], [200, 100]] }))?;
+        let got = items(&s, plan)?;
+        assert_eq!(got[bare.len()..], box_of((1500.0, 200.0), (3500.0, 1700.0), &label)[..]);
+
+        let n = undo_len(&s)?;
+        s.execute("erase", &json!({ "handles": [h.hex()] }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert_eq!(items(&s, plan)?, bare, "erased with its viewport");
+        s.undo()?;
+        assert_eq!(items(&s, plan)?, got, "and back");
+        Ok(())
+    }
+
+    #[test]
+    fn the_box_is_sized_for_the_views_own_sheet_and_each_enlargement_has_one() -> R {
+        let (mut s, plan, _sec) = fixture()?;
+        pushed_to_1_100(&mut s, plan, "P1")?;
+        let bare = items(&s, plan)?.len();
+        let (first, _) = enlarge(&mut s, plan, (1000.0, 500.0), (3000.0, 2000.0))?;
+        let (second, _) = enlarge(&mut s, plan, (4000.0, 500.0), (5000.0, 1500.0))?;
+        let got = items(&s, plan)?;
+        assert_eq!(got.len(), bare + 10);
+        let labels: Vec<_> =
+            got[bare..].iter().filter_map(|i| if let Item::Label(at, t, h) = i { Some((at.y, t.clone(), *h)) } else { None }).collect();
+        assert_eq!(labels, [(2000.0 + 250.0, format!("1/{first}"), 500.0), (1500.0 + 250.0, format!("1/{second}"), 500.0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_views_sheet_plots_the_box() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, plan, _sec) = fixture()?;
+        s.execute("newsheet", &json!({ "name": "P1", "viewIds": [plan.0] }))?;
+        let paper = Space::Paper("P1".into());
+        let opts = Options::default();
+        let before = build_plot(s.doc()?, &paper, &opts).prims.len();
+        enlarge(&mut s, plan, (1000.0, 500.0), (3000.0, 2000.0))?;
+        let after = build_plot(s.doc()?, &paper, &opts).prims.len();
+        assert!(after >= before + 4, "{before} -> {after}");
         Ok(())
     }
 

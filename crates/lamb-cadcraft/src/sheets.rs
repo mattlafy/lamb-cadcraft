@@ -857,6 +857,54 @@ pub(crate) fn numbered_viewports(d: &Drawing, view_blocks: &[(Id, String)]) -> V
     out
 }
 
+/// Every enlarged viewport of `view`, the view itself or its assembly block, layouts by name and
+/// then by the number it carries: its model window and `<n>/<layout>`, `n` the number on its drawing
+/// title, where assembly viewports number on from the single-view ones by viewport `id`.
+pub(crate) fn enlarged_windows(d: &Drawing, view: Id) -> Vec<(Bounds2, String)> {
+    let Ok(doc) = read_document(d) else { return Vec::new() };
+    let blocks: Vec<(Id, String)> = doc.views.iter().map(|v| (v.id(), view_block_name(v.id()))).collect();
+    let numbered = numbered_viewports(d, &blocks);
+    let window = |vp: &Viewport, n: usize, layout: &str| {
+        let scale = viewport_scale(vp);
+        (scale.is_finite() && scale > 0.0).then(|| {
+            let half = Vec2::new(vp.width * scale / 2.0, vp.view_height / 2.0);
+            (Bounds2::new(vp.view_center - half, vp.view_center + half), format!("{n}/{layout}"))
+        })
+    };
+    let mut layouts: Vec<&Layout> = d.layouts.iter().collect();
+    layouts.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = Vec::new();
+    for l in layouts {
+        let singles: Vec<_> = numbered.iter().filter(|(_, _, layout, _)| *layout == l.name).collect();
+        for (shown, n, _, h) in &singles {
+            let Some(EntityKind::Viewport(vp)) = l.entities.get(*h).map(|e| &e.kind) else { continue };
+            if *shown == view && is_enlarged(d, *h) {
+                out.extend(window(vp, *n, &l.name));
+            }
+        }
+        let mut assemblies: Vec<(&Viewport, Id, bool)> = l
+            .entities
+            .iter()
+            .filter_map(|e| {
+                let EntityKind::Viewport(vp) = &e.kind else { return None };
+                let data = read_entity_data(&e.common).ok()?;
+                if data.view_id.is_some() {
+                    return None;
+                }
+                let plan = data.assembly_of.filter(|p| blocks.iter().any(|(v, _)| v == p))?;
+                Some((vp, plan, data.enlarged))
+            })
+            .collect();
+        assemblies.sort_by_key(|(vp, ..)| vp.id);
+        for (i, (vp, shown, enlarged)) in assemblies.into_iter().enumerate() {
+            if enlarged && shown == view {
+                out.extend(window(vp, singles.len() + i + 1, &l.name));
+            }
+        }
+    }
+    out
+}
+
 /// The sheet showing `view`: `(n, layout)` as [`sheet_refs`] numbers it, `None` when no sheet
 /// (or an unreadable LAMB document) shows it.
 pub fn view_sheet_ref(d: &Drawing, view: Id) -> Option<(usize, String)> {
@@ -988,6 +1036,52 @@ mod tests {
         // A viewport naming a view outside the list takes no number.
         let refs = sheet_refs(s.doc()?, &[(detail, view_block_name(detail))]);
         assert_eq!(refs, [(detail, 1, "S1".to_owned())]);
+        Ok(())
+    }
+
+    #[test]
+    fn enlarged_windows_read_the_viewport_and_number_assemblies_after_single_views() -> R {
+        let (mut s, plan) = room_with("exterior_face", true, 200.0)?;
+        crate::maintain::install(&mut s);
+        let level = s.execute("level", &json!({ "mode": "create", "name": "L1", "floorElevationMm": 0 }))?["levelId"].as_u64().ok_or("no id")?;
+        let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
+        s.execute("placeview", &json!({ "viewId": plan.0, "kind": "plan", "levelId": level, "cutElevation": 1200, "transform": t }))?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert!(enlarged_windows(s.doc()?, plan).is_empty());
+
+        let r = s.execute("enlargedsheet", &json!({ "viewId": plan.0, "from": {"x": 100, "y": 200}, "to": {"x": 1100, "y": 900} }))?;
+        assert_eq!(r["show"], "assembly");
+        let layout = r["layout"].as_str().ok_or("no layout")?.to_owned();
+        let got = enlarged_windows(s.doc()?, plan);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (w, label) = &got[0];
+        assert_eq!(*label, format!("1/{layout}"));
+        assert!((w.min.x - 100.0).abs() < 1e-6 && (w.min.y - 200.0).abs() < 1e-6, "{w:?}");
+        assert!((w.max.x - 1100.0).abs() < 1e-6 && (w.max.y - 900.0).abs() < 1e-6, "{w:?}");
+        s.undo()?;
+
+        // One layout showing the view and its assembly block, both enlarged: the drawing titles' numbers.
+        s.execute("newsheet", &json!({ "name": "A1", "viewIds": [plan.0], "assemblyIds": [plan.0] }))?;
+        let handles: Vec<Handle> = s
+            .doc()?
+            .layout("A1")
+            .ok_or("no layout")?
+            .entities
+            .iter()
+            .filter(|e| read_entity_data(&e.common).is_ok_and(|x| x.view_id.is_some() || x.assembly_of.is_some()))
+            .map(|e| e.handle)
+            .collect();
+        assert_eq!(handles.len(), 2);
+        for h in handles {
+            let d = s.doc_mut()?;
+            let mut data = read_entity_data(&d.entity(h).ok_or("gone")?.common)?;
+            data.enlarged = true;
+            d.modify_entity(h, |e| {
+                let _ = set_entity_data(&mut e.common, &data);
+            })?;
+        }
+        let labels: Vec<String> = enlarged_windows(s.doc()?, plan).into_iter().map(|(_, l)| l).collect();
+        assert_eq!(labels, ["1/A1", "2/A1"]);
         Ok(())
     }
 

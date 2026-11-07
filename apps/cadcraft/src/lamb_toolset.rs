@@ -205,6 +205,10 @@ const SHEET_SET: IconDef = &[
     a(Line(&[(14.0, 8.0), (14.0, 21.0)])),
 ];
 
+/// A small rectangle with a larger accent one growing from its corner.
+const ENLARGED_SHEET: IconDef =
+    &[b(Loop(&[(3.0, 14.0), (10.0, 14.0), (10.0, 21.0), (3.0, 21.0)])), a(Loop(&[(10.0, 3.0), (21.0, 3.0), (21.0, 14.0), (10.0, 14.0)]))];
+
 /// A sheet's border with its title strip ruled into cells down the right edge.
 const TITLE_BLOCK: IconDef = &[
     b(Loop(&[(2.0, 4.0), (22.0, 4.0), (22.0, 20.0), (2.0, 20.0)])),
@@ -293,6 +297,7 @@ pub const LAMB_TAB: ExtTab = ExtTab {
                 tool(NEW_SHEET, "newsheet", "New Sheet"),
                 tool(DETAIL_SHEETS, "detailsheets", "Detail Sheets"),
                 tool(SHEET_SET, "sheetset", "Sheet Set"),
+                tool(ENLARGED_SHEET, "enlargedsheet", "Enlarged Sheet"),
                 tool(DIMENSION_PLAN, "autodim", "Dimension Plan"),
                 tool(TITLE_BLOCK, "titleblock", "Title Block"),
                 tool(FRAMING_BOM, "bomtable", "Framing BOM"),
