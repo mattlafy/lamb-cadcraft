@@ -1456,6 +1456,12 @@ pub(crate) mod tests {
 
     /// [`room`] with the inner face `inner` mm inside the outer one (the wall `inner` thick).
     pub(crate) fn room_with(kind: &str, tagged: bool, inner: f64) -> T<(Session, Id)> {
+        room_on("WALL-EXT", false, kind, tagged, inner)
+    }
+
+    /// [`room_with`] with its walls on `layer` (`0` is the drawing's own) — as two closed
+    /// polylines, or with `exploded` as eight LINEs end to end (LAMB T681).
+    pub(crate) fn room_on(layer: &str, exploded: bool, kind: &str, tagged: bool, inner: f64) -> T<(Session, Id)> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);
@@ -1470,9 +1476,21 @@ pub(crate) mod tests {
         line(&mut s, [0.0, 50.0], [1000.0, 50.0])?;
         line(&mut s, [0.0, 200.0], [1000.0, 200.0])?;
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
-        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
-        s.execute("pline", &json!({ "vertices": [[0, 0], [5000, 0], [5000, 4000], [0, 4000]], "closed": true }))?;
-        s.execute("pline", &json!({ "vertices": [[inner, inner], [5000.0 - inner, inner], [5000.0 - inner, 4000.0 - inner], [inner, 4000.0 - inner]], "closed": true }))?;
+        if layer == "0" {
+            s.execute("layer.current", &json!({ "name": "0" }))?;
+        } else {
+            s.execute("layer.new", &json!({ "name": layer, "current": true }))?;
+        }
+        let (a, b, c) = (inner, 5000.0 - inner, 4000.0 - inner);
+        for ring in [[[0.0, 0.0], [5000.0, 0.0], [5000.0, 4000.0], [0.0, 4000.0]], [[a, a], [b, a], [b, c], [a, c]]] {
+            if exploded {
+                for i in 0..4 {
+                    line(&mut s, ring[i], ring[(i + 1) % 4])?;
+                }
+            } else {
+                s.execute("pline", &json!({ "vertices": ring, "closed": true }))?;
+            }
+        }
         if tagged {
             s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
             s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 2500.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
@@ -2548,6 +2566,36 @@ pub(crate) mod tests {
             )?;
             Ok(())
         })
+    }
+
+    /// LAMB T681: a room on any layer its tag sits on is detailed like one on `WALL-EXT` — as
+    /// polylines or exploded into LINEs.
+    #[test]
+    fn a_room_on_any_tagged_layer_takes_the_detail_and_lays_its_bands() -> R {
+        for (layer, exploded) in [("WALL-EXT", false), ("A-WALL", false), ("A-WALL", true), ("0", true)] {
+            let (s, plan) = room_on(layer, exploded, "exterior_face", true, 200.0)?;
+            let (runs, _) = resolve_view_details(s.doc()?, plan)?;
+            assert_eq!(runs.len(), 4, "{layer} exploded={exploded}");
+            assert!(runs.iter().all(|r| !matches!(r, RunDetail::Untyped)), "{layer} exploded={exploded}: {runs:?}");
+            let laid = assembly_lines(s.doc()?, plan)?;
+            assert_eq!(laid.iter().map(|r| r.bands).collect::<Vec<_>>(), vec![3; 4], "{layer} exploded={exploded}");
+        }
+        Ok(())
+    }
+
+    /// LAMB T681: a section whose cut faces are on layer `0` takes a section detail tagged on a face.
+    #[test]
+    fn a_section_with_cut_faces_on_layer_0_takes_its_detail() -> R {
+        let (s, sec) = section_fixture(0.0, None, |s| {
+            s.execute("layer.current", &json!({ "name": "0" }))?;
+            s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
+            s.execute("pline", &json!({ "vertices": [[300, 250], [3700, 250], [3700, 2750], [300, 2750]], "closed": true }))?;
+            Ok(())
+        })?;
+        let (runs, _) = resolve_view_details(s.doc()?, sec)?;
+        assert!(runs.iter().any(|r| matches!(r, RunDetail::Tagged(_))), "{runs:?}");
+        assert!(crate::detailtags::view_detail_tags(s.doc()?, sec)?.unattached.is_empty());
+        Ok(())
     }
 
     /// `section_wall`'s plan, section and `SD` detail with the section's cut faces drawn by `faces`,

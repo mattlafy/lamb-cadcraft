@@ -1,7 +1,8 @@
 //! Detail tags (LAMB's `docs/07-architecture/cadcraft-integration.md` §9 "Detail tags are the
 //! assignment", phase 8, LAMB T349): a tag is an ordinary CADCraft `Leader` in a plan or section
 //! view's block (LAMB T456: §8 "Not only plans" — plan details tag plan views, section details
-//! vertical views, whose runs come from cut faces on `WALL*`, `FLOOR*`, `ROOF*` and `SLAB*`),
+//! vertical views, whose runs come from cut faces on `WALL*`, `FLOOR*`, `ROOF*` and `SLAB*` — and,
+//! LAMB T681, on the layer of any line a tag in that view sits on ([`wall_params_with`])),
 //! its tip `vertices[0]`, carrying [`EntityData::detail_tag`] — the detail view it names and whether
 //! it tags a junction (corner) or a run (edge). DXF/DWG see a plain leader.
 //!
@@ -234,8 +235,15 @@ pub(crate) fn place_target(graph: &WallGraph, corner: bool, ends: bool, tip: Poi
 /// [`place_target`] in `view`.
 fn view_target(s: &Session, view: Id, corner: bool, tip: Point2) -> std::result::Result<Target, String> {
     let p = DrawingProject::new(s.doc().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    let graph = wall_graph(&p, view, &wall_params(&p, view));
-    place_target(&graph, corner, view_direction(p.drawing(), view) == CutDirection::Plan, tip)
+    let graph = wall_graph(&p, view, &wall_params_with(&p, view, &[tip]));
+    place_target(&graph, corner, view_direction(p.drawing(), view) == CutDirection::Plan, tip).map_err(|e| {
+        // A tip on a line that makes no wall: say which layer and why (LAMB T681).
+        let lone = graph.runs.is_empty() || (!corner && !on_face_corner(&graph, tip) && attach_run(&graph, tip).is_none());
+        match lines_at(p.drawing(), view, tip).into_iter().next() {
+            Some((layer, _)) if lone => format!("No wall here: {layer} has no parallel face 50–800 mm from this line"),
+            _ => e,
+        }
+    })
 }
 
 /// A run's centreline end point at `end`.
@@ -304,10 +312,59 @@ pub(crate) fn exterior_layer_ids(p: &DrawingProject<'_>) -> Vec<String> {
 }
 
 /// What counts as a wall face in `view`: [`WallRunParams::for_vertical`] in a vertical view, else
-/// [`WallRunParams::defaults`].
+/// [`WallRunParams::defaults`] — plus the layer of every line a detail tag in `view` sits on
+/// ([`wall_params_with`], LAMB T681).
 pub(crate) fn wall_params(p: &DrawingProject<'_>, view: Id) -> WallRunParams {
+    wall_params_with(p, view, &[])
+}
+
+/// [`wall_params`] with `extra_tips` counted as tag tips too — the tag DETAILTAG is placing. Each
+/// tip (a callout box's anchor) adds the layer of every Line / LwPolyline / Arc in `view`'s block
+/// within `TOLERANCE.grouping_mm` of it, skipping detail tags, outside points and LAMB-internal
+/// layers, so a wall drawn on `A-WALL` or `0` is a wall in the view where it is tagged.
+pub(crate) fn wall_params_with(p: &DrawingProject<'_>, view: Id, extra_tips: &[Point2]) -> WallRunParams {
     let vertical = read_document(p.drawing()).is_ok_and(|doc| doc.views.iter().any(|v| matches!(v, AnyView::Vertical(_)) && v.id() == view));
-    if vertical { WallRunParams::for_vertical(p.layers()) } else { WallRunParams::defaults(p.layers()) }
+    let mut params = if vertical { WallRunParams::for_vertical(p.layers()) } else { WallRunParams::defaults(p.layers()) };
+    let mut tips: Vec<Point2> = tags_in(p.drawing(), view).unwrap_or_default().into_iter().map(|(_, tip, _)| tip).collect();
+    tips.extend_from_slice(extra_tips);
+    for tip in tips {
+        for (layer, _) in lines_at(p.drawing(), view, tip) {
+            if !params.wall_layer_ids.contains(&layer) {
+                params.wall_layer_ids.push(layer);
+            }
+        }
+    }
+    params
+}
+
+/// `(layer, distance)` of every Line / LwPolyline / Arc in `view`'s block within
+/// `TOLERANCE.grouping_mm` of `tip`, nearest first — not detail tags, outside points or entities on
+/// LAMB-internal layers.
+fn lines_at(d: &Drawing, view: Id, tip: Point2) -> Vec<(String, f64)> {
+    use lamb_core::geometry::polyline::{closest_point_on_segment, resolved_segments};
+    let Some(block) = d.block(&view_block_name(view)) else { return Vec::new() };
+    let mut out: Vec<(String, f64)> = Vec::new();
+    for e in block.entities.iter() {
+        if !matches!(e.kind, EntityKind::Line(_) | EntityKind::LwPolyline(_) | EntityKind::Arc(_)) {
+            continue;
+        }
+        let layer = e.common.layer.as_str();
+        if layer.eq_ignore_ascii_case(crate::outside::OUTSIDE_LAYER) || crate::views::internal_layer(d, layer) {
+            continue;
+        }
+        if read_entity_data(&e.common).ok().and_then(|x| x.detail_tag).is_some() {
+            continue;
+        }
+        let Ok(c) = crate::convert::to_polyline(e) else { continue };
+        let Some(d) = resolved_segments(&c.polyline).iter().map(|s| closest_point_on_segment(s, tip).distance).min_by(f64::total_cmp) else {
+            continue;
+        };
+        if d <= TOLERANCE.grouping_mm {
+            out.push((layer.to_string(), d));
+        }
+    }
+    out.sort_by(|a, b| a.1.total_cmp(&b.1));
+    out
 }
 
 /// The cut direction details tagging `view` must have: `Vertical` in a vertical view, else `Plan`.
@@ -1107,14 +1164,34 @@ mod tests {
         Ok(())
     }
 
+    /// LAMB T681: walls on `A-WALL` or `0` are no walls until a tag sits on them, then they are.
     #[test]
-    fn walls_on_layer_0_are_no_walls_and_every_tag_is_refused() -> R {
-        let (mut s, plan, detail) = walled(200.0, "0")?;
-        for (corner, tip) in [(false, (2500.0, 0.0)), (true, (0.0, 0.0))] {
-            let e = tag(&mut s, detail, corner, tip).err().ok_or("tag on layer 0 walls accepted")?;
-            assert_eq!(e.to_string(), "No walls here: wall faces are pairs of parallel lines on a WALL* layer (50–800 mm apart)");
+    fn walls_on_any_layer_become_walls_where_a_tag_sits_on_them() -> R {
+        for layer in ["A-WALL", "0"] {
+            let (mut s, plan, detail) = walled(200.0, layer)?;
+            let r = s.execute("detailtags", &json!({ "viewId": plan.0 }))?;
+            assert!(r["message"].as_str().is_some_and(|m| m.starts_with("<0 runs")), "{layer}: {r}");
+            tag(&mut s, detail, true, (0.0, 0.0)).map_err(|e| format!("corner tag on {layer}: {e}"))?;
+            tag(&mut s, detail, false, (2500.0, 0.0)).map_err(|e| format!("edge tag on {layer}: {e}"))?;
+            let r = s.execute("detailtags", &json!({ "viewId": plan.0 }))?;
+            assert_eq!(r["message"], "<4 runs: 1 tagged, 3 spread; 4 junctions: 1 tagged, 3 spread>", "{layer}");
         }
-        assert!(leaders(&s, plan)?.is_empty());
+        Ok(())
+    }
+
+    /// LAMB T681: a tip on a lone line says which layer has no partner face, and records nothing.
+    #[test]
+    fn a_tag_on_a_lone_line_is_refused_naming_its_layer() -> R {
+        let mut s = session()?;
+        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let detail = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "A-WALL", "current": true }))?;
+        s.execute("line", &json!({ "points": [[0, 0], [5000, 0]] }))?;
+        let n = s.doc()?.block(&view_block_name(plan)).ok_or("no block")?.entities.len();
+        let e = tag(&mut s, detail, false, (2500.0, 0.0)).err().ok_or("lone line accepted")?;
+        assert_eq!(e.to_string(), "No wall here: A-WALL has no parallel face 50–800 mm from this line");
+        assert_eq!(s.doc()?.block(&view_block_name(plan)).ok_or("no block")?.entities.len(), n, "a refusal records nothing");
         Ok(())
     }
 
