@@ -4,6 +4,7 @@
 //! invoked through `std::process::Command`.
 
 mod assets;
+mod dwg_dependency_targets;
 mod ico;
 mod layers;
 mod parity;
