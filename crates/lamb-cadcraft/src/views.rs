@@ -80,8 +80,14 @@ pub fn create_view(d: &mut Drawing, mut view: AnyView) -> Result<Id, ViewError> 
     Ok(id)
 }
 
-/// The Views palette's icon columns, left to right: index 0 is the reference pane, 1 the underlay.
-pub const BROWSER_COLUMNS: [&str; 2] = ["Ref", "Underlay"];
+/// The Views palette's tabs (LAMB T659), as `(name, text columns, icon columns)`: [`VIEWS_TAB`]
+/// lists Model and the views, [`SHEETS_TAB`] the sheets in plot order.
+pub const BROWSER_TABS: [(&str, &[&str], &[&str]); 2] =
+    [("Views", &["Level", "Sheet"], &["Ref", "Underlay"]), ("Sheets", &["Title"], &["Up", "Down"])];
+/// The index of the Views tab in [`BROWSER_TABS`].
+pub const VIEWS_TAB: usize = 0;
+/// The index of the Sheets tab in [`BROWSER_TABS`].
+pub const SHEETS_TAB: usize = 1;
 
 /// One icon cell of a [`BrowserRow`] (`cadcraft_ui_egui::viewlist::Cell` without the icon, which
 /// the column picks): `on` draws it full-strength; a click runs `command`.
@@ -93,41 +99,51 @@ pub struct BrowserCell {
 }
 
 /// One row of the desktop app's Views palette (`cadcraft_ui_egui::viewlist::Row`, same fields):
-/// the TS app's Views panel (`ViewsPanel.tsx`) as data. `cells` holds one entry per
-/// [`BROWSER_COLUMNS`] column, `None` where that mode is not valid for the row.
+/// the TS app's Views panel (`ViewsPanel.tsx`) as data. `tab` indexes [`BROWSER_TABS`]; `fields`
+/// and `cells` hold one entry per text and icon column of that tab, a cell `None` where that mode
+/// is not valid for the row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BrowserRow {
     pub label: String,
     pub active: bool,
     pub heading: bool,
-    /// A sheet row: its two cells are move up and move down, not [`BROWSER_COLUMNS`].
-    pub sheet: bool,
+    pub tab: usize,
+    pub fields: Vec<String>,
     pub command: Option<(String, serde_json::Value)>,
     pub cells: Vec<Option<BrowserCell>>,
 }
 
 fn row(label: String, active: bool, command: &str, params: serde_json::Value) -> BrowserRow {
-    BrowserRow { label, active, heading: false, sheet: false, command: Some((command.to_owned(), params)), cells: Vec::new() }
+    BrowserRow { label, active, heading: false, tab: VIEWS_TAB, fields: Vec::new(), command: Some((command.to_owned(), params)), cells: Vec::new() }
+}
+
+fn heading(label: &str) -> BrowserRow {
+    BrowserRow { label: label.to_owned(), active: false, heading: true, tab: VIEWS_TAB, fields: Vec::new(), command: None, cells: Vec::new() }
 }
 
 fn cell(on: bool, tip: String, command: &str, params: serde_json::Value) -> Option<BrowserCell> {
     Some(BrowserCell { on, tip, command: (command.to_owned(), params) })
 }
 
-/// The Views palette for `d` while editing `edit`: `Model`, then each view in document order as
-/// [`view_label`] (a plan's level and floor, or `(unplaced)`), the edited one active, each running
-/// `editview`; a drawing with no views offers `Start LAMB project` (LAMBPROJECT). Each view row has
-/// two cells ([`BROWSER_COLUMNS`]), `None` unless the mode is valid for it while editing a view:
-/// **Ref** for the edited view's eligible reference views — on for the one the shown pane displays
-/// (at most one), clicking an off one runs `refpane {viewId}` (which also turns the pane on), the on
-/// one `refpane {on: false}`; **Underlay** for its underlay candidates — on while it is one of the
-/// underlays (any number), a click runs `underlay {viewId}` (toggle), the tip noting `(mirrored)`.
-/// The edited view's own row has neither. A view shown on a sheet appends ` · <layout>` to its row's
-/// label (the cell tips keep the bare label). When any LAMB sheet exists, the views are followed by a
-/// `Sheets` heading and one `"<layout> — <title>"` row per sheet in tab order, which is plot order,
-/// the current one active, each running `layout set`, with two cells that run `sheetorder` by a step:
-/// move up, `None` on the first, and move down, `None` on the last. An unreadable LAMB slot gives
-/// just the Model row.
+/// The Views tab's groups, in order: heading and the views' kind word ([`crate::commands::kind_word`]).
+const GROUPS: [(&str, &str); 4] = [("Plans", "Plan"), ("Sections", "Section"), ("Elevations", "Elevation"), ("Details", "Detail")];
+
+/// The Views palette for `d` while editing `edit`. On [`VIEWS_TAB`]: `Model`, then the views
+/// grouped under `Plans`, `Sections`, `Elevations` and `Details` headings (an empty group has
+/// none), in document order inside a group; each row is labelled with the view's name, the edited
+/// one active, each running `editview`; a drawing with no views offers `Start LAMB project`
+/// (LAMBPROJECT). A view row's fields are **Level** ([`level_field`]) and **Sheet** (the layout the
+/// view is numbered on, else empty), and its two cells, `None` unless the mode is valid for it while
+/// editing a view: **Ref** for the edited view's eligible reference views — on for the one the shown
+/// pane displays (at most one), clicking an off one runs `refpane {viewId}` (which also turns the
+/// pane on), the on one `refpane {on: false}`; **Underlay** for its underlay candidates — on while
+/// it is one of the underlays (any number), a click runs `underlay {viewId}` (toggle), the tip
+/// noting `(mirrored)`. Cell tips name the view as `"<name> — <kind>"`. The edited view's own row
+/// has neither. On [`SHEETS_TAB`]: one row per LAMB sheet in tab order, which is plot order,
+/// labelled with the layout name, field **Title** (`titleblock::sheet_title`), the current one
+/// active, each running `layout set`, with two cells that run `sheetorder` by a step: move up,
+/// `None` on the first, and move down, `None` on the last. An unreadable LAMB slot gives just the
+/// Model row.
 pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     let mut rows = vec![row("Model".into(), *edit == Space::Model, "editview", serde_json::json!({}))];
     let Ok(doc) = read_document(d) else { return rows };
@@ -140,42 +156,45 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     let under = edited.map(|e| crate::overlays::underlay::current(d, e)).unwrap_or_default();
     let blocks: Vec<(Id, String)> = doc.views.iter().map(|v| (v.id(), view_block_name(v.id()))).collect();
     let numbered = crate::sheets::numbered_viewports(d, &blocks);
-    for v in &doc.views {
+    let view_row = |v: &AnyView| {
         let active = matches!(edit, Space::Block(name) if *name == view_block_name(v.id()));
-        let label = view_label(&doc, v);
-        let mut r = row(label.clone(), active, "editview", serde_json::json!({ "viewId": v.id().0 }));
+        let tip_name = format!("{} — {}", v.name(), crate::commands::kind_word(v));
+        let mut r = row(v.name().to_owned(), active, "editview", serde_json::json!({ "viewId": v.id().0 }));
         let ref_cell = reference.as_ref().filter(|(eligible, _)| eligible.contains(&v.id())).and_then(|(_, pick)| {
             if shown && *pick == v.id() {
-                cell(true, format!("Reference pane off ({label})"), "refpane", serde_json::json!({ "on": false }))
+                cell(true, format!("Reference pane off ({tip_name})"), "refpane", serde_json::json!({ "on": false }))
             } else {
-                cell(false, format!("Show {label} in the reference pane"), "refpane", serde_json::json!({ "viewId": v.id().0 }))
+                cell(false, format!("Show {tip_name} in the reference pane"), "refpane", serde_json::json!({ "viewId": v.id().0 }))
             }
         });
         let under_cell = candidates.iter().find(|c| c.view_id == v.id()).and_then(|c| {
             let mirrored = if c.mirrored { " (mirrored)" } else { "" };
-            cell(under.contains(&c.view_id), format!("Underlay {label}{mirrored}"), "underlay", serde_json::json!({ "viewId": c.view_id.0 }))
+            cell(under.contains(&c.view_id), format!("Underlay {tip_name}{mirrored}"), "underlay", serde_json::json!({ "viewId": c.view_id.0 }))
         });
         r.cells = vec![ref_cell, under_cell];
-        if let Some((_, _, layout, _)) = numbered.iter().find(|(view, ..)| *view == v.id()) {
-            r.label = format!("{label} · {layout}");
+        let sheet = numbered.iter().find(|(view, ..)| *view == v.id()).map(|(_, _, layout, _)| layout.to_string()).unwrap_or_default();
+        r.fields = vec![level_field(&doc, v), sheet];
+        r
+    };
+    for (title, kind) in GROUPS {
+        let group: Vec<&AnyView> = doc.views.iter().filter(|v| crate::commands::kind_word(v) == kind).collect();
+        if !group.is_empty() {
+            rows.push(heading(title));
+            rows.extend(group.into_iter().map(view_row));
         }
-        rows.push(r);
     }
     if doc.views.is_empty() {
         rows.push(row("Start LAMB project".into(), false, "lambproject", serde_json::json!({})));
     }
     let mut sheets: Vec<_> = d.layouts.iter().filter(|l| crate::titleblock::is_lamb_sheet(l)).collect();
     sheets.sort_by_key(|l| l.tab_order);
-    if !sheets.is_empty() {
-        rows.push(BrowserRow { label: "Sheets".into(), active: false, heading: true, sheet: false, command: None, cells: Vec::new() });
-    }
     let last = sheets.len().saturating_sub(1);
     for (k, l) in sheets.into_iter().enumerate() {
-        let label = format!("{} — {}", l.name, crate::titleblock::sheet_title(d, &doc, &l.name));
         let active = matches!(edit, Space::Paper(name) if *name == l.name);
-        let mut r = row(label, active, "layout", serde_json::json!({ "option": "set", "name": l.name }));
+        let mut r = row(l.name.clone(), active, "layout", serde_json::json!({ "option": "set", "name": l.name }));
         let step = |tip: &str, by: i32| cell(true, tip.to_owned(), "sheetorder", serde_json::json!({ "layout": l.name, "step": by }));
-        r.sheet = true;
+        r.tab = SHEETS_TAB;
+        r.fields = vec![crate::titleblock::sheet_title(d, &doc, &l.name)];
         r.cells =
             vec![if k == 0 { None } else { step("Move up in plot order", -1) }, if k == last { None } else { step("Move down in plot order", 1) }];
         rows.push(r);
@@ -183,20 +202,19 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     rows
 }
 
-/// A placed plan `"<name> — Plan · <level> <floor>"` (floor in signed mm, `+0`, `+3000`, `-450`);
-/// a placed section or elevation `"<name> — Section"` / `"<name> — Elevation"`; an unplaced plan,
-/// section or elevation `"<name> — <kind> (unplaced)"`; a detail `"<name> — Detail"`. A level that
-/// cannot be found leaves just `"<name> — <kind>"`.
-fn view_label(doc: &LambDocument, v: &AnyView) -> String {
-    let kind = crate::commands::kind_word(v);
-    let base = format!("{} — {kind}", v.name());
+/// A view row's Level field: a placed plan's `"<level> <floor>"` (floor in signed mm, `+0`,
+/// `+3000`, `-450`), `unplaced` for an unplaced plan, section or elevation, else empty (a placed
+/// section or elevation, a detail, or a plan whose level cannot be found).
+fn level_field(doc: &LambDocument, v: &AnyView) -> String {
     match v.placement() {
-        Some(Placement::Plan { level_id, .. }) => match doc.levels.iter().find(|l| l.id == *level_id) {
-            Some(l) => format!("{base} · {} {:+}", l.name, l.floor_elevation.value.round() as i64),
-            None => base,
-        },
-        None if matches!(v, AnyView::Plan(_) | AnyView::Vertical(_)) => format!("{base} (unplaced)"),
-        Some(Placement::Vertical { .. }) | None => base,
+        Some(Placement::Plan { level_id, .. }) => doc
+            .levels
+            .iter()
+            .find(|l| l.id == *level_id)
+            .map(|l| format!("{} {:+}", l.name, l.floor_elevation.value.round() as i64))
+            .unwrap_or_default(),
+        None if matches!(v, AnyView::Plan(_) | AnyView::Vertical(_)) => "unplaced".into(),
+        Some(Placement::Vertical { .. }) | None => String::new(),
     }
 }
 
@@ -239,15 +257,20 @@ mod tests {
         Ok(s)
     }
 
-    fn rows(s: &Session) -> std::result::Result<Vec<BrowserRow>, Box<dyn std::error::Error>> {
+    fn full(s: &Session) -> std::result::Result<Vec<BrowserRow>, Box<dyn std::error::Error>> {
         Ok(browser_rows(s.doc()?, &s.state()?.space))
+    }
+
+    /// The Views tab's clickable rows: Model, then the views (no headings, no sheets).
+    fn rows(s: &Session) -> std::result::Result<Vec<BrowserRow>, Box<dyn std::error::Error>> {
+        Ok(full(s)?.into_iter().filter(|r| r.tab == VIEWS_TAB && !r.heading).collect())
     }
 
     #[test]
     fn an_empty_drawing_offers_model_and_start_project() -> R {
         let s = session()?;
-        let r = rows(&s)?;
-        assert_eq!(r.len(), 2);
+        let r = full(&s)?;
+        assert_eq!(r.len(), 2, "no headings without views");
         assert_eq!((r[0].label.as_str(), r[0].active), ("Model", true));
         assert_eq!(r[0].command, Some(("editview".into(), json!({}))));
         assert_eq!(r[1].label, "Start LAMB project");
@@ -275,17 +298,15 @@ mod tests {
         let mut s = session()?;
         s.execute("lambproject", &json!({}))?;
         let r = rows(&s)?;
-        assert_eq!(
-            r.iter().map(|r| (r.label.as_str(), r.active)).collect::<Vec<_>>(),
-            [("Model", false), ("Ground Floor — Plan · Level 1 +0", true)]
-        );
+        assert_eq!(r.iter().map(|r| (r.label.as_str(), r.active)).collect::<Vec<_>>(), [("Model", false), ("Ground Floor", true)]);
+        assert_eq!(r[1].fields, ["Level 1 +0", ""]);
         let ground = read_document(s.doc()?)?.views[0].id();
         assert_eq!(r[1].command, Some(("editview".into(), json!({ "viewId": ground.0 }))));
 
         let id = s.execute("newplan", &json!({ "name": "Sketch" }))?["viewId"].as_u64().ok_or("no id")?;
         let r = rows(&s)?;
         assert_eq!(r.len(), 3, "no Start row once views exist");
-        assert_eq!(r[2].label, "Sketch — Plan (unplaced)");
+        assert_eq!((r[2].label.as_str(), r[2].fields.clone()), ("Sketch", vec!["unplaced".to_owned(), String::new()]));
         assert_eq!(r[2].command, Some(("editview".into(), json!({ "viewId": id }))));
 
         // A row's command is what a click runs: it makes that view the edit space.
@@ -321,8 +342,7 @@ mod tests {
         let _g = crate::overlays::underlay::tests::lock();
         let (mut s, plan, a, b) = crate::refpane::tests::project()?;
         let r = rows(&s)?;
-        assert!(!r.iter().any(|r| r.heading), "no heading rows: {r:?}");
-        let (gf, aa, bb) = ("Ground Floor — Plan · Level 1 +0", "A-A — Section", "B-B — Section");
+        let (gf, aa, bb) = ("Ground Floor", "A-A", "B-B");
         assert_eq!(cells(&r), [(gf, None, None), (aa, Some(false), None), (bb, Some(false), None)], "the edited plan has no cells");
         let c = r[3].cells[0].as_ref().ok_or("no B-B Ref cell")?;
         assert_eq!(c.command, ("refpane".into(), json!({ "viewId": b.0 })));
@@ -363,8 +383,9 @@ mod tests {
         s.execute("viewprops", &json!({ "mode": "intent", "viewId": b.0, "intent": "elevation" }))?;
         s.execute("editview", &json!({ "viewId": a.0 }))?;
         let r = rows(&s)?;
-        assert_eq!(r[2].label, "A-A — Section");
-        assert_eq!(r[3].label, "North — Elevation");
+        assert_eq!(r[2].label, "A-A");
+        assert_eq!(r[3].label, "North");
+        assert_eq!(r[3].fields, ["", ""], "a placed elevation on no sheet has empty fields");
         assert_eq!(r[3].cells[0].as_ref().map(|c| c.tip.as_str()), Some("Show North — Elevation in the reference pane"));
         assert_eq!(r[3].cells[1].as_ref().map(|c| c.tip.as_str()), Some("Underlay North — Elevation"));
         Ok(())
@@ -399,78 +420,84 @@ mod tests {
         Ok(())
     }
 
-    fn labels(r: &[BrowserRow]) -> Vec<&str> {
-        r.iter().map(|r| r.label.as_str()).collect()
+    /// (label, heading, fields) per Views-tab row.
+    fn views_tab(r: &[BrowserRow]) -> Vec<(&str, bool, Vec<&str>)> {
+        r.iter().filter(|r| r.tab == VIEWS_TAB).map(|r| (r.label.as_str(), r.heading, r.fields.iter().map(String::as_str).collect())).collect()
     }
 
     #[test]
-    fn sheets_follow_the_views_in_tab_order_and_views_name_their_sheet() -> R {
+    fn views_group_by_kind_and_sheets_list_on_their_own_tab_in_plot_order() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
         let mut s = session()?;
         crate::maintain::install(&mut s);
         let ground = s.execute("lambproject", &json!({}))?["viewId"].as_u64().ok_or("no id")?;
+        // A section created between the two plans stays out of the Plans group (LAMB T670).
+        s.execute("newsectionline", &json!({ "name": "S", "hostViewId": ground, "cutFrom": {"x": 0, "y": 2000}, "cutTo": {"x": 5000, "y": 2000} }))?;
         s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": ground, "floorToFloorMm": 3000, "name": "First" }))?;
-        s.execute("newplan", &json!({ "name": "Sketch" }))?;
-        assert!(!rows(&s)?.iter().any(|r| r.heading), "no Sheets before any sheet exists");
-        let (gf, first, sketch) = ("Ground Floor — Plan · Level 1 +0", "First — Plan · First +3000", "Sketch — Plan (unplaced)");
-        assert_eq!(labels(&rows(&s)?), ["Model", gf, first, sketch]);
-
+        s.start("newdetail")?;
+        s.input(cadcraft_engine::Input::Text("Eaves".into()))?;
+        s.execute("editview", &json!({}))?;
+        assert!(!full(&s)?.iter().any(|r| r.tab == SHEETS_TAB), "no sheets before any sheet exists");
+        assert_eq!(
+            views_tab(&full(&s)?),
+            [
+                ("Model", false, vec![]),
+                ("Plans", true, vec![]),
+                ("Ground Floor", false, vec!["Level 1 +0", ""]),
+                ("First", false, vec!["First +3000", ""]),
+                ("Sections", true, vec![]),
+                ("S", false, vec!["", ""]),
+                ("Details", true, vec![]),
+                ("Eaves", false, vec!["", ""]),
+            ]
+        );
         s.execute("layout", &json!({ "option": "new", "name": "Notes" }))?;
-        assert!(!rows(&s)?.iter().any(|r| r.heading), "a plain layout is not a sheet");
-        s.execute("editview", &json!({ "viewId": ground }))?;
+        assert!(!full(&s)?.iter().any(|r| r.tab == SHEETS_TAB), "a plain layout is not a sheet");
 
         s.execute("sheetset", &json!({}))?;
-        let r = rows(&s)?;
-        assert_eq!(
-            labels(&r),
-            [
-                "Model",
-                "Ground Floor — Plan · Level 1 +0 · A101",
-                "First — Plan · First +3000 · A102",
-                sketch,
-                "Sheets",
-                "A001 — Drawing List",
-                "A101 — Ground Floor",
-                "A102 — First",
-            ],
-            "the unplaced plan is on no sheet, and the Notes layout is off the list"
-        );
-        assert!(r[4].heading && r[4].command.is_none() && r[4].cells.is_empty());
-        assert!(r[5..].iter().all(|r| r.sheet && !r.heading));
-        assert!(r[..5].iter().all(|r| !r.sheet), "view rows and the heading are not sheet rows");
+        s.execute("editview", &json!({}))?;
+        let r = full(&s)?;
+        let sheet_of = |name: &str| r.iter().find(|r| r.label == name).and_then(|r| r.fields.get(1)).cloned().unwrap_or_default();
+        assert_eq!((sheet_of("Ground Floor").as_str(), sheet_of("First").as_str()), ("A101", "A102"));
+        assert!(r.iter().filter(|r| r.heading).all(|r| r.tab == VIEWS_TAB && r.command.is_none() && r.cells.is_empty()), "no Sheets heading");
+        let sheets: Vec<&BrowserRow> = r.iter().filter(|r| r.tab == SHEETS_TAB).collect();
+        let names: Vec<&str> = sheets.iter().map(|r| r.label.as_str()).collect();
+        let mut tabs: Vec<_> =
+            s.doc()?.layouts.iter().filter(|l| crate::titleblock::is_lamb_sheet(l)).map(|l| (l.tab_order, l.name.clone())).collect();
+        tabs.sort();
+        assert_eq!(names, tabs.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(), "plot order; Notes is off the list");
+        assert!(names.len() >= 3 && names[..3] == ["A001", "A101", "A102"], "{names:?}");
+        assert_eq!(sheets[0].fields, ["Drawing List"]);
+        assert_eq!(sheets[1].fields, ["Ground Floor"]);
         let has = |r: &BrowserRow, col: usize| r.cells[col].is_some();
-        assert_eq!(
-            r[5..].iter().map(|r| (has(r, 0), has(r, 1))).collect::<Vec<_>>(),
-            [(false, true), (true, true), (true, false)],
-            "no way off either end"
-        );
-        let up = r[6].cells[0].as_ref().ok_or("no up cell")?;
+        let n = sheets.len();
+        assert!(!has(sheets[0], 0) && has(sheets[0], 1), "the first has no Up");
+        assert!(has(sheets[n - 1], 0) && !has(sheets[n - 1], 1), "the last has no Down");
+        assert!(sheets[1..n - 1].iter().all(|r| has(r, 0) && has(r, 1)));
+        let up = sheets[1].cells[0].as_ref().ok_or("no up cell")?;
         assert!(up.on && up.tip == "Move up in plot order");
         assert_eq!(up.command, ("sheetorder".into(), json!({ "layout": "A101", "step": -1 })));
-        let down = r[6].cells[1].as_ref().ok_or("no down cell")?;
-        assert!(down.on && down.tip == "Move down in plot order");
+        let down = sheets[1].cells[1].as_ref().ok_or("no down cell")?;
         assert_eq!(down.command, ("sheetorder".into(), json!({ "layout": "A101", "step": 1 })));
-        assert_eq!(r[1].command, Some(("editview".into(), json!({ "viewId": ground }))), "the suffix changes only the label");
 
-        let mut tabs: Vec<_> = s.doc()?.layouts.iter().map(|l| (l.tab_order, l.name.clone())).collect();
-        tabs.sort();
-        assert_eq!(tabs.iter().take(3).map(|(_, n)| n.as_str()).collect::<Vec<_>>(), ["A001", "A101", "A102"]);
-
-        let (cmd, params) = r[7].command.clone().ok_or("no command")?;
+        let (cmd, params) = sheets[2].command.clone().ok_or("no command")?;
         assert_eq!((cmd.as_str(), &params), ("layout", &json!({ "option": "set", "name": "A102" })));
         s.execute(&cmd, &params)?;
         assert_eq!(s.state()?.space, Space::Paper("A102".into()));
-        let r = rows(&s)?;
-        assert_eq!(r.iter().filter(|r| r.active).map(|r| r.label.as_str()).collect::<Vec<_>>(), ["A102 — First"], "the sheet alone");
+        let r = full(&s)?;
+        assert_eq!(r.iter().filter(|r| r.active).map(|r| r.label.as_str()).collect::<Vec<_>>(), ["A102"], "the sheet alone");
 
         // A cell moves the sheet and leaves the row's own command alone: A102 stays the current sheet.
-        click(&mut s, &r[7], 0)?;
+        let a102 = r.iter().find(|r| r.label == "A102").ok_or("no A102")?.clone();
+        click(&mut s, &a102, 0)?;
         assert_eq!(s.state()?.space, Space::Paper("A102".into()));
-        assert_eq!(labels(&rows(&s)?)[5..], ["A001 — Drawing List", "A102 — First", "A101 — Ground Floor"]);
+        let after: Vec<String> = full(&s)?.into_iter().filter(|r| r.tab == SHEETS_TAB).map(|r| r.label).collect();
+        assert_eq!(after[..3], ["A001", "A102", "A101"]);
         Ok(())
     }
 
     #[test]
-    fn a_sheet_suffix_leaves_the_cell_tips_alone() -> R {
+    fn a_sheet_field_leaves_the_cell_tips_alone() -> R {
         let _g = crate::overlays::underlay::tests::lock();
         let (mut s, _plan, a, b) = crate::refpane::tests::project()?;
         s.execute("editview", &json!({ "viewId": a.0 }))?;
@@ -478,7 +505,8 @@ mod tests {
         s.execute("editview", &json!({ "viewId": a.0 }))?;
         let r = rows(&s)?;
         let bb = r.iter().find(|r| r.command == Some(("editview".into(), json!({ "viewId": b.0 })))).ok_or("no B-B")?;
-        assert!(bb.label.starts_with("B-B — Section · "), "{}", bb.label);
+        assert_eq!(bb.label, "B-B");
+        assert!(!bb.fields[1].is_empty(), "{bb:?}");
         assert_eq!(bb.cells[0].as_ref().map(|c| c.tip.as_str()), Some("Show B-B — Section in the reference pane"));
         assert_eq!(bb.cells[1].as_ref().map(|c| c.tip.as_str()), Some("Underlay B-B — Section"));
         Ok(())

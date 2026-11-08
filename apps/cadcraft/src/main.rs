@@ -275,8 +275,8 @@ fn install_lamb() {
     if let Err(e) = cadcraft_ui_egui::viewlist::register_row_source(lamb_view_rows) {
         log::warn!("LAMB Views palette not installed: {e}");
     }
-    if let Err(e) = cadcraft_ui_egui::viewlist::register_columns(&lamb_cadcraft::views::BROWSER_COLUMNS) {
-        log::warn!("LAMB Views palette columns not installed: {e}");
+    if let Err(e) = cadcraft_ui_egui::viewlist::register_tabs(&LAMB_VIEW_TABS) {
+        log::warn!("LAMB Views palette tabs not installed: {e}");
     }
     if let Err(e) = cadcraft_ui_egui::chatpane::register_backend(LAMB_CHAT) {
         log::warn!("LAMB Assistant palette not installed: {e}");
@@ -322,22 +322,29 @@ fn version_string() -> String {
     format!("cadcraft {}", cadcraft_engine::build_version())
 }
 
+/// The Views palette's tabs (fork, LAMB T659): `lamb_cadcraft::views::BROWSER_TABS`.
+static LAMB_VIEW_TABS: [cadcraft_ui_egui::viewlist::Tab; 2] = {
+    use cadcraft_ui_egui::viewlist::Tab;
+    let [(n0, t0, i0), (n1, t1, i1)] = lamb_cadcraft::views::BROWSER_TABS;
+    [Tab { name: n0, text_columns: t0, icon_columns: i0 }, Tab { name: n1, text_columns: t1, icon_columns: i1 }]
+};
+
 /// The Views palette's rows (fork, LAMB T343): LAMB's view browser as generic list rows.
 fn lamb_view_rows(d: &cadcraft_engine::doc::Drawing, edit: &cadcraft_engine::doc::Space) -> Vec<cadcraft_ui_egui::viewlist::Row> {
     lamb_cadcraft::views::browser_rows(d, edit)
         .into_iter()
         .map(|r| {
             use cadcraft_ui_egui::{icons::Icon, viewlist};
-            // The columns of `lamb_cadcraft::views::BROWSER_COLUMNS`: Ref (a split pane), Underlay; a
-            // sheet row's two cells move it in plot order.
-            let icons = if r.sheet { [Icon::MoveUp, Icon::MoveDown] } else { [Icon::Workspace, Icon::Layers] };
+            // The icon columns of `lamb_cadcraft::views::BROWSER_TABS`: on the Views tab Ref (a split
+            // pane) and Underlay; on the Sheets tab, move up and down in plot order.
+            let icons = if r.tab == lamb_cadcraft::views::SHEETS_TAB { [Icon::MoveUp, Icon::MoveDown] } else { [Icon::Workspace, Icon::Layers] };
             let cells = r
                 .cells
                 .into_iter()
                 .zip(icons)
                 .map(|(c, icon)| c.map(|c| viewlist::Cell { icon, on: c.on, tip: c.tip, command: c.command }))
                 .collect();
-            viewlist::Row { label: r.label, active: r.active, heading: r.heading, command: r.command, cells }
+            viewlist::Row { label: r.label, active: r.active, heading: r.heading, tab: r.tab, fields: r.fields, command: r.command, cells }
         })
         .collect()
 }

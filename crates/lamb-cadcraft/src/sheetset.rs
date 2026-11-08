@@ -2393,7 +2393,7 @@ mod tests {
         let list: Vec<&str> = list.as_array().ok_or("no list")?.iter().filter_map(|l| l["name"].as_str()).collect();
         assert_eq!(list, tabs(&s)?, "layout list");
         let rows = crate::views::browser_rows(s.doc()?, &s.state()?.space);
-        let row_names: Vec<&str> = rows.iter().filter(|r| r.sheet).filter_map(|r| r.label.split(" — ").next()).collect();
+        let row_names: Vec<&str> = rows.iter().filter(|r| r.tab == crate::views::SHEETS_TAB).map(|r| r.label.as_str()).collect();
         assert_eq!(row_names, names, "palette rows");
 
         // SHEETORDER leaves the Drawing List to the next SHEETSET, and that run keeps the order.

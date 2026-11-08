@@ -622,9 +622,15 @@ pub fn start_page(app: &mut CadApp, ui: &mut egui::Ui) {
     }
 }
 
-/// Fork (LAMB T525, T606): the rows the views popup lists — every clickable row, Model included.
+/// Fork (LAMB T525, T606, T659): the rows the views popup lists — every clickable row of the
+/// first tab, Model included (the layout tabs already reach the other tabs' sheets).
 fn view_choices(rows: Vec<crate::viewlist::Row>) -> Vec<crate::viewlist::Row> {
-    rows.into_iter().filter(|r| !r.heading && r.command.is_some()).collect()
+    rows.into_iter().filter(|r| r.tab == 0 && !r.heading && r.command.is_some()).collect()
+}
+
+/// Fork (LAMB T659): a popup entry's text, the row's label then its non-empty fields, ` · `-joined.
+fn view_choice_text(row: &crate::viewlist::Row) -> String {
+    std::iter::once(row.label.as_str()).chain(row.fields.iter().map(String::as_str).filter(|f| !f.is_empty())).collect::<Vec<_>>().join(" · ")
 }
 
 /// Fork (LAMB T525): the room the views button takes right of the Model tab: none when Model is
@@ -664,7 +670,7 @@ fn view_list_popup(ui: &mut egui::Ui, rows: &[crate::viewlist::Row]) -> Option<(
     let mut chosen = None;
     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
         for row in rows {
-            if ui.add(egui::Button::selectable(row.active, row.label.as_str()).truncate()).clicked() {
+            if ui.add(egui::Button::selectable(row.active, view_choice_text(row)).truncate()).clicked() {
                 chosen = row.command.clone();
                 ui.close();
             }
@@ -682,6 +688,8 @@ mod tests {
             label: label.into(),
             active,
             heading,
+            tab: 0,
+            fields: vec![],
             command: (!heading).then(|| ("editview".to_string(), json!({ "view": label }))),
             cells: vec![],
         }
@@ -689,9 +697,16 @@ mod tests {
 
     #[test]
     fn the_views_popup_lists_views_and_returns_the_clicked_command() {
-        let rows = vec![row("Plans", true, false), row("Model", false, true), row("Level 1", false, false), row("Section A", false, true)];
+        let mut level = row("Level 1", false, false);
+        level.fields = vec!["Level 1 +0".into(), "A101".into()];
+        let mut section = row("Section A", false, true);
+        section.fields = vec!["unplaced".into(), String::new()];
+        let mut sheet = row("A101", false, false);
+        sheet.tab = 1;
+        let rows = vec![row("Plans", true, false), row("Model", false, true), level, section, sheet];
         let views = view_choices(rows);
-        assert_eq!(views.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["Model", "Level 1", "Section A"]);
+        assert_eq!(views.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["Model", "Level 1", "Section A"], "no sheets");
+        assert_eq!(views.iter().map(view_choice_text).collect::<Vec<_>>(), ["Model", "Level 1 · Level 1 +0 · A101", "Section A · unplaced"]);
         assert!(views_width(&views) > 0.0);
         // No source (no rows) or only Model and headings: no button.
         assert!(view_choices(vec![]).is_empty());
@@ -709,7 +724,8 @@ mod tests {
         h.run();
         use egui_kittest::kittest::Queryable;
         assert!(h.query_by_label("Model").is_some());
-        h.get_by_label("Section A").click();
+        assert!(h.query_by_label("Level 1 · Level 1 +0 · A101").is_some());
+        h.get_by_label("Section A · unplaced").click();
         h.run();
         assert_eq!(h.state().1, Some(("editview".to_string(), json!({ "view": "Section A" }))));
     }
