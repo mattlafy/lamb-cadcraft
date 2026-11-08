@@ -372,3 +372,34 @@ fn plot_path_extension_picks_the_format_like_export() {
     assert!(!dir.join("w.png").exists(), "nothing written when `output` and the path disagree");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A layout's first paper view shows the whole sheet in the page's own units: an A1 page in
+/// millimetres on a MEASUREMENT 0 drawing opens on the 841 x 594 sheet, not on its corner.
+#[test]
+fn first_paper_view_is_the_sheet_in_its_page_units() {
+    let mut s = session_with_model();
+    s.doc_mut().unwrap().header.set_i64("MEASUREMENT", 0);
+    for (name, mm) in [("A1mm", true), ("A1in", false)] {
+        s.execute("layout.new", &json!({"name": name})).unwrap();
+        let l = s.doc_mut().unwrap().layouts.iter_mut().find(|l| l.name == name).unwrap();
+        l.page.width_mm = 594.0;
+        l.page.height_mm = 841.0;
+        l.page.landscape = true;
+        l.page.paper_mm = mm;
+    }
+    s.execute("layout.set", &json!({"name": "A1mm"})).unwrap();
+    let v = s.state().unwrap().view();
+    assert!(v.center.near(Vec2::new(420.5, 297.0), 1e-6), "{:?}", v.center);
+    assert!(v.height >= 594.0);
+    s.execute("layout.set", &json!({"name": "A1in"})).unwrap();
+    let v = s.state().unwrap().view();
+    assert!(v.center.near(Vec2::new(420.5 / 25.4, 297.0 / 25.4), 1e-6), "{:?}", v.center);
+    assert!((v.height - 594.0 / 25.4 * 1.15).abs() < 1e-6);
+    // A later visit keeps the view the user left.
+    s.execute("layout.set", &json!({"name": "A1mm"})).unwrap();
+    let panned = crate::View { center: Vec2::new(10.0, 20.0), height: 100.0, twist: 0.0 };
+    s.state_mut().unwrap().set_view(panned);
+    s.execute("layout.set", &json!({"name": "Model"})).unwrap();
+    s.execute("layout.set", &json!({"name": "A1mm"})).unwrap();
+    assert_eq!(s.state().unwrap().view(), panned);
+}
