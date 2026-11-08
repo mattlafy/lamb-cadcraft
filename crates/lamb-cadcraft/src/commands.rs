@@ -28,6 +28,9 @@
 //!   existing sheets keep their size — see [`crate::sheetset`].
 //! - `titleblock {project?, client?, address?, drawnBy?, date?, north?}` (`tblock`): the text every
 //!   sheet's title block shows and project north, in one undo step — see [`crate::titleblock`].
+//! - `issue {description, date?}` / `issue {remove}` (`iss`): adds an issue of the set (numbered one
+//!   past the highest, dated today unless given) or removes one; every sheet's title strip lists the
+//!   latest six — see [`crate::titleblock`].
 //! - `bomtable {layout?, at?}` (`bom`): the framing BOM — repeat copies and placed corner and jamb
 //!   details counted per level — as a table on layout `BOM` — see [`crate::bom`].
 //! - `openingschedule {layout?, at?}` (`osch`): the door and window schedule, marks computed in row
@@ -889,6 +892,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["tblock"])
             .params("{project?, client?, address?, drawnBy?, date?, north?} → {project, client, address, drawnBy, date, north}")
             .interactive(crate::titleblock::titleblock_machine),
+        CommandSpec::new("issue", "Issue", crate::titleblock::issue)
+            .alias(&["iss"])
+            .params("{description, date?} | {remove} → {issues, message}")
+            .interactive(crate::titleblock::issue_machine),
         CommandSpec::new("bomtable", "Framing BOM", crate::bom::bomtable)
             .alias(&["bom"])
             .params("{layout?, at?}")

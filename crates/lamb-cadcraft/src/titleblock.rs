@@ -9,8 +9,15 @@
 //! millimetres says so in a suffix). The block holds the printable-area rectangle, a strip down
 //! its right edge ([`crate::sheets::frame_strip_width`]) and the strip's horizontal dividers. The
 //! Insert's attributes, bottom up and with Lock position set: `SHEET` (the layout name, largest
-//! text), `TITLE` ([`sheet_title`]), `SCALE`, `DATE`, `DRAWN`, `ADDRESS`, `CLIENT`, `PROJECT`. A
-//! long value is narrowed to fit its cell.
+//! text), `TITLE` ([`sheet_title`]), `SCALE`, `DATE`, `DRAWN`, `ADDRESS`, `CLIENT`, `PROJECT`,
+//! then `ISSUE1`…`ISSUE6`. A long value is narrowed to fit its cell. Each of the eight cells carries
+//! its name (`Project`, `Sheet`…) as small text in its top-left corner, part of the block.
+//!
+//! Above `PROJECT` is the ISSUES area: a heading row (`No.`, `Date`, `Description`, in the block) over
+//! [`ISSUE_ROWS`] rows, the attributes `ISSUE1`…, which hold the latest issues, `ISSUE1` (the bottom
+//! row) the oldest shown, each `<n>  <date>  <description>`; unused rows are empty. Issues are
+//! set-wide: every sheet lists the same ones. The whole strip shrinks by one factor to fit a narrow
+//! strip or a short page.
 //!
 //! `PROJECT` is `LambDocument.sheet_info.project`, or else the document's name; `CLIENT`,
 //! `ADDRESS`, `DRAWN` and `DATE` are stored text, empty until set. `SCALE` is the common label of
@@ -19,12 +26,18 @@
 //! [`titleblock_observer`] reconciles every layout after every command: a frame that is off is
 //! updated in place (same handle), so one moved by hand snaps back; a missing one is added, an extra
 //! one erased; and the drawing is written back only when something changed, so the change lands in
-//! the command's own undo step.
+//! the command's own undo step. A frame block whose contents are not what its page wants (one made
+//! before the labels and the ISSUES area) is rebuilt in place under the same name.
 //!
 //! `titleblock {project?, client?, address?, drawnBy?, date?, north?}` (`tblock`) sets the given ones
 //! in one undo step and returns all six. `north` is project north, degrees clockwise from the
 //! project's global +Y, and turns the arrows of plan drawing titles ([`crate::vptitles`]). Typed,
 //! `Enter an option [Project/Client/Address/Drawnby/Date/North]:` then the value, looping until Enter.
+//!
+//! `issue {description, date?}` (`iss`) adds an issue numbered one past the highest so far, dated
+//! today (UTC, `YYYY-MM-DD`) unless `date` is given; `issue {remove: n}` removes issue `n`, and the
+//! others keep their numbers. An empty description is refused. One undo step each; returns
+//! `{issues: [{number, date, description}], message}`. Typed, `Issue description:` then `Date <today>:`.
 
 use std::sync::Arc;
 
@@ -38,11 +51,12 @@ use lamb_core::model::{AnyView, Id};
 use serde_json::{Value, json};
 
 use crate::commands::{bad, name_input, other};
-use crate::schema::{EXT_KEY, LambDocument, SheetInfo, read_document, read_entity_data, view_block_name, write_document};
+use crate::schema::{EXT_KEY, Issue, LambDocument, SheetInfo, read_document, read_entity_data, view_block_name, write_document};
 use crate::sheets::{SHEET_MARGIN_MM, frame_strip_width, numbered_viewports, viewport_scale};
 use crate::vptitles::scale_label;
 
 const CMD: &str = "titleblock";
+const ISSUE_CMD: &str = "issue";
 /// Every frame block's name starts with this.
 const FRAME_PREFIX: &str = "LAMB_SHEETFRAME_";
 /// The layer frames are placed on.
@@ -59,6 +73,17 @@ const CELLS: [(&str, f64, f64); 8] = [
     ("CLIENT", 14.0, 3.5),
     ("PROJECT", 20.0, 5.0),
 ];
+/// How many issues the strip lists: the latest ones.
+pub const ISSUE_ROWS: usize = 6;
+const ISSUE_TAGS: [&str; ISSUE_ROWS] = ["ISSUE1", "ISSUE2", "ISSUE3", "ISSUE4", "ISSUE5", "ISSUE6"];
+/// An issue row's height and text height, mm; the heading row is the same.
+const ISSUE_ROW_MM: f64 = 7.0;
+const ISSUE_TEXT_MM: f64 = 2.5;
+/// The heading's words, each at an offset in characters of issue text, matching `<n>  <date>  `.
+const ISSUE_HEADING: [(&str, f64); 3] = [("No.", 0.0), ("Date", 3.0), ("Description", 15.0)];
+/// A cell label's text height, and its inset from the cell's top-left corner, mm.
+const LABEL_MM: f64 = 1.8;
+const LABEL_INSET_MM: f64 = 1.0;
 /// The strip width the cells and text heights are sized for, mm; a narrower strip shrinks them.
 const FULL_STRIP_MM: f64 = 70.0;
 const CELL_PAD_MM: f64 = 3.0;
@@ -72,7 +97,12 @@ struct Geometry {
     strip_x: f64,
     /// Per [`CELLS`] entry: (bottom y, cell height, text height).
     cells: [(f64, f64, f64); CELLS.len()],
+    /// Per issue row, bottom up, then the heading row: (bottom y, row height, text height).
+    issues: [(f64, f64, f64); ISSUE_ROWS + 1],
     pad: f64,
+    /// A cell label's text height and inset.
+    label: f64,
+    inset: f64,
 }
 
 fn printable(sheet: &Sheet) -> cadcraft_geom::Bounds2 {
@@ -83,15 +113,32 @@ fn geometry(sheet: &Sheet) -> Geometry {
     let p = printable(sheet);
     let strip = frame_strip_width(sheet);
     let mm = 1.0 / sheet.unit_mm;
-    let full_height: f64 = CELLS.iter().map(|c| c.1).sum();
+    let full_height: f64 = CELLS.iter().map(|c| c.1).sum::<f64>() + (ISSUE_ROWS + 1) as f64 * ISSUE_ROW_MM;
     let k = (strip / (FULL_STRIP_MM * mm)).min(p.height() / (full_height * mm)).min(1.0);
     let mut y = p.min.y;
-    let cells = CELLS.map(|(_, cell, text)| {
+    let mut row = |cell: f64, text: f64| {
         let c = (y, cell * k * mm, text * k * mm);
         y += c.1;
         c
-    });
-    Geometry { min: (p.min.x, p.min.y), max: (p.max.x, p.max.y), strip_x: p.max.x - strip, cells, pad: CELL_PAD_MM * k * mm }
+    };
+    let cells = CELLS.map(|(_, cell, text)| row(cell, text));
+    let issues = [(); ISSUE_ROWS + 1].map(|()| row(ISSUE_ROW_MM, ISSUE_TEXT_MM));
+    Geometry {
+        min: (p.min.x, p.min.y),
+        max: (p.max.x, p.max.y),
+        strip_x: p.max.x - strip,
+        cells,
+        issues,
+        pad: CELL_PAD_MM * k * mm,
+        label: LABEL_MM * k * mm,
+        inset: LABEL_INSET_MM * k * mm,
+    }
+}
+
+/// `PROJECT` → `Project`.
+fn title_case(tag: &str) -> String {
+    let mut c = tag.chars();
+    c.next().map_or_else(String::new, |f| f.to_string() + &c.as_str().to_ascii_lowercase())
 }
 
 /// The block a page's frame uses; only pages drawn alike share one.
@@ -113,6 +160,11 @@ fn block_name(sheet: &Sheet) -> String {
 /// One attribute a frame wants: (tag, place, text height, width factor, value).
 type WantedAttrib = (&'static str, Vec3, f64, f64, String);
 
+/// Every attribute's tag, in order: the cells, then the issue rows.
+fn tags() -> impl Iterator<Item = &'static str> {
+    CELLS.iter().map(|c| c.0).chain(ISSUE_TAGS)
+}
+
 /// One sheet's wanted frame.
 #[derive(Clone, Debug, PartialEq)]
 struct Wanted {
@@ -120,21 +172,25 @@ struct Wanted {
     attribs: Vec<WantedAttrib>,
 }
 
+fn text(p: Vec3, height: f64, width_factor: f64, value: &str) -> Text {
+    Text {
+        insert: p,
+        align_pt: Some(p),
+        height,
+        value: value.into(),
+        rotation: 0.0,
+        width_factor,
+        oblique: 0.0,
+        style: "Standard".into(),
+        halign: HAlign::Left,
+        valign: VAlign::Baseline,
+    }
+}
+
 fn attrib(tag: &str, p: Vec3, height: f64, width_factor: f64, value: &str) -> Attrib {
     Attrib {
         tag: tag.into(),
-        text: Text {
-            insert: p,
-            align_pt: Some(p),
-            height,
-            value: value.into(),
-            rotation: 0.0,
-            width_factor,
-            oblique: 0.0,
-            style: "Standard".into(),
-            halign: HAlign::Left,
-            valign: VAlign::Baseline,
-        },
+        text: text(p, height, width_factor, value),
         invisible: false,
         constant: false,
         prompt: String::new(),
@@ -144,21 +200,40 @@ fn attrib(tag: &str, p: Vec3, height: f64, width_factor: f64, value: &str) -> At
     }
 }
 
-/// The frame a sheet wants, its values in [`CELLS`] order.
-fn wanted(sheet: &Sheet, values: [String; CELLS.len()]) -> Wanted {
+/// The frame a sheet wants, its values in [`tags`] order (missing ones empty).
+fn wanted(sheet: &Sheet, values: Vec<String>) -> Wanted {
     let g = geometry(sheet);
     let room = g.max.0 - g.strip_x - 2.0 * g.pad;
-    let attribs = CELLS
-        .iter()
-        .zip(g.cells)
-        .zip(values)
-        .map(|((c, (bottom, cell, text)), value)| {
+    // A cell's value is centred in the room below its label; an issue row's in the row.
+    let label_zone = g.label + 2.0 * g.inset;
+    let baselines = g.cells.iter().map(|(bottom, cell, text)| (*bottom + (cell - label_zone - text) / 2.0, *text));
+    let baselines = baselines.chain(g.issues.iter().take(ISSUE_ROWS).map(|(bottom, row, text)| (*bottom + (row - text) / 2.0, *text)));
+    let mut values = values.into_iter();
+    let attribs = tags()
+        .zip(baselines)
+        .map(|(tag, (y, text))| {
+            let value = values.next().unwrap_or_default();
             let advance = value.chars().count() as f64 * text * CHAR_ADVANCE;
             let width_factor = if advance > room { room / advance } else { 1.0 };
-            (c.0, Vec3::new(g.strip_x + g.pad, bottom + (cell - text) / 2.0, 0.0), text, width_factor, value)
+            (tag, Vec3::new(g.strip_x + g.pad, y, 0.0), text, width_factor, value)
         })
         .collect();
     Wanted { block: block_name(sheet), attribs }
+}
+
+/// What an issue row says: `<n>  <date>  <description>`.
+fn issue_line(i: &Issue) -> String {
+    format!("{}  {}  {}", i.number, i.date, i.description)
+}
+
+/// The issue rows' values, bottom up: the latest [`ISSUE_ROWS`] issues, oldest first, then empties.
+fn issue_values(issues: &[Issue]) -> Vec<String> {
+    let mut sorted: Vec<&Issue> = issues.iter().collect();
+    sorted.sort_by_key(|i| i.number);
+    let shown = sorted.iter().skip(sorted.len().saturating_sub(ISSUE_ROWS));
+    let mut out: Vec<String> = shown.map(|i| issue_line(i)).collect();
+    out.resize(ISSUE_ROWS, String::new());
+    out
 }
 
 fn insert_of(w: &Wanted) -> Insert {
@@ -300,24 +375,24 @@ fn plan(d: &Drawing) -> std::result::Result<Vec<LayoutPlan>, String> {
             [one] => one.clone(),
             _ => "As noted".to_owned(),
         };
-        let w = wanted(
-            &sheet,
-            [
-                l.name.clone(),
-                sheet_title(d, &doc, &l.name),
-                scale,
-                info.date.clone(),
-                info.drawn_by.clone(),
-                info.address.clone(),
-                info.client.clone(),
-                project.clone(),
-            ],
-        );
+        let mut values = vec![
+            l.name.clone(),
+            sheet_title(d, &doc, &l.name),
+            scale,
+            info.date.clone(),
+            info.drawn_by.clone(),
+            info.address.clone(),
+            info.client.clone(),
+            project.clone(),
+        ];
+        values.extend(issue_values(&info.issues));
+        let w = wanted(&sheet, values);
+        let stale = d.block(&w.block).is_some_and(|b| !block_is(b, &frame_contents(&sheet)));
         let mut lp = LayoutPlan { layout: l.name.clone(), ..LayoutPlan::default() };
         match frames.next() {
             Some(e) => {
                 if let Some(i) = frame_of(e)
-                    && !matches(e, i, &w)
+                    && (stale || !matches(e, i, &w))
                 {
                     lp.update = Some((e.handle, w));
                 }
@@ -332,22 +407,52 @@ fn plan(d: &Drawing) -> std::result::Result<Vec<LayoutPlan>, String> {
     Ok(out)
 }
 
-/// A page's block definition: the printable rectangle, the strip's edge and its dividers, on layer
-/// `0`.
-fn ensure_block(d: &mut Drawing, name: &str, sheet: &Sheet) -> std::result::Result<(), String> {
-    if d.block(name).is_some() {
-        return Ok(());
-    }
-    d.blocks.insert(name.into(), Arc::new(Block::new(name)));
-    let space = Space::Block(name.into());
+/// What a page's frame block holds: the printable rectangle, the strip's edge, a divider above every
+/// cell and issue row, each cell's label in its top-left corner and the ISSUES heading.
+fn frame_contents(sheet: &Sheet) -> Vec<EntityKind> {
     let g = geometry(sheet);
     let (x0, y0, x1, y1) = (g.min.0, g.min.1, g.max.0, g.max.1);
     let mut segments =
         vec![((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)), ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0)), ((g.strip_x, y0), (g.strip_x, y1))];
-    segments.extend(g.cells.iter().map(|(bottom, cell, _)| ((g.strip_x, bottom + cell), (x1, bottom + cell))));
-    for (a, b) in segments {
-        let line = Line { a: Vec3::new(a.0, a.1, 0.0), b: Vec3::new(b.0, b.1, 0.0) };
-        d.add(&space, Common { layer: "0".into(), ..Common::default() }, EntityKind::Line(line)).map_err(|e| e.to_string())?;
+    segments.extend(g.cells.iter().chain(&g.issues).map(|(bottom, cell, _)| ((g.strip_x, bottom + cell), (x1, bottom + cell))));
+    let mut out: Vec<EntityKind> =
+        segments.into_iter().map(|(a, b)| EntityKind::Line(Line { a: Vec3::new(a.0, a.1, 0.0), b: Vec3::new(b.0, b.1, 0.0) })).collect();
+    for ((tag, ..), (bottom, cell, _)) in CELLS.iter().zip(g.cells) {
+        let at = Vec3::new(g.strip_x + g.inset, bottom + cell - g.inset - g.label, 0.0);
+        out.push(EntityKind::Text(text(at, g.label, 1.0, &title_case(tag))));
+    }
+    if let Some((bottom, row, h)) = g.issues.last().copied() {
+        for (word, chars) in ISSUE_HEADING {
+            let at = Vec3::new(g.strip_x + g.pad + chars * h * CHAR_ADVANCE, bottom + (row - h) / 2.0, 0.0);
+            out.push(EntityKind::Text(text(at, h, 1.0, word)));
+        }
+    }
+    out
+}
+
+/// Whether block `b` holds `want`, within drawing tolerance (so a DXF round trip still matches).
+fn block_is(b: &Block, want: &[EntityKind]) -> bool {
+    let have: Vec<&EntityKind> = b.entities.iter().map(|e| &e.kind).collect();
+    have.len() == want.len()
+        && have.iter().zip(want).all(|(h, w)| match (h, w) {
+            (EntityKind::Line(h), EntityKind::Line(w)) => near(h.a, w.a) && near(h.b, w.b),
+            (EntityKind::Text(h), EntityKind::Text(w)) => {
+                h.value == w.value && near(h.insert, w.insert) && (h.height - w.height).abs() <= TOLERANCE.coincidence_mm
+            }
+            _ => false,
+        })
+}
+
+/// A page's block definition, on layer `0`: made when missing, rebuilt when it holds anything else.
+fn ensure_block(d: &mut Drawing, name: &str, sheet: &Sheet) -> std::result::Result<(), String> {
+    let want = frame_contents(sheet);
+    if d.block(name).is_some_and(|b| block_is(b, &want)) {
+        return Ok(());
+    }
+    d.blocks.insert(name.into(), Arc::new(Block::new(name)));
+    let space = Space::Block(name.into());
+    for kind in want {
+        d.add(&space, Common { layer: "0".into(), ..Common::default() }, kind).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -436,6 +541,92 @@ pub(crate) fn titleblock(s: &mut Session, p: &Value) -> Result<Value> {
         write_document(s.doc_mut()?, &doc).map_err(other)?;
     }
     Ok(info_json(&info))
+}
+
+/// Today, UTC, `YYYY-MM-DD`.
+fn today() -> String {
+    let now = crate::maintain::now();
+    now.get(..10).unwrap_or(&now).to_owned()
+}
+
+fn issues_json(issues: &[Issue]) -> Value {
+    Value::Array(issues.iter().map(|i| json!({ "number": i.number, "date": i.date, "description": i.description })).collect())
+}
+
+/// An optional string parameter, trimmed; absent or null is empty.
+fn text_param(p: &Value, key: &str) -> Result<String> {
+    match p.get(key).filter(|v| !v.is_null()) {
+        Some(v) => Ok(v.as_str().ok_or_else(|| bad(ISSUE_CMD, &format!("`{key}` must be a string")))?.trim().to_owned()),
+        None => Ok(String::new()),
+    }
+}
+
+pub(crate) fn issue(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut doc = read_document(s.doc()?).map_err(other)?;
+    let mut info = doc.sheet_info.clone().unwrap_or_default();
+    let message = if let Some(v) = p.get("remove").filter(|v| !v.is_null()) {
+        let n = v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| bad(ISSUE_CMD, "`remove` must be an issue number"))?;
+        let before = info.issues.len();
+        info.issues.retain(|i| i.number != n);
+        if info.issues.len() == before {
+            return Err(bad(ISSUE_CMD, &format!("there is no issue {n}")));
+        }
+        format!("Issue {n} removed.")
+    } else {
+        let description = text_param(p, "description")?;
+        if description.is_empty() {
+            return Err(bad(ISSUE_CMD, "an issue needs a description"));
+        }
+        let date = text_param(p, "date")?;
+        let date = if date.is_empty() { today() } else { date };
+        let number = info.issues.iter().map(|i| i.number).max().unwrap_or(0) + 1;
+        let m = format!("Issue {number} added: {date} {description}.");
+        info.issues.push(Issue { number, date, description });
+        m
+    };
+    doc.sheet_info = Some(info.clone());
+    write_document(s.doc_mut()?, &doc).map_err(other)?;
+    Ok(json!({ "issues": issues_json(&info.issues), "message": message }))
+}
+
+/// ISSUE at the command line: the description, then the date (today by default).
+struct IssueMachine {
+    description: Option<String>,
+}
+
+impl Interactive for IssueMachine {
+    fn name(&self) -> &'static str {
+        ISSUE_CMD
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        match self.description {
+            None => Prompt::new("Issue description", Accept::TEXT),
+            Some(_) => Prompt::new("Date", Accept::TEXT).default(today()),
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let Some(description) = self.description.clone() else {
+            let Some(text) = name_input(i, "") else { return Ok(Step::Continue) };
+            if text.is_empty() {
+                return Ok(Step::Cancel);
+            }
+            self.description = Some(text);
+            return Ok(Step::Continue);
+        };
+        let Some(date) = name_input(i, &today()) else { return Ok(Step::Continue) };
+        let r = issue(s, &json!({ "description": description, "date": date }))?;
+        if let Some(m) = r["message"].as_str() {
+            s.echo(m.to_owned());
+        }
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn issue_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(IssueMachine { description: None }))
 }
 
 /// (keyword, parameter, prompt).
@@ -590,14 +781,15 @@ mod tests {
         let i = &f[0].1;
         assert_eq!(f[0].2, FRAME_LAYER);
         assert_eq!((i.insert.x, i.insert.y), (0.0, 0.0));
-        assert_eq!(i.attribs.iter().map(|a| a.tag.as_str()).collect::<Vec<_>>(), CELLS.map(|c| c.0));
+        assert_eq!(i.attribs.iter().map(|a| a.tag.as_str()).collect::<Vec<_>>(), tags().collect::<Vec<_>>());
         assert!(i.attribs.iter().all(|a| a.modes.lock_position && !a.invisible));
         assert!(i.attribs.windows(2).all(|p| p[0].text.insert.y < p[1].text.insert.y), "bottom up");
         assert!(i.attribs[0].text.height > i.attribs[1].text.height, "SHEET is largest");
         assert_eq!(i.block, "LAMB_SHEETFRAME_914X610");
-        // The printable rectangle, the strip's edge and the eight dividers, one definition.
+        // The printable rectangle, the strip's edge, eight cell and seven issue dividers, eight
+        // labels and three heading words; one definition.
         let def = s.doc()?.block(&i.block).ok_or("no definition")?;
-        assert_eq!(def.entities.len(), 13);
+        assert_eq!(def.entities.len(), 5 + 8 + 7 + 8 + 3);
         assert_eq!(frames(&s, "A102")?[0].1.block, i.block);
         let layer = s.doc()?.layer(FRAME_LAYER).ok_or("no layer")?;
         assert!(layer.plot && layer.color == Color::Index(7));
@@ -644,13 +836,179 @@ mod tests {
             }
             assert_eq!(n, 3, "{paper}");
             // The strip's cells fit the page, and a long value is narrowed to fit its cell.
-            assert!(g.cells[7].0 + g.cells[7].1 <= g.max.1 + 1e-9, "{paper}");
+            assert!(g.issues[ISSUE_ROWS].0 + g.issues[ISSUE_ROWS].1 <= g.max.1 + 1e-9, "{paper}");
             s.execute("titleblock", &json!({ "address": "x".repeat(200) }))?;
             let i = frames(&s, "A501")?.remove(0).1;
             let a = i.attribs.iter().find(|a| a.tag == "ADDRESS").ok_or("no ADDRESS")?;
             let width = 200.0 * a.text.height * CHAR_ADVANCE * a.text.width_factor;
             assert!(a.text.insert.x + width <= g.max.0, "{paper}");
         }
+        Ok(())
+    }
+
+    /// The frame block's texts: (value, insert).
+    fn block_texts(s: &Session, block: &str) -> T<Vec<(String, Vec3, f64)>> {
+        let def = s.doc()?.block(block).ok_or("no definition")?;
+        Ok(def
+            .entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Text(t) => Some((t.value.clone(), t.insert, t.height)),
+                _ => None,
+            })
+            .collect())
+    }
+
+    #[test]
+    fn issues_number_up_and_every_sheet_lists_the_latest_six() -> R {
+        let mut s = two_plans()?;
+        s.execute("sheetset", &json!({}))?;
+        let n = undo_len(&s)?;
+        for (k, d) in ["Issued for review", "Issued for permit", "Issued for tender"].iter().enumerate() {
+            let r = s.execute("issue", &json!({ "description": d, "date": format!("2026-11-0{}", k + 1) }))?;
+            assert_eq!(r["issues"].as_array().map(Vec::len), Some(k + 1));
+            assert_eq!(r["issues"][k]["number"], json!(k + 1));
+        }
+        assert_eq!(undo_len(&s)?, n + 3, "one undo step each, the frames in it");
+        for name in ["A101", "A102"] {
+            let i = frames(&s, name)?.remove(0).1;
+            assert_eq!(
+                ["ISSUE1", "ISSUE2", "ISSUE3", "ISSUE4"].map(|t| val(&i, t)),
+                ["1  2026-11-01  Issued for review", "2  2026-11-02  Issued for permit", "3  2026-11-03  Issued for tender", ""].map(str::to_owned),
+                "{name}"
+            );
+        }
+        let handle = frames(&s, "A101")?[0].0;
+        s.undo()?;
+        assert_eq!(val(&frames(&s, "A101")?[0].1, "ISSUE3"), "", "undo takes the row with it");
+        s.redo()?;
+
+        // Removing keeps the others' numbers; the next one is one past the highest.
+        let r = s.execute("issue", &json!({ "remove": 2 }))?;
+        assert_eq!(r["issues"].as_array().map(|a| a.iter().map(|i| i["number"].clone()).collect::<Vec<_>>()), Some(vec![json!(1), json!(3)]));
+        let i = frames(&s, "A101")?.remove(0).1;
+        assert_eq!(val(&i, "ISSUE2"), "3  2026-11-03  Issued for tender");
+        assert_eq!(val(&i, "ISSUE3"), "");
+        assert!(s.execute("issue", &json!({ "remove": 2 })).is_err(), "no issue 2 now");
+        let r = s.execute("issue", &json!({ "description": "Rev" }))?;
+        assert_eq!(r["issues"][2]["number"], json!(4));
+        let today = r["issues"][2]["date"].as_str().unwrap_or_default().to_owned();
+        assert!(today.len() == 10 && today.as_bytes()[4] == b'-' && today.as_bytes()[7] == b'-', "{today}");
+
+        // Removing the latest frees its number.
+        s.execute("issue", &json!({ "remove": 4 }))?;
+        let r = s.execute("issue", &json!({ "description": "Again", "date": "d" }))?;
+        assert_eq!(r["issues"][2]["number"], json!(4));
+
+        // Eight issues: the strip shows 3…8, oldest at the bottom.
+        let mut e = two_plans()?;
+        e.execute("sheetset", &json!({}))?;
+        for k in 1..=8 {
+            e.execute("issue", &json!({ "description": format!("I{k}"), "date": "d" }))?;
+        }
+        let i = frames(&e, "A102")?.remove(0).1;
+        assert_eq!(ISSUE_TAGS.map(|t| val(&i, t)), ["3  d  I3", "4  d  I4", "5  d  I5", "6  d  I6", "7  d  I7", "8  d  I8"].map(str::to_owned));
+        assert_eq!(frames(&s, "A101")?[0].0, handle, "updated in place");
+
+        // An empty description is refused and changes nothing.
+        let n = undo_len(&s)?;
+        assert!(s.execute("issue", &json!({ "description": "  " })).is_err());
+        assert!(s.execute("issue", &json!({})).is_err());
+        assert_eq!(undo_len(&s)?, n);
+        Ok(())
+    }
+
+    #[test]
+    fn cells_carry_labels_above_their_values() -> R {
+        let mut s = two_plans()?;
+        s.execute("sheetset", &json!({}))?;
+        let i = frames(&s, "A101")?.remove(0).1;
+        let texts = block_texts(&s, &i.block)?;
+        for (tag, ..) in CELLS {
+            let label = title_case(tag);
+            let (_, at, h) = texts.iter().find(|t| t.0 == label).ok_or(format!("no label {label}"))?;
+            let a = i.attribs.iter().find(|a| a.tag == tag).ok_or("no attrib")?;
+            assert!(a.text.insert.y + a.text.height < at.y, "{tag}: the value sits below its label");
+            assert!((h - LABEL_MM).abs() < 1e-9, "{tag}");
+        }
+        for word in ["No.", "Date", "Description"] {
+            let heading = |t: &&(String, Vec3, f64)| t.0 == word && (t.2 - ISSUE_TEXT_MM).abs() < 1e-9;
+            let (_, at, _) = texts.iter().find(heading).ok_or(format!("no heading {word}"))?;
+            let top = i.attribs.iter().map(|a| a.text.insert.y).fold(f64::MIN, f64::max);
+            assert!(at.y > top, "{word}: the heading is above every row");
+        }
+        assert_eq!(title_case("ADDRESS"), "Address");
+        Ok(())
+    }
+
+    #[test]
+    fn an_old_frame_block_is_rebuilt_on_the_next_command() -> R {
+        let mut s = two_plans()?;
+        s.execute("sheetset", &json!({}))?;
+        let (handle, i, _) = frames(&s, "A101")?.remove(0);
+        // As T634 left it: lines only, and no issue attributes.
+        let d = s.doc_mut()?;
+        let name = i.block.clone();
+        let lines: Vec<EntityKind> =
+            d.block(&name).ok_or("no def")?.entities.iter().map(|e| e.kind.clone()).filter(|k| matches!(k, EntityKind::Line(_))).take(13).collect();
+        d.blocks.insert(name.clone(), Arc::new(Block::new(&name)));
+        for k in lines {
+            d.add(&Space::Block(name.clone()), Common::default(), k)?;
+        }
+        for l in ["A101", "A102"] {
+            let h = d.layout(l).ok_or("no layout")?.entities.iter().find(|e| frame_of(e).is_some()).ok_or("no frame")?.handle;
+            d.space_mut(&Space::Paper(l.into())).ok_or("no space")?.modify(h, |e| {
+                if let EntityKind::Insert(i) = &mut e.kind {
+                    i.attribs.truncate(CELLS.len());
+                }
+            });
+        }
+        assert_eq!(s.doc()?.block(&name).map(|b| b.entities.len()), Some(13));
+        s.execute("line", &json!({ "points": [[9000, 9000], [9500, 9000]] }))?;
+        assert_eq!(s.doc()?.block(&name).map(|b| b.entities.len()), Some(31), "rebuilt");
+        let (h, i, _) = frames(&s, "A101")?.remove(0);
+        assert_eq!(h, handle, "same Insert");
+        assert_eq!(i.attribs.len(), CELLS.len() + ISSUE_ROWS);
+        assert!(super::plan(s.doc()?)?.is_empty(), "settled");
+        Ok(())
+    }
+
+    #[test]
+    fn a_small_page_shrinks_the_whole_strip_to_fit() -> R {
+        // ARCH A portrait is narrow (the strip shrinks with it); A5 landscape is short.
+        for (paper, landscape) in [("ARCH A", false), ("A5", true)] {
+            let (mut s, _, d1, _) = room()?;
+            s.execute("newsheet", &json!({ "name": "A501", "viewIds": [d1.0] }))?;
+            s.execute("pagesetup", &json!({ "layout": "A501", "paper": paper, "landscape": landscape }))?;
+            let sheet = cadcraft_render::sheet(s.doc()?, "A501").ok_or("no sheet")?;
+            let g = geometry(&sheet);
+            let top = g.issues[ISSUE_ROWS];
+            assert!(top.0 + top.1 <= g.max.1 + 1e-9, "{paper}: fits the printable height");
+            assert!(top.1 < ISSUE_ROW_MM / sheet.unit_mm, "{paper}: shrunk");
+            assert!((g.cells[0].1 / top.1 - CELLS[0].1 / ISSUE_ROW_MM).abs() < 1e-9, "{paper}: one factor for all");
+            let i = frames(&s, "A501")?.remove(0).1;
+            assert_eq!(i.attribs.len(), CELLS.len() + ISSUE_ROWS);
+            assert!(i.attribs.iter().all(|a| a.text.insert.y < g.max.1), "{paper}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn typed_issue_takes_a_description_then_a_date() -> R {
+        let mut s = two_plans()?;
+        s.execute("sheetset", &json!({}))?;
+        s.start("iss")?;
+        assert_eq!(s.current_prompt().map(|p| p.message.clone()).as_deref(), Some("Issue description"));
+        s.input(Input::Text("Issued for permit".into()))?;
+        let today = s.current_prompt().and_then(|p| p.default).ok_or("no default date")?;
+        assert_eq!(today.len(), 10);
+        s.input(Input::Enter)?;
+        assert!(s.current_prompt().is_none());
+        assert_eq!(val(&frames(&s, "A101")?[0].1, "ISSUE1"), format!("1  {today}  Issued for permit"));
+        s.start("issue")?;
+        s.input(Input::Text("Rev".into()))?;
+        s.input(Input::Text("2027-01-02".into()))?;
+        assert_eq!(val(&frames(&s, "A102")?[0].1, "ISSUE2"), "2  2027-01-02  Rev");
         Ok(())
     }
 
@@ -753,12 +1111,15 @@ mod tests {
         let (mut s, plan, d1, _) = room()?;
         s.execute("newsheet", &json!({ "name": "A501", "viewIds": [plan.0, d1.0] }))?;
         s.execute("titleblock", &json!({ "client": "Client & Co", "date": "x".repeat(200) }))?;
+        s.execute("issue", &json!({ "description": "Issued for permit", "date": "2026-11-08" }))?;
         let bytes = cadcraft_io::write(s.doc()?, "t.dxf").map_err(|e| format!("{e:?}"))?;
         let back = cadcraft_io::read(&bytes, "t.dxf").map_err(|e| format!("{e:?}"))?;
         let p = super::plan(&back)?;
         assert!(p.is_empty(), "the observer would change nothing after a round trip: {p:?}");
         let l = back.layout("A501").ok_or("no layout")?;
         assert_eq!(l.entities.iter().filter(|e| frame_of(e).is_some()).count(), 1);
+        let issues = read_document(&back)?.sheet_info.ok_or("no info")?.issues;
+        assert_eq!(issues, vec![Issue { number: 1, date: "2026-11-08".into(), description: "Issued for permit".into() }]);
         Ok(())
     }
 

@@ -138,6 +138,18 @@ pub struct SheetInfo {
     pub date: String,
     /// Project north, degrees clockwise from the project's global +Y.
     pub north_deg: f64,
+    /// The set's issues, oldest first (`issue`, [`crate::titleblock`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<Issue>,
+}
+
+/// One issue of the drawing set: its number (never reused while it stands), date and what it was for.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Issue {
+    pub number: u32,
+    pub date: String,
+    pub description: String,
 }
 
 impl LambDocument {
