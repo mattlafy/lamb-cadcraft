@@ -187,13 +187,13 @@ fn block_hatches_of(runs: &[RunAssembly]) -> impl Iterator<Item = (&str, Hatch)>
 
 /// Every entity in `detail`'s block except `reference` and repeat members ([`crate::repeats`]) that
 /// is one straight open segment, with its layer.
-fn detail_lines(d: &Drawing, detail: Id, reference: cadcraft_doc::Handle) -> Result<Vec<(Point2, Point2, String)>, String> {
+fn detail_lines(d: &Drawing, detail: Id, reference: &[cadcraft_doc::Handle]) -> Result<Vec<(Point2, Point2, String)>, String> {
     let Some(block) = d.block(&view_block_name(detail)) else { return Ok(Vec::new()) };
     let repeated = repeat_members(d, detail)?;
     Ok(block
         .entities
         .iter()
-        .filter(|e| e.handle != reference && !repeated.contains(&e.handle))
+        .filter(|e| !reference.contains(&e.handle) && !repeated.contains(&e.handle))
         .filter_map(|e| {
             let poly = to_polyline(e).ok()?.polyline;
             match poly.segments.as_slice() {
@@ -394,7 +394,7 @@ fn run_lines(
     sides: &lamb_core::derivation::wall_spaces::RunSides,
 ) -> Result<(Vec<AssemblyLine>, usize, Vec<usize>, Option<WidthConflict>, FaceRef, Vec<BandHatch>), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
-    let lines = detail_lines(d, detail, r.handle)?;
+    let lines = detail_lines(d, detail, &r.handles())?;
     let (reference, face) = laid_reference(d, view, run, sides, &r, &lines)?;
     let bands = detail_bands(reference, &lines)?;
     let frame = detail_frame(reference, &lines)?;
@@ -734,7 +734,7 @@ fn corner_lines(
 ) -> Result<Vec<AssemblyLine>, String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
-    let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| *h != r.handle).collect();
+    let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| !r.handles().contains(h)).collect();
     let lines = member_segments(d, detail, &others);
     if j.arms.len() == 4 {
         let k = quadrant.ok_or("pick the quadrant's corner, not the crossing")?;
@@ -818,7 +818,7 @@ fn opening_lines(
 ) -> Result<Vec<AssemblyLine>, String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
-    let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| *h != r.handle).collect();
+    let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| !r.handles().contains(h)).collect();
     let lines = member_segments(d, detail, &others);
     let (face, insets, outward) = junction_placement(d, view, &r, &lines, &[Some(bridge.a.0), Some(bridge.b.0)], runs, sides)?;
     match end {
@@ -886,7 +886,7 @@ fn end_lines(
 ) -> Result<Vec<AssemblyLine>, String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
-    let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| *h != r.handle).collect();
+    let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| !r.handles().contains(h)).collect();
     let lines = member_segments(d, detail, &others);
     let (face, insets, outward) = junction_placement(d, view, &r, &lines, &[Some(i)], runs, sides)?;
     let run = runs.get(i).ok_or("the free end names no run")?;
@@ -2398,7 +2398,7 @@ pub(crate) mod tests {
         let (mut s, plan) = room("exterior_face", true)?;
         // Two different corner details on the bottom corners: those two junctions are tagged; the
         // top two see both details across their gap and resolve to a conflict, still undetailed.
-        let d1 = detail_id(&s)?;
+        let d1 = Id(s.execute("newdetail", &json!({ "name": "D0" }))?["viewId"].as_u64().ok_or("no id")?);
         let d2 = Id(s.execute("newdetail", &json!({ "name": "D2" }))?["viewId"].as_u64().ok_or("no id")?);
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
         for (detail, tip) in [(d1, (0.0, 0.0)), (d2, (5000.0, 0.0))] {
@@ -2934,7 +2934,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A corner detail `CD` (vertical when `vertical`): a reference (−1000,0)–(0,0) of `kind`, a
+    /// A corner detail `CD` (vertical when `vertical`): a corner reference polyline (−1000,0)→(0,0)→(0,1000) of `kind`, a
     /// `CRN-A` line (0,0)–(0,1000) and a `CRN-B` band (−1000,200)–(0,200) putting the wall side at
     /// +y; corner-tagged at `tip` in `view`, which is edited afterwards.
     pub(crate) fn corner_detail(s: &mut Session, view: Id, kind: &str, vertical: bool, tip: (f64, f64)) -> T<Id> {
@@ -2944,7 +2944,9 @@ pub(crate) mod tests {
         }
         let cd = Id(s.execute("newdetail", &p)?["viewId"].as_u64().ok_or("no id")?);
         s.execute("editview", &json!({ "viewId": cd.0 }))?;
-        let r = line(s, [-1000.0, 0.0], [0.0, 0.0])?;
+        let before = all_handles(s)?;
+        s.execute("pline", &json!({ "vertices": [[-1000.0, 0.0], [0.0, 0.0], [0.0, 1000.0]] }))?;
+        let r = all_handles(s)?.into_iter().find(|h| !before.contains(h)).ok_or("pline not drawn")?;
         s.execute("detailref", &json!({ "handle": r.hex(), "kind": kind }))?;
         s.execute("layer.new", &json!({ "name": "CRN-A", "current": true }))?;
         line(s, [0.0, 0.0], [0.0, 1000.0])?;
@@ -3381,7 +3383,9 @@ pub(crate) mod tests {
         let before = assembly_lines(s.doc()?, plan)?;
         let cd = Id(s.execute("newdetail", &json!({ "name": "CD" }))?["viewId"].as_u64().ok_or("no id")?);
         s.execute("editview", &json!({ "viewId": cd.0 }))?;
-        let rl = line(&mut s, [-300.0, 0.0], [0.0, 0.0])?;
+        let pre = all_handles(&s)?;
+        s.execute("pline", &json!({ "vertices": [[-300.0, 0.0], [0.0, 0.0], [0.0, 300.0]] }))?;
+        let rl = all_handles(&s)?.into_iter().find(|h| !pre.contains(h)).ok_or("pline not drawn")?;
         s.execute("detailref", &json!({ "handle": rl.hex(), "kind": "interior_face" }))?;
         s.execute("layer.new", &json!({ "name": "CRN-A", "current": true }))?;
         line(&mut s, [0.0, 0.0], [0.0, 300.0])?;
@@ -4280,12 +4284,7 @@ pub(crate) mod tests {
     fn a_strip_ends_on_the_bands_trimmed_at_a_corner_detail() -> R {
         let (mut s, plan) = room("exterior_face", true)?;
         strip(&mut s, plan, 0.0)?;
-        let d1 = detail_id(&s)?;
-        s.execute(
-            "detailtag",
-            &json!({ "detailViewId": d1.0, "corner": true, "tip": {"x": 0.0, "y": 0.0}, "bubble": {"x": -1000.0, "y": -1000.0} }),
-        )?;
-        without_assembly(&mut s)?;
+        corner_detail(&mut s, plan, "exterior_face", false, (0.0, 0.0))?;
         s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
         let name = assembly_block_name(plan);
         assert_eq!(block_hatches(&s, &name)?.len(), 4);

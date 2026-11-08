@@ -266,7 +266,7 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
                 if *m == dim {
                     return Err(other("A repeat cannot contain its own pitch dimension"));
                 }
-                if reference.is_some_and(|r| r.handle == *m) {
+                if reference.as_ref().is_some_and(|r| r.handles().contains(m)) {
                     return Err(other("The reference line cannot be repeated"));
                 }
                 if taken.contains(m) {
@@ -281,7 +281,7 @@ pub(crate) fn repeat(s: &mut Session, p: &Value) -> Result<Value> {
                     if *c == dim {
                         return Err(other("A repeat cannot contain its own pitch dimension"));
                     }
-                    if reference.is_some_and(|r| r.handle == *c) {
+                    if reference.as_ref().is_some_and(|r| r.handles().contains(c)) {
                         return Err(other("The reference line cannot be repeated"));
                     }
                     if members.contains(c) {

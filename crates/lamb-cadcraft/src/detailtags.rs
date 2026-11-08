@@ -650,7 +650,7 @@ fn detail_direction(s: &Session, id: Id) -> Option<CutDirection> {
 /// around `tip`, in the edited plan or section view.
 pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
     let detail = p.get("detailViewId").and_then(id_value).ok_or_else(|| bad("detailtag", "`detailViewId` is required"))?;
-    let corner = p.get("corner").and_then(Value::as_bool).unwrap_or(false);
+    let corner_given = p.get("corner").and_then(Value::as_bool);
     let flip = p.get("flip").and_then(Value::as_bool).unwrap_or(false);
     let tip = point_param("detailtag", p, "tip")?;
     let given = |k: &str| p.get(k).filter(|v| !v.is_null());
@@ -668,7 +668,19 @@ pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
         (CutDirection::Plan, CutDirection::Vertical) => return Err(other("That detail is drawn in plan; tag it in a plan view")),
         _ => {}
     }
+    // The detail's kind (from its reference, LAMB T674): a corner detail tags only a wall corner, a
+    // linear one never a junction (it still tags faces, jambs and free ends); no reference accepts either.
+    let kind = crate::detailref::detail_is_corner(s.doc()?, detail);
+    let corner = corner_given.or(kind).unwrap_or(false);
+    let detail_name =
+        || read_document(s.doc()?).map_err(other).map(|d| d.views.iter().find(|v| v.id() == detail).map(|v| v.name().to_owned()).unwrap_or_default());
+    if kind == Some(true) && !corner {
+        return Err(other(format!("{} is a corner detail: tag a wall corner with it", detail_name()?)));
+    }
     let target = view_target(s, view, corner, Point2 { x: tip.x, y: tip.y }).map_err(other)?;
+    if kind == Some(false) && matches!(target, Target::Junction(_)) {
+        return Err(other(format!("{} is a linear detail: tag a wall face with it", detail_name()?)));
+    }
     if let Shape::Box(a, b) = shape
         && let Some(e) = box_refusal(tip, a, b)
     {
@@ -819,6 +831,8 @@ struct Offered {
     id: Id,
     keyword: String,
     name: String,
+    /// Its kind from its reference: `Some(true)` corner, `Some(false)` linear, `None` no reference yet.
+    corner: Option<bool>,
 }
 
 /// DETAILTAG: detail (one keyword per detail drawn in the edited view's direction, `Corner`
@@ -887,7 +901,12 @@ impl Interactive for DetailTagM {
             .views
             .iter()
             .filter_map(|v| match v {
-                AnyView::Detail(d) if d.cut_direction == dir => Some(Offered { id: d.id, keyword: detail_keyword(&d.name), name: d.name.clone() }),
+                AnyView::Detail(d) if d.cut_direction == dir => Some(Offered {
+                    id: d.id,
+                    keyword: detail_keyword(&d.name),
+                    name: d.name.clone(),
+                    corner: crate::detailref::detail_is_corner(s.doc().ok()?, d.id),
+                }),
                 _ => None,
             })
             .collect();
@@ -910,6 +929,9 @@ impl Interactive for DetailTagM {
                 Input::Enter => match self.default {
                     Some(id) => {
                         self.detail = Some(id);
+                        if self.offered.iter().any(|o| o.id == id && o.corner == Some(true)) {
+                            self.corner = true;
+                        }
                         return Ok(Step::Continue);
                     }
                     None => return Ok(Step::Cancel),
@@ -925,6 +947,9 @@ impl Interactive for DetailTagM {
             let by_id = || text.parse::<u64>().ok().and_then(|n| self.offered.iter().find(|o| o.id == Id(n)));
             if let Some(o) = by_name.or_else(by_id) {
                 self.detail = Some(o.id);
+                if o.corner == Some(true) {
+                    self.corner = true;
+                }
                 return Ok(Step::Continue);
             }
             // A detail drawn the other way gets the reason it is not offered.
@@ -1565,6 +1590,37 @@ mod tests {
             s.log
         );
         assert_eq!(cadcraft_io::write_dxf(s.doc()?), before);
+        Ok(())
+    }
+
+    /// LAMB T674: the detail's reference decides its kind — a linear detail refuses a wall corner, a
+    /// corner detail a wall face — and picking a corner detail asks for a wall corner by itself.
+    #[test]
+    fn a_detail_s_reference_decides_corner_or_face() -> R {
+        let (mut s, plan) = crate::assembly::tests::room("exterior_face", true)?;
+        let d1 = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
+        assert_eq!(crate::detailref::detail_is_corner(s.doc()?, d1), Some(false));
+        let undo = s.state()?.undo.len();
+        let e = tag(&mut s, d1, true, (0.0, 0.0)).err().ok_or("linear detail tagged a corner")?;
+        assert_eq!(e.to_string(), "D1 is a linear detail: tag a wall face with it");
+        assert_eq!(s.state()?.undo.len(), undo, "nothing recorded");
+
+        let cd = crate::assembly::tests::corner_detail(&mut s, plan, "exterior_face", false, (5000.0, 0.0))?;
+        assert_eq!(crate::detailref::detail_is_corner(s.doc()?, cd), Some(true));
+        for (p, want) in [(json!({}), "Not at a wall corner"), (json!({ "corner": false }), "CD is a corner detail: tag a wall corner with it")] {
+            let mut p = p;
+            p["detailViewId"] = json!(cd.0);
+            p["tip"] = json!({"x": 2500.0, "y": 0.0});
+            p["bubble"] = json!({"x": 2500.0, "y": -1000.0});
+            let e = s.execute("detailtag", &p).err().ok_or("corner detail tagged a face")?;
+            assert!(e.to_string().starts_with(want), "{e}");
+        }
+        // Omitting `corner` takes the detail's kind.
+        s.execute("detailtag", &json!({ "detailViewId": cd.0, "tip": {"x": 0.0, "y": 4000.0}, "bubble": {"x": -1000.0, "y": 5000.0} }))?;
+
+        s.start("detailtag")?;
+        s.input(Input::Keyword("CD".into()))?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point at a wall corner"));
         Ok(())
     }
 }

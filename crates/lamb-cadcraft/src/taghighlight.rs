@@ -238,7 +238,8 @@ mod tests {
         let (mut s, plan) = room("exterior_face", true)?;
         let d1 = tags_in(s.doc()?, plan)?.first().map(|(_, _, t)| t.detail_view_id).ok_or("no tag")?;
         // A second detail edge-tagged on the right wall (x 5000).
-        let cd = corner_detail(&mut s, plan, "exterior_face", false, (0.0, 0.0))?;
+        let cd = Id(s.execute("newdetail", &json!({ "name": "D2" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
         s.execute("detailtag", &json!({ "detailViewId": cd.0, "tip": {"x": 5000.0, "y": 2000.0}, "bubble": {"x": 6000.0, "y": 2000.0} }))?;
         let d = s.doc()?;
         let (runs, _) = resolve_view_details(d, plan)?;
