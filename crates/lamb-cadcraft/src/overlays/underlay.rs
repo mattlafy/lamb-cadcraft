@@ -8,7 +8,8 @@
 //! Session UI state, never saved (ruling T350.1): each edited view's underlays ([`CHOSEN`], block
 //! name → set of block names; LAMB T522: any number at once). A choice that is no longer a
 //! candidate reads as off. LAMB T590: an edited plan or section with an assembly block
-//! ([`assembly_block_name`]) also draws that block's lines pale under it, on by default,
+//! ([`assembly_block_name`]) also draws that block's lines under it, on by default (LAMB T673:
+//! in their layers' colours, as on sheets — only other views' underlays are pale),
 //! `underlay {assembly: false}` turning it off ([`ASSEMBLY_OFF`], session state too). Display list
 //! only: plots are unchanged. UNDERLAY changes no
 //! drawing revision, so it bumps [`cadcraft_render::bump_overlays`] for the canvas's overlay cache.
@@ -227,7 +228,7 @@ fn pairs<'a>(d: &'a Drawing, space: &Space) -> Option<(DrawingProject<'a>, Id, V
 
 /// The edited view's assembly block (LAMB T590, unless turned off) and then every underlay's
 /// linework for `space`, mapped into the edited view's local coordinates, pale, one pass per
-/// underlay in candidate order. Infinite lines and wipeout masks are left out. Empty without either.
+/// underlay in candidate order; the assembly lines keep their own colours (LAMB T673). Infinite lines and wipeout masks are left out. Empty without either.
 pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let mut out = DisplayList { bounds: Bounds2::EMPTY, ..DisplayList::default() };
     let Some((dp, edit)) = view_of(d, space) else { return out };
@@ -236,7 +237,7 @@ pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
         && let Some(block) = d.block(&assembly_block_name(edit))
     {
         // Assembly lines are in the view's own local coordinates: no map.
-        push_pale(&cadcraft_render::build_entities(d, block.entities.iter().map(|e| &**e), &opts), Some, &mut out);
+        push_mapped(&cadcraft_render::build_entities(d, block.entities.iter().map(|e| &**e), &opts), Some, false, &mut out);
     }
     for u in current(d, edit) {
         draw_one(d, &dp, edit, u, &opts, &mut out);
@@ -244,9 +245,10 @@ pub(super) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     out
 }
 
-/// Append `src`'s primitives to `out`, each point through `map`, pale; infinite lines and masks
-/// are left out, and so is any primitive with a point that does not map.
-fn push_pale(src: &DisplayList, map: impl Fn(Vec2) -> Option<Vec2>, out: &mut DisplayList) {
+/// Append `src`'s primitives to `out`, each point through `map`, pale when `pale` (else in their
+/// own colour and transparency); infinite lines and masks are left out, and so is any primitive
+/// with a point that does not map.
+fn push_mapped(src: &DisplayList, map: impl Fn(Vec2) -> Option<Vec2>, pale: bool, out: &mut DisplayList) {
     for prim in &src.prims {
         if matches!(prim.kind, Kind::Infinite { .. } | Kind::Mask) {
             continue;
@@ -258,7 +260,8 @@ fn push_pale(src: &DisplayList, map: impl Fn(Vec2) -> Option<Vec2>, out: &mut Di
         for p in &pts {
             out.bounds.add(*p);
         }
-        out.prims.push(DPrim { color: UNDERLAY_COLOR, aci7: false, transparency: UNDERLAY_TRANSPARENCY, start, len: pts.len() as u32, ..*prim });
+        let prim = DPrim { start, len: pts.len() as u32, ..*prim };
+        out.prims.push(if pale { DPrim { color: UNDERLAY_COLOR, aci7: false, transparency: UNDERLAY_TRANSPARENCY, ..prim } } else { prim });
     }
 }
 
@@ -266,7 +269,7 @@ fn push_pale(src: &DisplayList, map: impl Fn(Vec2) -> Option<Vec2>, out: &mut Di
 fn draw_one(d: &Drawing, dp: &DrawingProject<'_>, edit: Id, u: Id, opts: &Options, out: &mut DisplayList) {
     let Some(block) = d.block(&view_block_name(u)) else { return };
     let src = cadcraft_render::build_entities(d, block.entities.iter().map(|e| &**e), opts);
-    push_pale(&src, |p| map(dp, u, edit, p), out);
+    push_mapped(&src, |p| map(dp, u, edit, p), true, out);
 }
 
 /// The bounds of every underlay's mapped linework in `space` (EMPTY without one): ZOOM Extents
@@ -530,22 +533,26 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// LAMB T590: the tagged room's assembly lines draw pale under the edited plan, in its own
-    /// coordinates, until `underlay {assembly: false}`.
+    /// LAMB T590: the tagged room's assembly lines draw under the edited plan, in its own
+    /// coordinates, until `underlay {assembly: false}`; LAMB T673: in their layers' colours.
     #[test]
-    fn the_edited_plans_assembly_block_draws_pale_under_it_until_turned_off() -> R {
+    fn the_edited_plans_assembly_block_draws_in_its_layer_colours_until_turned_off() -> R {
         let _g = lock();
         let (mut s, plan) = crate::assembly::tests::room("exterior_face", true)?;
         assert!(draw(s.doc()?, &block(plan), &Options::default()).prims.is_empty(), "no assembly block, nothing drawn");
+        s.doc_mut()?.layer_mut("CLAD").ok_or("no layer")?.color = cadcraft_color::Color::Index(1);
+        s.doc_mut()?.layer_mut("GYP").ok_or("no layer")?.color = cadcraft_color::Color::Index(5);
         s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
         let asm = s.doc()?.block(&assembly_block_name(plan)).ok_or("no assembly block")?.clone();
         assert_eq!(asm.entities.len(), 12);
         let list = draw(s.doc()?, &block(plan), &Options::default());
         let lines = polylines(&list);
-        assert_eq!(lines.len(), 12, "one pale line per assembly line");
-        assert!(lines.iter().all(|(p, _)| (p.color, p.transparency, p.aci7) == (UNDERLAY_COLOR, UNDERLAY_TRANSPARENCY, false)));
-        // The bottom run's CLAD band at y = -20, unmapped.
-        assert!(lines.iter().any(|(_, pts)| pts.iter().all(|p| (p.y + 20.0).abs() < 1e-6)), "{lines:?}");
+        assert_eq!(lines.len(), 12, "one line per assembly line");
+        let (red, blue) = (Rgb(255, 0, 0), Rgb(0, 0, 255));
+        assert!(lines.iter().all(|(p, _)| (p.color == red || p.color == blue) && p.transparency == 0), "{lines:?}");
+        // The bottom run's CLAD band at y = -20, unmapped, in CLAD's red.
+        assert!(lines.iter().any(|(p, pts)| p.color == red && pts.iter().all(|p| (p.y + 20.0).abs() < 1e-6)), "{lines:?}");
+        assert!(lines.iter().any(|(p, _)| p.color == blue), "GYP's bands in blue");
         let full = lamb_overlay(s.doc()?, &block(plan), &Options::default());
         assert_eq!(full.prims[..12], list.prims[..], "drawn first, under the markers");
 
