@@ -16,6 +16,13 @@
 //! first member's layer and pitch length); Used in the views' names in document order. One undo
 //! step; no wall types is refused, nothing changed. Returns `{layout, handle, rows: [{mark, detail,
 //! buildUp, thicknessMm, repeats, usedIn}], message}`.
+//!
+//! `walltags {viewId?, off?}` (`wtag`, LAMB T690) adds the placed plan to, or removes it from,
+//! `wall_tag_plans` (refused for anything but a placed plan); [`crate::annotations`] writes each
+//! listed plan's [`wall_tags`] into its annotation block: per run whose resolved detail is a wall
+//! type, its mark in a hexagon on the run's inside face at its midpoint, none on a run shorter than
+//! [`MIN_TAGGED_RUN_MM`] at 1:50. A plan already in that state records no undo step. Returns
+//! `{viewId, tags, message}`.
 
 use cadcraft_doc::{Drawing, Table};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
@@ -23,15 +30,22 @@ use lamb_core::geometry::Point2;
 use lamb_core::model::{AnyView, Id};
 use serde_json::{Value, json};
 
-use crate::assembly::detail_layers;
+use lamb_core::derivation::wall_spaces::outside_on_left;
+use lamb_core::derivation::walls::{RunCurve, WallRun};
+use lamb_core::geometry::point::{normalize2, sub2};
+
+use crate::annotations::k;
+use crate::assembly::{detail_layers, run_midpoint};
 use crate::bom::{self, Refreshed};
-use crate::commands::{name_input, other};
+use crate::commands::{bad, edited_view, id_value, name_input, other};
 use crate::detailref::detail_reference;
 use crate::detailsheets::named;
-use crate::detailtags::resolve_view_details;
+use crate::detailtags::{graph_and_sides, resolve_view_details};
+use crate::project::DrawingProject;
 use crate::repeats::detail_repeats;
 use crate::schedule::write_schedule;
-use crate::schema::{read_document, view_block_name};
+use crate::schema::{read_document, view_block_name, write_document};
+use crate::sheets::view_scale;
 
 pub const WALL_TYPES_TITLE: &str = "Wall Types";
 pub(crate) const DEFAULT_LAYOUT: &str = "A604";
@@ -71,8 +85,10 @@ fn repeats_text(d: &Drawing, detail: Id) -> String {
         .join(", ")
 }
 
-/// Every wall type, marked in first-met order. An unreadable drawing has none.
-pub fn wall_type_rows(d: &Drawing) -> Vec<WallTypeRow> {
+/// Every wall type in first-met order with the names of the views using it, a type whose build-up
+/// cannot be read left out: the one numbering the legend and the plan tags both read (index `i` is
+/// [`mark`]`(i)`). An unreadable drawing has none.
+fn wall_types(d: &Drawing) -> Vec<(Id, Vec<String>)> {
     let Ok(doc) = read_document(d) else { return Vec::new() };
     let mut found: Vec<(Id, Vec<String>)> = Vec::new();
     for v in doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_) | AnyView::Vertical(_))) {
@@ -90,8 +106,20 @@ pub fn wall_type_rows(d: &Drawing) -> Vec<WallTypeRow> {
             }
         }
     }
+    found.retain(|(detail, _)| detail_layers(d, *detail).is_ok());
+    found
+}
+
+/// The mark of the `i`th wall type: `W1`, `W2`, …
+fn mark(i: usize) -> String {
+    format!("W{}", i + 1)
+}
+
+/// Every wall type, marked in first-met order. An unreadable drawing has none.
+pub fn wall_type_rows(d: &Drawing) -> Vec<WallTypeRow> {
+    let Ok(doc) = read_document(d) else { return Vec::new() };
     let mut rows = Vec::new();
-    for (detail, used_in) in found {
+    for (i, (detail, used_in)) in wall_types(d).into_iter().enumerate() {
         let Ok(layers) = detail_layers(d, detail) else { continue };
         let Some(view) = doc.views.iter().find(|v| v.id() == detail) else { continue };
         let build_up = layers
@@ -101,7 +129,7 @@ pub fn wall_type_rows(d: &Drawing) -> Vec<WallTypeRow> {
             .join(" · ");
         let thickness_mm = layers.iter().map(|l| l.offset + l.thickness).fold(0.0, f64::max).round();
         rows.push(WallTypeRow {
-            mark: format!("W{}", rows.len() + 1),
+            mark: mark(i),
             detail,
             name: view.name().to_owned(),
             build_up,
@@ -111,6 +139,72 @@ pub fn wall_type_rows(d: &Drawing) -> Vec<WallTypeRow> {
         });
     }
     rows
+}
+
+/// One wall type tag on a plan: its type's mark at a run's midpoint, `inward` the unit normal
+/// toward the run's inside, `half_width` half the run's width.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WallTag {
+    pub plan: Id,
+    pub mark: String,
+    pub at: Point2,
+    pub inward: Point2,
+    pub half_width: f64,
+}
+
+/// A run shorter than this (× [`k`] of its plan's scale) gets no tag.
+pub const MIN_TAGGED_RUN_MM: f64 = 1500.0;
+
+fn run_length(run: &WallRun) -> f64 {
+    match run.centreline {
+        RunCurve::Line { from, to } => (to.x - from.x).hypot(to.y - from.y),
+        RunCurve::Arc { radius, sweep, .. } => (radius * sweep).abs(),
+    }
+}
+
+/// The left of `run`'s direction of travel at its midpoint: for an arc, radial at mid-sweep.
+fn left_at_mid(run: &WallRun) -> Point2 {
+    let dir = match run.centreline {
+        RunCurve::Line { from, to } => normalize2(sub2(to, from)),
+        RunCurve::Arc { start_angle, sweep, .. } => {
+            let a = start_angle + sweep / 2.0;
+            let turn = if sweep < 0.0 { -1.0 } else { 1.0 };
+            Point2 { x: -a.sin() * turn, y: a.cos() * turn }
+        }
+    };
+    Point2 { x: -dir.y, y: dir.x }
+}
+
+/// Every wall type tag of every placed plan in `wall_tag_plans`: one per run whose resolved edge
+/// detail is a wall type and whose length is at least [`MIN_TAGGED_RUN_MM`] × k(scale), on its
+/// inside (an undecided run's left).
+pub fn wall_tags(d: &Drawing) -> Vec<WallTag> {
+    let Ok(doc) = read_document(d) else { return Vec::new() };
+    if doc.wall_tag_plans.is_empty() {
+        return Vec::new();
+    }
+    let Ok(p) = DrawingProject::new(d) else { return Vec::new() };
+    let types = wall_types(d);
+    let mut out = Vec::new();
+    for &plan in &doc.wall_tag_plans {
+        if !doc.views.iter().any(|v| matches!(v, AnyView::Plan(pv) if pv.id == plan && pv.placement.is_some())) {
+            continue;
+        }
+        let Ok((details, _)) = resolve_view_details(d, plan) else { continue };
+        let min = MIN_TAGGED_RUN_MM * k(view_scale(d, &doc, plan));
+        let (graph, sides) = graph_and_sides(&p, plan);
+        for (i, rd) in details.iter().enumerate() {
+            let Some(t) = named(rd).and_then(|id| types.iter().position(|(t, _)| *t == id)) else { continue };
+            let Some(run) = graph.runs.get(i).filter(|r| run_length(r) >= min) else { continue };
+            let left = left_at_mid(run);
+            let inward = match sides.runs.get(i).and_then(outside_on_left) {
+                Some(true) => Point2 { x: -left.x, y: -left.y },
+                _ => left,
+            };
+            out.push(WallTag { plan, mark: mark(t), at: run_midpoint(run), inward, half_width: run.width / 2.0 });
+        }
+    }
+    out
 }
 
 /// The Wall Types table with its top-left corner at `at` (paper mm): a row per type.
@@ -173,6 +267,99 @@ impl Interactive for WallTypes {
 
 pub(crate) fn walltypes_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::new(WallTypes))
+}
+
+/// A placed plan `view`'s name, or why it is not one.
+fn check_plan(d: &Drawing, view: Id) -> std::result::Result<String, String> {
+    let doc = read_document(d).map_err(|e| e.to_string())?;
+    match doc.views.iter().find(|v| v.id() == view) {
+        None => Err("No such view".into()),
+        Some(AnyView::Plan(p)) if p.placement.is_some() => Ok(p.name.clone()),
+        Some(AnyView::Plan(p)) => Err(format!("{} is floating: place it on a level before tagging its walls", p.name)),
+        Some(_) => Err("WALLTAGS tags plan views only".into()),
+    }
+}
+
+/// WALLTAGS `{viewId?, off?}`. See the module doc.
+pub(crate) fn walltags(s: &mut Session, p: &Value) -> Result<Value> {
+    let view = match p.get("viewId") {
+        None | Some(Value::Null) => edited_view(s).ok_or_else(|| other("Edit a plan first (EDITVIEW), or give `viewId`"))?,
+        Some(v) => id_value(v).ok_or_else(|| bad("walltags", "`viewId` must be a view id"))?,
+    };
+    let off = match p.get("off") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad("walltags", "`off` must be true or false")),
+    };
+    let name = check_plan(s.doc()?, view).map_err(other)?;
+    let mut doc = read_document(s.doc()?).map_err(|e| other(e.to_string()))?;
+    let list = &mut doc.wall_tag_plans;
+    if list.contains(&view) == off {
+        list.retain(|v| *v != view);
+        if !off {
+            list.push(view);
+        }
+        write_document(s.doc_mut()?, &doc).map_err(|e| other(e.to_string()))?;
+    }
+    let (n, message) = if off {
+        (0, format!("Wall tags off for {name}."))
+    } else {
+        let n = wall_tags(s.doc()?).iter().filter(|t| t.plan == view).count();
+        (n, format!("{n} wall tag{} on {name}.", if n == 1 { "" } else { "s" }))
+    };
+    s.echo(message.clone());
+    Ok(json!({ "viewId": view.0, "tags": n, "message": message }))
+}
+
+/// WALLTAGS' interactive form, on the edited plan: `Wall tags [On/Off] <On>:`.
+struct WallTagsM {
+    view: Id,
+}
+
+impl Interactive for WallTagsM {
+    fn name(&self) -> &'static str {
+        "walltags"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Wall tags", Accept::TEXT).kw(&["On", "Off"]).options_only().default("On".to_owned())
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        s.echo("WALLTAGS: tags each wall of this plan with its wall type mark from the Wall Types legend, on screen and on its sheet.");
+        let edited = edited_view(s).ok_or_else(|| "WALLTAGS needs a plan: open one from the Views palette or with EDITVIEW.".to_owned());
+        match edited.and_then(|v| check_plan(s.doc().map_err(|e| e.to_string())?, v).map(|_| v)) {
+            Ok(v) => {
+                self.view = v;
+                Ok(Step::Continue)
+            }
+            Err(e) => {
+                s.echo(e);
+                Ok(Step::Done)
+            }
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        let off = match i {
+            Input::Cancel => return Ok(Step::Cancel),
+            Input::Enter => false,
+            Input::Text(t) | Input::Keyword(t) => match t.trim().to_ascii_lowercase().as_str() {
+                "on" => false,
+                "off" => true,
+                _ => {
+                    s.echo("On or Off");
+                    return Ok(Step::Continue);
+                }
+            },
+            _ => return Ok(Step::Continue),
+        };
+        if let Err(e) = walltags(s, &json!({ "viewId": self.view.0, "off": off })) {
+            s.echo(e.to_string());
+        }
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn walltags_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(WallTagsM { view: Id(0) }))
 }
 
 #[cfg(test)]
@@ -249,6 +436,169 @@ mod tests {
         let (_, t) = crate::schedule::titled_on(s.doc()?, DEFAULT_LAYOUT, WALL_TYPES_TITLE).ok_or("no table")?;
         assert_eq!(t.cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), HEADER);
         Ok(t.cells[2..].iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect())
+    }
+
+    /// An edge detail `name`: reference (0,0)–(1000,0), GYP bands at `bands`.
+    fn edge_detail(s: &mut Session, name: &str, bands: [f64; 2]) -> T<Id> {
+        let d = id(&s.execute("newdetail", &json!({ "name": name }))?)?;
+        s.execute("editview", &json!({ "viewId": d.0 }))?;
+        s.execute("layer.current", &json!({ "name": "0" }))?;
+        let r = line(s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": format!("{:X}", r.0), "kind": "exterior_face" }))?;
+        if s.execute("layer.new", &json!({ "name": "GYP", "current": true })).is_err() {
+            s.execute("layer.current", &json!({ "name": "GYP" }))?;
+        }
+        for y in bands {
+            line(s, [0.0, y], [1000.0, y])?;
+        }
+        Ok(d)
+    }
+
+    /// A placed plan with the observers installed, a closed room of 200 mm WALL-EXT walls, outer face
+    /// 0..`w` × 0..4000, edge detail `D1` tagged on its bottom and left walls and `D2` on its top and
+    /// right. Returns (session, plan, [D1, D2], the top tag's entities).
+    fn two_types(w: f64) -> T<(Session, Id, [Id; 2], Vec<Handle>)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        crate::maintain::install(&mut s);
+        let plan = id(&s.execute("lambproject", &json!({}))?)?;
+        let d1 = edge_detail(&mut s, "D1", [50.0, 200.0])?;
+        let d2 = edge_detail(&mut s, "D2", [13.0, 140.0])?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [w, 0], [w, 4000], [0, 4000]], "closed": true }))?;
+        s.execute("pline", &json!({ "vertices": [[200, 200], [w - 200.0, 200], [w - 200.0, 3800], [200, 3800]], "closed": true }))?;
+        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
+        s.execute("detailtag", &json!({ "detailViewId": d1.0, "tip": {"x": w / 2.0, "y": 0.0}, "bubble": {"x": w / 2.0, "y": -1000.0} }))?;
+        s.execute("detailtag", &json!({ "detailViewId": d1.0, "tip": {"x": 0.0, "y": 2000.0}, "bubble": {"x": -1000.0, "y": 2000.0} }))?;
+        s.execute("detailtag", &json!({ "detailViewId": d2.0, "tip": {"x": w, "y": 2000.0}, "bubble": {"x": w + 1000.0, "y": 2000.0} }))?;
+        let before = all_handles(&s)?;
+        s.execute("detailtag", &json!({ "detailViewId": d2.0, "tip": {"x": w / 2.0, "y": 4000.0}, "bubble": {"x": w / 2.0, "y": 5000.0} }))?;
+        let top = all_handles(&s)?.into_iter().filter(|h| !before.contains(h)).collect();
+        Ok((s, plan, [d1, d2], top))
+    }
+
+    /// Plan `plan`'s annotation block: each hexagon's centre (the centroid of its six LINEs) with
+    /// the text inside it, in block order.
+    fn hexagons(s: &Session, plan: Id) -> T<Vec<(f64, f64, String)>> {
+        let Some(b) = s.doc()?.block(&crate::schema::annotation_block_name(plan)) else { return Ok(Vec::new()) };
+        let es: Vec<&EntityKind> = b.entities.iter().map(|e| &e.kind).collect();
+        let mut out = Vec::new();
+        for w in es.windows(7) {
+            let lines: Vec<_> = w[..6].iter().filter_map(|k| if let EntityKind::Line(l) = k { Some(l) } else { None }).collect();
+            let (EntityKind::Text(t), 6) = (w[6], lines.len()) else { continue };
+            let closed = (0..6).all(|j| (lines[j].b.x - lines[(j + 1) % 6].a.x).abs() < 1e-6 && (lines[j].b.y - lines[(j + 1) % 6].a.y).abs() < 1e-6);
+            if !closed {
+                continue;
+            }
+            let (x, y) = (lines.iter().map(|l| l.a.x).sum::<f64>() / 6.0, lines.iter().map(|l| l.a.y).sum::<f64>() / 6.0);
+            out.push((x.round(), y.round(), t.value.clone()));
+        }
+        Ok(out)
+    }
+
+    fn sorted(mut h: Vec<(f64, f64, String)>) -> Vec<(f64, f64, String)> {
+        h.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        h
+    }
+
+    fn tag(x: f64, y: f64, m: &str) -> (f64, f64, String) {
+        (x, y, m.to_owned())
+    }
+
+    #[test]
+    fn a_tagged_plan_marks_each_run_inside_with_its_a604_row() -> R {
+        let (mut s, plan, [d1, d2], _) = two_types(5000.0)?;
+        assert!(hexagons(&s, plan)?.is_empty(), "off by default");
+        let n = undo_len(&s)?;
+        let r = s.execute("walltags", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!(r["tags"], 4, "{r}");
+        s.execute("walltypes", &json!({}))?;
+        let rows = body(&s)?;
+        let mark = |d: &str| rows.iter().find(|r| r[1] == d).map(|r| r[0].clone()).ok_or("no row");
+        let (m1, m2) = (mark("D1")?, mark("D2")?);
+        assert_eq!(wall_type_rows(s.doc()?).iter().map(|r| r.detail).collect::<Vec<_>>(), [d1, d2]);
+        // Each centre sits half the wall plus 400 inside the run's midpoint: inside the room.
+        assert_eq!(
+            sorted(hexagons(&s, plan)?),
+            sorted(vec![tag(2500.0, 600.0, &m1), tag(600.0, 2000.0, &m1), tag(2500.0, 3400.0, &m2), tag(4400.0, 2000.0, &m2)]),
+        );
+        let n = undo_len(&s)?;
+        s.execute("walltags", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(undo_len(&s)?, n, "already on records no undo step");
+        Ok(())
+    }
+
+    #[test]
+    fn a_short_run_gets_no_tag() -> R {
+        let (mut s, plan, _, _) = two_types(1000.0)?;
+        let r = s.execute("walltags", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(r["message"], "2 wall tags on Ground Floor.", "{r}");
+        assert_eq!(hexagons(&s, plan)?.len(), 2);
+        assert!(hexagons(&s, plan)?.iter().all(|h| (h.1 - 2000.0).abs() < 1.0), "only the 4000 walls");
+        Ok(())
+    }
+
+    #[test]
+    fn tags_follow_their_walls_and_details_and_turn_off() -> R {
+        let (mut s, plan, [d1, _], top) = two_types(5000.0)?;
+        s.execute("walltags", &json!({ "viewId": plan.0 }))?;
+        let n = undo_len(&s)?;
+        s.execute("stretch", &json!({ "window": [[4700, -100], [5100, 4100]], "delta": [500, 0] }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "the move and its tag are one step");
+        assert!(hexagons(&s, plan)?.contains(&tag(4900.0, 2000.0, "W2")), "{:?}", hexagons(&s, plan)?);
+        s.undo()?;
+        assert!(hexagons(&s, plan)?.contains(&tag(4400.0, 2000.0, "W2")));
+        s.execute("erase", &json!({ "handles": top.iter().map(|h| format!("{:X}", h.0)).collect::<Vec<_>>() }))?;
+        s.execute("detailtag", &json!({ "detailViewId": d1.0, "tip": {"x": 2500.0, "y": 4000.0}, "bubble": {"x": 2500.0, "y": 5000.0} }))?;
+        assert!(hexagons(&s, plan)?.contains(&tag(2500.0, 3400.0, "W1")), "retagged: {:?}", hexagons(&s, plan)?);
+        let r = s.execute("walltags", &json!({ "viewId": plan.0, "off": true }))?;
+        assert_eq!(r["message"], "Wall tags off for Ground Floor.");
+        assert!(hexagons(&s, plan)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_never_turned_on_is_unchanged_and_the_list_survives_dxf() -> R {
+        let (mut s, plan, _, _) = two_types(5000.0)?;
+        let block = |s: &Session| -> T<Option<String>> {
+            Ok(s.doc()?.block(&crate::schema::annotation_block_name(plan)).map(|b| format!("{:?}", b.entities)))
+        };
+        let before = block(&s)?;
+        s.execute("walltypes", &json!({}))?;
+        assert_eq!(block(&s)?, before, "a legend alone tags nothing");
+        assert!(hexagons(&s, plan)?.is_empty());
+        s.execute("walltags", &json!({ "viewId": plan.0 }))?;
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(read_document(&back)?.wall_tag_plans, [plan]);
+        assert!(crate::annotations::settled(&back)?, "the observer would change nothing after a round trip");
+        Ok(())
+    }
+
+    #[test]
+    fn walltags_outside_a_placed_plan_is_refused_with_no_undo_step() -> R {
+        let (mut s, _, [d1, _], _) = two_types(5000.0)?;
+        let floating = id(&s.execute("newplan", &json!({ "name": "Loose" }))?)?;
+        let n = undo_len(&s)?;
+        assert!(s.execute("walltags", &json!({ "viewId": d1.0 })).is_err(), "a detail");
+        assert!(s.execute("walltags", &json!({ "viewId": floating.0 })).is_err(), "a floating plan");
+        assert_eq!(undo_len(&s)?, n);
+        assert!(read_document(s.doc()?)?.wall_tag_plans.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_form_asks_on_or_off() -> R {
+        let (mut s, plan, _, _) = two_types(5000.0)?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.start("wtag")?;
+        let p = s.current_prompt().ok_or("no prompt")?;
+        assert_eq!((p.message.as_str(), p.default.as_deref()), ("Wall tags", Some("On")));
+        s.input(Input::Enter)?;
+        assert_eq!(hexagons(&s, plan)?.len(), 4);
+        Ok(())
     }
 
     #[test]

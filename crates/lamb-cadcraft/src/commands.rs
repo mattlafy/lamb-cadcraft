@@ -46,6 +46,8 @@
 //! - `walltypes {layout?, at?}` (`wtype`): the wall-type legend — each edge detail on a wall, marked
 //!   `W1`…, with its build-up, thickness and repeats — as a table on layout `A604` — see
 //!   [`crate::walltypes`].
+//! - `walltags {viewId?, off?}` (`wtag`): tags each wall of a placed plan with its wall type mark in a
+//!   hexagon, generated into its annotation block — see [`crate::walltypes`].
 //! - `vpview {handle, viewId | null}`: binds a layout viewport to a view — its `view_id`, every other
 //!   view's layer frozen in it, zoomed to the view; `null` unbinds it. One undo step; the
 //!   Properties palette's View row runs it ([`crate::props`]).
@@ -946,6 +948,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["wtype"])
             .params("{layout?, at?} → {layout, handle, rows: [{mark, detail, buildUp, thicknessMm, repeats, usedIn}], message}")
             .interactive(crate::walltypes::walltypes_machine),
+        CommandSpec::new("walltags", "Wall Tags", crate::walltypes::walltags)
+            .alias(&["wtag"])
+            .params("{viewId?, off?} → {viewId, tags, message}")
+            .interactive(crate::walltypes::walltags_machine),
         CommandSpec::new("vpview", "Viewport View", vpview).params("{handle, viewId | null} → {handle, viewId}"),
         CommandSpec::new("editview", "Edit View", editview).params("{viewId?}").noundo().menu(MENU_VIEW_SETUP).interactive(editview_machine),
         CommandSpec::new("viewprops", "View Properties", crate::viewprops::viewprops)

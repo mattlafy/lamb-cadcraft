@@ -101,6 +101,9 @@ pub struct LambDocument {
     /// space ([`crate::autodim::interior`], `autodim {interior: true}`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_dim_interior_plans: Vec<Id>,
+    /// Plan views given wall type tags ([`crate::walltypes::wall_tags`], `walltags`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wall_tag_plans: Vec<Id>,
     /// Edge detail views given generated layer notes ([`crate::detailnotes`], `detailnotes`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detail_note_views: Vec<Id>,
@@ -179,6 +182,7 @@ impl LambDocument {
             mitre_plans: Vec::new(),
             auto_dim_plans: Vec::new(),
             auto_dim_interior_plans: Vec::new(),
+            wall_tag_plans: Vec::new(),
             detail_note_views: Vec::new(),
             sheet_paper: None,
             sheet_info: None,

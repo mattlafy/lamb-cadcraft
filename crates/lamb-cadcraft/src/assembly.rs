@@ -976,7 +976,7 @@ fn block_lines_of<'a>(
 }
 
 /// The midpoint of a run's centreline: a line's mean of ends, an arc's point at half its sweep.
-fn run_midpoint(run: &WallRun) -> Point2 {
+pub(crate) fn run_midpoint(run: &WallRun) -> Point2 {
     match run.centreline {
         RunCurve::Line { from, to } => Point2 { x: (from.x + to.x) / 2.0, y: (from.y + to.y) / 2.0 },
         RunCurve::Arc { center, radius, start_angle, sweep } => {

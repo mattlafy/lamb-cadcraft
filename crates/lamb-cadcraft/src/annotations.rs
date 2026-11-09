@@ -9,6 +9,8 @@
 //! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641), one
 //! in `auto_dim_interior_plans` its rooms' clear dimensions (LAMB T686),
 //! and every placed plan a text of each opening's schedule mark outside it ([`crate::schedule`], LAMB T639).
+//! A plan in `wall_tag_plans` gets each wall type tag, its mark in a hexagon inside the run
+//! ([`crate::walltypes::wall_tags`], LAMB T690).
 //! An edge detail in `detail_note_views` gets a leader and a `<thickness> <material>` note per layer
 //! and one per repeat ([`crate::detailnotes`], LAMB T689).
 //! A placed plan, section or elevation with an enlarged sheet gets a box around each enlarged area and
@@ -45,6 +47,7 @@ use crate::rooms::{RoomTag, area_text, room_tags};
 use crate::schedule::{PlanMark, plan_marks};
 use crate::schema::{annotation_block_name, read_document, view_block_name};
 use crate::sheets::{enlarged_windows, sheet_refs, view_scale};
+use crate::walltypes::{WallTag, wall_tags};
 
 /// The scale every length constant below is the value at.
 const BASE_SCALE: f64 = 50.0;
@@ -111,7 +114,14 @@ fn enlarged_boxes(d: &Drawing, id: Id, scale: f64) -> Vec<Item> {
 /// What view `id` wants, in write order: a plan its cut symbols, opening marks and room tags, a vertical view
 /// its level lines, and either the box of each enlarged area; a detail in `detail_note_views` its layer
 /// notes ([`crate::detailnotes`]); nothing for an unplaced plan or vertical view or any other detail.
-fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>, marks: &[PlanMark], rooms: &[RoomTag]) -> Result<Vec<Item>, String> {
+fn wanted(
+    d: &Drawing,
+    id: Id,
+    sheet_of: &dyn Fn(Id) -> Option<String>,
+    marks: &[PlanMark],
+    rooms: &[RoomTag],
+    tags: &[WallTag],
+) -> Result<Vec<Item>, String> {
     let dp = DrawingProject::new(d).map_err(|e| e.to_string())?;
     if dp.view(id).is_some_and(|v| v.kind == ViewKind::Detail) {
         if !dp.document().detail_note_views.contains(&id) {
@@ -161,6 +171,18 @@ fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>, marks: &
     for m in marks.iter().filter(|m| m.plan == plan) {
         let off = MARK_OFFSET_MM * f;
         out.push(Item::Text(v(m.at.x + m.out.x * off, m.at.y + m.out.y * off), m.mark.clone(), height));
+    }
+    // Each wall type tag: a flat-topped hexagon of circumradius 0.9 × height round its mark.
+    for t in tags.iter().filter(|t| t.plan == plan) {
+        let off = t.half_width + MARK_OFFSET_MM * f;
+        let c = v(t.at.x + t.inward.x * off, t.at.y + t.inward.y * off);
+        let r = 0.9 * height;
+        let corner = |i: usize| {
+            let (s, co) = (i as f64 * std::f64::consts::FRAC_PI_3).sin_cos();
+            v(c.x + r * co, c.y + r * s)
+        };
+        out.extend((0..6).map(|i| Item::Line(corner(i), corner((i + 1) % 6))));
+        out.push(Item::Text(c, t.mark.clone(), 0.6 * height));
     }
     // Each room: name, number and area, centred on its point, 0.35 × height apart.
     for r in rooms.iter().filter(|r| r.plan == plan) {
@@ -364,9 +386,10 @@ fn plan_changes(d: &Drawing) -> Result<Vec<(Id, Vec<Item>)>, String> {
     let sheet_of = |id: Id| refs.iter().find(|(v, _, _)| *v == id).map(|(_, n, l)| format!("{n}/{l}"));
     let marks = plan_marks(d);
     let rooms = room_tags(d);
+    let tags = wall_tags(d);
     let mut out = Vec::new();
     for p in doc.views.iter().map(AnyView::id) {
-        let want = wanted(d, p, &sheet_of, &marks, &rooms)?;
+        let want = wanted(d, p, &sheet_of, &marks, &rooms, &tags)?;
         let changed = match d.block(&annotation_block_name(p)) {
             Some(b) => !block_matches(b, &want),
             None => !want.is_empty(),
