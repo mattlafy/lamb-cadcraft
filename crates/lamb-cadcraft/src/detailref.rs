@@ -7,7 +7,11 @@
 //!
 //! A reference is **linear** (one straight line) or a **corner** (LAMB T674): an open polyline of
 //! two straight, non-collinear segments, or two straight lines meeting at one end within
-//! `TOLERANCE.coincidence_mm`. A detail's kind — linear or corner — comes from its reference.
+//! `TOLERANCE.coincidence_mm`. A detail's kind comes from its reference (LAMB T683): a linear
+//! detail is a repeating condition laid along a wall run and tags wall faces only; a corner
+//! reference makes an **anchored** detail, aligned at the corner vertex, which tags wall corners,
+//! opening jambs (plan), heads and sills (section) and free ends — never a face. Its first arm
+//! (`from → to`) is the face arm ending at the anchor; the second is the return across the wall.
 //!
 //! - `detailref {handle, handle2?, kind?}` (LAMB ▸ Details ▸ Detail Reference): only while editing a
 //!   detail view; `handle` must be a straight line or a corner polyline in its block, `handle2` a
@@ -144,9 +148,9 @@ fn line_pair(x: &Entity, y: &Entity, kind: DetailRefKind) -> Option<DetailRef> {
     Some(DetailRef { handle: x.handle, kind, from, to: c, corner: Some(CornerArm { handle: Some(y.handle), end }) })
 }
 
-/// `detail`'s kind: `Some(true)` for a corner reference, `Some(false)` for a linear one, `None`
-/// when it has no readable reference yet.
-pub fn detail_is_corner(d: &Drawing, detail: Id) -> Option<bool> {
+/// `detail`'s kind: `Some(true)` for an anchored detail (a corner reference), `Some(false)` for a
+/// linear one, `None` when it has no readable reference yet.
+pub fn detail_is_anchored(d: &Drawing, detail: Id) -> Option<bool> {
     detail_reference(d, detail).ok().flatten().map(|r| r.corner.is_some())
 }
 
@@ -593,7 +597,7 @@ mod tests {
         assert_eq!(r, json!({ "handle": hex(c), "kind": "grid", "shape": "corner" }));
         let got = detail_reference(s.doc()?, detail)?.ok_or("no reference")?;
         assert_eq!((got.from, got.to, got.corner), (P(-1000.0, 0.0), P(0.0, 0.0), Some(CornerArm { handle: None, end: P(0.0, 1000.0) })));
-        assert_eq!(detail_is_corner(s.doc()?, detail), Some(true));
+        assert_eq!(detail_is_anchored(s.doc()?, detail), Some(true));
 
         // A (0,0)-(1000,0) and a line from (1000,0.3) up: they meet at A's far end.
         let up = line(&mut s, [1000.0, 0.3], [1000.0, 800.0])?;

@@ -1446,6 +1446,17 @@ pub(crate) mod tests {
         Ok(all_handles(s)?.into_iter().find(|h| !before.contains(h)).ok_or("line not drawn")?)
     }
 
+    /// An anchored (jamb, head/sill or end) detail's corner reference of `kind` on the current layer
+    /// (LAMB T683): the face arm (−1000,0)→(0,0) ending at the jamb corner, then the return arm
+    /// (0,0)→(0,200) across the wall. Returns the polyline's handle.
+    pub(crate) fn jamb_ref(s: &mut Session, kind: &str) -> T<Handle> {
+        let before = all_handles(s)?;
+        s.execute("pline", &json!({ "vertices": [[-1000.0, 0.0], [0.0, 0.0], [0.0, 200.0]] }))?;
+        let r = all_handles(s)?.into_iter().find(|h| !before.contains(h)).ok_or("pline not drawn")?;
+        s.execute("detailref", &json!({ "handle": r.hex(), "kind": kind }))?;
+        Ok(r)
+    }
+
     /// `detailtags.rs`'s room: a plan with a closed 5000 × 4000 room of 200 mm walls on `WALL-EXT`
     /// (outer face 0..5000 × 0..4000) and a detail `D1` holding a reference (0,0)–(1000,0) of
     /// `kind` and bands at y = −20 (`CLAD`), 50 and 200 (`GYP`). With `tagged`, one edge tag on the
@@ -3514,8 +3525,7 @@ pub(crate) mod tests {
         let jd = Id(s.execute("newdetail", &json!({ "name": "JD" }))?["viewId"].as_u64().ok_or("no id")?);
         s.execute("editview", &json!({ "viewId": jd.0 }))?;
         s.execute("layer.current", &json!({ "name": "0" }))?;
-        let r = line(&mut s, [-1000.0, 0.0], [0.0, 0.0])?;
-        s.execute("detailref", &json!({ "handle": r.hex(), "kind": "exterior_face" }))?;
+        jamb_ref(&mut s, "exterior_face")?;
         s.execute("layer.new", &json!({ "name": "JAMB", "current": true }))?;
         line(&mut s, [-50.0, 0.0], [-50.0, 200.0])?;
         s.execute("layer.current", &json!({ "name": "GYP" }))?;
@@ -3819,8 +3829,7 @@ pub(crate) mod tests {
         let jd = Id(s.execute("newdetail", &json!({ "name": "JD" }))?["viewId"].as_u64().ok_or("no id")?);
         s.execute("editview", &json!({ "viewId": jd.0 }))?;
         s.execute("layer.current", &json!({ "name": "0" }))?;
-        let r = line(&mut s, [-1000.0, 0.0], [0.0, 0.0])?;
-        s.execute("detailref", &json!({ "handle": r.hex(), "kind": jamb_kind }))?;
+        jamb_ref(&mut s, jamb_kind)?;
         s.execute("layer.new", &json!({ "name": "JAMB", "current": true }))?;
         line(&mut s, [-50.0, 0.0], [-50.0, 200.0])?;
         s.execute("layer.current", &json!({ "name": "GYP" }))?;
@@ -4014,8 +4023,7 @@ pub(crate) mod tests {
             let id = Id(s.execute("newdetail", &json!({ "name": name, "cutDirection": "vertical" }))?["viewId"].as_u64().ok_or("no id")?);
             s.execute("editview", &json!({ "viewId": id.0 }))?;
             s.execute("layer.current", &json!({ "name": "0" }))?;
-            let r = line(s, [-1000.0, 0.0], [0.0, 0.0])?;
-            s.execute("detailref", &json!({ "handle": r.hex(), "kind": "exterior_face" }))?;
+            jamb_ref(s, "exterior_face")?;
             s.execute("layer.new", &json!({ "name": layer, "current": true }))?;
             line(s, [-50.0, 0.0], [-50.0, 200.0])?;
             s.execute("layer.current", &json!({ "name": "GYP" }))?;

@@ -668,18 +668,22 @@ pub(crate) fn detailtag(s: &mut Session, p: &Value) -> Result<Value> {
         (CutDirection::Plan, CutDirection::Vertical) => return Err(other("That detail is drawn in plan; tag it in a plan view")),
         _ => {}
     }
-    // The detail's kind (from its reference, LAMB T674): a corner detail tags only a wall corner, a
-    // linear one never a junction (it still tags faces, jambs and free ends); no reference accepts either.
-    let kind = crate::detailref::detail_is_corner(s.doc()?, detail);
+    // The detail's kind (from its reference, LAMB T674/T683): an anchored detail (corner
+    // reference) tags a wall corner, opening or free end, never a face; a linear one tags faces
+    // only. No reference yet accepts either. Tags already placed are not re-checked.
+    let kind = crate::detailref::detail_is_anchored(s.doc()?, detail);
     let corner = corner_given.or(kind).unwrap_or(false);
     let detail_name =
         || read_document(s.doc()?).map_err(other).map(|d| d.views.iter().find(|v| v.id() == detail).map(|v| v.name().to_owned()).unwrap_or_default());
     if kind == Some(true) && !corner {
-        return Err(other(format!("{} is a corner detail: tag a wall corner with it", detail_name()?)));
+        return Err(other(format!("{} is an anchored detail: tag a wall corner, opening or wall end with it", detail_name()?)));
     }
     let target = view_target(s, view, corner, Point2 { x: tip.x, y: tip.y }).map_err(other)?;
-    if kind == Some(false) && matches!(target, Target::Junction(_)) {
-        return Err(other(format!("{} is a linear detail: tag a wall face with it", detail_name()?)));
+    if kind == Some(false) && !matches!(target, Target::Run(_)) {
+        return Err(other(format!(
+            "{} is a linear detail: tag a wall face with it (a corner, jamb or end detail needs a corner reference — DETAILREF)",
+            detail_name()?
+        )));
     }
     if let Shape::Box(a, b) = shape
         && let Some(e) = box_refusal(tip, a, b)
@@ -831,16 +835,20 @@ struct Offered {
     id: Id,
     keyword: String,
     name: String,
-    /// Its kind from its reference: `Some(true)` corner, `Some(false)` linear, `None` no reference yet.
-    corner: Option<bool>,
+    /// Its kind from its reference: `Some(true)` anchored, `Some(false)` linear, `None` no reference yet.
+    anchored: Option<bool>,
 }
 
 /// DETAILTAG: detail (one keyword per detail drawn in the edited view's direction, `Corner`
-/// toggles corner mode; a typed name or id also selects), tag point, bubble point.
+/// toggles corner mode, which lists only anchored and reference-less details; a typed name or id
+/// also selects), tag point, bubble point. The picked detail's kind sets the mode (LAMB T683):
+/// anchored → corner, linear → face.
 struct DetailTagM {
     default: Option<Id>,
     detail: Option<Id>,
     corner: bool,
+    /// The edited view is a plan view (its free ends take tags).
+    plan: bool,
     /// `Flip` was toggled at the tag point prompt (this tag only).
     flip: bool,
     tip: Option<Vec2>,
@@ -853,7 +861,18 @@ struct DetailTagM {
 impl DetailTagM {
     fn default_name(&self) -> Option<String> {
         let id = self.default?;
-        self.offered.iter().find(|o| o.id == id).map(|o| o.name.clone())
+        self.listed().find(|o| o.id == id).map(|o| o.name.clone())
+    }
+    /// The details the keyword list holds: all, or in corner mode the anchored and reference-less.
+    fn listed(&self) -> impl Iterator<Item = &Offered> {
+        self.offered.iter().filter(|o| !self.corner || o.anchored != Some(false))
+    }
+    /// Detail `id` is picked: its kind sets the mode.
+    fn pick(&mut self, id: Id) {
+        self.detail = Some(id);
+        if let Some(a) = self.offered.iter().find(|o| o.id == id).and_then(|o| o.anchored) {
+            self.corner = a;
+        }
     }
 }
 
@@ -864,8 +883,8 @@ impl Interactive for DetailTagM {
     fn prompt(&self, _s: &Session) -> Prompt {
         match (self.detail, self.tip) {
             (None, _) => {
-                let msg = if self.corner { "Select corner detail" } else { "Select detail" };
-                let kws: Vec<&str> = self.offered.iter().map(|o| o.keyword.as_str()).chain(["Corner"]).collect();
+                let msg = if self.corner { "Select anchored detail" } else { "Select detail" };
+                let kws: Vec<&str> = self.listed().map(|o| o.keyword.as_str()).chain(["Corner"]).collect();
                 let p = Prompt::new(msg, Accept::TEXT).kw(&kws).options_only();
                 match self.default_name() {
                     Some(n) => p.default(n),
@@ -874,7 +893,12 @@ impl Interactive for DetailTagM {
             }
             (Some(_), None) => {
                 if self.corner {
-                    Prompt::new("Specify tag point at a wall corner", Accept::POINT)
+                    let msg = if self.plan {
+                        "Specify tag point at a wall corner, opening or wall end"
+                    } else {
+                        "Specify tag point at a wall corner or opening"
+                    };
+                    Prompt::new(msg, Accept::POINT)
                 } else {
                     let msg = if self.flip { "Specify tag point on a wall face (flipped)" } else { "Specify tag point on a wall face" };
                     Prompt::new(msg, Accept::POINT).kw(&["Flip"])
@@ -896,6 +920,7 @@ impl Interactive for DetailTagM {
             }
         };
         let dir = view_direction(s.doc()?, view);
+        self.plan = dir == CutDirection::Plan;
         let doc = read_document(s.doc()?).map_err(other)?;
         self.offered = doc
             .views
@@ -905,7 +930,7 @@ impl Interactive for DetailTagM {
                     id: d.id,
                     keyword: detail_keyword(&d.name),
                     name: d.name.clone(),
-                    corner: crate::detailref::detail_is_corner(s.doc().ok()?, d.id),
+                    anchored: crate::detailref::detail_is_anchored(s.doc().ok()?, d.id),
                 }),
                 _ => None,
             })
@@ -927,14 +952,11 @@ impl Interactive for DetailTagM {
         let Some(detail) = self.detail else {
             let text = match i {
                 Input::Enter => match self.default {
-                    Some(id) => {
-                        self.detail = Some(id);
-                        if self.offered.iter().any(|o| o.id == id && o.corner == Some(true)) {
-                            self.corner = true;
-                        }
+                    Some(id) if self.listed().any(|o| o.id == id) => {
+                        self.pick(id);
                         return Ok(Step::Continue);
                     }
-                    None => return Ok(Step::Cancel),
+                    _ => return Ok(Step::Cancel),
                 },
                 Input::Text(t) | Input::Keyword(t) => t.trim().to_owned(),
                 _ => return Ok(Step::Continue),
@@ -945,11 +967,8 @@ impl Interactive for DetailTagM {
             }
             let by_name = self.offered.iter().find(|o| o.keyword.eq_ignore_ascii_case(&text) || o.name.eq_ignore_ascii_case(&text));
             let by_id = || text.parse::<u64>().ok().and_then(|n| self.offered.iter().find(|o| o.id == Id(n)));
-            if let Some(o) = by_name.or_else(by_id) {
-                self.detail = Some(o.id);
-                if o.corner == Some(true) {
-                    self.corner = true;
-                }
+            if let Some(id) = by_name.or_else(by_id).map(|o| o.id) {
+                self.pick(id);
                 return Ok(Step::Continue);
             }
             // A detail drawn the other way gets the reason it is not offered.
@@ -1039,7 +1058,17 @@ impl Interactive for DetailTagM {
 }
 
 pub(crate) fn detailtag_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(DetailTagM { default: None, detail: None, corner: false, flip: false, tip: None, offered: Vec::new(), boxing: false, box_a: None }))
+    Ok(Box::new(DetailTagM {
+        default: None,
+        detail: None,
+        corner: false,
+        plan: true,
+        flip: false,
+        tip: None,
+        offered: Vec::new(),
+        boxing: false,
+        box_a: None,
+    }))
 }
 
 #[cfg(test)]
@@ -1304,9 +1333,9 @@ mod tests {
         s.start("dtag")?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [D1/Corner] <D1>:"));
         s.input(Input::Keyword("Corner".into()))?;
-        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Select corner detail"));
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Select anchored detail"));
         s.input(Input::Text("d1".into()))?;
-        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point at a wall corner"));
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point at a wall corner, opening or wall end"));
         s.input(Input::Point(Vec2::new(0.0, 0.0)))?;
         assert_eq!(s.current_prompt().and_then(|p| p.base), Some(Vec2::new(0.0, 0.0)));
         s.input(Input::Point(Vec2::new(-1000.0, -1000.0)))?;
@@ -1593,21 +1622,25 @@ mod tests {
         Ok(())
     }
 
-    /// LAMB T674: the detail's reference decides its kind — a linear detail refuses a wall corner, a
-    /// corner detail a wall face — and picking a corner detail asks for a wall corner by itself.
+    /// LAMB T674/T683: the detail's reference decides its kind — a linear detail refuses a wall
+    /// corner, an anchored (corner reference) detail a wall face — and picking an anchored detail
+    /// asks for a wall corner, opening or end by itself.
     #[test]
     fn a_detail_s_reference_decides_corner_or_face() -> R {
         let (mut s, plan) = crate::assembly::tests::room("exterior_face", true)?;
         let d1 = read_document(s.doc()?)?.views.iter().find(|v| matches!(v, AnyView::Detail(_))).ok_or("no detail")?.id();
-        assert_eq!(crate::detailref::detail_is_corner(s.doc()?, d1), Some(false));
+        assert_eq!(crate::detailref::detail_is_anchored(s.doc()?, d1), Some(false));
         let undo = s.state()?.undo.len();
         let e = tag(&mut s, d1, true, (0.0, 0.0)).err().ok_or("linear detail tagged a corner")?;
-        assert_eq!(e.to_string(), "D1 is a linear detail: tag a wall face with it");
+        assert_eq!(e.to_string(), LINEAR_D1);
         assert_eq!(s.state()?.undo.len(), undo, "nothing recorded");
 
         let cd = crate::assembly::tests::corner_detail(&mut s, plan, "exterior_face", false, (5000.0, 0.0))?;
-        assert_eq!(crate::detailref::detail_is_corner(s.doc()?, cd), Some(true));
-        for (p, want) in [(json!({}), "Not at a wall corner"), (json!({ "corner": false }), "CD is a corner detail: tag a wall corner with it")] {
+        assert_eq!(crate::detailref::detail_is_anchored(s.doc()?, cd), Some(true));
+        for (p, want) in [
+            (json!({}), "Not at a wall corner"),
+            (json!({ "corner": false }), "CD is an anchored detail: tag a wall corner, opening or wall end with it"),
+        ] {
             let mut p = p;
             p["detailViewId"] = json!(cd.0);
             p["tip"] = json!({"x": 2500.0, "y": 0.0});
@@ -1620,7 +1653,65 @@ mod tests {
 
         s.start("detailtag")?;
         s.input(Input::Keyword("CD".into()))?;
-        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point at a wall corner"));
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point at a wall corner, opening or wall end"));
+        Ok(())
+    }
+
+    const LINEAR_D1: &str = "D1 is a linear detail: tag a wall face with it (a corner, jamb or end detail needs a corner reference — DETAILREF)";
+
+    /// LAMB T683: a linear (single-line) detail is refused at an opening jamb, at a wall's free end
+    /// and at a section's head, recording nothing; it still tags a face. (The corner-reference `JD`,
+    /// `H` and `S` lay at jambs, ends, heads and sills in `assembly.rs`'s tests.)
+    #[test]
+    fn a_linear_detail_refuses_a_jamb_a_free_end_and_a_head() -> R {
+        let (mut s, _plan) = crate::assembly::tests::window_room(false, false)?;
+        let d1 = d1_of(&s)?;
+        let undo = s.state()?.undo.len();
+        let e = tag(&mut s, d1, true, (2500.0, 100.0)).err().ok_or("linear detail tagged a jamb")?;
+        assert_eq!(e.to_string(), LINEAR_D1);
+        assert_eq!(s.state()?.undo.len(), undo, "nothing recorded");
+        s.execute("detailtag", &json!({ "detailViewId": d1.0, "tip": {"x": 4000.0, "y": 4000.0}, "bubble": {"x": 4000.0, "y": 5000.0} }))?;
+
+        let (mut s, _plan, _jd) = crate::assembly::tests::gap_room()?;
+        let undo = s.state()?.undo.len();
+        let d1 = d1_of(&s)?;
+        let e = tag(&mut s, d1, true, (2000.0, 100.0)).err().ok_or("linear detail tagged a free end")?;
+        assert_eq!(e.to_string(), LINEAR_D1);
+        assert_eq!(s.state()?.undo.len(), undo, "nothing recorded");
+
+        let (mut s, _sec, _) = crate::assembly::tests::window_section(false)?;
+        let sd = read_document(s.doc()?)?.views.iter().find(|v| v.name() == "SD").ok_or("no SD")?.id();
+        let undo = s.state()?.undo.len();
+        let e = s
+            .execute("detailtag", &json!({ "detailViewId": sd.0, "corner": true, "tip": {"x": 150, "y": 2050}, "bubble": {"x": 1500, "y": 2050} }))
+            .err()
+            .ok_or("linear detail tagged a head")?;
+        assert!(e.to_string().starts_with("SD is a linear detail: tag a wall face with it"), "{e}");
+        assert_eq!(s.state()?.undo.len(), undo, "nothing recorded");
+        Ok(())
+    }
+
+    fn d1_of(s: &Session) -> T<Id> {
+        Ok(read_document(s.doc()?)?.views.iter().find(|v| v.name() == "D1").ok_or("no D1")?.id())
+    }
+
+    /// LAMB T683: `Corner` lists only anchored and reference-less details, and picking a linear
+    /// detail (typed by name) after `Corner` asks the face prompt.
+    #[test]
+    fn corner_mode_lists_anchored_details_and_a_linear_pick_asks_for_a_face() -> R {
+        let (mut s, _plan) = crate::assembly::tests::window_room(false, false)?;
+        s.start("dtag")?;
+        assert_eq!(s.current_prompt().map(|p| p.keywords.clone()), Some(vec!["D1".to_owned(), "JD".to_owned(), "Corner".to_owned()]));
+        s.input(Input::Keyword("Corner".into()))?;
+        let p = s.current_prompt().ok_or("no prompt")?;
+        assert_eq!((p.message.as_str(), p.keywords.clone()), ("Select anchored detail", vec!["JD".to_owned(), "Corner".to_owned()]));
+        s.input(Input::Text("D1".into()))?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point on a wall face"));
+        s.input(Input::Cancel)?;
+
+        s.start("dtag")?;
+        s.input(Input::Text("JD".into()))?;
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point at a wall corner, opening or wall end"));
         Ok(())
     }
 }
