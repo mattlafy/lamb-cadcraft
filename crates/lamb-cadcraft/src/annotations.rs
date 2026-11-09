@@ -6,7 +6,8 @@
 //! level's projected floor elevation spanning the view block's extents ±[`LEVEL_OVERRUN_MM`], and
 //! `"<name> <±elev>"` left-aligned past its right end, plus a vertical floor-to-floor dimension per
 //! pair of consecutive levels by elevation (LAMB T500). Plan cut elevations stay overlay-only. A
-//! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641),
+//! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641), one
+//! in `auto_dim_interior_plans` its rooms' clear dimensions (LAMB T686),
 //! and every placed plan a text of each opening's schedule mark outside it ([`crate::schedule`], LAMB T639).
 //! A placed plan, section or elevation with an enlarged sheet gets a box around each enlarged area and
 //! `<n>/<layout>` above its top-left corner ([`crate::sheets::enlarged_windows`], LAMB T655).
@@ -156,6 +157,10 @@ fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>, marks: &
     if dp.document().auto_dim_plans.contains(&plan) {
         let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
         out.extend(crate::autodim::strings(&dp, plan, f).into_iter().map(|d| Item::Dim(at(d.a), at(d.b), d.rotation, at(d.line_at), scale)));
+    }
+    if dp.document().auto_dim_interior_plans.contains(&plan) {
+        let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
+        out.extend(crate::autodim::interior(&dp, plan).into_iter().map(|d| Item::Dim(at(d.a), at(d.b), d.rotation, at(d.line_at), scale)));
     }
     out.extend(enlarged_boxes(d, id, scale));
     Ok(out)

@@ -22,8 +22,8 @@
 //! - `enlargedsheet {viewId, from, to, scale?, show?}` (`esheet`): a chosen area of a plan, section or
 //!   elevation on a new sheet at a larger scale, plotted after the view's own sheet — see
 //!   [`crate::sheetset`].
-//! - `autodim {view?, off?}` (`adim`): a placed plan's generated exterior dimension strings, on or
-//!   off — see [`crate::autodim`].
+//! - `autodim {view?, off?, interior?}` (`adim`): a placed plan's generated exterior dimension
+//!   strings, or with `interior: true` its rooms' clear dimensions, on or off — see [`crate::autodim`].
 //! - `sheetsize {paper}` (`ssize`): the paper new sheets are made on, ARCH D landscape until set;
 //!   existing sheets keep their size — see [`crate::sheetset`].
 //! - `titleblock {project?, client?, address?, drawnBy?, date?, north?}` (`tblock`): the text every
@@ -884,7 +884,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .interactive(crate::sheetset::enlargedsheet_machine),
         CommandSpec::new("autodim", "Dimension Plan", crate::autodim::autodim)
             .alias(&["adim"])
-            .params("{view?, off?} → {view, dimensions, message}")
+            .params("{view?, off?, interior?} → {view, dimensions, interior, message}")
             .interactive(crate::autodim::autodim_machine),
         CommandSpec::new("sheetsize", "Sheet Size", crate::sheetset::sheetsize)
             .alias(&["ssize"])
