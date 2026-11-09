@@ -24,6 +24,8 @@
 //!   [`crate::sheetset`].
 //! - `autodim {view?, off?, interior?}` (`adim`): a placed plan's generated exterior dimension
 //!   strings, or with `interior: true` its rooms' clear dimensions, on or off — see [`crate::autodim`].
+//! - `detailnotes {viewId?, off?}` (`dnote`): an edge detail's generated layer notes with leaders,
+//!   on or off — see [`crate::detailnotes`].
 //! - `sheetsize {paper}` (`ssize`): the paper new sheets are made on, ARCH D landscape until set;
 //!   existing sheets keep their size — see [`crate::sheetset`].
 //! - `titleblock {project?, client?, address?, drawnBy?, date?, north?}` (`tblock`): the text every
@@ -904,6 +906,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["adim"])
             .params("{view?, off?, interior?} → {view, dimensions, interior, message}")
             .interactive(crate::autodim::autodim_machine),
+        CommandSpec::new("detailnotes", "Detail Notes", crate::detailnotes::detailnotes)
+            .alias(&["dnote"])
+            .params("{viewId?, off?} → {viewId, notes, message}")
+            .interactive(crate::detailnotes::detailnotes_machine),
         CommandSpec::new("sheetsize", "Sheet Size", crate::sheetset::sheetsize)
             .alias(&["ssize"])
             .params("{paper} → {paper, widthMm, heightMm, message}")

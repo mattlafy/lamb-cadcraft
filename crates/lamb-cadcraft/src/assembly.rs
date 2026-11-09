@@ -187,7 +187,7 @@ fn block_hatches_of(runs: &[RunAssembly]) -> impl Iterator<Item = (&str, Hatch)>
 
 /// Every entity in `detail`'s block except `reference` and repeat members ([`crate::repeats`]) that
 /// is one straight open segment, with its layer.
-fn detail_lines(d: &Drawing, detail: Id, reference: &[cadcraft_doc::Handle]) -> Result<Vec<(Point2, Point2, String)>, String> {
+pub(crate) fn detail_lines(d: &Drawing, detail: Id, reference: &[cadcraft_doc::Handle]) -> Result<Vec<(Point2, Point2, String)>, String> {
     let Some(block) = d.block(&view_block_name(detail)) else { return Ok(Vec::new()) };
     let repeated = repeat_members(d, detail)?;
     Ok(block

@@ -9,6 +9,8 @@
 //! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641), one
 //! in `auto_dim_interior_plans` its rooms' clear dimensions (LAMB T686),
 //! and every placed plan a text of each opening's schedule mark outside it ([`crate::schedule`], LAMB T639).
+//! An edge detail in `detail_note_views` gets a leader and a `<thickness> <material>` note per layer
+//! and one per repeat ([`crate::detailnotes`], LAMB T689).
 //! A placed plan, section or elevation with an enlarged sheet gets a box around each enlarged area and
 //! `<n>/<layout>` above its top-left corner ([`crate::sheets::enlarged_windows`], LAMB T655).
 //!
@@ -82,7 +84,7 @@ enum Item {
 }
 
 /// What a length constant is multiplied by at 1:`scale`.
-fn k(scale: f64) -> f64 {
+pub(crate) fn k(scale: f64) -> f64 {
     scale / BASE_SCALE
 }
 
@@ -107,9 +109,22 @@ fn enlarged_boxes(d: &Drawing, id: Id, scale: f64) -> Vec<Item> {
 }
 
 /// What view `id` wants, in write order: a plan its cut symbols, opening marks and room tags, a vertical view
-/// its level lines, and either the box of each enlarged area; nothing for an unplaced view.
+/// its level lines, and either the box of each enlarged area; a detail in `detail_note_views` its layer
+/// notes ([`crate::detailnotes`]); nothing for an unplaced plan or vertical view or any other detail.
 fn wanted(d: &Drawing, id: Id, sheet_of: &dyn Fn(Id) -> Option<String>, marks: &[PlanMark], rooms: &[RoomTag]) -> Result<Vec<Item>, String> {
     let dp = DrawingProject::new(d).map_err(|e| e.to_string())?;
+    if dp.view(id).is_some_and(|v| v.kind == ViewKind::Detail) {
+        if !dp.document().detail_note_views.contains(&id) {
+            return Ok(Vec::new());
+        }
+        let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
+        let mut out = Vec::new();
+        for n in crate::detailnotes::notes(d, id, view_scale(d, dp.document(), id)) {
+            out.extend(n.leader.windows(2).map(|w| Item::Line(at(w[0]), at(w[1]))));
+            out.push(Item::Label(at(n.at), n.text, n.height));
+        }
+        return Ok(out);
+    }
     let Some(view) = dp.view(id).filter(|v| v.placement.is_some()) else { return Ok(Vec::new()) };
     let scale = view_scale(d, dp.document(), id);
     if view.kind == ViewKind::Vertical {

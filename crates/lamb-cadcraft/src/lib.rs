@@ -41,6 +41,7 @@ pub mod commands;
 pub mod convert;
 pub mod corners;
 mod cutlinecmd;
+pub mod detailnotes;
 pub mod detailref;
 pub mod detailsheets;
 pub mod detailtags;
