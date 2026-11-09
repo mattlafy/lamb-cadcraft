@@ -246,7 +246,7 @@ pub(crate) fn osnap_with_neighborhood(
         Some((hit, prims)) => (hit, Some(prims)),
         None => (None, None),
     };
-    best = with_providers(d, space, cursor, aperture, best);
+    best = with_providers(d, space, cursor, aperture, osmode, best);
     let views = viewport::near(d, space, cursor, aperture);
     if views.is_empty() {
         return (best, near_prims);
@@ -283,8 +283,9 @@ pub(crate) fn osnap_with_neighborhood(
 }
 
 /// A snap source outside the engine: returns its candidate points for this space, cursor and
-/// aperture (world units). Its hits compete with the built-in snaps in every [`osnap`] call.
-pub type SnapProvider = fn(&Drawing, &Space, Vec2, f64) -> Vec<SnapHit>;
+/// aperture (world units), given the running `osmode` of the [`osnap`] call. Its hits compete
+/// with the built-in snaps in every [`osnap`] call.
+pub type SnapProvider = fn(&Drawing, &Space, Vec2, f64, u32) -> Vec<SnapHit>;
 
 static SNAP_PROVIDERS: std::sync::RwLock<Vec<SnapProvider>> = std::sync::RwLock::new(Vec::new());
 
@@ -299,13 +300,13 @@ pub fn register_snap_provider(p: SnapProvider) -> Result<(), &'static str> {
 /// Merge the registered providers' hits into `best`: a hit within `aperture` of the cursor
 /// replaces it only when strictly nearer (built-in snaps win ties). Provider hits always carry
 /// [`mode::PROVIDER`] and keep their own name.
-fn with_providers(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64, mut best: Option<SnapHit>) -> Option<SnapHit> {
+fn with_providers(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64, osmode: u32, mut best: Option<SnapHit>) -> Option<SnapHit> {
     let providers: Vec<SnapProvider> = match SNAP_PROVIDERS.read() {
         Ok(v) => v.clone(),
         Err(_) => return best,
     };
     for p in providers {
-        for mut hit in p(d, space, cursor, aperture) {
+        for mut hit in p(d, space, cursor, aperture, osmode) {
             if !hit.point.is_finite() {
                 continue;
             }

@@ -12,8 +12,11 @@ use serde_json::json;
 
 /// The points the registered provider returns, set by the test step by step.
 static POINTS: Mutex<Vec<Vec2>> = Mutex::new(Vec::new());
+/// The running OSMODE the provider was last asked with.
+static OSMODE: Mutex<u32> = Mutex::new(0);
 
-fn provider(_: &Drawing, _: &Space, _: Vec2, _: f64) -> Vec<SnapHit> {
+fn provider(_: &Drawing, _: &Space, _: Vec2, _: f64, osmode: u32) -> Vec<SnapHit> {
+    *OSMODE.lock().unwrap() = osmode;
     let pts = POINTS.lock().map(|v| v.clone()).unwrap_or_default();
     // The provider claims a built-in mode; the engine must overwrite it.
     pts.into_iter().map(|point| SnapHit { point, mode: mode::END, name: "Marker", viewport: None, deferred: None }).collect()
@@ -43,6 +46,9 @@ fn provider_hits_compete_with_builtin_snaps() {
     set(&[Vec2::new(1.0, 0.2)]);
     let hit = snap(mode::END).unwrap();
     assert_eq!((hit.point, hit.mode, hit.name), (Vec2::new(1.0, 0.2), mode::PROVIDER, "Marker"));
+    assert_eq!(*OSMODE.lock().unwrap(), mode::END, "the provider is given the running OSMODE");
+    snap(mode::END | mode::MID);
+    assert_eq!(*OSMODE.lock().unwrap(), mode::END | mode::MID);
 
     // Farther than the endpoint (but inside the aperture): the endpoint wins.
     set(&[Vec2::new(2.5, 0.5)]);

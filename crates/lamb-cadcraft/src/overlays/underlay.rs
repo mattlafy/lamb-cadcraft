@@ -13,10 +13,14 @@
 //! `underlay {assembly: false}` turning it off ([`ASSEMBLY_OFF`], session state too). Display list
 //! only: plots are unchanged. UNDERLAY changes no
 //! drawing revision, so it bumps [`cadcraft_render::bump_overlays`] for the canvas's overlay cache.
+//! LAMB T685: the assembly block's lines snap with the running object snaps (the `osmode` the
+//! snap call was given) while DETAILSNAP is on ([`DETAIL_SNAPS_OFF`], session state, on by
+//! default); other views' underlays keep their fixed [`UNDERLAY_SNAPS`].
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cadcraft_color::Rgb;
 use cadcraft_doc::{Drawing, Space};
@@ -46,6 +50,54 @@ static CHOSEN: Mutex<BTreeMap<String, BTreeSet<String>>> = Mutex::new(BTreeMap::
 
 /// Block names of the views whose assembly underlay is turned off (LAMB T590; on by default).
 static ASSEMBLY_OFF: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Set while DETAILSNAP is off: the assembly block's lines offer no snaps (LAMB T685).
+static DETAIL_SNAPS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether the assembly block's lines snap (DETAILSNAP; on by default).
+pub(crate) fn detail_snaps_on() -> bool {
+    !DETAIL_SNAPS_OFF.load(Ordering::Relaxed)
+}
+
+/// Turn detail snaps on or off; returns its message. Nothing draws differently, so no overlay bump.
+fn set_detail_snaps(on: bool) -> String {
+    DETAIL_SNAPS_OFF.store(!on, Ordering::Relaxed);
+    if on { "Detail snaps on".to_owned() } else { "Detail snaps off".to_owned() }
+}
+
+/// DETAILSNAP `{on?: bool}`: the assembled detail lines snap with the running object snaps, or
+/// not; `on` omitted toggles. Returns `{on, message}`; not an undo step.
+pub(crate) fn detailsnap(_s: &mut Session, p: &Value) -> Result<Value> {
+    let on = match p.get("on").filter(|v| !v.is_null()) {
+        Some(v) => v.as_bool().ok_or_else(|| other("on must be true or false"))?,
+        None => !detail_snaps_on(),
+    };
+    Ok(json!({ "on": on, "message": set_detail_snaps(on) }))
+}
+
+/// DETAILSNAP typed or from the menu: no prompt, it toggles and echoes, like a status-bar switch.
+struct DetailSnapMachine;
+
+impl Interactive for DetailSnapMachine {
+    fn name(&self) -> &'static str {
+        "detailsnap"
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("Detail snaps", Accept::TEXT)
+    }
+    fn begin(&mut self, s: &mut Session) -> Result<Step> {
+        let m = set_detail_snaps(!detail_snaps_on());
+        s.echo(m);
+        Ok(Step::Done)
+    }
+    fn input(&mut self, _s: &mut Session, _i: Input) -> Result<Step> {
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn detailsnap_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(DetailSnapMachine))
+}
 
 fn assembly_off() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
     ASSEMBLY_OFF.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -219,13 +271,6 @@ pub(crate) fn underlay_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::new(UnderlayMachine))
 }
 
-/// The edited view and its underlays, for `space` (`None` without any).
-fn pairs<'a>(d: &'a Drawing, space: &Space) -> Option<(DrawingProject<'a>, Id, Vec<Id>)> {
-    let (dp, edit) = view_of(d, space)?;
-    let us = current(d, edit);
-    (!us.is_empty()).then_some((dp, edit, us))
-}
-
 /// The edited view's assembly block (LAMB T590, unless turned off) and then every underlay's
 /// linework for `space`, mapped into the edited view's local coordinates, pale, one pass per
 /// underlay in candidate order; the assembly lines keep their own colours (LAMB T673). Infinite lines and wipeout masks are left out. Empty without either.
@@ -287,15 +332,33 @@ impl Drop for NestedGuard {
     }
 }
 
-/// CADCraft's own snap in each underlay's block at the cursor (mapped edited → underlay, the
-/// aperture scaled by the map), mapped back: at most one hit per underlay. Empty without an
-/// underlay, or inside such a call.
-pub(super) fn snaps(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64) -> Vec<SnapHit> {
+/// CADCraft's own snap in the edited view's assembly block with the running `osmode` (LAMB T685;
+/// shown, DETAILSNAP on, no map: its lines are in the view's own coordinates), then in each
+/// underlay's block at the cursor (mapped edited → underlay, the aperture scaled by the map),
+/// mapped back: at most one hit per block. Empty without either, or inside such a call.
+pub(super) fn snaps(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64, osmode: u32) -> Vec<SnapHit> {
     if nested() {
         return Vec::new();
     }
-    let Some((dp, edit, us)) = pairs(d, space) else { return Vec::new() };
-    us.into_iter().filter_map(|u| snap_one(d, &dp, edit, u, cursor, aperture)).collect()
+    let Some((dp, edit)) = view_of(d, space) else { return Vec::new() };
+    let mut hits: Vec<SnapHit> = snap_assembly(d, edit, cursor, aperture, osmode).into_iter().collect();
+    hits.extend(current(d, edit).into_iter().filter_map(|u| snap_one(d, &dp, edit, u, cursor, aperture)));
+    hits
+}
+
+/// [`snaps`] for `edit`'s assembly block.
+fn snap_assembly(d: &Drawing, edit: Id, cursor: Vec2, aperture: f64, osmode: u32) -> Option<SnapHit> {
+    if !detail_snaps_on() || !assembly_shown(edit) {
+        return None;
+    }
+    let name = assembly_block_name(edit);
+    d.block(&name)?;
+    NESTED.with(|n| n.set(true));
+    let hit = {
+        let _g = NestedGuard;
+        osnap(d, &Space::Block(name), cursor, aperture, osmode & !mode::PROVIDER, None, false)
+    }?;
+    Some(SnapHit { viewport: None, deferred: None, ..hit })
 }
 
 /// [`snaps`] for one underlay `u`.
@@ -316,6 +379,7 @@ fn snap_one(d: &Drawing, dp: &DrawingProject<'_>, edit: Id, u: Id, cursor: Vec2,
 pub(crate) fn reset() {
     chosen().clear();
     assembly_off().clear();
+    DETAIL_SNAPS_OFF.store(false, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -404,15 +468,15 @@ pub(crate) mod tests {
         let _g = lock();
         let (mut s, a, b) = plans()?;
         let cursor = Vec2::new(10003.0, 6002.0);
-        assert!(lamb_snaps(s.doc()?, &block(a), cursor, 10.0).is_empty(), "off: nothing");
+        assert!(lamb_snaps(s.doc()?, &block(a), cursor, 10.0, mode::END).is_empty(), "off: nothing");
         s.execute("underlay", &json!({ "viewId": b.0 }))?;
-        let hits = lamb_snaps(s.doc()?, &block(a), cursor, 10.0);
+        let hits = lamb_snaps(s.doc()?, &block(a), cursor, 10.0, mode::END);
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert!(near(hits[0].point, Vec2::new(10000.0, 6000.0)), "{:?}", hits[0].point);
-        let mid = lamb_snaps(s.doc()?, &block(a), Vec2::new(9998.0, 5501.0), 10.0);
+        let mid = lamb_snaps(s.doc()?, &block(a), Vec2::new(9998.0, 5501.0), 10.0, mode::END);
         assert!(mid.iter().any(|h| near(h.point, Vec2::new(10000.0, 5500.0))), "{mid:?}");
         s.execute("underlay", &json!({}))?;
-        assert!(lamb_snaps(s.doc()?, &block(a), cursor, 10.0).is_empty(), "no viewId turns it off");
+        assert!(lamb_snaps(s.doc()?, &block(a), cursor, 10.0, mode::END).is_empty(), "no viewId turns it off");
         Ok(())
     }
 
@@ -454,11 +518,11 @@ pub(crate) mod tests {
         s.execute("editview", &json!({ "viewId": b.0 }))?;
         s.execute("underlay", &json!({ "viewId": a.0 }))?;
         // In A: B's line end. In B: A's line end (-3000,-3000) in B's local = R(-90°)(p - origin).
-        let in_a = lamb_snaps(s.doc()?, &block(a), Vec2::new(10001.0, 6001.0), 10.0);
+        let in_a = lamb_snaps(s.doc()?, &block(a), Vec2::new(10001.0, 6001.0), 10.0, mode::END);
         assert_eq!(in_a.len(), 1);
         assert!(near(in_a[0].point, Vec2::new(10000.0, 6000.0)));
         let a_end_in_b = Vec2::new(-8000.0, 13000.0);
-        let in_b = lamb_snaps(s.doc()?, &block(b), a_end_in_b + Vec2::new(2.0, 1.0), 10.0);
+        let in_b = lamb_snaps(s.doc()?, &block(b), a_end_in_b + Vec2::new(2.0, 1.0), 10.0, mode::END);
         assert_eq!(in_b.len(), 1, "{in_b:?}");
         assert!(near(in_b[0].point, a_end_in_b), "{:?}", in_b[0].point);
         // The whole osnap, providers included, terminates too.
@@ -566,6 +630,59 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// LAMB T685: the edited plan's assembled detail lines snap with the running OSMODE while
+    /// DETAILSNAP is on and the assembly underlay shows; nowhere else.
+    #[test]
+    fn assembled_detail_lines_snap_with_the_running_osnaps_until_detailsnap_is_off() -> R {
+        let _g = lock();
+        let (mut s, plan) = crate::assembly::tests::room("exterior_face", true)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        // The bottom run's CLAD band at y = -20: its first end and its midpoint.
+        let lines = polylines(&draw(s.doc()?, &block(plan), &Options::default()));
+        let band = lines
+            .iter()
+            .map(|(_, pts)| pts.clone())
+            .find(|pts| pts.len() == 2 && pts.iter().all(|p| (p.y + 20.0).abs() < 1e-6))
+            .ok_or("no bottom CLAD band")?;
+        let (end, mid) = (band[0], (band[0] + band[1]) * 0.5);
+        let off = Vec2::new(1.0, -2.0);
+        let snap = |s: &Session, at: Vec2, osmode: u32| -> std::result::Result<Option<SnapHit>, E> {
+            Ok(osnap(s.doc()?, &block(plan), at + off, 10.0, osmode, None, false))
+        };
+        let hits = |s: &Session, at: Vec2| -> std::result::Result<bool, E> { Ok(snap(s, at, mode::END)?.is_some_and(|h| near(h.point, at))) };
+
+        let hit = snap(&s, end, mode::END)?.ok_or("no END hit")?;
+        assert!(near(hit.point, end), "{hit:?} vs {end:?}");
+        assert_eq!(hit.mode, mode::PROVIDER, "a provider hit");
+        assert!(snap(&s, end, mode::CEN)?.is_none(), "CEN only: nothing");
+        let hit = snap(&s, mid, mode::MID)?.ok_or("no MID hit")?;
+        assert!(near(hit.point, mid), "{hit:?} vs {mid:?}");
+
+        let r = s.execute("detailsnap", &json!({ "on": false }))?;
+        assert_eq!(r, json!({ "on": false, "message": "Detail snaps off" }));
+        assert!(!detail_snaps_on());
+        assert!(!hits(&s, end)?, "detail snaps off: no hit");
+        let r = s.execute("detailsnap", &json!({}))?;
+        assert_eq!(r, json!({ "on": true, "message": "Detail snaps on" }), "{{}} toggles back");
+        assert!(hits(&s, end)?);
+
+        s.start("detailsnap")?;
+        assert!(s.running.is_none(), "no prompt");
+        assert!(s.log.iter().any(|l| l == "Detail snaps off"), "{:?}", s.log);
+        assert!(!hits(&s, end)?);
+        s.execute("detailsnap", &json!({ "on": true }))?;
+
+        s.execute("underlay", &json!({ "assembly": false }))?;
+        assert!(!hits(&s, end)?, "assembly underlay off: no hit");
+        s.execute("underlay", &json!({ "assembly": true }))?;
+        assert!(hits(&s, end)?);
+
+        let d = s.doc()?;
+        assert!(snaps(d, &Space::Model, end + off, 10.0, mode::END).is_empty(), "the Model tab: no assembly hits");
+        assert!(snaps(d, &Space::Paper("Layout1".into()), end + off, 10.0, mode::END).is_empty(), "a sheet: no assembly hits");
+        Ok(())
+    }
+
     /// LAMB T522: plan A with two other placed plans B (rotated, offset) and C (identity, 6 m up),
     /// each with its own line; any number of them are underlays at once.
     #[test]
@@ -584,7 +701,7 @@ pub(crate) mod tests {
         let b_end = Vec2::new(10000.0, 6000.0);
         let c_end = Vec2::new(0.0, 3000.0);
         let snaps_at = |s: &Session, p: Vec2| -> std::result::Result<bool, E> {
-            Ok(lamb_snaps(s.doc()?, &block(a), p + Vec2::new(2.0, 1.0), 10.0).iter().any(|h| near(h.point, p)))
+            Ok(lamb_snaps(s.doc()?, &block(a), p + Vec2::new(2.0, 1.0), 10.0, mode::END).iter().any(|h| near(h.point, p)))
         };
 
         s.execute("underlay", &json!({ "viewId": b.0 }))?;

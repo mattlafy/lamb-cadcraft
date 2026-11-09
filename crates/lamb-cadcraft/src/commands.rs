@@ -951,6 +951,11 @@ pub fn commands() -> Vec<CommandSpec> {
             .noundo()
             .menu(MENU_DISPLAY)
             .interactive(crate::overlays::underlay::underlay_machine),
+        CommandSpec::new("detailsnap", "Detail Snaps", crate::overlays::underlay::detailsnap)
+            .params("{on?: bool}")
+            .noundo()
+            .menu(MENU_DISPLAY)
+            .interactive(crate::overlays::underlay::detailsnap_machine),
         CommandSpec::new("panelock", "Pane Lock", panelock).params("{on?: bool}").noundo().menu(MENU_DISPLAY),
         CommandSpec::new("ucsalign", "UCS Align", ucsalign).params("{on?: bool}").key("F6").noundo().transparent().menu(MENU_DISPLAY),
         CommandSpec::new("ghosthide", "Ghost Hide", ghosthide).params("{}").noundo().menu(MENU_DISPLAY),
@@ -1130,7 +1135,7 @@ mod tests {
             ),
             ("View Setup", &["editview", "viewprops", "unplaceview", "placeview"]),
             ("Levels & Cuts", &["level", "levelline", "cutline", "viewhole"]),
-            ("Display", &["refpane", "underlay", "panelock", "ucsalign", "ghosthide", "ghostshow"]),
+            ("Display", &["refpane", "underlay", "detailsnap", "panelock", "ucsalign", "ghosthide", "ghostshow"]),
             ("Links", &["link", "unlink", "showlinks"]),
             ("Details", &["detailtag", "detailtags", "detailref", "repeat", "detailflip"]),
             ("Walls & Framing", &["assemblyplan", "assemblyview", "wallrun", "wallfit", "wallconflicts", "studgrid", "studmove", "resolve"]),

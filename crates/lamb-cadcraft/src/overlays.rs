@@ -186,12 +186,13 @@ fn append_list(list: &mut DisplayList, more: DisplayList) {
 }
 
 /// The snap provider: every marker centre of the edited view within `aperture` of the cursor,
-/// plus the underlay's snap ([`underlay`]). Nothing inside the underlay's own snap call.
-pub fn lamb_snaps(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64) -> Vec<SnapHit> {
+/// plus the underlay's snaps ([`underlay`]; the assembly block's with the running `osmode`).
+/// Nothing inside the underlay's own snap call.
+pub fn lamb_snaps(d: &Drawing, space: &Space, cursor: Vec2, aperture: f64, osmode: u32) -> Vec<SnapHit> {
     if underlay::nested() {
         return Vec::new();
     }
-    let mut hits = underlay::snaps(d, space, cursor, aperture);
+    let mut hits = underlay::snaps(d, space, cursor, aperture, osmode);
     let Some((dp, id)) = view_of(d, space) else { return hits };
     let Ok(markers) = compute_markers_for_view(&dp, id) else { return hits };
     hits.extend(markers.iter().map(|m| Vec2::new(m.position.x, m.position.y)).filter(|p| p.dist(cursor) <= aperture).map(|point| SnapHit {
