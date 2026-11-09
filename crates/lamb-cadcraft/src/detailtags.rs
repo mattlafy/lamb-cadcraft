@@ -18,7 +18,8 @@
 //!   corner` in Corner mode; asked again after a refused point) → `Specify bubble point or [Box]:`.
 //! - A callout-box tag (LAMB T594): `detailtag {…, tip, box: {a:{x,y}, b:{x,y}}}` in place of
 //!   `bubble` (both or neither is a bad-params error) makes one closed 4-vertex `LwPolyline`,
-//!   linetype `DASHED` (loaded when missing), encircling the area, with no leader; its tag point is
+//!   linetype `DASHED` (loaded when missing), encircling the area, with no leader — its bubble sits
+//!   on the box's upper-right corner ([`crate::bubbles`], LAMB T684); its tag point is
 //!   [`DetailTag::anchor`]. The box must enclose the tag point and be wider and taller than
 //!   `TOLERANCE.coincidence_mm`. Interactive: `Box` → `Specify first corner of the callout box:` →
 //!   `Specify opposite corner:` (a refused box asks for the first corner again).

@@ -5,6 +5,11 @@
 //! sheet that shows the detail (`<n>/<layout>`, [`crate::sheets::sheet_refs`]; empty when none).
 //! DXF/DWG see an ordinary callout.
 //!
+//! A callout-box tag (LAMB T594, a tagged `LwPolyline` with an anchor) gets the same bubble, with
+//! no leader, its circle through the box's upper-right corner (the vertex with the largest
+//! `x + y`) and outside the box (LAMB T684). The box always drives: a box's bubble moved on its own
+//! goes back to the corner, and MOVE/COPY/ROTATE of the box carry it.
+//!
 //! A tag leader and its bubble are the two members of one unnamed, selectable group
 //! ([`GROUP_DESCRIPTION`], LAMB T509), so picking either selects both and MOVE/COPY/ERASE act on
 //! the pair. The group is the bubble's identity: [`bubble_observer`] reconciles every plan and
@@ -23,7 +28,7 @@
 use std::sync::Arc;
 
 use cadcraft_doc::{
-    Attrib, AttribModes, Block, Circle, Common, Drawing, Entity, EntityKind, Group, HAlign, Handle, Insert, Line, Space, Text, VAlign,
+    Attrib, AttribModes, Block, Circle, Common, Drawing, Entity, EntityKind, Group, HAlign, Handle, Insert, Line, LwPolyline, Space, Text, VAlign,
 };
 use cadcraft_engine::Session;
 use cadcraft_geom::Vec3;
@@ -209,6 +214,14 @@ fn leader_end(d: &Drawing, h: Handle) -> Option<Vec3> {
     }
 }
 
+/// Where a callout box's bubble goes: its circle passes through the box's upper-right corner
+/// (the vertex with the largest `x + y`), outside the box, for a bubble scaled by `k`.
+fn box_bubble_at(pl: &LwPolyline, k: f64) -> Option<Vec3> {
+    let c = pl.vertices.iter().map(|v| v.p).max_by(|a, b| (a.x + a.y).total_cmp(&(b.x + b.y)))?;
+    let off = BUBBLE_RADIUS_MM * k / std::f64::consts::SQRT_2;
+    Some(Vec3::new(c.x + off, c.y + off, pl.elevation))
+}
+
 fn is_bubble(e: &Entity) -> bool {
     matches!(&e.kind, EntityKind::Insert(i) if i.block.eq_ignore_ascii_case(BUBBLE_BLOCK))
 }
@@ -235,9 +248,22 @@ fn plan(d: &Drawing, before: Option<&Drawing>) -> Result<Plan, String> {
         let mut claimed: Vec<Handle> = Vec::new();
         let mut orphans = Vec::new();
         for e in block.entities.iter() {
-            let EntityKind::Leader(l) = &e.kind else { continue };
+            if !matches!(e.kind, EntityKind::Leader(_) | EntityKind::LwPolyline(_)) {
+                continue;
+            }
             let Some(tag) = read_entity_data(&e.common).map_err(|e| e.to_string())?.detail_tag else { continue };
-            let Some(&end) = l.vertices.last() else { continue };
+            // A leader's bubble sits on its last vertex; a callout box's on its upper-right corner.
+            let (end, leader) = match &e.kind {
+                EntityKind::Leader(l) => match l.vertices.last() {
+                    Some(&v) => (v, true),
+                    None => continue,
+                },
+                EntityKind::LwPolyline(pl) if tag.anchor.is_some() => match box_bubble_at(pl, k) {
+                    Some(v) => (v, false),
+                    None => continue,
+                },
+                _ => continue,
+            };
             let wanted_at = |at: Vec3| Wanted {
                 at,
                 layer: e.common.layer.clone(),
@@ -257,8 +283,9 @@ fn plan(d: &Drawing, before: Option<&Drawing>) -> Result<Plan, String> {
             };
             claimed.push(hb);
             let at = insert_at(d, hb).unwrap_or(end);
-            let dragged = before
-                .is_some_and(|b| insert_at(b, hb).is_some_and(|was| !near(was, at)) && leader_end(b, e.handle).is_some_and(|was| near(was, end)));
+            let dragged = leader
+                && before
+                    .is_some_and(|b| insert_at(b, hb).is_some_and(|was| !near(was, at)) && leader_end(b, e.handle).is_some_and(|was| near(was, end)));
             let w = if dragged && !near(at, end) {
                 bp.leader_ends.push((e.handle, at));
                 wanted_at(at)
@@ -754,6 +781,86 @@ mod tests {
         assert!(bubbles(&s, sec)?.is_empty());
         assert!(s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.iter().all(|e| !matches!(e.kind, EntityKind::Leader(_))));
         assert!(tag_groups(&s)?.is_empty());
+        Ok(())
+    }
+
+    /// LAMB T684: a callout box around tip (1200, 0); returns the box's handle (hex).
+    fn box_tag(s: &mut Session, detail: Id) -> T<String> {
+        let r = s.execute(
+            "detailtag",
+            &json!({ "detailViewId": detail.0, "tip": {"x": 1200, "y": 0}, "box": {"a": {"x": 900, "y": -300}, "b": {"x": 1500, "y": 300}} }),
+        )?;
+        Ok(r["handle"].as_str().ok_or("no handle")?.to_owned())
+    }
+
+    fn corner_at(x: f64, y: f64, k: f64) -> (f64, f64) {
+        let off = BUBBLE_RADIUS_MM * k / std::f64::consts::SQRT_2;
+        (x + off, y + off)
+    }
+
+    #[test]
+    fn a_box_tag_gets_its_bubble_on_the_upper_right_corner_grouped_in_one_undo_step() -> R {
+        let (mut s, plan, detail) = room()?;
+        let n = undo_len(&s)?;
+        let bx = hx(&box_tag(&mut s, detail)?)?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let b = bubbles(&s, plan)?;
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert_eq!((b[0].1, b[0].2.as_str(), b[0].3.as_str(), b[0].4.as_str()), (corner_at(1500.0, 300.0, 1.0), "TAGS", "D1", ""));
+        assert_eq!(tag_groups(&s)?.iter().map(|g| (g.selectable, g.members.clone())).collect::<Vec<_>>(), [(true, vec![bx, b[0].0])]);
+        assert!(plan_for(s.doc()?)?.is_empty(), "settled");
+        s.undo()?;
+        assert!(bubbles(&s, plan)?.is_empty());
+        assert!(tag_groups(&s)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_box_carries_its_bubble_takes_it_back_when_moved_alone_and_erases_it() -> R {
+        let (mut s, plan, detail) = room()?;
+        let bx = box_tag(&mut s, detail)?;
+        let hb = bubbles(&s, plan)?[0].0;
+        s.execute("move", &json!({ "handles": [bx], "delta": [100, 0] }))?;
+        let b = bubbles(&s, plan)?;
+        assert_eq!((b.len(), b[0].0, b[0].1), (1, hb, corner_at(1600.0, 300.0, 1.0)), "moved, not re-created");
+        s.execute("move", &json!({ "handles": [hb.hex()], "delta": [500, 500] }))?;
+        let b = bubbles(&s, plan)?;
+        assert_eq!((b.len(), b[0].0, b[0].1), (1, hb, corner_at(1600.0, 300.0, 1.0)), "the box drives");
+        s.execute("erase", &json!({ "handles": [bx] }))?;
+        assert!(bubbles(&s, plan)?.is_empty());
+        assert!(tag_groups(&s)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_box_bubble_names_its_sheet_and_keeps_its_paper_size() -> R {
+        let (mut s, plan, detail) = room()?;
+        box_tag(&mut s, detail)?;
+        s.execute("detailsheets", &json!({}))?;
+        assert_eq!(bubbles(&s, plan)?.into_iter().map(|b| b.4).collect::<Vec<_>>(), ["1/A501"]);
+
+        let out = s.execute("newsheet", &json!({ "name": "P1", "viewIds": [plan.0] }))?;
+        let vp = out["viewports"][0].as_str().ok_or("no viewport")?.to_owned();
+        // A plan this long only fits its viewport at 1:100.
+        s.execute("line", &json!({ "points": [[0, 500], [40000, 500]] }))?;
+        s.execute("vpview", &json!({ "handle": vp, "viewId": plan.0 }))?;
+        let b = bubbles(&s, plan)?;
+        let EntityKind::Insert(i) = &s.doc()?.entity(b[0].0).ok_or("gone")?.kind else { return Err("not an insert".into()) };
+        assert_eq!((i.scale, b[0].1), (Vec3::new(2.0, 2.0, 2.0), corner_at(1500.0, 300.0, 2.0)), "1:100 is twice 1:50");
+        Ok(())
+    }
+
+    #[test]
+    fn a_section_box_tag_gets_its_bubble() -> R {
+        let (mut s, sec, sd) = section_room()?;
+        let r = s.execute(
+            "detailtag",
+            &json!({ "detailViewId": sd.0, "corner": false, "tip": {"x": 150, "y": 2000}, "box": {"a": {"x": -200, "y": 1500}, "b": {"x": 500, "y": 2500}} }),
+        )?;
+        let bx = hx(r["handle"].as_str().ok_or("no handle")?)?;
+        let b = bubbles(&s, sec)?;
+        assert_eq!((b.len(), b[0].1, b[0].3.as_str()), (1, corner_at(500.0, 2500.0, 1.0), "SD"));
+        assert_eq!(tag_groups(&s)?.iter().map(|g| g.members.clone()).collect::<Vec<_>>(), [vec![bx, b[0].0]]);
         Ok(())
     }
 
