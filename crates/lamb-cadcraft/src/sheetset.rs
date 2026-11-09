@@ -24,7 +24,8 @@
 //! [`crate::bom`] table when there is framing to count; with none an existing one is left alone.
 //! `A602` holds the [`crate::schedule`] opening schedule (LAMB T639) likewise, when a placed plan has
 //! openings, and `A603` the [`crate::rooms`] room schedule (LAMB T657) when a plan has named rooms.
-//! Each table is compared with what it would become and replaced, at its own corner, only when its
+//! The set's general notes ([`crate::titleblock`], `generalnote`) go on `A001` too, as a `General
+//! Notes` table right of the Drawing List. Each table is compared with what it would become and replaced, at its own corner, only when its
 //! text differs. A table taller than the sheet is written whole and the message says it runs off.
 //! All of it is one undo step; nothing to change changes nothing.
 //!
@@ -102,7 +103,7 @@ use crate::sheets::{
     DEFAULT_SHEET_PAPER, VPORT_LAYER, create_enlarged_sheet, create_packed_sheet, create_sheet, enlarged_area, enlarged_scale, ensure_vport_layer,
     pack_verticals, refit_viewport, sheet_paper_size, view_drawn, view_placed, view_sheet_ref, viewport_scale, window_fits,
 };
-use crate::titleblock::{is_lamb_sheet, sheet_title};
+use crate::titleblock::{NOTES_TITLE, is_lamb_sheet, refresh_notes, sheet_title};
 use crate::vptitles::scale_label;
 
 const PLAN_PREFIX: &str = "A1";
@@ -116,8 +117,8 @@ const FRAMING_GROUP: &str = "framing";
 const LIST_PREFIX: &str = "A0";
 const BOM_PREFIX: &str = "A6";
 const SET_PREFIXES: [&str; 7] = [LIST_PREFIX, PLAN_PREFIX, ELEVATION_PREFIX, SECTION_PREFIX, FRAMING_PREFIX, DETAIL_PREFIX, BOM_PREFIX];
-const LIST_SHEET: &str = "A001";
-const LIST_TITLE: &str = "Drawing List";
+pub(crate) const LIST_SHEET: &str = "A001";
+pub(crate) const LIST_TITLE: &str = "Drawing List";
 const LIST_COL_WIDTHS: [f64; 2] = [30.0, 150.0];
 
 /// Whether `name` is a set sheet name: a set prefix and two digits.
@@ -216,7 +217,7 @@ fn refresh_list(d: &mut Drawing, known: &[String]) -> Result<Option<Refreshed>> 
     bom::ensure_sheet_layout(d, LIST_SHEET)?;
     order_tabs(d, known);
     let rows: Vec<Vec<String>> = set_titles(d)?.into_iter().map(|(n, t)| vec![n, t]).collect();
-    bom::refresh_table(d, LIST_SHEET, LIST_TITLE, &|at| bom::schedule_table(LIST_TITLE, &["Sheet", "Title"], &LIST_COL_WIDTHS, &rows, at))
+    bom::refresh_table(d, LIST_SHEET, LIST_TITLE, None, &|at| bom::schedule_table(LIST_TITLE, &["Sheet", "Title"], &LIST_COL_WIDTHS, &rows, at))
 }
 
 /// Every set sheet in tab order, with its title.
@@ -463,15 +464,25 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         parts.push(part);
         sheets.push(sheet);
     }
-    if let Some(change) = refresh_list(&mut d, &known)? {
-        let (part, sheet) = table_report(LIST_SHEET, "list", LIST_TITLE, change);
-        parts.insert(0, part);
-        sheets.insert(0, sheet);
+    // A001's tables lead what is reported: the list, then the notes.
+    let mut first = 0;
+    for (title, change) in [(LIST_TITLE, refresh_list(&mut d, &known)?), (NOTES_TITLE, refresh_notes(&mut d)?)] {
+        if let Some(change) = change {
+            let group = if title == LIST_TITLE { "list" } else { "notes" };
+            let (part, sheet) = table_report(LIST_SHEET, group, title, change);
+            parts.insert(first, part);
+            sheets.insert(first, sheet);
+            first += 1;
+        }
     }
     let mut off_sheet: Vec<String> = Vec::new();
-    for (layout, title) in
-        [(LIST_SHEET, LIST_TITLE), (bom::DEFAULT_LAYOUT, BOM_TITLE), (schedule::DEFAULT_LAYOUT, OPENING_TITLE), (rooms::DEFAULT_LAYOUT, ROOM_TITLE)]
-    {
+    for (layout, title) in [
+        (LIST_SHEET, LIST_TITLE),
+        (LIST_SHEET, NOTES_TITLE),
+        (bom::DEFAULT_LAYOUT, BOM_TITLE),
+        (schedule::DEFAULT_LAYOUT, OPENING_TITLE),
+        (rooms::DEFAULT_LAYOUT, ROOM_TITLE),
+    ] {
         if bom::table_runs_off(&d, layout, title)? {
             off_sheet.push(format!("{layout} {title}"));
         }

@@ -141,6 +141,10 @@ pub struct SheetInfo {
     /// The set's issues, oldest first (`issue`, [`crate::titleblock`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<Issue>,
+    /// The set's general notes, in order; a note's number is its position (`generalnote`,
+    /// [`crate::titleblock`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// One issue of the drawing set: its number (never reused while it stands), date and what it was for.

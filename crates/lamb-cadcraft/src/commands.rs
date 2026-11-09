@@ -31,6 +31,8 @@
 //! - `issue {description, date?}` / `issue {remove}` (`iss`): adds an issue of the set (numbered one
 //!   past the highest, dated today unless given) or removes one; every sheet's title strip lists the
 //!   latest six — see [`crate::titleblock`].
+//! - `generalnote {text}` / `{remove}` / `{text, at}` (`gnote`): adds, removes or replaces one of the
+//!   set's numbered general notes, printed on `A001` beside the drawing list — see [`crate::titleblock`].
 //! - `bomtable {layout?, at?}` (`bom`): the framing BOM — repeat copies and placed corner and jamb
 //!   details counted per level — as a table on layout `BOM` — see [`crate::bom`].
 //! - `openingschedule {layout?, at?}` (`osch`): the door and window schedule, marks computed in row
@@ -896,6 +898,10 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["iss"])
             .params("{description, date?} | {remove} → {issues, message}")
             .interactive(crate::titleblock::issue_machine),
+        CommandSpec::new("generalnote", "General Note", crate::titleblock::generalnote)
+            .alias(&["gnote"])
+            .params("{text} | {remove} | {text, at} → {notes, message}")
+            .interactive(crate::titleblock::generalnote_machine),
         CommandSpec::new("bomtable", "Framing BOM", crate::bom::bomtable)
             .alias(&["bom"])
             .params("{layout?, at?}")

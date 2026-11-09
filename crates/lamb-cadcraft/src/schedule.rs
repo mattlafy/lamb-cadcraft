@@ -258,7 +258,7 @@ pub(crate) fn refresh_opening_schedule(d: &mut Drawing) -> Result<Option<Refresh
     if rows.is_empty() {
         return Ok(None);
     }
-    bom::refresh_table(d, DEFAULT_LAYOUT, OPENING_TITLE, &|at| opening_table(&rows, at))
+    bom::refresh_table(d, DEFAULT_LAYOUT, OPENING_TITLE, None, &|at| opening_table(&rows, at))
 }
 
 /// The handle of the opening schedule on `layout`, and its table.
@@ -297,7 +297,7 @@ pub(crate) fn write_schedule(
     };
     // Build on a copy and assign it back once: one undo step, and none when nothing changes.
     let mut d = s.doc()?.clone();
-    let mut changed = bom::refresh_table(&mut d, &layout, title, make)?.is_some();
+    let mut changed = bom::refresh_table(&mut d, &layout, title, None, make)?.is_some();
     let (handle, table) = titled_on(&d, &layout, title).ok_or_else(|| other("The schedule was not written"))?;
     if let Some(at) = at.filter(|at| (table.insert.x, table.insert.y) != (at.x, at.y)) {
         let l = d.layouts.iter_mut().find(|l| l.name == layout).ok_or_else(|| other("The schedule's layout is gone"))?;

@@ -295,7 +295,7 @@ fn is_titled(e: &cadcraft_doc::Entity, title: &str) -> bool {
 }
 
 /// The table titled `title` on `layout`.
-fn titled_table<'a>(d: &'a Drawing, layout: &str, title: &str) -> Option<&'a Table> {
+pub(crate) fn titled_table<'a>(d: &'a Drawing, layout: &str, title: &str) -> Option<&'a Table> {
     d.layout(layout)?.entities.iter().filter(|e| is_titled(e, title)).find_map(|e| match &e.kind {
         EntityKind::Table(t) => Some(t),
         _ => None,
@@ -324,11 +324,7 @@ fn layout_sheet(d: &Drawing, layout: &str) -> Result<Sheet> {
 /// `title` there: at `at`, or else the top-left corner of the sheet's usable area.
 fn write_table(d: &mut Drawing, layout: &str, title: &str, at: Option<Point2>, make: &dyn Fn(Point2) -> Table) -> Result<cadcraft_doc::Handle> {
     ensure_sheet_layout(d, layout)?;
-    let old: Vec<cadcraft_doc::Handle> =
-        d.layout(layout).map(|l| l.entities.iter().filter(|e| is_titled(e, title)).map(|e| e.handle).collect()).unwrap_or_default();
-    for h in old {
-        d.remove_entity(h);
-    }
+    remove_table(d, layout, title);
     let at = match at {
         Some(at) => at,
         None => {
@@ -348,8 +344,14 @@ pub(crate) enum Refreshed {
 
 /// Brings the table titled `title` on `layout` up to what `make` builds, where it stands: a table
 /// with the same cell text is left alone (`None`), a different one replaced at its own corner, a
-/// missing one written at the sheet's usable top-left.
-pub(crate) fn refresh_table(d: &mut Drawing, layout: &str, title: &str, make: &dyn Fn(Point2) -> Table) -> Result<Option<Refreshed>> {
+/// missing one written at `default_at`, or else the sheet's usable top-left.
+pub(crate) fn refresh_table(
+    d: &mut Drawing,
+    layout: &str,
+    title: &str,
+    default_at: Option<Point2>,
+    make: &dyn Fn(Point2) -> Table,
+) -> Result<Option<Refreshed>> {
     let texts = |t: &Table| -> Vec<Vec<String>> { t.cells.iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect() };
     let at = match titled_table(d, layout, title) {
         None => None,
@@ -361,8 +363,18 @@ pub(crate) fn refresh_table(d: &mut Drawing, layout: &str, title: &str, make: &d
             Some(at)
         }
     };
-    write_table(d, layout, title, at, make)?;
+    write_table(d, layout, title, at.or(default_at), make)?;
     Ok(Some(if at.is_some() { Refreshed::Updated } else { Refreshed::Made }))
+}
+
+/// Removes every table titled `title` on `layout`; whether there was one.
+pub(crate) fn remove_table(d: &mut Drawing, layout: &str, title: &str) -> bool {
+    let old: Vec<cadcraft_doc::Handle> =
+        d.layout(layout).map(|l| l.entities.iter().filter(|e| is_titled(e, title)).map(|e| e.handle).collect()).unwrap_or_default();
+    for h in &old {
+        d.remove_entity(*h);
+    }
+    !old.is_empty()
 }
 
 /// Refreshes the Framing BOM on its set sheet from [`bom_rows`]; no rows touches nothing.
@@ -371,7 +383,7 @@ pub(crate) fn refresh_bom(d: &mut Drawing) -> Result<Option<Refreshed>> {
     if rows.is_empty() {
         return Ok(None);
     }
-    refresh_table(d, DEFAULT_LAYOUT, BOM_TITLE, &|at| bom_table(&rows, at))
+    refresh_table(d, DEFAULT_LAYOUT, BOM_TITLE, None, &|at| bom_table(&rows, at))
 }
 
 /// Whether the table titled `title` on `layout` reaches below the sheet's usable area.

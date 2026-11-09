@@ -38,6 +38,12 @@
 //! today (UTC, `YYYY-MM-DD`) unless `date` is given; `issue {remove: n}` removes issue `n`, and the
 //! others keep their numbers. An empty description is refused. One undo step each; returns
 //! `{issues: [{number, date, description}], message}`. Typed, `Issue description:` then `Date <today>:`.
+//!
+//! `generalnote {text}` (`gnote`) appends one of the set's general notes, `{remove: n}` removes note
+//! `n` (the rest renumber: a note's number is its position) and `{text, at: n}` replaces it; empty text
+//! or a number out of range is refused. One undo step each, returning `{notes, message}`; on a set with
+//! a sheet `A001` the `General Notes` table there ([`refresh_notes`], right of the Drawing List) changes
+//! in the same step. Typed, `General note:`; an empty answer cancels.
 
 use std::sync::Arc;
 
@@ -46,17 +52,27 @@ use cadcraft_doc::{Attrib, AttribModes, Block, Common, Drawing, Entity, EntityKi
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::Vec3;
 use cadcraft_render::Sheet;
+use lamb_core::geometry::Point2;
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id};
 use serde_json::{Value, json};
 
+use crate::bom::{self, Refreshed};
 use crate::commands::{bad, name_input, other};
 use crate::schema::{EXT_KEY, Issue, LambDocument, SheetInfo, read_document, read_entity_data, view_block_name, write_document};
-use crate::sheets::{SHEET_MARGIN_MM, frame_strip_width, numbered_viewports, viewport_scale};
+use crate::sheets::{SHEET_MARGIN_MM, frame_strip_width, numbered_viewports, usable_area, viewport_scale};
+use crate::sheetset::{LIST_SHEET, LIST_TITLE};
 use crate::vptitles::scale_label;
 
 const CMD: &str = "titleblock";
 const ISSUE_CMD: &str = "issue";
+const NOTE_CMD: &str = "generalnote";
+/// The general notes table's title, header and column widths (mm).
+pub(crate) const NOTES_TITLE: &str = "General Notes";
+const NOTES_HEADER: [&str; 2] = ["No.", "Note"];
+const NOTES_COL_WIDTHS: [f64; 2] = [12.0, 160.0];
+/// The gap between the Drawing List and the notes table, mm.
+const NOTES_GAP_MM: f64 = 10.0;
 /// Every frame block's name starts with this.
 const FRAME_PREFIX: &str = "LAMB_SHEETFRAME_";
 /// The layer frames are placed on.
@@ -296,7 +312,8 @@ pub(crate) fn is_lamb_sheet(l: &Layout) -> bool {
 
 /// What a sheet is called in its title block: one view viewport gives the view's name; one assembly
 /// viewport `<view name> framing`; one enlarged viewport `<view name>, enlarged`; several viewports all showing details `Details`, otherwise
-/// `Views`; no viewports the title cell of the layout's first table, else the layout's name.
+/// `Views`; no viewports the title cell of the layout's first table (never the General Notes), else
+/// the layout's name.
 pub(crate) fn sheet_title(d: &Drawing, doc: &LambDocument, layout: &str) -> String {
     let Some(l) = d.layout(layout) else { return layout.to_owned() };
     let view = |id: Id| doc.views.iter().find(|v| v.id() == id);
@@ -317,7 +334,8 @@ pub(crate) fn sheet_title(d: &Drawing, doc: &LambDocument, layout: &str) -> Stri
             .entities
             .iter()
             .find_map(|e| match &e.kind {
-                EntityKind::Table(t) => Some(t.cells.first().and_then(|r| r.first()).map_or("", |c| c.text.as_str())),
+                // The general notes sit beside the sheet's own table and never name the sheet.
+                EntityKind::Table(t) => Some(t.cells.first().and_then(|r| r.first()).map_or("", |c| c.text.as_str())).filter(|t| *t != NOTES_TITLE),
                 _ => None,
             })
             .filter(|t| !t.is_empty())
@@ -629,6 +647,113 @@ pub(crate) fn issue_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::new(IssueMachine { description: None }))
 }
 
+fn notes_json(notes: &[String]) -> Value {
+    Value::Array(notes.iter().map(|n| Value::String(n.clone())).collect())
+}
+
+/// Note number `key` as a position in `notes`: 1-based, in range.
+fn note_index(p: &Value, key: &str, notes: &[String]) -> Result<Option<usize>> {
+    let Some(v) = p.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
+    let n = v.as_u64().ok_or_else(|| bad(NOTE_CMD, &format!("`{key}` must be a note number")))?;
+    match usize::try_from(n).ok().filter(|n| (1..=notes.len()).contains(n)) {
+        Some(n) => Ok(Some(n - 1)),
+        None => Err(bad(NOTE_CMD, &format!("there is no note {n}"))),
+    }
+}
+
+pub(crate) fn generalnote(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut doc = read_document(s.doc()?).map_err(other)?;
+    let mut info = doc.sheet_info.clone().unwrap_or_default();
+    let message = if let Some(k) = note_index(p, "remove", &info.notes)? {
+        info.notes.remove(k);
+        format!("Note {} removed.", k + 1)
+    } else {
+        let text = p
+            .get("text")
+            .filter(|v| !v.is_null())
+            .map_or(Ok(String::new()), |v| v.as_str().map(|t| t.trim().to_owned()).ok_or_else(|| bad(NOTE_CMD, "`text` must be a string")))?;
+        if text.is_empty() {
+            return Err(bad(NOTE_CMD, "a note needs text"));
+        }
+        match note_index(p, "at", &info.notes)? {
+            Some(k) => {
+                if let Some(slot) = info.notes.get_mut(k) {
+                    *slot = text;
+                }
+                format!("Note {} replaced.", k + 1)
+            }
+            None => {
+                info.notes.push(text);
+                format!("Note {} added.", info.notes.len())
+            }
+        }
+    };
+    doc.sheet_info = Some(info.clone());
+    // Build on a copy and assign it back once: one undo step, the table in it.
+    let mut d = s.doc()?.clone();
+    write_document(&mut d, &doc).map_err(other)?;
+    refresh_notes(&mut d)?;
+    *s.doc_mut()? = d;
+    Ok(json!({ "notes": notes_json(&info.notes), "message": message }))
+}
+
+/// Brings `A001`'s General Notes table up to the set's notes: right of the Drawing List when new, at
+/// its own corner otherwise; with no notes an existing table is removed. Without `A001` nothing is
+/// drawn.
+pub(crate) fn refresh_notes(d: &mut Drawing) -> Result<Option<Refreshed>> {
+    if d.layout(LIST_SHEET).is_none() || !d.ext.contains_key(EXT_KEY) {
+        return Ok(None);
+    }
+    let notes = read_document(d).map_err(other)?.sheet_info.unwrap_or_default().notes;
+    if notes.is_empty() {
+        return Ok(bom::remove_table(d, LIST_SHEET, NOTES_TITLE).then_some(Refreshed::Updated));
+    }
+    let beside = bom::titled_table(d, LIST_SHEET, LIST_TITLE)
+        .map(|t| Point2 { x: t.insert.x + t.col_widths.iter().sum::<f64>() + NOTES_GAP_MM, y: t.insert.y });
+    let default_at = match beside {
+        Some(at) => at,
+        None => {
+            let sheet = cadcraft_render::sheet(d, LIST_SHEET).ok_or_else(|| other("A001 has no page"))?;
+            let area = usable_area(&sheet);
+            Point2 { x: area.min.x, y: area.max.y }
+        }
+    };
+    let rows: Vec<Vec<String>> = notes.iter().enumerate().map(|(k, n)| vec![(k + 1).to_string(), n.clone()]).collect();
+    bom::refresh_table(d, LIST_SHEET, NOTES_TITLE, Some(default_at), &|at| {
+        bom::schedule_table(NOTES_TITLE, &NOTES_HEADER, &NOTES_COL_WIDTHS, &rows, at)
+    })
+}
+
+/// GENERALNOTE at the command line: the note's text; an empty answer cancels.
+struct GeneralNote;
+
+impl Interactive for GeneralNote {
+    fn name(&self) -> &'static str {
+        NOTE_CMD
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        Prompt::new("General note", Accept::TEXT)
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let Some(text) = name_input(i, "") else { return Ok(Step::Continue) };
+        if text.is_empty() {
+            return Ok(Step::Cancel);
+        }
+        let r = generalnote(s, &json!({ "text": text }))?;
+        if let Some(m) = r["message"].as_str() {
+            s.echo(m.to_owned());
+        }
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn generalnote_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
+    Ok(Box::new(GeneralNote))
+}
+
 /// (keyword, parameter, prompt).
 const FIELDS: [(&str, &str, &str); 6] = [
     ("Project", "project", "Enter project"),
@@ -714,9 +839,7 @@ pub(crate) fn titleblock_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
 mod tests {
     use super::*;
     use crate::assembly::tests::{room_with, undo_len};
-    use crate::sheets::usable_area;
-    use cadcraft_doc::{Layout, PageSetup, Viewport};
-    use lamb_core::geometry::Point2;
+    use cadcraft_doc::{Layout, PageSetup, Table, Viewport};
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
     type T<X> = std::result::Result<X, Box<dyn std::error::Error>>;
@@ -1150,6 +1273,121 @@ mod tests {
         s.input(Input::Text("up".into()))?;
         s.input(Input::Text("North".into()))?;
         assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("330"), "not a number changes nothing");
+        Ok(())
+    }
+
+    /// A001's General Notes rows, `(number, text)`, and the table's corner; `None` without one.
+    fn notes_table(s: &Session) -> T<Option<(Vec<(String, String)>, Vec3)>> {
+        Ok(bom::titled_table(s.doc()?, LIST_SHEET, NOTES_TITLE).map(|t: &Table| {
+            let rows = t.cells.iter().skip(2).map(|r| (r[0].text.clone(), r[1].text.clone())).collect();
+            (rows, t.insert)
+        }))
+    }
+
+    fn rows(texts: &[&str]) -> Vec<(String, String)> {
+        texts.iter().enumerate().map(|(k, t)| ((k + 1).to_string(), (*t).to_owned())).collect()
+    }
+
+    #[test]
+    fn sheetset_writes_the_notes_beside_the_drawing_list() -> R {
+        let mut s = two_plans()?;
+        for t in ["Verify all dimensions on site.", "Do not scale.", "Framing to NZS 3604."] {
+            s.execute("generalnote", &json!({ "text": t }))?;
+        }
+        assert!(s.doc()?.layout(LIST_SHEET).is_none(), "no A001 yet: stored only");
+        let r = s.execute("sheetset", &json!({}))?;
+        assert!(r["message"].as_str().is_some_and(|m| m.contains("A001 General Notes")), "{r}");
+        let (got, at) = notes_table(&s)?.ok_or("no notes table")?;
+        assert_eq!(got, rows(&["Verify all dimensions on site.", "Do not scale.", "Framing to NZS 3604."]));
+        let list = bom::titled_table(s.doc()?, LIST_SHEET, LIST_TITLE).ok_or("no list")?;
+        let list_right = list.insert.x + list.col_widths.iter().sum::<f64>();
+        assert!((at.x - list_right - NOTES_GAP_MM).abs() < 1e-9 && (at.y - list.insert.y).abs() < 1e-9, "right of the list, tops aligned");
+        let t = bom::titled_table(s.doc()?, LIST_SHEET, NOTES_TITLE).ok_or("no notes")?;
+        assert_eq!(t.cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), NOTES_HEADER);
+        assert_eq!(t.col_widths, NOTES_COL_WIDTHS);
+        let area = usable_area(&cadcraft_render::sheet(s.doc()?, LIST_SHEET).ok_or("no sheet")?);
+        assert!(at.x + NOTES_COL_WIDTHS.iter().sum::<f64>() <= area.max.x, "inside the usable area");
+        assert_eq!(four(&s, LIST_SHEET)?.1, LIST_TITLE, "the frame still names the list");
+
+        let n = undo_len(&s)?;
+        let before = notes_table(&s)?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n, "a second run changes nothing: {r}");
+        assert_eq!(notes_table(&s)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn generalnote_edits_the_table_in_its_own_undo_step() -> R {
+        let mut s = two_plans()?;
+        s.execute("sheetset", &json!({}))?;
+        assert!(notes_table(&s)?.is_none(), "no notes, no table");
+        let n = undo_len(&s)?;
+        for (k, t) in ["A", "B", "C"].iter().enumerate() {
+            let r = s.execute("generalnote", &json!({ "text": t }))?;
+            assert_eq!(r["message"], json!(format!("Note {} added.", k + 1)));
+        }
+        assert_eq!(undo_len(&s)?, n + 3);
+        assert_eq!(notes_table(&s)?.ok_or("no table")?.0, rows(&["A", "B", "C"]));
+        let corner = notes_table(&s)?.ok_or("no table")?.1;
+
+        let r = s.execute("generalnote", &json!({ "remove": 2 }))?;
+        assert_eq!(r, json!({ "notes": ["A", "C"], "message": "Note 2 removed." }));
+        assert_eq!(notes_table(&s)?.ok_or("no table")?, (rows(&["A", "C"]), corner), "renumbered, in place");
+        let r = s.execute("generalnote", &json!({ "text": " Z ", "at": 1 }))?;
+        assert_eq!(r["message"], json!("Note 1 replaced."));
+        assert_eq!(notes_table(&s)?.ok_or("no table")?.0, rows(&["Z", "C"]));
+        s.undo()?;
+        assert_eq!(notes_table(&s)?.ok_or("no table")?.0, rows(&["A", "C"]), "undo takes the table with it");
+
+        // Refusals record nothing.
+        let n = undo_len(&s)?;
+        for p in [
+            json!({ "text": "  " }),
+            json!({}),
+            json!({ "remove": 3 }),
+            json!({ "remove": 0 }),
+            json!({ "text": "x", "at": 9 }),
+            json!({ "text": 4 }),
+        ] {
+            assert!(s.execute("generalnote", &p).is_err(), "{p}");
+        }
+        assert_eq!(undo_len(&s)?, n);
+
+        s.execute("generalnote", &json!({ "remove": 1 }))?;
+        s.execute("generalnote", &json!({ "remove": 1 }))?;
+        assert!(notes_table(&s)?.is_none(), "the last note takes the table");
+        assert!(bom::titled_table(s.doc()?, LIST_SHEET, LIST_TITLE).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn notes_without_a001_are_kept_and_survive_dxf() -> R {
+        let (mut s, ..) = room()?;
+        s.execute("generalnote", &json!({ "text": "Client & Co approval required." }))?;
+        s.execute("generalnote", &json!({ "text": "Second" }))?;
+        assert!(s.doc()?.layout(LIST_SHEET).is_none());
+        let bytes = cadcraft_io::write(s.doc()?, "t.dxf").map_err(|e| format!("{e:?}"))?;
+        let back = cadcraft_io::read(&bytes, "t.dxf").map_err(|e| format!("{e:?}"))?;
+        let notes = read_document(&back)?.sheet_info.ok_or("no info")?.notes;
+        assert_eq!(notes, vec!["Client & Co approval required.".to_owned(), "Second".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_generalnote_adds_a_note_and_empty_cancels() -> R {
+        let mut s = two_plans()?;
+        s.execute("sheetset", &json!({}))?;
+        s.start("gnote")?;
+        assert_eq!(s.current_prompt().map(|p| p.message.clone()).as_deref(), Some("General note"));
+        s.input(Input::Text("Do not scale.".into()))?;
+        assert!(s.current_prompt().is_none());
+        assert_eq!(notes_table(&s)?.ok_or("no table")?.0, rows(&["Do not scale."]));
+        let n = undo_len(&s)?;
+        s.start("generalnote")?;
+        s.input(Input::Enter)?;
+        assert!(s.current_prompt().is_none(), "empty cancels");
+        assert_eq!(undo_len(&s)?, n);
         Ok(())
     }
 }

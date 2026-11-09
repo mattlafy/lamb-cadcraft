@@ -339,7 +339,7 @@ pub(crate) fn refresh_room_schedule(d: &mut Drawing) -> Result<Option<Refreshed>
     if rows.is_empty() {
         return Ok(None);
     }
-    bom::refresh_table(d, DEFAULT_LAYOUT, ROOM_TITLE, &|at| room_table(&rows, at))
+    bom::refresh_table(d, DEFAULT_LAYOUT, ROOM_TITLE, None, &|at| room_table(&rows, at))
 }
 
 /// ROOMSCHEDULE `{layout?, at?}`. See the module doc.
