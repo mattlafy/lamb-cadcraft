@@ -23,7 +23,8 @@
 //! [`crate::titleblock::sheet_title`]; it is made once another set sheet exists. `A601` holds the
 //! [`crate::bom`] table when there is framing to count; with none an existing one is left alone.
 //! `A602` holds the [`crate::schedule`] opening schedule (LAMB T639) likewise, when a placed plan has
-//! openings, and `A603` the [`crate::rooms`] room schedule (LAMB T657) when a plan has named rooms.
+//! openings, `A603` the [`crate::rooms`] room schedule (LAMB T657) when a plan has named rooms, and
+//! `A604` the [`crate::walltypes`] Wall Types legend (LAMB T688) when a wall has an edge detail.
 //! The set's general notes ([`crate::titleblock`], `generalnote`) go on `A001` too, as a `General
 //! Notes` table right of the Drawing List. Each table is compared with what it would become and replaced, at its own corner, only when its
 //! text differs. A table taller than the sheet is written whole and the message says it runs off.
@@ -105,6 +106,7 @@ use crate::sheets::{
 };
 use crate::titleblock::{NOTES_TITLE, is_lamb_sheet, refresh_notes, sheet_title};
 use crate::vptitles::scale_label;
+use crate::walltypes::{self, WALL_TYPES_TITLE, refresh_wall_types};
 
 const PLAN_PREFIX: &str = "A1";
 const ELEVATION_PREFIX: &str = "A2";
@@ -464,6 +466,11 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         parts.push(part);
         sheets.push(sheet);
     }
+    if let Some(change) = refresh_wall_types(&mut d)? {
+        let (part, sheet) = table_report(walltypes::DEFAULT_LAYOUT, "schedule", WALL_TYPES_TITLE, change);
+        parts.push(part);
+        sheets.push(sheet);
+    }
     // A001's tables lead what is reported: the list, then the notes.
     let mut first = 0;
     for (title, change) in [(LIST_TITLE, refresh_list(&mut d, &known)?), (NOTES_TITLE, refresh_notes(&mut d)?)] {
@@ -482,6 +489,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         (bom::DEFAULT_LAYOUT, BOM_TITLE),
         (schedule::DEFAULT_LAYOUT, OPENING_TITLE),
         (rooms::DEFAULT_LAYOUT, ROOM_TITLE),
+        (walltypes::DEFAULT_LAYOUT, WALL_TYPES_TITLE),
     ] {
         if bom::table_runs_off(&d, layout, title)? {
             off_sheet.push(format!("{layout} {title}"));
@@ -1294,7 +1302,7 @@ mod tests {
         let (mut s, _) = stud_room()?;
         let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
         let names = set_sheets(s.doc()?);
-        assert!(names.first().is_some_and(|n| n == "A001") && names.last().is_some_and(|n| n == "A601"), "{names:?}");
+        assert!(names.first().is_some_and(|n| n == "A001") && names.contains(&"A601".to_owned()), "{names:?}");
         assert_eq!(r["pdf"]["pages"], names.len(), "{r}");
         assert_eq!(craft_pdf::open_slice(&std::fs::read(&path)?, None).map_err(|e| format!("{e:?}"))?.pages().len(), names.len());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1451,11 +1459,13 @@ mod tests {
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
         let got = laid(&r);
         assert_eq!(got.first(), Some(&("A001".to_owned(), "list".to_owned(), vec![])), "{r}");
-        assert_eq!(got.last(), Some(&("A601".to_owned(), "bom".to_owned(), vec![])), "{r}");
+        // The stud room's wall carries an edge detail, so the Wall Types legend follows the BOM.
+        let tail: Vec<_> = got.iter().rev().take(2).rev().cloned().collect();
+        assert_eq!(tail, [("A601".to_owned(), "bom".to_owned(), vec![]), ("A604".to_owned(), "schedule".to_owned(), vec![])], "{r}");
 
         let names: Vec<String> = tabs(&s)?.into_iter().filter(|n| is_set_name(n)).collect();
         assert_eq!(names.first().map(String::as_str), Some("A001"));
-        assert_eq!(names.last().map(String::as_str), Some("A601"));
+        assert_eq!(names.last().map(String::as_str), Some("A604"));
         assert_eq!(tabs(&s)?[..names.len()], names[..], "the set leads the tabs");
         let list = table(&s, "A001", "Drawing List")?;
         assert_eq!(list.cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Sheet", "Title"]);
@@ -1464,7 +1474,8 @@ mod tests {
         let rows = body(&list);
         assert_eq!(rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(), names, "every set sheet in tab order");
         assert_eq!(rows[0], row("A001", "Drawing List"));
-        assert_eq!(rows.last(), Some(&row("A601", "Framing BOM")));
+        assert_eq!(rows.last(), Some(&row("A604", "Wall Types")));
+        assert!(rows.contains(&row("A601", "Framing BOM")), "{rows:?}");
         assert!(rows.contains(&row("A101", "Ground")), "{rows:?}");
 
         let area = crate::sheets::usable_area(&cadcraft_render::sheet(s.doc()?, "A001").ok_or("no sheet")?);
@@ -1480,14 +1491,14 @@ mod tests {
         assert_eq!(laid(&r), [], "{r}");
         assert_eq!(r["message"].as_str().map(|m| m.starts_with("Sheet set: nothing new to lay out")), Some(true), "{r}");
 
-        // More framing changes only the BOM.
+        // More framing changes the BOM, and the wall type's Repeats with it.
         add_stud(&mut s, plan)?;
         let list_before = table(&s, "A001", "Drawing List")?;
         let bom_before = table(&s, "A601", "Framing BOM")?;
         let n = undo_len(&s)?;
         let r = s.execute("sheetset", &json!({}))?;
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
-        assert_eq!(laid(&r), [("A601".to_owned(), "bom".to_owned(), vec![])], "{r}");
+        assert_eq!(laid(&r), [("A601".to_owned(), "bom".to_owned(), vec![]), ("A604".to_owned(), "schedule".to_owned(), vec![])], "{r}");
         assert!(r["message"].as_str().is_some_and(|m| m.contains("A601 Framing BOM updated")), "{r}");
         assert_eq!(table(&s, "A001", "Drawing List")?, list_before, "the list holds");
         let bom = table(&s, "A601", "Framing BOM")?;

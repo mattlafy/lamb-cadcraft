@@ -204,6 +204,43 @@ fn detail_lines(d: &Drawing, detail: Id, reference: &[cadcraft_doc::Handle]) -> 
         .collect())
 }
 
+/// One layer of an edge detail's build-up (LAMB T688): a layer name and the spread of its face
+/// lines across the wall.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DetailLayer {
+    pub layer: String,
+    /// The smallest band offset on this layer, mm from the reference face.
+    pub offset: f64,
+    /// Largest minus smallest band offset on this layer; 0 for a layer with one band.
+    pub thickness: f64,
+}
+
+/// The build-up of the edge detail `detail` (LAMB T688): its bands ([`detail_bands`] over
+/// `detail_lines`) grouped by layer, ordered by each layer's smallest offset (from the reference
+/// face outward). A band is a face line, so a layer's thickness is the spread of its bands' offsets;
+/// a one-band layer is listed with thickness 0. A corner reference is `Err("corner detail")`; no
+/// reference is an error too.
+pub fn detail_layers(d: &Drawing, detail: Id) -> Result<Vec<DetailLayer>, String> {
+    let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
+    if r.corner.is_some() {
+        return Err("corner detail".to_owned());
+    }
+    let lines = detail_lines(d, detail, &r.handles())?;
+    let mut out: Vec<DetailLayer> = Vec::new();
+    for b in detail_bands((r.from, r.to), &lines)? {
+        match out.iter_mut().find(|l| l.layer == b.layer) {
+            Some(l) => {
+                let far = (l.offset + l.thickness).max(b.offset);
+                l.offset = l.offset.min(b.offset);
+                l.thickness = far - l.offset;
+            }
+            None => out.push(DetailLayer { layer: b.layer, offset: b.offset, thickness: 0.0 }),
+        }
+    }
+    out.sort_by(|a, b| a.offset.total_cmp(&b.offset).then_with(|| a.layer.cmp(&b.layer)));
+    Ok(out)
+}
+
 /// Every straight segment of the `members` of `detail`'s block (each through [`to_polyline`], open
 /// or closed; bulged segments and entities it refuses are skipped), with the member's layer.
 fn member_segments(d: &Drawing, detail: Id, members: &[cadcraft_doc::Handle]) -> Vec<(Point2, Point2, String)> {

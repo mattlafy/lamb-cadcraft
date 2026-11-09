@@ -96,6 +96,7 @@ pub mod views;
 pub mod vptitles;
 pub mod wallfit;
 mod wallrun;
+pub mod walltypes;
 
 pub use annotations::annotation_observer;
 pub use assembly::assembly_observer;

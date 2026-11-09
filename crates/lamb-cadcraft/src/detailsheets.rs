@@ -27,7 +27,7 @@ use crate::sheets::{SheetError, create_packed_sheet, pack_details, view_sheet_re
 const DEFAULT_PREFIX: &str = "A5";
 
 /// The detail view a resolved detail names, if it is an assignment.
-fn named(r: &RunDetail) -> Option<Id> {
+pub(crate) fn named(r: &RunDetail) -> Option<Id> {
     match r {
         RunDetail::Tagged(s) | RunDetail::Spread(s) | RunDetail::Gap(s) => s.parse().ok().map(Id),
         RunDetail::Conflict | RunDetail::Untyped => None,
