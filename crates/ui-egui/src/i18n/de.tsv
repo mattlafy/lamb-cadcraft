@@ -386,6 +386,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Angezeigte Layer: {shown} von {total}.   Aktueller Layer: {layer}
 	Layout	Layout
 	Layout list	Layoutliste
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Leader	Führungslinie
 	Left	Links
 	Length	Länge

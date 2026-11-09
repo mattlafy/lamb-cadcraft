@@ -384,6 +384,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	显示的图层: {shown} / {total}。当前图层: {layer}
 	Layout	布局
 	Layout list	布局列表
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Leader	引线
 	Left	左
 	Length	长度

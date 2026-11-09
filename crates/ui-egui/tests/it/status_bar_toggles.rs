@@ -62,3 +62,57 @@ fn clicking_grid_and_snap_on_the_status_bar_keeps_line_running() {
         .collect();
     assert_eq!(lines, vec![(Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0))]);
 }
+
+fn osmode(h: &Harness<'_, CadApp>) -> u32 {
+    h.state().session.settings.osmode
+}
+
+fn open_osnap_menu(h: &mut Harness<'_, CadApp>) {
+    h.get_by_label("Object Snap menu").click();
+    h.run_steps(2);
+}
+
+/// The chevron beside OSNAP opens a menu of the running snaps (LAMB T679): ticking one sets its
+/// bit and turns OSNAP on, unticking clears only its bit, several ticks fit in one opening, and
+/// LINE keeps running throughout.
+#[test]
+fn the_object_snap_menu_toggles_single_snaps_and_keeps_line_running() {
+    use cadcraft_engine::snap::mode;
+    let mut h = harness();
+    {
+        let s = &mut h.state_mut().session;
+        s.settings.osmode = mode::OFF;
+        s.start("line").unwrap();
+        s.input(Input::Point(Vec2::new(0.0, 0.0))).unwrap();
+    }
+    h.run_steps(2);
+    open_osnap_menu(&mut h);
+    h.get_by_label("Midpoint").click();
+    h.run_steps(2);
+    assert_eq!(osmode(&h), mode::MID, "MID set, OSNAP turned on");
+    h.state_mut().session.settings.osmode |= mode::OFF;
+    h.run_steps(2);
+    h.get_by_label("Endpoint").click();
+    h.run_steps(2);
+    assert_eq!(osmode(&h), mode::MID | mode::END, "the menu stayed open; END set and OFF cleared");
+    h.get_by_label("Midpoint").click();
+    h.run_steps(2);
+    assert_eq!(osmode(&h), mode::END, "unticking clears only MID");
+    assert_eq!(running(&h).as_deref(), Some("line"));
+}
+
+/// Hatch snaps flips OSNAPHATCH; Osnap Settings... opens Drafting Settings. Nothing registers
+/// menu extras in this binary, so the menu has none.
+#[test]
+fn the_object_snap_menu_flips_hatch_snaps_and_opens_drafting_settings() {
+    let mut h = harness();
+    let hatch = h.state().session.settings.osnaphatch;
+    open_osnap_menu(&mut h);
+    assert!(cadcraft_ui_egui::chrome::statusext::osnap_extras(h.state()).is_empty(), "unregistered: no extras");
+    h.get_by_label("Hatch snaps").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.settings.osnaphatch, !hatch);
+    h.get_by_label("Osnap Settings...").click();
+    h.run_steps(2);
+    assert_eq!(h.state().ui.dialog.as_deref(), Some("dsettings"));
+}

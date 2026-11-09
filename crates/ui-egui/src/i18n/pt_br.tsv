@@ -483,6 +483,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Camadas exibidas: {shown} de {total}.   Camada atual: {layer}
 	Layout	Layout
 	Layout list	Lista de layouts
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Layout paper	Papel do layout
 	Leader	Linha de chamada
 	Leaders Only	Somente linhas de chamada

@@ -381,6 +381,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Calques affichés : {shown} sur {total}.   Calque courant : {layer}
 	Layout	Présentation
 	Layout list	Liste des présentations
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Leader	Repère
 	Left	Gauche
 	Length	Longueur

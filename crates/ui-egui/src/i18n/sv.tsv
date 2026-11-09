@@ -487,6 +487,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Visade lager: {shown} av {total}.   Aktuellt lager: {layer}
 	Layout	Layout
 	Layout list	Layoutlista
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Layout paper	Layoutpapper
 	Leader	Hänvisningslinje
 	Leaders Only	Bara hänvisningslinjer

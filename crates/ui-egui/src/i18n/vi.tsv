@@ -464,6 +464,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Đang hiển thị {shown} trên {total} layer.   Layer hiện hành: {layer}
 	Layout	Layout
 	Layout list	Danh sách layout
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Leader	Đường dẫn ghi chú
 	Leaders Only	Chỉ đường dẫn ghi chú
 	Left	Trái

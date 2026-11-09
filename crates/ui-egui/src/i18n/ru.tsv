@@ -381,6 +381,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Показано слоев: {shown} из {total}.   Текущий слой: {layer}
 	Layout	Лист
 	Layout list	Список листов
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Leader	Выноска
 	Left	Слева
 	Length	Длина

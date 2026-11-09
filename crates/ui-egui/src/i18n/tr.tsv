@@ -563,6 +563,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Gösterilen katmanlar: {shown} / {total}.   Geçerli katman: {layer}
 	Layout	Yerleşim
 	Layout list	Yerleşim listesi
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Layout paper	Yerleşim kağıdı
 	Layout {name}: {table}	Yerleşim {name}: {table}
 	Leader	Kılavuz

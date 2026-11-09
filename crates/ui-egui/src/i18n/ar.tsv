@@ -502,6 +502,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	الطبقات المعروضة: {shown} من {total}.   الطبقة الحالية: {layer}
 	Layout	تخطيط
 	Layout list	قائمة التخطيطات
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Layout paper	ورقة التخطيط
 	Layout {name}: {table}	التخطيط {name}: {table}
 	Leader	خط الإشارة

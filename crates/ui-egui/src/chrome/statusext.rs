@@ -39,6 +39,22 @@ pub fn toggles(app: &CadApp) -> Vec<StatusToggle> {
     SOURCE.get().map(|f| f(&app.session)).unwrap_or_default()
 }
 
+/// Extra checkboxes in the Object Snap menu (fork-only, LAMB T679), below Hatch snaps: each is
+/// labelled `label`, ticked by `on`, and toggling it runs its command as a pill click does.
+pub type OsnapExtraSource = fn(&Session) -> Vec<StatusToggle>;
+
+static OSNAP_EXTRAS: OnceLock<OsnapExtraSource> = OnceLock::new();
+
+/// Register the Object Snap menu's extras. Once per process; a second call is an error.
+pub fn register_osnap_extras(f: OsnapExtraSource) -> Result<(), &'static str> {
+    OSNAP_EXTRAS.set(f).map_err(|_| "osnap extras source already registered")
+}
+
+/// The Object Snap menu's extras for the app's session; empty when nothing is registered.
+pub fn osnap_extras(app: &CadApp) -> Vec<StatusToggle> {
+    OSNAP_EXTRAS.get().map(|f| f(&app.session)).unwrap_or_default()
+}
+
 /// The name of a model-like block space (fork-only, LAMB T466): `Some(label)` means the session's
 /// block space is a view called `label`, shown on the first layout tab and keeping the annotation
 /// scale list.
@@ -127,6 +143,35 @@ mod tests {
         assert!(activate(&mut app, &rows[0]).is_ok());
         assert_ne!(app.session.settings.orthomode, before, "ortho flipped");
         assert_eq!(toggles(&app)[0].on, !before, "the pill follows the setting");
+    }
+
+    fn extras(s: &Session) -> Vec<StatusToggle> {
+        vec![StatusToggle { label: "Ortho extra".into(), on: s.settings.orthomode, tip: "Ortho".into(), command: ("ortho".into(), json!({})) }]
+    }
+
+    #[test]
+    fn a_registered_osnap_extra_shows_in_the_object_snap_menu_and_runs_its_command() {
+        use egui_kittest::kittest::Queryable;
+        let _ = register_osnap_extras(extras);
+        assert!(register_osnap_extras(extras).is_err(), "one source per process");
+        let mut session = Session::empty();
+        session.open_drawing(cadcraft_engine::doc::Drawing::new_imperial(), "Extras", None);
+        let app = CadApp::new(session, crate::Services::default());
+        let before = app.session.settings.orthomode;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
+            |ui, app: &mut CadApp| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        assert!(h.query_by_label("Ortho extra").is_none(), "only inside the menu");
+        h.get_by_label("Object Snap menu").click();
+        h.run_steps(2);
+        h.get_by_label("Ortho extra").click();
+        h.run_steps(2);
+        assert_ne!(h.state().session.settings.orthomode, before, "its command ran");
     }
 
     #[test]

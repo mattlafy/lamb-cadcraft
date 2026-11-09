@@ -319,12 +319,73 @@ fn draw_status_toggles(
             toggle_cmd = Some(cmd);
         }
         rx += size + 4.0;
+        if cmd == "osnap" {
+            rx = osnap_chevron(app, ui, painter, t, (rect, rx));
+        }
     }
     // The toggles don't cancel the active command (#1108); the dialog buttons start theirs.
     match toggle_cmd {
         Some(c) if c.starts_with("ui.") => app.start(c),
         Some(c) => crate::menus::run_transparent(app, c),
         None => {}
+    }
+}
+
+/// Width the Object Snap menu chevron adds to the toggle row: its 14 px slot, 2 px from the OSNAP
+/// button, then the usual 4 px gap to the next toggle.
+const OSNAP_CHEVRON: f32 = 16.0;
+
+/// The chevron right of the OSNAP toggle (fork, LAMB T679) and its popup of running snaps; returns
+/// the next toggle's left edge.
+fn osnap_chevron(app: &mut CadApp, ui: &mut egui::Ui, painter: &egui::Painter, t: Tokens, (rect, rx): (Rect, f32)) -> f32 {
+    let label = "Object Snap menu";
+    // `rx` is 4 px past the OSNAP button; the slot sits 2 px from it.
+    let cr = Rect::from_min_size(pos2(rx - 2.0, rect.center().y - 8.0), vec2(14.0, 16.0));
+    let resp = ui.interact(cr, ui.scope_id().with("osnap_menu"), Sense::click());
+    if resp.hovered() {
+        painter.rect_filled(cr, 3.0, t.control_hover.gamma_multiply(0.5));
+    }
+    icons::paint(painter, cr.shrink2(vec2(0.0, 1.0)), Icon::ChevronDown, false);
+    icons::describe_control(ui, &resp, label, None, false);
+    let resp = resp.on_hover_text(crate::i18n::t(label));
+    egui::Popup::from_toggle_button_response(&resp)
+        .width(200.0)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| osnap_menu(app, ui));
+    rx + OSNAP_CHEVRON
+}
+
+/// The Object Snap menu: one checkbox per running snap (ticking one also turns OSNAP on, as
+/// choosing a snap does in the reference product), Hatch snaps, the registered extras, then
+/// Osnap Settings.... Nothing here cancels the running command.
+fn osnap_menu(app: &mut CadApp, ui: &mut egui::Ui) {
+    use cadcraft_engine::snap::mode;
+    let s = &mut app.session.settings;
+    for (bit, name) in mode::ALL {
+        let mut v = s.osmode & bit != 0;
+        if ui.checkbox(&mut v, crate::i18n::t(name)).changed() {
+            s.osmode = if v { (s.osmode | bit) & !mode::OFF } else { s.osmode & !bit };
+        }
+    }
+    ui.separator();
+    ui.checkbox(&mut s.osnaphatch, crate::tl!("Hatch snaps"));
+    let extras = statusext::osnap_extras(app);
+    let mut run = None;
+    for (i, x) in extras.iter().enumerate() {
+        let mut v = x.on;
+        if ui.checkbox(&mut v, &x.label).on_hover_text(&x.tip).changed() {
+            run = Some(i);
+        }
+    }
+    if let Some(x) = run.and_then(|i| extras.get(i))
+        && let Err(e) = statusext::activate(app, x)
+    {
+        app.status = Some((e, crate::now_ms()));
+    }
+    ui.separator();
+    if ui.button(crate::tl!("Osnap Settings...")).clicked() {
+        app.start("ui.dialog.dsettings");
+        ui.close();
     }
 }
 
@@ -381,7 +442,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             (Icon::Gear, false, "ui.dialog.dsettings", "Drafting Settings"),
         ];
         let size = 20.0;
-        let rx = r.right() - 8.0 - toggles.len() as f32 * (size + 4.0);
+        let rx = r.right() - 8.0 - toggles.len() as f32 * (size + 4.0) - OSNAP_CHEVRON;
         // Coordinates.
         let coord = app.canvas.cursor.map(|c| {
             let (lu, lp) = app.session.doc().map(|d| (d.header.i64("LUNITS", 2), d.header.i64("LUPREC", 4))).unwrap_or((2, 4));

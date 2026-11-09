@@ -562,6 +562,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Megjelenített rétegek: {shown} / {total}.   Aktuális réteg: {layer}
 	Layout	Elrendezés
 	Layout list	Elrendezések listája
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Layout paper	Elrendezés papírja
 	Layout {name}: {table}	Elrendezés: {name} – {table}
 	Leader	Mutatóvonal

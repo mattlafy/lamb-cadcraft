@@ -465,6 +465,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Prikazani slojevi: {shown} od {total}.   Trenutni sloj: {layer}
 	Layout	Raspored
 	Layout list	Lista rasporeda
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Leader	Pokazna linija
 	Leaders Only	Samo pokazne linije
 	Left	Lijevo

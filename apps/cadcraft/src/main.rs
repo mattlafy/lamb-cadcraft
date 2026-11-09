@@ -284,6 +284,9 @@ fn install_lamb() {
     if let Err(e) = cadcraft_ui_egui::chrome::statusext::register_status_toggles(lamb_status_toggles) {
         log::warn!("LAMB status toggles not installed: {e}");
     }
+    if let Err(e) = cadcraft_ui_egui::chrome::statusext::register_osnap_extras(lamb_osnap_extras) {
+        log::warn!("LAMB Object Snap menu entries not installed: {e}");
+    }
     if let Err(e) = cadcraft_ui_egui::chrome::statusext::register_space_label(lamb_cadcraft::commands::view_tab_label) {
         log::warn!("LAMB view tab label not installed: {e}");
     }
@@ -434,10 +437,16 @@ const LAMB_CHAT: cadcraft_ui_egui::chatpane::ChatBackend = cadcraft_ui_egui::cha
 };
 
 fn lamb_status_toggles(s: &cadcraft_engine::Session) -> Vec<cadcraft_ui_egui::chrome::statusext::StatusToggle> {
-    lamb_cadcraft::commands::status_toggles(s)
-        .into_iter()
-        .map(|t| cadcraft_ui_egui::chrome::statusext::StatusToggle { label: t.label, on: t.on, tip: t.tip, command: t.command })
-        .collect()
+    to_status_toggles(lamb_cadcraft::commands::status_toggles(s))
+}
+
+/// The Object Snap menu's LAMB entries (LAMB T679): Detail snaps.
+fn lamb_osnap_extras(s: &cadcraft_engine::Session) -> Vec<cadcraft_ui_egui::chrome::statusext::StatusToggle> {
+    to_status_toggles(lamb_cadcraft::commands::osnap_extras(s))
+}
+
+fn to_status_toggles(list: Vec<lamb_cadcraft::commands::StatusToggle>) -> Vec<cadcraft_ui_egui::chrome::statusext::StatusToggle> {
+    list.into_iter().map(|t| cadcraft_ui_egui::chrome::statusext::StatusToggle { label: t.label, on: t.on, tip: t.tip, command: t.command }).collect()
 }
 
 /// The Properties palette's LAMB group (fork, LAMB T361): Role and the cut/seen height source.

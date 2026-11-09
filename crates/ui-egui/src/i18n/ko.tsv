@@ -465,6 +465,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	표시된 도면층: {total}개 중 {shown}개.   현재 도면층: {layer}
 	Layout	배치
 	Layout list	배치 목록
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Leader	지시선
 	Leaders Only	지시선만
 	Left	왼쪽

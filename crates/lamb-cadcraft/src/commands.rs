@@ -802,6 +802,21 @@ pub fn status_toggles(s: &Session) -> Vec<StatusToggle> {
     ]
 }
 
+/// The Object Snap menu's LAMB entries (LAMB T679): Detail snaps (DETAILSNAP), only while the
+/// drawing has LAMB views.
+pub fn osnap_extras(s: &Session) -> Vec<StatusToggle> {
+    let has_views = s.doc().ok().and_then(|d| DrawingProject::new(d).ok()).is_some_and(|p| p.views().next().is_some());
+    if !has_views {
+        return Vec::new();
+    }
+    vec![StatusToggle {
+        label: "Detail snaps".into(),
+        on: crate::overlays::underlay::detail_snaps_on(),
+        tip: "Assembled detail lines snap with the running object snaps (DETAILSNAP)".into(),
+        command: ("detailsnap".into(), json!({})),
+    }]
+}
+
 /// Whether the canvas shows its scale bar HUD (LAMB T363): only in a drawing with LAMB views.
 pub fn scale_bar_wanted(d: &cadcraft_doc::Drawing) -> bool {
     DrawingProject::new(d).ok().is_some_and(|p| p.views().next().is_some())
@@ -1491,6 +1506,29 @@ mod tests {
             s.execute(&t.command.0, &t.command.1)?;
         }
         assert_eq!(state(&s), vec![("LOCK".to_string(), true), ("UCS".to_string(), false)]);
+        Ok(())
+    }
+
+    #[test]
+    fn osnap_extras_offer_detail_snaps_on_a_lamb_drawing_only() -> R {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+        let _g = crate::overlays::underlay::tests::lock();
+        install_app()?;
+        assert!(osnap_extras(&session()?).is_empty(), "a plain drawing has no LAMB snap entries");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamb-core/tests/lamb/u-wall-two-sections.lamb.json");
+        let files: BTreeMap<String, String> = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let project = lamb_core::persistence::files_to_project(&files).map_err(|e| format!("{e:?}"))?;
+        let (d, _, _) = crate::import::project_to_drawing(&project)?;
+        let mut s = Session::new();
+        s.open_drawing(d, "u-wall", None);
+        let state = |s: &Session| osnap_extras(s).into_iter().map(|t| (t.label, t.on)).collect::<Vec<_>>();
+        assert_eq!(state(&s), vec![("Detail snaps".to_string(), true)]);
+        for t in osnap_extras(&s) {
+            s.execute(&t.command.0, &t.command.1)?;
+        }
+        assert_eq!(state(&s), vec![("Detail snaps".to_string(), false)], "after detailsnap");
+        s.execute("detailsnap", &json!({ "on": true }))?;
         Ok(())
     }
 

@@ -482,6 +482,8 @@
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Показано шарів: {shown} із {total}.   Поточний шар: {layer}
 	Layout	Аркуш
 	Layout list	Список аркушів
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Leader	Виноска
 	Leaders Only	Лише виноски
 	Left	Ліворуч

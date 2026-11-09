@@ -476,6 +476,8 @@ menu	Modify	Edita
 	Layers displayed: {shown} of {total}.   Current layer: {layer}	Layer visualizzati: {shown} di {total}.   Layer corrente: {layer}
 	Layout	Layout
 	Layout list	Elenco layout
+	Object Snap menu	Object Snap menu
+	Hatch snaps	Hatch snaps
 	Leader	Direttrice
 	Leaders Only	Solo direttrici
 	Left	Sinistra
