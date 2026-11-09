@@ -904,7 +904,7 @@ mod tests {
         assert_eq!(plain_mtext("\\H2.5x;Big"), "Big");
         assert_eq!(plain_mtext("unterminated \\H2"), "unterminated ");
         assert_eq!(plain_mtext("\\U+0041B \\U+00E8"), "AB è");
-        assert_eq!(plain_mtext("\\U+12"), "", "a short escape is a code with an argument");
+        assert_eq!(plain_mtext("\\U+12"), "+12", "a short escape loses only the backslash and the code");
     }
 
     #[test]
