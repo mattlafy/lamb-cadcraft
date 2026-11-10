@@ -19,8 +19,10 @@
 //! - NEWSECTIONLINE's one-click form in a placed section ([`perpendicular_cut`],
 //!   [`vertical_preview`]): the branch itself lives in `commands.rs`'s machine.
 //!
-//! Both creating commands return `{viewId, levelId}`, name the level and the plan `Level <n+1>`
-//! unless given a name, and are one undo step.
+//! Both creating commands return `{viewId, levelId}` and are one undo step. Unless given a name
+//! (which names both), the level is `Level <n+1>` and the plan is named by storey
+//! ([`default_plan_name`]): `Ground Floor`, `Second Floor`, … `11th Floor`, or `Basement` below
+//! every level.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -29,6 +31,7 @@ use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step,
 use cadcraft_geom::{Bounds2, Vec2};
 use lamb_core::derivation::projection::{PerpendicularCutLine, perpendicular_cut_line_through, plan_placement_through};
 use lamb_core::derivation::read::{ProjectRead, ViewKind};
+use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::geometry::{IDENTITY_TRANSFORM, Point2, Transform2D};
 use lamb_core::model::{Actor, AnyView, Id, Level, Placement, PlanView, VerticalIntent, authored_field, is_plan_view};
 use serde_json::{Value, json};
@@ -47,7 +50,8 @@ const EMPTY_HALF_SPAN_MM: f64 = 5000.0;
 /// Length of a one-click perpendicular section's cut line (TS `CUT_LINE_LENGTH_MM`).
 pub(crate) const CUT_LINE_LENGTH_MM: f64 = 20000.0;
 
-/// What a new level-and-plan gets; the name defaults to `Level <levels + 1>`.
+/// What a new level-and-plan gets; without a name the level is `Level <levels + 1>` and the plan
+/// [`default_plan_name`].
 struct PlanSpec {
     name: Option<String>,
     floor: f64,
@@ -59,7 +63,10 @@ struct PlanSpec {
 /// TS `createLevelAndPlacedPlan`: the level and its placed plan, one undo step.
 fn create_level_and_plan(s: &mut Session, spec: PlanSpec) -> Result<Value> {
     let doc = read_document(s.doc()?).map_err(other)?;
-    let name = spec.name.unwrap_or_else(|| default_level_name(doc.levels.len()));
+    let (level_name, name) = match spec.name {
+        Some(n) => (n.clone(), n),
+        None => (default_level_name(doc.levels.len()), default_plan_name(&doc, spec.floor)),
+    };
     let cut = spec.cut_height.unwrap_or(doc.defaults.default_cut_height_mm);
     let d = s.doc_mut()?;
     let level_id = Id(d.new_handle().0);
@@ -68,7 +75,7 @@ fn create_level_and_plan(s: &mut Session, spec: PlanSpec) -> Result<Value> {
     let view_id = create_view(d, plan).map_err(other)?;
     let mut doc = read_document(d).map_err(other)?;
     let floor_elevation = authored_field(spec.floor, view_id, Actor::User { user_id: "local".into() }, &now());
-    doc.levels.push(Level { id: level_id, name, order: spec.order, floor_elevation });
+    doc.levels.push(Level { id: level_id, name: level_name, order: spec.order, floor_elevation });
     write_document(d, &doc).map_err(other)?;
     Ok(json!({ "viewId": view_id.0, "levelId": level_id.0 }))
 }
@@ -80,6 +87,46 @@ fn next_order(doc: &LambDocument) -> f64 {
 
 fn default_level_name(levels: usize) -> String {
     format!("Level {}", levels + 1)
+}
+
+/// A plan's default name by storey: `n` is one more than the levels whose floor is below `floor`;
+/// `n == 1` is `Basement` when a level is above it, else `Ground Floor`; then `Second Floor` …
+/// `Tenth Floor`, `11th Floor`, `21st Floor`. A name a view already has gets ` 2`, ` 3`, ….
+pub(crate) fn default_plan_name(doc: &LambDocument, floor: f64) -> String {
+    let tol = TOLERANCE.coincidence_mm;
+    let n = 1 + doc.levels.iter().filter(|l| l.floor_elevation.value < floor - tol).count();
+    let base = match n {
+        1 if doc.levels.iter().any(|l| l.floor_elevation.value > floor + tol) => "Basement".to_owned(),
+        1 => "Ground Floor".to_owned(),
+        n => format!("{} Floor", storey_ordinal(n)),
+    };
+    let taken = |name: &str| doc.views.iter().any(|v| v.name() == name);
+    if !taken(&base) {
+        return base;
+    }
+    (2..).map(|k| format!("{base} {k}")).find(|c| !taken(c)).unwrap_or(base)
+}
+
+/// `Second` … `Tenth`, then `11th`, `12th`, `13th`, `21st`, `22nd`, `23rd`, ….
+fn storey_ordinal(n: usize) -> String {
+    const WORDS: [&str; 9] = ["Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth", "Ninth", "Tenth"];
+    if let Some(w) = n.checked_sub(2).and_then(|i| WORDS.get(i)) {
+        return (*w).to_owned();
+    }
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+/// The name of the view a creating command returned in `viewId`.
+fn created_name(s: &Session, r: &Value) -> Option<String> {
+    let id = r.get("viewId").and_then(id_value)?;
+    read_document_of(s)?.views.iter().find(|v| v.id() == id).map(|v| v.name().to_owned())
 }
 
 fn opt_name(p: &Value) -> Option<String> {
@@ -329,16 +376,16 @@ impl Interactive for NewOffsetPlan {
             _ => return Ok(Step::Continue),
         };
         remember(self.store(), value);
-        let name = default_level_name(read_document(s.doc()?).map_err(other)?.levels.len());
         let mut params = match mode {
-            Mode::Offset => json!({ "mode": "offset", "floorToFloorMm": value, "name": name }),
-            _ => json!({ "mode": "height", "floorElevationMm": value, "name": name }),
+            Mode::Offset => json!({ "mode": "offset", "floorToFloorMm": value }),
+            _ => json!({ "mode": "height", "floorElevationMm": value }),
         };
         if let Some(from) = self.from {
             params["fromViewId"] = json!(from.0);
         }
         match newoffsetplan(s, &params) {
             Ok(r) => {
+                let name = created_name(s, &r).unwrap_or_default();
                 echo_created(s, "Plan", &name, &r);
             }
             Err(e) => s.echo(e.to_string()),
@@ -387,10 +434,10 @@ impl Interactive for NewPlanLine {
             _ => return Ok(Step::Continue),
         };
         let Some(view) = self.view else { return Ok(Step::Done) };
-        let name = default_level_name(read_document(s.doc()?).map_err(other)?.levels.len());
-        let params = json!({ "fromVerticalViewId": view.0, "localPoint": {"x": p.x, "y": p.y}, "name": name });
+        let params = json!({ "fromVerticalViewId": view.0, "localPoint": {"x": p.x, "y": p.y} });
         match newplanline(s, &params) {
             Ok(r) => {
+                let name = created_name(s, &r).unwrap_or_default();
                 echo_created(s, "Plan", &name, &r);
             }
             Err(e) => s.echo(e.to_string()),
@@ -514,9 +561,9 @@ mod tests {
         s.input(Input::Text("3000".into()))?;
         assert!(s.running.is_none(), "done");
         let doc = read_document(s.doc()?)?;
-        let view = doc.views.iter().find(|v| v.name() == "Level 2").ok_or("no plan")?.id();
+        let view = doc.views.iter().find(|v| v.name() == "Second Floor").ok_or("no plan")?.id();
         check_offset_result(&s, &json!({ "viewId": view.0, "levelId": level_of(&s, view)?.0.id.0 }))?;
-        assert!(s.log.iter().any(|l| l == &format!("Plan \"Level 2\" created (view {}).", view.0)), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l == &format!("Plan \"Second Floor\" created (view {}).", view.0)), "{:?}", s.log);
 
         // Height mode, Enter at the mode prompt is Offset, so pick H.
         s.start("np")?;
@@ -537,7 +584,7 @@ mod tests {
         s.input(Input::Enter)?;
         s.input(Input::Text("3000".into()))?;
         let doc = read_document(s.doc()?)?;
-        let view = doc.views.iter().find(|v| v.name() == "Level 4").ok_or("no plan")?.id();
+        let view = doc.views.iter().find(|v| v.name() == "Second Floor 2").ok_or("no plan")?.id();
         let (level, placement) = level_of(&s, view)?;
         assert_eq!(level.floor_elevation.value, 3000.0, "3000 above the ground plan's level");
         assert!(matches!(placement, Placement::Plan { transform, .. } if transform == MOVED), "the ground plan's transform");
@@ -627,7 +674,7 @@ mod tests {
         s.input(Input::Point(Vec2::new(4000.0, 2700.0)))?;
         assert!(s.running.is_none());
         let doc = read_document(s.doc()?)?;
-        let view = doc.views.iter().find(|v| v.name() == "Level 2").ok_or("no plan")?.id();
+        let view = doc.views.iter().find(|v| v.name() == "Second Floor").ok_or("no plan")?.id();
         assert_eq!(level_of(&s, view)?.0.floor_elevation.value, 2700.0);
         assert_eq!(space(&s)?, Space::Block(view_block_name(section)), "stays in the section, as newplanline does");
         Ok(())
@@ -651,9 +698,71 @@ mod tests {
         s.input(Input::Point(Vec2::new(4000.0, 2700.0)))?;
         assert!(s.running.is_none());
         let doc = read_document(s.doc()?)?;
-        let view = doc.views.iter().find(|v| v.name() == "Level 2").ok_or("no plan")?.id();
+        let view = doc.views.iter().find(|v| v.name() == "Second Floor").ok_or("no plan")?.id();
         assert_eq!(level_of(&s, view)?.0.floor_elevation.value, 2700.0);
         assert_eq!(space(&s)?, Space::Block(view_block_name(section)));
+        Ok(())
+    }
+
+    /// LAMB T664: defaulted plans are named by storey; their levels stay `Level n`.
+    #[test]
+    fn default_plan_names_follow_the_storey() -> R {
+        let (mut s, plan) = project()?;
+        let plan_and_level = |s: &Session, r: &Value| -> Res<(String, String)> {
+            let view = Id(r["viewId"].as_u64().ok_or("no id")?);
+            let name = read_document(s.doc()?)?.views.iter().find(|v| v.id() == view).ok_or("no view")?.name().to_owned();
+            Ok((name, level_of(s, view)?.0.name))
+        };
+        let r = s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": plan.0, "floorToFloorMm": 3000 }))?;
+        assert_eq!(plan_and_level(&s, &r)?, ("Second Floor".into(), "Level 2".into()));
+        let second = Id(r["viewId"].as_u64().ok_or("no id")?);
+        let r = s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": second.0, "floorToFloorMm": 3000 }))?;
+        assert_eq!(plan_and_level(&s, &r)?, ("Third Floor".into(), "Level 3".into()));
+        let section = with_section(&mut s, plan)?;
+        let r = s.execute("newplanline", &json!({ "fromVerticalViewId": section.0, "localPoint": {"x": 4000, "y": 9000} }))?;
+        assert_eq!(plan_and_level(&s, &r)?, ("Fourth Floor".into(), "Level 4".into()));
+        let r = s.execute("newoffsetplan", &json!({ "mode": "height", "fromViewId": plan.0, "floorElevationMm": -2700 }))?;
+        assert_eq!(plan_and_level(&s, &r)?, ("Basement".into(), "Level 5".into()));
+        let r = s.execute("newoffsetplan", &json!({ "mode": "height", "fromViewId": plan.0, "floorElevationMm": -2700 }))?;
+        assert_eq!(plan_and_level(&s, &r)?.0, "Basement 2", "a taken default gets a number");
+        let r = s.execute("newoffsetplan", &json!({ "mode": "height", "fromViewId": plan.0, "floorElevationMm": 12000, "name": "Roof" }))?;
+        assert_eq!(plan_and_level(&s, &r)?, ("Roof".into(), "Roof".into()), "an explicit name names both");
+
+        // Interactive: the echo names the plan actually created.
+        s.execute("editview", &json!({ "viewId": section.0 }))?;
+        s.start("newplanline")?;
+        s.input(Input::Point(Vec2::new(4000.0, 15000.0)))?;
+        let doc = read_document(s.doc()?)?;
+        let view = doc.views.iter().find(|v| v.name() == "Eighth Floor").ok_or("no plan")?.id();
+        assert!(s.log.iter().any(|l| l == &format!("Plan \"Eighth Floor\" created (view {}).", view.0)), "{:?}", s.log);
+        Ok(())
+    }
+
+    #[test]
+    fn default_plan_name_ordinals_and_basement() -> R {
+        let mut doc = LambDocument::default();
+        assert_eq!(default_plan_name(&doc, 0.0), "Ground Floor");
+        let level = |i: usize, floor: f64| Level {
+            id: Id(1000 + i as u64),
+            name: format!("Level {i}"),
+            order: i as f64,
+            floor_elevation: authored_field(floor, Id(0), Actor::User { user_id: "local".into() }, "t"),
+        };
+        let mut named = |n: usize| {
+            while doc.levels.len() < n - 1 {
+                let i = doc.levels.len();
+                doc.levels.push(level(i, i as f64 * 3000.0));
+            }
+            default_plan_name(&doc, (n - 1) as f64 * 3000.0)
+        };
+        let got: Vec<String> = [1, 2, 10, 11, 12, 13, 21, 22, 23].into_iter().map(&mut named).collect();
+        assert_eq!(
+            got,
+            ["Ground Floor", "Second Floor", "Tenth Floor", "11th Floor", "12th Floor", "13th Floor", "21st Floor", "22nd Floor", "23rd Floor"]
+        );
+        assert_eq!(default_plan_name(&doc, -3000.0), "Basement");
+        assert_eq!(storey_ordinal(101), "101st");
+        assert_eq!(storey_ordinal(111), "111th");
         Ok(())
     }
 
