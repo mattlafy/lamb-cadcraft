@@ -19,8 +19,9 @@
 //!
 //! The set opens on a drawing list and ends on the BOM (LAMB T636), both rewritten by this command
 //! alone, so a sheet renamed by hand shows at the next run. `A001` holds a `Drawing List` table
-//! (`Sheet | Title`) of every set sheet in tab order, itself included, titled by
-//! [`crate::titleblock::sheet_title`]; it is made once another set sheet exists. `A601` holds the
+//! (`Sheet | Title | Rev`) of every set sheet in tab order, itself included, titled by
+//! [`crate::titleblock::sheet_title`], its `Rev` the latest issue that sheet's own title strip lists
+//! (blank when none, LAMB T695); it is made once another set sheet exists. `A601` holds the
 //! [`crate::bom`] table when there is framing to count; with none an existing one is left alone.
 //! `A602` holds the [`crate::schedule`] opening schedule (LAMB T639) likewise, when a placed plan has
 //! openings, `A603` the [`crate::rooms`] room schedule (LAMB T657) when a plan has named rooms, and
@@ -104,7 +105,7 @@ use crate::sheets::{
     DEFAULT_SHEET_PAPER, VPORT_LAYER, create_enlarged_sheet, create_packed_sheet, create_sheet, enlarged_area, enlarged_scale, ensure_vport_layer,
     pack_verticals, refit_viewport, sheet_paper_size, view_drawn, view_placed, view_sheet_ref, viewport_scale, window_fits,
 };
-use crate::titleblock::{NOTES_TITLE, is_lamb_sheet, refresh_notes, sheet_title};
+use crate::titleblock::{NOTES_TITLE, is_lamb_sheet, refresh_notes, sheet_issues, sheet_title};
 use crate::vptitles::scale_label;
 use crate::walltypes::{self, WALL_TYPES_TITLE, refresh_wall_types};
 
@@ -121,7 +122,7 @@ const BOM_PREFIX: &str = "A6";
 const SET_PREFIXES: [&str; 7] = [LIST_PREFIX, PLAN_PREFIX, ELEVATION_PREFIX, SECTION_PREFIX, FRAMING_PREFIX, DETAIL_PREFIX, BOM_PREFIX];
 pub(crate) const LIST_SHEET: &str = "A001";
 pub(crate) const LIST_TITLE: &str = "Drawing List";
-const LIST_COL_WIDTHS: [f64; 2] = [30.0, 150.0];
+const LIST_COL_WIDTHS: [f64; 3] = [30.0, 150.0, 15.0];
 
 /// Whether `name` is a set sheet name: a set prefix and two digits.
 fn is_set_name(name: &str) -> bool {
@@ -218,8 +219,22 @@ fn refresh_list(d: &mut Drawing, known: &[String]) -> Result<Option<Refreshed>> 
     }
     bom::ensure_sheet_layout(d, LIST_SHEET)?;
     order_tabs(d, known);
-    let rows: Vec<Vec<String>> = set_titles(d)?.into_iter().map(|(n, t)| vec![n, t]).collect();
-    bom::refresh_table(d, LIST_SHEET, LIST_TITLE, None, &|at| bom::schedule_table(LIST_TITLE, &["Sheet", "Title"], &LIST_COL_WIDTHS, &rows, at))
+    let issues = read_document(d).map_err(other)?.sheet_info.map(|i| i.issues).unwrap_or_default();
+    // A sheet's Rev is the latest issue its own title strip lists, so the two always agree.
+    let rev = |n: &str| {
+        let latest = d.layout(n).and_then(|l| sheet_issues(&issues, l).iter().map(|i| i.number).max());
+        latest.map(|n| n.to_string()).unwrap_or_default()
+    };
+    let rows: Vec<Vec<String>> = set_titles(d)?
+        .into_iter()
+        .map(|(n, t)| {
+            let r = rev(&n);
+            vec![n, t, r]
+        })
+        .collect();
+    bom::refresh_table(d, LIST_SHEET, LIST_TITLE, None, &|at| {
+        bom::schedule_table(LIST_TITLE, &["Sheet", "Title", "Rev"], &LIST_COL_WIDTHS, &rows, at)
+    })
 }
 
 /// Every set sheet in tab order, with its title.
@@ -1424,7 +1439,11 @@ mod tests {
     }
 
     fn row(sheet: &str, title: &str) -> Vec<String> {
-        vec![sheet.to_owned(), title.to_owned()]
+        row_rev(sheet, title, "")
+    }
+
+    fn row_rev(sheet: &str, title: &str, rev: &str) -> Vec<String> {
+        vec![sheet.to_owned(), title.to_owned(), rev.to_owned()]
     }
 
     /// Moves the table on `layout` by hand.
@@ -1468,8 +1487,8 @@ mod tests {
         assert_eq!(names.last().map(String::as_str), Some("A604"));
         assert_eq!(tabs(&s)?[..names.len()], names[..], "the set leads the tabs");
         let list = table(&s, "A001", "Drawing List")?;
-        assert_eq!(list.cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Sheet", "Title"]);
-        assert_eq!(list.col_widths, [30.0, 150.0]);
+        assert_eq!(list.cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Sheet", "Title", "Rev"]);
+        assert_eq!(list.col_widths, [30.0, 150.0, 15.0]);
         assert_eq!((list.text_height, list.row_heights[0]), (2.5, 7.0));
         let rows = body(&list);
         assert_eq!(rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(), names, "every set sheet in tab order");
@@ -1533,6 +1552,38 @@ mod tests {
         s.undo()?;
         assert_eq!(body(&table(&s, "A001", "Drawing List")?), before);
         assert!(s.doc()?.layout("A103").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn the_list_gives_each_sheet_its_current_revision() -> R {
+        let (mut s, _) = set()?;
+        s.execute("sheetset", &json!({}))?;
+        assert!(body(&table(&s, "A001", "Drawing List")?).iter().all(|r| r[2].is_empty()), "no issues, blank Rev");
+        s.execute("issue", &json!({ "description": "For comment", "date": "d1" }))?;
+        s.execute("issue", &json!({ "description": "Rev A", "date": "d2", "sheets": ["A201"] }))?;
+        // A list written before the Rev column: two columns, replaced at its own corner.
+        let old = table(&s, "A001", "Drawing List")?;
+        let at = lamb_core::geometry::Point2 { x: old.insert.x, y: old.insert.y };
+        let two: Vec<Vec<String>> = body(&old).into_iter().map(|r| r[..2].to_vec()).collect();
+        bom::remove_table(s.doc_mut()?, "A001", LIST_TITLE);
+        bom::refresh_table(s.doc_mut()?, "A001", LIST_TITLE, Some(at), &|p| {
+            bom::schedule_table(LIST_TITLE, &["Sheet", "Title"], &[30.0, 150.0], &two, p)
+        })?;
+        let r = s.execute("sheetset", &json!({}))?;
+        assert!(r["message"].as_str().is_some_and(|m| m.contains("A001 Drawing List updated")), "{r}");
+        let list = table(&s, "A001", "Drawing List")?;
+        assert_eq!(list.cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Sheet", "Title", "Rev"]);
+        assert_eq!((list.insert.x, list.insert.y), (old.insert.x, old.insert.y), "at its own corner");
+        let rows = body(&list);
+        assert_eq!(rows[0], row_rev("A001", "Drawing List", "1"));
+        assert_eq!(rows[1], row_rev("A101", "Ground Floor", "1"));
+        assert!(rows.contains(&row_rev("A201", "North", "2")), "{rows:?}");
+        assert!(rows.iter().filter(|r| r[0] != "A201").all(|r| r[2] == "1"), "{rows:?}");
+        let n = undo_len(&s)?;
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(undo_len(&s)?, n, "a second SHEETSET changes nothing");
+        assert_eq!(table(&s, "A001", "Drawing List")?, list);
         Ok(())
     }
 

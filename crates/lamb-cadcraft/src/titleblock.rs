@@ -283,7 +283,7 @@ fn delta_rev(e: &Entity) -> Option<u32> {
 
 /// The issues layout `l` lists: the set-wide ones, and the revisions that name it or whose delta it
 /// carries.
-fn sheet_issues(issues: &[Issue], l: &Layout) -> Vec<Issue> {
+pub(crate) fn sheet_issues(issues: &[Issue], l: &Layout) -> Vec<Issue> {
     let deltas: Vec<u32> = l.entities.iter().filter_map(|e| delta_rev(e)).collect();
     issues.iter().filter(|i| !i.revision || i.sheets.contains(&l.name) || deltas.contains(&i.number)).cloned().collect()
 }
