@@ -19,6 +19,15 @@
 //! is kept for the two directions with the longest overlap. Each dimension starts a third of the way
 //! along the overlap and runs straight across the room, its line through the room. Arc edges never
 //! pair; a space with no pair gets none.
+//!
+//! Locating dimensions (LAMB T694) are a third opt-in, `autodim {locate: true}`, kept in
+//! `auto_dim_locate_plans`: [`locate`] sets out every straight interior wall on its centreline.
+//! Interior straight runs are grouped by direction; per group, a chain is placed where the most
+//! still-uncovered runs cross (the candidates are those runs' extent midpoints), and takes the
+//! centreline of every run of the group crossing it. Each end continues to the inner face of the
+//! nearest parallel exterior wall crossing the chain beyond it, or stops at the outermost centreline
+//! when there is none; chains repeat until every run is covered, and a chain of one station gives no
+//! dimension. Arc runs never take part.
 
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use lamb_core::derivation::read::ProjectRead;
@@ -261,6 +270,120 @@ pub(crate) fn interior(p: &DrawingProject<'_>, view: Id) -> Vec<DimSpan> {
     out
 }
 
+/// A straight run's centreline, for [`locate`].
+struct Centreline {
+    from: Point2,
+    to: Point2,
+    dir: Point2,
+    width: f64,
+    exterior: bool,
+}
+
+/// `view`'s generated locating dimensions: per direction group of straight interior runs, chains
+/// through their centrelines out to the bounding exterior walls' inner faces (see the module doc).
+pub(crate) fn locate(p: &DrawingProject<'_>, view: Id) -> Vec<DimSpan> {
+    let (graph, sides) = graph_and_sides(p, view);
+    let tol = TOLERANCE.coincidence_mm;
+    let sin_tol = TOLERANCE.angle_deg.to_radians().sin();
+    let lines: Vec<Centreline> = graph
+        .runs
+        .iter()
+        .zip(&sides.runs)
+        .filter_map(|(r, side)| {
+            let RunCurve::Line { from, to } = r.centreline else { return None };
+            if dist2(from, to) <= tol {
+                return None;
+            }
+            Some(Centreline { from, to, dir: normalize2(sub2(to, from)), width: r.width, exterior: side.exterior })
+        })
+        .collect();
+    let upright = |mut heading: f64| {
+        if heading > FRAC_PI_2 + 1e-12 {
+            heading -= std::f64::consts::PI;
+        } else if heading <= -FRAC_PI_2 + 1e-12 {
+            heading += std::f64::consts::PI;
+        }
+        heading
+    };
+    // Interior runs by direction, in the order of their first run.
+    let mut groups: Vec<(Point2, Vec<&Centreline>)> = Vec::new();
+    for l in lines.iter().filter(|l| !l.exterior) {
+        match groups.iter_mut().find(|g| cross2(g.0, l.dir).abs() <= sin_tol) {
+            Some(g) => g.1.push(l),
+            None => {
+                let h = upright(l.dir.y.atan2(l.dir.x));
+                groups.push((Point2 { x: h.cos(), y: h.sin() }, vec![l]));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (d, members) in &groups {
+        let d = *d;
+        let n = Point2 { x: -d.y, y: d.x };
+        let rotation = upright(n.y.atan2(n.x));
+        let extent = |l: &Centreline| {
+            let (a, b) = (dot2(l.from, d), dot2(l.to, d));
+            (a.min(b), a.max(b))
+        };
+        let crosses = |l: &Centreline, t: f64| {
+            let (lo, hi) = extent(l);
+            lo - tol <= t && t <= hi + tol
+        };
+        let mut covered = vec![false; members.len()];
+        loop {
+            // The uncovered midpoint the most uncovered runs cross; ties: the smallest.
+            let mut best: Option<(usize, f64)> = None;
+            for (l, _) in members.iter().zip(&covered).filter(|(_, c)| !**c) {
+                let (lo, hi) = extent(l);
+                let t = (lo + hi) / 2.0;
+                let count = members.iter().zip(&covered).filter(|(m, c)| !**c && crosses(m, t)).count();
+                if best.is_none_or(|(bc, bt)| count > bc || (count == bc && t < bt)) {
+                    best = Some((count, t));
+                }
+            }
+            let Some((_, t)) = best else { break };
+            let mut stations: Vec<f64> = Vec::new();
+            for (l, c) in members.iter().zip(covered.iter_mut()) {
+                if crosses(l, t) {
+                    *c = true;
+                    stations.push(dot2(l.from, n));
+                }
+            }
+            stations.sort_by(f64::total_cmp);
+            stations.dedup_by(|b, a| *b - *a <= tol);
+            let (Some(&first), Some(&last)) = (stations.first(), stations.last()) else { continue };
+            // The nearest parallel exterior run crossing the chain on each side: its inner face.
+            let walls: Vec<(f64, f64)> = lines
+                .iter()
+                .filter(|l| l.exterior && cross2(d, l.dir).abs() <= sin_tol && crosses(l, t))
+                .map(|l| (dot2(l.from, n), l.width / 2.0))
+                .collect();
+            let below = walls.iter().filter(|(s, _)| *s < first - tol).max_by(|a, b| a.0.total_cmp(&b.0));
+            let above = walls.iter().filter(|(s, _)| *s > last + tol).min_by(|a, b| a.0.total_cmp(&b.0));
+            if let Some(face) = below.map(|(s, w)| s + w).filter(|f| *f < first - tol) {
+                stations.insert(0, face);
+            }
+            if let Some(face) = above.map(|(s, w)| s - w).filter(|f| *f > last + tol) {
+                stations.push(face);
+            }
+            let place = |s: f64| add2(scale2(d, t), scale2(n, s));
+            out.extend(stations.windows(2).filter_map(|w| {
+                let a = place(*w.first()?);
+                Some(DimSpan { a, b: place(*w.get(1)?), rotation, line_at: a })
+            }));
+        }
+    }
+    out
+}
+
+/// Which of AUTODIM's three independent kinds a call turns on or off.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Exterior,
+    Interior,
+    Locate,
+}
+
 /// `Ok` when `view` is a placed plan, else why not.
 fn check_plan(s: &Session, view: Id) -> std::result::Result<(), String> {
     let doc = read_document(s.doc().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -272,11 +395,12 @@ fn check_plan(s: &Session, view: Id) -> std::result::Result<(), String> {
     }
 }
 
-/// AUTODIM `{view?, off?, interior?}`: turns the plan's generated dimension strings on, or off with
-/// `off: true`; with `interior: true` the same for its interior clear dimensions instead, the two
-/// independent. `view` defaults to the edited view. Returns `{view, dimensions, interior, message}`,
-/// `dimensions` counting what the plan now has of that kind. A plan already in that state records
-/// no undo step.
+/// AUTODIM `{view?, off?, interior?, locate?}`: turns the plan's generated dimension strings on, or
+/// off with `off: true`; with `interior: true` the same for its interior clear dimensions instead,
+/// with `locate: true` for its locating dimensions, the three independent (`interior` and `locate`
+/// together refuse). `view` defaults to the edited view. Returns `{view, dimensions, interior,
+/// locate, message}`, `dimensions` counting what the plan now has of that kind. A plan already in
+/// that state records no undo step.
 pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
     let view = match p.get("view") {
         None | Some(Value::Null) => edited_view(s).ok_or_else(|| other("Edit a plan first (EDITVIEW), or give `view`"))?,
@@ -292,9 +416,24 @@ pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err(bad("autodim", "`interior` must be true or false")),
     };
+    let locating = match p.get("locate") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad("autodim", "`locate` must be true or false")),
+    };
+    let kind = match (inside, locating) {
+        (true, true) => return Err(bad("autodim", "give interior or locate, not both")),
+        (true, false) => Kind::Interior,
+        (false, true) => Kind::Locate,
+        (false, false) => Kind::Exterior,
+    };
     check_plan(s, view).map_err(other)?;
     let mut doc = read_document(s.doc()?).map_err(|e| other(e.to_string()))?;
-    let list = if inside { &mut doc.auto_dim_interior_plans } else { &mut doc.auto_dim_plans };
+    let list = match kind {
+        Kind::Exterior => &mut doc.auto_dim_plans,
+        Kind::Interior => &mut doc.auto_dim_interior_plans,
+        Kind::Locate => &mut doc.auto_dim_locate_plans,
+    };
     if list.contains(&view) == off {
         list.retain(|v| *v != view);
         if !off {
@@ -306,23 +445,29 @@ pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
         0
     } else {
         let dp = DrawingProject::new(s.doc()?).map_err(|e| other(e.to_string()))?;
-        if inside { interior(&dp, view).len() } else { strings(&dp, view, 1.0).len() }
+        match kind {
+            Kind::Exterior => strings(&dp, view, 1.0).len(),
+            Kind::Interior => interior(&dp, view).len(),
+            Kind::Locate => locate(&dp, view).len(),
+        }
     };
-    let message = match (inside, off) {
-        (false, true) => "Generated dimensions off".to_owned(),
-        (false, false) => format!("{dimensions} generated dimensions"),
-        (true, true) => "Interior dimensions off".to_owned(),
-        (true, false) => format!("{dimensions} interior dimensions"),
+    let message = match (kind, off) {
+        (Kind::Exterior, true) => "Generated dimensions off".to_owned(),
+        (Kind::Exterior, false) => format!("{dimensions} generated dimensions"),
+        (Kind::Interior, true) => "Interior dimensions off".to_owned(),
+        (Kind::Interior, false) => format!("{dimensions} interior dimensions"),
+        (Kind::Locate, true) => "Locating dimensions off".to_owned(),
+        (Kind::Locate, false) => format!("{dimensions} locating dimensions"),
     };
     s.echo(message.clone());
-    Ok(json!({ "view": view.0, "dimensions": dimensions, "interior": inside, "message": message }))
+    Ok(json!({ "view": view.0, "dimensions": dimensions, "interior": inside, "locate": locating, "message": message }))
 }
 
 /// AUTODIM's interactive form, on the edited plan.
 struct AutoDimM {
     view: Id,
-    /// At the `Interior dimensions` sub-prompt.
-    interior: bool,
+    /// `Exterior` at the first prompt; otherwise the kind whose `On or Off` sub-prompt it is at.
+    kind: Kind,
 }
 
 impl Interactive for AutoDimM {
@@ -330,10 +475,13 @@ impl Interactive for AutoDimM {
         "autodim"
     }
     fn prompt(&self, _s: &Session) -> Prompt {
-        if self.interior {
-            Prompt::new("Interior dimensions", Accept::TEXT).kw(&["On", "Off"]).options_only().default("On".to_owned())
-        } else {
-            Prompt::new("Dimension plan", Accept::TEXT).kw(&["On", "Off", "Interior"]).options_only().default("On".to_owned())
+        let on_off = |label: &str| Prompt::new(label, Accept::TEXT).kw(&["On", "Off"]).options_only().default("On".to_owned());
+        match self.kind {
+            Kind::Interior => on_off("Interior dimensions"),
+            Kind::Locate => on_off("Locating dimensions"),
+            Kind::Exterior => {
+                Prompt::new("Dimension plan", Accept::TEXT).kw(&["On", "Off", "Interior", "Locate"]).options_only().default("On".to_owned())
+            }
         }
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
@@ -357,18 +505,23 @@ impl Interactive for AutoDimM {
             Input::Text(t) | Input::Keyword(t) => match t.trim().to_ascii_lowercase().as_str() {
                 "on" => false,
                 "off" => true,
-                "interior" | "i" if !self.interior => {
-                    self.interior = true;
+                "interior" | "i" if self.kind == Kind::Exterior => {
+                    self.kind = Kind::Interior;
+                    return Ok(Step::Continue);
+                }
+                "locate" | "l" if self.kind == Kind::Exterior => {
+                    self.kind = Kind::Locate;
                     return Ok(Step::Continue);
                 }
                 _ => {
-                    s.echo(if self.interior { "On or Off" } else { "On, Off or Interior" });
+                    s.echo(if self.kind == Kind::Exterior { "On, Off, Interior or Locate" } else { "On or Off" });
                     return Ok(Step::Continue);
                 }
             },
             _ => return Ok(Step::Continue),
         };
-        if let Err(e) = autodim(s, &json!({ "view": self.view.0, "off": off, "interior": self.interior })) {
+        let p = json!({ "view": self.view.0, "off": off, "interior": self.kind == Kind::Interior, "locate": self.kind == Kind::Locate });
+        if let Err(e) = autodim(s, &p) {
             s.echo(e.to_string());
         }
         Ok(Step::Done)
@@ -376,7 +529,7 @@ impl Interactive for AutoDimM {
 }
 
 pub(crate) fn autodim_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
-    Ok(Box::new(AutoDimM { view: Id(0), interior: false }))
+    Ok(Box::new(AutoDimM { view: Id(0), kind: Kind::Exterior }))
 }
 
 #[cfg(test)]
@@ -719,7 +872,7 @@ mod tests {
     fn the_interactive_interior_option_asks_on_or_off() -> R {
         let (mut s, plan) = room()?;
         s.start("autodim")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Dimension plan [On/Off/Interior] <On>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Dimension plan [On/Off/Interior/Locate] <On>:"));
         s.input(Input::Keyword("Interior".into()))?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Interior dimensions [On/Off] <On>:"));
         s.input(Input::Enter)?;
@@ -737,7 +890,7 @@ mod tests {
     fn the_interactive_form_defaults_to_on_and_off_turns_it_off() -> R {
         let (mut s, plan) = room()?;
         s.start("autodim")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Dimension plan [On/Off/Interior] <On>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Dimension plan [On/Off/Interior/Locate] <On>:"));
         s.input(Input::Text("x".into()))?;
         assert!(s.running.is_some(), "re-asks");
         s.input(Input::Enter)?;
@@ -751,6 +904,154 @@ mod tests {
         s.start("autodim")?;
         assert!(s.running.is_none(), "ends outside a plan");
         assert!(s.log.iter().any(|l| l == "AUTODIM needs a plan: open one from the Views palette or with EDITVIEW."), "{:?}", s.log);
+        Ok(())
+    }
+
+    /// A 6000 × 4000 room of 200 walls (outer face on `WALL-EXT`) split into three by two 100
+    /// partitions centred on x 2000 and x 4000; the room faces are on `WALL-INT`, so the partitions
+    /// are interior.
+    fn partitioned() -> T<(Session, Id)> {
+        let (mut s, plan) = placed()?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [6000, 0], [6000, 4000], [0, 4000]], "closed": true }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-INT", "current": true }))?;
+        for (x0, x1) in [(200, 1950), (2050, 3950), (4050, 5800)] {
+            s.execute("pline", &json!({ "vertices": [[x0, 200], [x1, 200], [x1, 3800], [x0, 3800]], "closed": true }))?;
+        }
+        Ok((s, plan))
+    }
+
+    /// The locating dimensions as `(measurement, p13.y)` in whole mm, sorted by `p13.x`.
+    fn chain(s: &Session, view: Id) -> T<Vec<(i64, i64, i64)>> {
+        let mut got = Vec::new();
+        for d in dims(s, view)? {
+            got.push((d.p13.x.min(d.p14.x).round() as i64, measured(s, &d)?.round() as i64, d.p13.y.round() as i64));
+        }
+        got.sort();
+        Ok(got)
+    }
+
+    #[test]
+    fn two_partitions_get_one_chain_from_inner_face_through_their_centrelines() -> R {
+        let (mut s, plan) = partitioned()?;
+        let n = undo_len(&s)?;
+        let r = s.execute("autodim", &json!({ "view": plan.0, "locate": true }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!((r["dimensions"].as_u64(), r["locate"].as_bool()), (Some(3), Some(true)), "{r}");
+        assert_eq!(r["message"], "3 locating dimensions");
+        let got = chain(&s, plan)?;
+        assert_eq!(got.iter().map(|g| (g.0, g.1)).collect::<Vec<_>>(), [(200, 1800), (2000, 2000), (4000, 1800)], "{got:?}");
+        assert!(got.iter().all(|g| g.2 == got[0].2) && (200..=3800).contains(&got[0].2), "one string line through the room: {got:?}");
+        for d in dims(&s, plan)? {
+            let DimKind::Linear { rotation } = d.kind else { return Err("not a linear dimension".into()) };
+            assert!(rotation.abs() < 1e-9, "reads along x: {rotation}");
+        }
+        assert!(read_document(s.doc()?)?.auto_dim_plans.is_empty() && read_document(s.doc()?)?.auto_dim_interior_plans.is_empty());
+
+        // Moving a partition updates them in that command's undo step.
+        let n = undo_len(&s)?;
+        s.execute("stretch", &json!({ "window": [[1900, 100], [2100, 3900]], "delta": [300, 0] }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert_eq!(chain(&s, plan)?.iter().map(|g| (g.0, g.1)).collect::<Vec<_>>(), [(200, 2100), (2300, 1700), (4000, 1800)]);
+        s.undo()?;
+        assert_eq!(chain(&s, plan)?, got);
+
+        // interior + locate refuses; off removes them; a repeat records nothing.
+        let n = undo_len(&s)?;
+        assert!(s.execute("autodim", &json!({ "view": plan.0, "locate": true, "interior": true })).is_err());
+        assert_eq!(undo_len(&s)?, n);
+        let r = s.execute("autodim", &json!({ "view": plan.0, "locate": true, "off": true }))?;
+        assert_eq!((undo_len(&s)?, r["message"].as_str()), (n + 1, Some("Locating dimensions off")));
+        assert!(dims(&s, plan)?.is_empty() && read_document(s.doc()?)?.auto_dim_locate_plans.is_empty());
+        s.execute("autodim", &json!({ "view": plan.0, "locate": true, "off": true }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "already off: no undo step");
+        Ok(())
+    }
+
+    #[test]
+    fn locating_dimensions_live_in_the_annotation_block_and_survive_a_dxf_round_trip() -> R {
+        let (mut s, plan) = partitioned()?;
+        let in_view = |s: &Session| -> T<usize> { Ok(s.doc()?.block(&view_block_name(plan)).ok_or("no block")?.entities.len()) };
+        let n = in_view(&s)?;
+        s.execute("autodim", &json!({ "view": plan.0, "locate": true }))?;
+        assert_eq!(in_view(&s)?, n, "not one in the view block");
+        assert_eq!(dims(&s, plan)?.len(), 3);
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert!(crate::annotations::settled(&back)?, "the observer would change nothing after a round trip");
+        assert_eq!(read_document(&back)?.auto_dim_locate_plans, [plan]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_partition_off_the_first_line_gets_its_own_chain_and_a_lone_one_or_an_arc_none() -> R {
+        // Two partitions standing on the south and north walls, x 2000 (y 200..1500) and x 4000
+        // (y 2500..3800): no one line crosses both.
+        let (mut s, plan) = placed()?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [6000, 0], [6000, 4000], [0, 4000]], "closed": true }))?;
+        s.execute("layer.new", &json!({ "name": "WALL-INT", "current": true }))?;
+        s.execute(
+            "pline",
+            &json!({ "vertices": [[200, 200], [1950, 200], [1950, 1500], [2050, 1500], [2050, 200], [5800, 200], [5800, 3800],
+                [4050, 3800], [4050, 2500], [3950, 2500], [3950, 3800], [200, 3800]], "closed": true }),
+        )?;
+        s.execute("autodim", &json!({ "view": plan.0, "locate": true }))?;
+        let mut got = chain(&s, plan)?;
+        got.sort_by_key(|g| (g.2, g.0));
+        let ys: Vec<i64> = got.iter().map(|g| g.2).collect();
+        assert_eq!(got.iter().map(|g| (g.0, g.1)).collect::<Vec<_>>(), [(200, 1800), (2000, 3800), (200, 3800), (4000, 1800)], "{got:?}");
+        assert!(ys[0] == ys[1] && ys[2] == ys[3] && ys[0] < 1500 && ys[2] > 2500, "two string lines: {got:?}");
+
+        // A stadium room, arcs east and west: nothing parallel bounds a vertical stub's chain, so
+        // the lone stub gets no dimension.
+        let (mut s, plan) = placed()?;
+        let v = |x: f64, y: f64, bulge: f64| json!({ "p": [x, y], "bulge": bulge });
+        s.execute(
+            "pline",
+            &json!({ "vertices": [v(1000.0, 0.0, 0.0), v(3000.0, 0.0, 1.0), v(3000.0, 2200.0, 0.0), v(1000.0, 2200.0, 1.0)], "closed": true }),
+        )?;
+        s.execute("layer.new", &json!({ "name": "WALL-INT", "current": true }))?;
+        s.execute(
+            "pline",
+            &json!({ "vertices": [v(1000.0, 200.0, 0.0), v(1950.0, 200.0, 0.0), v(1950.0, 1000.0, 0.0), v(2050.0, 1000.0, 0.0),
+                v(2050.0, 200.0, 0.0), v(3000.0, 200.0, 1.0), v(3000.0, 2000.0, 0.0), v(1000.0, 2000.0, 1.0)], "closed": true }),
+        )?;
+        let dp = DrawingProject::new(s.doc()?)?;
+        let (graph, sides) = graph_and_sides(&dp, plan);
+        assert!(
+            graph.runs.iter().zip(&sides.runs).any(|(r, x)| !x.exterior && matches!(r.centreline, RunCurve::Line { .. })),
+            "the stub is an interior straight run"
+        );
+        let r = s.execute("autodim", &json!({ "view": plan.0, "locate": true }))?;
+        assert_eq!(r["dimensions"].as_u64(), Some(0), "{r}");
+        assert!(dims(&s, plan)?.is_empty());
+
+        // A D-shaped room: the stub is located off the west wall; the arc bounds nothing.
+        let (mut s, plan) = placed()?;
+        let v = |x: f64, y: f64, bulge: f64| json!({ "p": [x, y], "bulge": bulge });
+        s.execute(
+            "pline",
+            &json!({ "vertices": [v(0.0, 0.0, 0.0), v(3000.0, 0.0, 1.0), v(3000.0, 2200.0, 0.0), v(0.0, 2200.0, 0.0)], "closed": true }),
+        )?;
+        s.execute("layer.new", &json!({ "name": "WALL-INT", "current": true }))?;
+        s.execute(
+            "pline",
+            &json!({ "vertices": [v(200.0, 200.0, 0.0), v(1450.0, 200.0, 0.0), v(1450.0, 1000.0, 0.0), v(1550.0, 1000.0, 0.0),
+                v(1550.0, 200.0, 0.0), v(3000.0, 200.0, 1.0), v(3000.0, 2000.0, 0.0), v(200.0, 2000.0, 0.0)], "closed": true }),
+        )?;
+        s.execute("autodim", &json!({ "view": plan.0, "locate": true }))?;
+        assert_eq!(chain(&s, plan)?.iter().map(|g| (g.0, g.1)).collect::<Vec<_>>(), [(200, 1300)]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_interactive_locate_option_asks_on_or_off() -> R {
+        let (mut s, plan) = partitioned()?;
+        s.start("autodim")?;
+        s.input(Input::Text("L".into()))?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Locating dimensions [On/Off] <On>:"));
+        s.input(Input::Enter)?;
+        assert!(s.running.is_none());
+        assert_eq!(dims(&s, plan)?.len(), 3);
+        assert_eq!(read_document(s.doc()?)?.auto_dim_locate_plans, [plan]);
         Ok(())
     }
 }

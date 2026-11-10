@@ -22,8 +22,9 @@
 //! - `enlargedsheet {viewId, from, to, scale?, show?}` (`esheet`): a chosen area of a plan, section or
 //!   elevation on a new sheet at a larger scale, plotted after the view's own sheet — see
 //!   [`crate::sheetset`].
-//! - `autodim {view?, off?, interior?}` (`adim`): a placed plan's generated exterior dimension
-//!   strings, or with `interior: true` its rooms' clear dimensions, on or off — see [`crate::autodim`].
+//! - `autodim {view?, off?, interior?, locate?}` (`adim`): a placed plan's generated exterior
+//!   dimension strings, or with `interior: true` its rooms' clear dimensions, or with `locate: true`
+//!   the setting-out strings locating its interior walls, on or off — see [`crate::autodim`].
 //! - `detailnotes {viewId?, off?}` (`dnote`): an edge detail's generated layer notes with leaders,
 //!   on or off — see [`crate::detailnotes`].
 //! - `sheetsize {paper}` (`ssize`): the paper new sheets are made on, ARCH D landscape until set;
@@ -909,7 +910,7 @@ pub fn commands() -> Vec<CommandSpec> {
             .interactive(crate::sheetset::enlargedsheet_machine),
         CommandSpec::new("autodim", "Dimension Plan", crate::autodim::autodim)
             .alias(&["adim"])
-            .params("{view?, off?, interior?} → {view, dimensions, interior, message}")
+            .params("{view?, off?, interior?, locate?} → {view, dimensions, interior, locate, message}")
             .interactive(crate::autodim::autodim_machine),
         CommandSpec::new("detailnotes", "Detail Notes", crate::detailnotes::detailnotes)
             .alias(&["dnote"])

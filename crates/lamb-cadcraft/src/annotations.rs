@@ -7,7 +7,8 @@
 //! `"<name> <±elev>"` left-aligned past its right end, plus a vertical floor-to-floor dimension per
 //! pair of consecutive levels by elevation (LAMB T500). Plan cut elevations stay overlay-only. A
 //! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641), one
-//! in `auto_dim_interior_plans` its rooms' clear dimensions (LAMB T686),
+//! in `auto_dim_interior_plans` its rooms' clear dimensions (LAMB T686), one in `auto_dim_locate_plans`
+//! the setting-out strings locating its interior walls (LAMB T694),
 //! and every placed plan a text of each opening's schedule mark outside it ([`crate::schedule`], LAMB T639).
 //! A plan in `wall_tag_plans` gets each wall type tag, its mark in a hexagon inside the run
 //! ([`crate::walltypes::wall_tags`], LAMB T690).
@@ -198,6 +199,10 @@ fn wanted(
     if dp.document().auto_dim_interior_plans.contains(&plan) {
         let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
         out.extend(crate::autodim::interior(&dp, plan).into_iter().map(|d| Item::Dim(at(d.a), at(d.b), d.rotation, at(d.line_at), scale)));
+    }
+    if dp.document().auto_dim_locate_plans.contains(&plan) {
+        let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
+        out.extend(crate::autodim::locate(&dp, plan).into_iter().map(|d| Item::Dim(at(d.a), at(d.b), d.rotation, at(d.line_at), scale)));
     }
     out.extend(enlarged_boxes(d, id, scale));
     Ok(out)
