@@ -48,7 +48,12 @@
 //! spanning two bands, laid as a strip between those bands' final, trimmed lines on each straight
 //! run. Hatches are not members: nothing counts them as lines. Not carried: a hatch that does not
 //! reach two bands (the reference line is not a band), has several loops or a curved edge, or is a
-//! repeat member; and none on an arc run. A corner, jamb or end detail (LAMB T691) carries every
+//! repeat member; and none on an arc run. A HATCH that is itself a repeat member (LAMB T692) is laid
+//! with every copy of its repeat on a straight run ([`RunAssembly::copy_hatches`]) when its loops
+//! are straight-edged and every vertex lies within the along-extent of the repeat's member lines:
+//! its vertices map by the copy's own map, its angle turns with the mapped first edge (never
+//! mirrored), and stud moves and trims carry it with its copy; these follow each run's band strips
+//! in the block. Arc runs carry none. A corner, jamb or end detail (LAMB T691) carries every
 //! HATCH of its block whose loops have only straight edges and that is not a repeat member, placed
 //! by exactly the map that places that detail's lines (a jamb's mirror placement mirrors the loop)
 //! with its pattern angle turned to the mapped direction, never mirrored; these follow the band
@@ -108,6 +113,10 @@ pub struct RunAssembly {
     pub face: Option<FaceRef>,
     /// The detail's hatches between two bands, laid along this run; none on an arc run.
     pub hatches: Vec<BandHatch>,
+    /// Indexed like `copies` (LAMB T692): each copy's placed repeat-member hatches with their layers
+    /// — loops filled, `associative: false`, no sources; empty when its repeat has no hatch member
+    /// or the run is an arc. A missing trailing entry reads as empty.
+    pub copy_hatches: Vec<Vec<(String, Hatch)>>,
 }
 
 /// A detail's hatch laid along a run as a strip between two of its bands.
@@ -198,7 +207,73 @@ fn block_hatches_of<'a>(
         .chain(openings.iter().flat_map(|o| &o.hatches))
         .chain(ends.iter().flat_map(|e| &e.hatches))
         .map(|(layer, h)| (layer.as_str(), h.clone()));
-    runs.iter().flat_map(|r| r.hatches.iter().filter_map(|h| Some((h.layer.as_str(), laid_hatch(r.lines.get(..r.bands)?, h)?)))).chain(placed)
+    runs.iter()
+        .flat_map(|r| {
+            let strips = r.hatches.iter().filter_map(|h| Some((h.layer.as_str(), laid_hatch(r.lines.get(..r.bands)?, h)?)));
+            strips.chain(r.copy_hatches.iter().flatten().map(|(layer, h)| (layer.as_str(), h.clone())))
+        })
+        .chain(placed)
+}
+
+/// The HATCH members of `members` in `detail`'s block (LAMB T692) a straight run carries with every
+/// copy of their repeat, with their layers: each whose loops have only straight edges, whose first
+/// loop has two distinct first vertices, and whose every vertex lies within the along-extent
+/// (`frame.along` from `frame.origin`, ± `TOLERANCE.coincidence_mm`) of the repeat's member lines
+/// `segments` — so laying its vertices changes neither the copy count nor the grid shift.
+fn repeat_hatches(
+    d: &Drawing,
+    detail: Id,
+    members: &[cadcraft_doc::Handle],
+    frame: &DetailFrame,
+    segments: &[(Point2, Point2, String)],
+) -> Vec<(String, Hatch)> {
+    let Some(block) = d.block(&view_block_name(detail)) else { return Vec::new() };
+    let t = |x: f64, y: f64| (x - frame.origin.x) * frame.along.x + (y - frame.origin.y) * frame.along.y;
+    let ts = || segments.iter().flat_map(|(a, b, _)| [t(a.x, a.y), t(b.x, b.y)]);
+    let tol = TOLERANCE.coincidence_mm;
+    let (lo, hi) = (ts().fold(f64::INFINITY, f64::min) - tol, ts().fold(f64::NEG_INFINITY, f64::max) + tol);
+    block
+        .entities
+        .iter()
+        .filter(|e| members.contains(&e.handle))
+        .filter_map(|e| {
+            let EntityKind::Hatch(h) = &e.kind else { return None };
+            let vs = || h.loops.iter().flat_map(|l| &l.vertices);
+            if vs().any(|v| v.bulge != 0.0 || !(lo..=hi).contains(&t(v.p.x, v.p.y))) {
+                return None;
+            }
+            let first = h.loops.first()?;
+            let (a, b) = (first.vertices.first()?, first.vertices.get(1)?);
+            ((a.p.x - b.p.x).hypot(a.p.y - b.p.y) > tol).then(|| (e.common.layer.clone(), h.clone()))
+        })
+        .collect()
+}
+
+/// One copy's placed `hatches` from its mapped loop `points` (every loop vertex of every hatch, in
+/// order, as zero-length lines): loops of the mapped vertices, `angle` turned by the mapped first
+/// edge's direction less the source first edge's, `origin` the first mapped vertex,
+/// `associative: false`, no sources.
+fn copy_hatch(hatches: &[(String, Hatch)], points: &[AssemblyLine]) -> Vec<(String, Hatch)> {
+    let mut at = points.iter().map(|l| l.from);
+    let mut out = Vec::new();
+    for (layer, h) in hatches {
+        let mut loops = Vec::new();
+        for l in &h.loops {
+            let mut vertices = Vec::new();
+            for v in &l.vertices {
+                let Some(p) = at.next() else { return out };
+                vertices.push(PolyVertex { p: Vec2::new(p.x, p.y), ..*v });
+            }
+            loops.push(HatchLoop { vertices, outer: l.outer, sources: Vec::new() });
+        }
+        let src = h.loops.first().map(|l| l.vertices.as_slice()).unwrap_or_default();
+        let dst = loops.first().map(|l| l.vertices.as_slice()).unwrap_or_default();
+        let ([s0, s1, ..], [m0, m1, ..]) = (src, dst) else { continue };
+        let turn = (m1.p.y - m0.p.y).atan2(m1.p.x - m0.p.x) - (s1.p.y - s0.p.y).atan2(s1.p.x - s0.p.x);
+        let origin = m0.p;
+        out.push((layer.clone(), Hatch { loops, associative: false, angle: norm_angle(h.angle + turn), origin, ..h.clone() }));
+    }
+    out
 }
 
 /// The hatches a corner, jamb or end placement of `detail` carries (LAMB T691), with their layers:
@@ -497,8 +572,8 @@ fn laid_reference(
 }
 
 /// One run's lines from `detail` (bands, then each repeat's copies), how many of them are bands, the
-/// line count of each copy, its width conflict, the face it was laid from and its band hatches, or
-/// why not.
+/// line count of each copy, its width conflict, the face it was laid from, its band hatches and each
+/// copy's repeat-member hatches ([`repeat_hatches`], straight runs only), or why not.
 #[allow(clippy::type_complexity)]
 fn run_lines(
     d: &Drawing,
@@ -506,7 +581,7 @@ fn run_lines(
     detail: Id,
     run: &lamb_core::derivation::walls::WallRun,
     sides: &lamb_core::derivation::wall_spaces::RunSides,
-) -> Result<(Vec<AssemblyLine>, usize, Vec<usize>, Option<WidthConflict>, FaceRef, Vec<BandHatch>), String> {
+) -> Result<(Vec<AssemblyLine>, usize, Vec<usize>, Option<WidthConflict>, FaceRef, Vec<BandHatch>, Vec<Vec<(String, Hatch)>>), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let lines = detail_lines(d, detail, &r.handles())?;
     let (reference, face) = laid_reference(d, view, run, sides, &r, &lines)?;
@@ -515,27 +590,42 @@ fn run_lines(
     let mut laid = lay_bands(run, sides, face, &bands)?;
     let n = laid.len();
     let grid = crate::studgrid::run_grid(d, view, run);
+    let straight = matches!(run.centreline, RunCurve::Line { .. });
     let mut copies = Vec::new();
+    let mut copy_hatches = Vec::new();
     for rep in detail_repeats(d, detail)? {
         let members = member_segments(d, detail, &rep.members);
-        let copy = lay_repeat(run, sides, face, &frame, &members, rep.pitch, grid.as_ref())?;
-        if !members.is_empty() {
-            copies.extend(std::iter::repeat_n(members.len(), copy.len() / members.len()));
+        if members.is_empty() {
+            continue;
         }
-        laid.extend(copy);
+        let hatches = if straight { repeat_hatches(d, detail, &rep.members, &frame, &members) } else { Vec::new() };
+        let mut with_points = members.clone();
+        for (layer, h) in &hatches {
+            for v in h.loops.iter().flat_map(|l| &l.vertices) {
+                let p = Point2 { x: v.p.x, y: v.p.y };
+                with_points.push((p, p, layer.clone()));
+            }
+        }
+        let copy = lay_repeat(run, sides, face, &frame, &with_points, rep.pitch, grid.as_ref())?;
+        for c in copy.chunks_exact(with_points.len()) {
+            laid.extend_from_slice(&c[..members.len()]);
+            copies.push(members.len());
+            copy_hatches.push(copy_hatch(&hatches, &c[members.len()..]));
+        }
     }
-    move_studs(&mut laid[n..], &copies, run, &crate::studgrid::stud_moves(d, view, run));
+    move_studs(&mut laid[n..], &copies, &mut copy_hatches, run, &crate::studgrid::stud_moves(d, view, run));
     let hatches = match run.centreline {
         RunCurve::Arc { .. } => Vec::new(),
         RunCurve::Line { .. } => band_hatches(d, detail, run, sides, face, &frame, &bands)?,
     };
-    Ok((laid, n, copies, width_conflict(run, face, &bands), face, hatches))
+    Ok((laid, n, copies, width_conflict(run, face, &bands), face, hatches, copy_hatches))
 }
 
 /// LAMB T464: each stud-move point, in order, shifts the not-yet-moved repeat copy whose centre
 /// along straight `run` is nearest it (ties → the lower index) so that its centre sits at the point.
-/// `lines` are the copies' lines, `copies` their line counts. Arc runs or no copies: inert.
-fn move_studs(lines: &mut [AssemblyLine], copies: &[usize], run: &WallRun, moves: &[Point2]) {
+/// `lines` are the copies' lines, `copies` their line counts; a moved copy's `hatches` entry (indexed
+/// like `copies`) moves with it. Arc runs or no copies: inert.
+fn move_studs(lines: &mut [AssemblyLine], copies: &[usize], hatches: &mut [Vec<(String, Hatch)>], run: &WallRun, moves: &[Point2]) {
     let RunCurve::Line { from, to } = run.centreline else { return };
     let len = (to.x - from.x).hypot(to.y - from.y);
     if len <= 0.0 || moves.is_empty() {
@@ -570,6 +660,12 @@ fn move_studs(lines: &mut [AssemblyLine], copies: &[usize], run: &WallRun, moves
             l.from = Point2 { x: l.from.x + dx, y: l.from.y + dy };
             l.to = Point2 { x: l.to.x + dx, y: l.to.y + dy };
         }
+        for (_, h) in hatches.get_mut(i).into_iter().flatten() {
+            h.origin = Vec2::new(h.origin.x + dx, h.origin.y + dy);
+            for v in h.loops.iter_mut().flat_map(|l| &mut l.vertices) {
+                v.p = Vec2::new(v.p.x + dx, v.p.y + dy);
+            }
+        }
     }
 }
 
@@ -597,6 +693,7 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
                 conflict: None,
                 face: None,
                 hatches: Vec::new(),
+                copy_hatches: Vec::new(),
             };
             let id = match resolved {
                 RunDetail::Tagged(id) | RunDetail::Spread(id) | RunDetail::Gap(id) => id,
@@ -605,9 +702,18 @@ pub fn assembly_lines(d: &Drawing, plan: Id) -> Result<Vec<RunAssembly>, String>
             };
             let Ok(detail) = id.parse::<u64>().map(Id) else { return skip("detail id is not a number", None) };
             match run_lines(d, plan, detail, run, side) {
-                Ok((lines, bands, copies, conflict, face, hatches)) => {
-                    RunAssembly { run: i, detail: Some(detail), lines, bands, copies, skipped: None, conflict, face: Some(face), hatches }
-                }
+                Ok((lines, bands, copies, conflict, face, hatches, copy_hatches)) => RunAssembly {
+                    run: i,
+                    detail: Some(detail),
+                    lines,
+                    bands,
+                    copies,
+                    skipped: None,
+                    conflict,
+                    face: Some(face),
+                    hatches,
+                    copy_hatches,
+                },
                 Err(e) => skip(&e, Some(detail)),
             }
         })
@@ -697,7 +803,8 @@ fn trim_jamb(runs: &mut [RunAssembly], graph_runs: &[WallRun], (i, end): (usize,
 }
 
 /// Clips `r`'s band lines to `reach` along `u` from `node` ([`trim_to_reach`], dropping those wholly
-/// inside, with any hatch between them) and drops every repeat copy with a line end inside it.
+/// inside, with any hatch between them) and drops every repeat copy with a line end inside it, with
+/// its hatches.
 fn trim_run(r: &mut RunAssembly, node: Point2, u: Point2, reach: f64) {
     let limit = reach - TOLERANCE.coincidence_mm;
     let inside = |p: Point2| (p.x - node.x) * u.x + (p.y - node.y) * u.y < limit;
@@ -719,15 +826,20 @@ fn trim_run(r: &mut RunAssembly, node: Point2, u: Point2, reach: f64) {
         _ => false,
     });
     let mut copies = Vec::new();
+    let mut copy_hatches = Vec::new();
+    let mut hatches = std::mem::take(&mut r.copy_hatches).into_iter();
     for n in std::mem::take(&mut r.copies) {
         let copy: Vec<AssemblyLine> = rest.drain(..n.min(rest.len())).collect();
+        let h = hatches.next().unwrap_or_default();
         if !copy.iter().any(|l| inside(l.from) || inside(l.to)) {
             r.lines.extend(copy);
             copies.push(n);
+            copy_hatches.push(h);
         }
     }
     r.lines.extend(rest);
     r.copies = copies;
+    r.copy_hatches = copy_hatches;
 }
 
 /// The angular [`trim_run`] for an arc run (LAMB T571): angles are about `center` from the run's
@@ -771,15 +883,20 @@ fn trim_arc_run(r: &mut RunAssembly, center: Point2, end_angle: f64, toward: f64
         d > -reach && d < reach - tol
     };
     let mut copies = Vec::new();
+    let mut copy_hatches = Vec::new();
+    let mut hatches = std::mem::take(&mut r.copy_hatches).into_iter();
     for n in std::mem::take(&mut r.copies) {
         let copy: Vec<AssemblyLine> = rest.drain(..n.min(rest.len())).collect();
+        let h = hatches.next().unwrap_or_default();
         if !copy.iter().any(|l| inside(l.from) || inside(l.to)) {
             r.lines.extend(copy);
             copies.push(n);
+            copy_hatches.push(h);
         }
     }
     r.lines.extend(rest);
     r.copies = copies;
+    r.copy_hatches = copy_hatches;
 }
 
 /// One junction's placed corner detail, or why it was not placed.
@@ -2377,6 +2494,7 @@ pub(crate) mod tests {
             conflict: None,
             face: None,
             hatches: vec![],
+            copy_hatches: vec![],
         };
         let mut block = Block::new("X");
         block.entities.push(Entity {
@@ -4462,6 +4580,7 @@ pub(crate) mod tests {
             conflict: None,
             face: None,
             hatches: vec![hatch(0, 1), hatch(1, 2)],
+            copy_hatches: Vec::new(),
         };
         trim_run(&mut r, Point2 { x: 0.0, y: 0.0 }, Point2 { x: 1.0, y: 0.0 }, 100.0);
         assert_eq!(r.bands, 2);
@@ -4734,6 +4853,147 @@ pub(crate) mod tests {
         assert!(block_matches_view(s.doc()?, plan));
         s.undo()?;
         assert!(block_hatches(&s, &name)?.iter().all(|(_, h)| h.scale == 1.0), "undo restores");
+        Ok(())
+    }
+
+    /// Into the first detail of `(s, plan)`: a 38-wide closed stud on `STUD`, hatched `ANSI31` at 0°,
+    /// repeated at `pitch` together with its hatch, plus each of `extra` (closed vertex lists) hatched
+    /// and its hatch alone added to the repeat. Back in `plan`. Returns the stud hatch's handle.
+    fn hatched_studs(s: &mut Session, plan: Id, pitch: f64, extra: &[Value]) -> T<String> {
+        let detail = detail_id(s)?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.new", &json!({ "name": "STUD", "current": true }))?;
+        let mut members = Vec::new();
+        let mut stud_hatch = String::new();
+        for (i, v) in std::iter::once(json!([[100, 50], [138, 50], [138, 200], [100, 200]])).chain(extra.iter().cloned()).enumerate() {
+            let before = all_handles(s)?;
+            s.execute("pline", &json!({ "vertices": v, "closed": true }))?;
+            let edge = all_handles(s)?.into_iter().find(|h| !before.contains(h)).ok_or("no stud")?;
+            let r = s.execute("hatch", &json!({ "handles": [edge.hex()], "pattern": "ANSI31", "angle": 0.0 }))?;
+            let h = r["handle"].as_str().ok_or("no hatch")?.to_string();
+            if i == 0 {
+                members.push(edge.hex());
+                stud_hatch = h.clone();
+            }
+            members.push(h);
+        }
+        let before = all_handles(s)?;
+        s.execute("dimaligned", &json!({ "p1": [100, 0], "p2": [100.0 + pitch, 0], "at": [300, -300] }))?;
+        let dim = all_handles(s)?.into_iter().find(|h| !before.contains(h)).ok_or("no dimension")?;
+        s.execute("repeat", &json!({ "dimension": dim.hex(), "handles": members }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        Ok(stud_hatch)
+    }
+
+    /// Every run's `copy_hatches` is aligned with `copies`, and each copy's one hatch loops exactly
+    /// over its copy's line ends, with its angle the mapped first edge's direction (source edge along
+    /// +x, pattern 0°) and its origin the first loop vertex.
+    fn assert_copy_hatches_follow(runs: &[RunAssembly]) -> R {
+        let sorted = |mut v: Vec<(f64, f64)>| {
+            v.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+            v.dedup();
+            v
+        };
+        for r in runs {
+            assert_eq!(r.copy_hatches.len(), r.copies.len(), "run {}", r.run);
+            let mut at = r.bands;
+            for (n, hs) in r.copies.iter().zip(&r.copy_hatches) {
+                let [(layer, h)] = hs.as_slice() else { return Err(format!("run {}: {hs:?}", r.run).into()) };
+                assert_eq!((layer.as_str(), h.associative), ("STUD", false));
+                let want = sorted(r.lines[at..at + n].iter().flat_map(|l| [l.from, l.to]).map(|p| (r6(p.x), r6(p.y))).collect());
+                assert_eq!(sorted(loop_points(h)), want, "run {}", r.run);
+                let v = &h.loops[0].vertices;
+                assert_eq!(degrees(h.angle), degrees((v[1].p.y - v[0].p.y).atan2(v[1].p.x - v[0].p.x)), "run {}", r.run);
+                assert_eq!((r6(h.origin.x), r6(h.origin.y)), (r6(v[0].p.x), r6(v[0].p.y)));
+                at += n;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_hatched_stud_repeat_lays_one_hatch_per_copy_turned_with_each_run() -> R {
+        let (plain, _) = stud_room(406.4)?;
+        let (mut s, plan) = room("exterior_face", true)?;
+        hatched_studs(&mut s, plan, 406.4, &[])?;
+        let runs = assembly_lines(s.doc()?, plan)?;
+        let before = assembly_lines(plain.doc()?, plan)?;
+        // The hatch adds no lines and changes no copy: the BOM is unchanged.
+        assert_eq!(copies_of(&runs), copies_of(&before));
+        let shape = |rs: &[RunAssembly]| rs.iter().map(|r| (r.bands, r.copies.clone())).collect::<Vec<_>>();
+        assert_eq!(shape(&runs), shape(&before));
+        assert_eq!(crate::bom::bom_rows(s.doc()?), crate::bom::bom_rows(plain.doc()?));
+        assert!(runs.iter().all(|r| !r.copies.is_empty()), "{runs:?}");
+        assert_copy_hatches_follow(&runs)?;
+        let mut angles: Vec<f64> = runs.iter().map(|r| degrees(r.copy_hatches[0][0].1.angle)).collect();
+        angles.sort_by(f64::total_cmp);
+        angles.dedup();
+        assert!(angles.len() >= 2, "angles turn with the runs: {angles:?}");
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let total: usize = runs.iter().map(|r| r.copies.len()).sum();
+        assert_eq!(block_hatches(&s, &assembly_block_name(plan))?.len(), total);
+        assert!(block_matches_view(s.doc()?, plan));
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes())?;
+        assert!(block_matches_view(&back, plan), "DXF round trip");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stud_move_and_a_corner_s_reach_carry_each_copy_s_hatch_with_it() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        hatched_studs(&mut s, plan, 406.4, &[])?;
+        let before = assembly_lines(s.doc()?, plan)?;
+        s.execute("studmove", &json!({ "point": {"x": 2030.0, "y": 100.0} }))?;
+        let moved = assembly_lines(s.doc()?, plan)?;
+        assert_ne!(copies_of(&moved), copies_of(&before), "a copy moved");
+        assert_copy_hatches_follow(&moved)?;
+        corner_detail(&mut s, plan, "exterior_face", false, (0.0, 0.0))?;
+        let trimmed = assembly_lines(s.doc()?, plan)?;
+        assert!(trimmed.iter().zip(&moved).all(|(t, m)| t.copies.len() < m.copies.len()), "corners drop copies");
+        assert_copy_hatches_follow(&trimmed)?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_arc_run_gets_copies_but_no_copy_hatches() -> R {
+        let (mut s, plan) = d_room()?;
+        hatched_studs(&mut s, plan, 400.0, &[])?;
+        let d = s.doc()?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, plan);
+        let runs = assembly_lines(d, plan)?;
+        let arc = runs.iter().find(|r| matches!(graph.runs[r.run].centreline, RunCurve::Arc { .. })).ok_or("no arc run")?;
+        assert!(!arc.copies.is_empty() && arc.copy_hatches.iter().all(Vec::is_empty), "{arc:?}");
+        assert!(runs.iter().any(|r| r.copy_hatches.iter().any(|h| !h.is_empty())), "straight runs carry them");
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_hatch_past_the_member_lines_is_not_carried_and_the_copy_count_holds() -> R {
+        let (plain, _) = stud_room(406.4)?;
+        let (mut s, plan) = room("exterior_face", true)?;
+        hatched_studs(&mut s, plan, 406.4, &[json!([[60, 60], [180, 60], [180, 90], [60, 90]])])?;
+        let runs = assembly_lines(s.doc()?, plan)?;
+        assert_eq!(copies_of(&runs), copies_of(&assembly_lines(plain.doc()?, plan)?));
+        // Only the stud's own hatch is laid with each copy.
+        assert_copy_hatches_follow(&runs)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hatchedit_of_a_stud_hatch_rewrites_every_copy_in_its_step() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        crate::maintain::install(&mut s);
+        let hatch = hatched_studs(&mut s, plan, 406.4, &[])?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let name = assembly_block_name(plan);
+        let detail = detail_id(&s)?;
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        let n = undo_len(&s)?;
+        s.execute("hatchedit", &json!({ "handles": [hatch], "scale": 3 }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        let got = block_hatches(&s, &name)?;
+        assert!(!got.is_empty() && got.iter().all(|(_, h)| h.scale == 3.0), "{got:?}");
+        assert!(block_matches_view(s.doc()?, plan));
         Ok(())
     }
 }

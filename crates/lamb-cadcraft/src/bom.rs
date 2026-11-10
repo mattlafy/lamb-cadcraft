@@ -600,6 +600,7 @@ pub(crate) mod tests {
             conflict: None,
             face: None,
             hatches: Vec::new(),
+            copy_hatches: Vec::new(),
         };
         assert_eq!(band_lengths(&r), HashMap::from([("A", 300.0), ("B", 200.0)]));
     }
