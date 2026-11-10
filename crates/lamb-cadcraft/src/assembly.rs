@@ -47,8 +47,12 @@
 //! non-associative HATCH per [`BandHatch`] (LAMB T642): a detail's hatch with one straight-edged loop
 //! spanning two bands, laid as a strip between those bands' final, trimmed lines on each straight
 //! run. Hatches are not members: nothing counts them as lines. Not carried: a hatch that does not
-//! reach two bands (the reference line is not a band), has several loops or a curved edge, is a repeat
-//! member, or belongs to a corner, jamb or end detail; and none on an arc run.
+//! reach two bands (the reference line is not a band), has several loops or a curved edge, or is a
+//! repeat member; and none on an arc run. A corner, jamb or end detail (LAMB T691) carries every
+//! HATCH of its block whose loops have only straight edges and that is not a repeat member, placed
+//! by exactly the map that places that detail's lines (a jamb's mirror placement mirrors the loop)
+//! with its pattern angle turned to the mapped direction, never mirrored; these follow the band
+//! strips in the block, in the order corners, openings, ends.
 //! Not the AI-line sweep in [`crate::sweeps`].
 
 use std::sync::Arc;
@@ -180,9 +184,82 @@ fn laid_hatch(lines: &[AssemblyLine], h: &BandHatch) -> Option<Hatch> {
     Some(Hatch { loops: vec![HatchLoop { vertices, outer: true, sources: Vec::new() }], ..h.hatch.clone() })
 }
 
-/// Every hatch written to a view's assembly block, in write order, with its layer.
-fn block_hatches_of(runs: &[RunAssembly]) -> impl Iterator<Item = (&str, Hatch)> {
-    runs.iter().flat_map(|r| r.hatches.iter().filter_map(|h| Some((h.layer.as_str(), laid_hatch(r.lines.get(..r.bands)?, h)?))))
+/// Every hatch written to a view's assembly block, in write order, with its layer: the runs' band
+/// strips, then the corners', openings' and free ends' placed hatches.
+fn block_hatches_of<'a>(
+    runs: &'a [RunAssembly],
+    corners: &'a [CornerAssembly],
+    openings: &'a [OpeningAssembly],
+    ends: &'a [EndAssembly],
+) -> impl Iterator<Item = (&'a str, Hatch)> {
+    let placed = corners
+        .iter()
+        .flat_map(|c| &c.hatches)
+        .chain(openings.iter().flat_map(|o| &o.hatches))
+        .chain(ends.iter().flat_map(|e| &e.hatches))
+        .map(|(layer, h)| (layer.as_str(), h.clone()));
+    runs.iter().flat_map(|r| r.hatches.iter().filter_map(|h| Some((h.layer.as_str(), laid_hatch(r.lines.get(..r.bands)?, h)?)))).chain(placed)
+}
+
+/// The hatches a corner, jamb or end placement of `detail` carries (LAMB T691), with their layers:
+/// every HATCH in its block outside repeat members whose loops all have straight edges.
+fn junction_hatches(d: &Drawing, detail: Id) -> Result<Vec<(String, Hatch)>, String> {
+    let Some(block) = d.block(&view_block_name(detail)) else { return Ok(Vec::new()) };
+    let repeated = repeat_members(d, detail)?;
+    Ok(block
+        .entities
+        .iter()
+        .filter(|e| !repeated.contains(&e.handle))
+        .filter_map(|e| match &e.kind {
+            EntityKind::Hatch(h) if h.loops.iter().all(|l| l.vertices.iter().all(|v| v.bulge == 0.0)) => Some((e.common.layer.clone(), h.clone())),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The points of `hatches` a placer maps, as one zero-length segment `(p, p, layer)` each, appended
+/// after a detail's member lines so the hatches land by exactly the map that places those lines:
+/// per hatch, every loop vertex in loop order, then its `origin`, then `origin + (cos angle, sin
+/// angle)`. lamb-core's `detail_frame` ignores segments no longer than
+/// `TOLERANCE.coincidence_mm`, so they leave the frame as it was; [`junction_placement`] is given
+/// the member lines alone.
+fn hatch_points(hatches: &[(String, Hatch)]) -> Vec<(Point2, Point2, String)> {
+    let mut out = Vec::new();
+    for (layer, h) in hatches {
+        let mut push = |x: f64, y: f64| out.push((Point2 { x, y }, Point2 { x, y }, layer.clone()));
+        for v in h.loops.iter().flat_map(|l| &l.vertices) {
+            push(v.p.x, v.p.y);
+        }
+        push(h.origin.x, h.origin.y);
+        push(h.origin.x + h.angle.cos(), h.origin.y + h.angle.sin());
+    }
+    out
+}
+
+/// Splits one placement of member lines followed by [`hatch_points`]`(hatches)` into the placed
+/// lines (the first `members`) and the placed hatches: loops of the mapped vertices (flags and
+/// order kept — a mirror reverses winding), `origin` the mapped origin, `angle` the mapped
+/// direction's, `associative: false`, no sources.
+fn split_placed(mut placed: Vec<AssemblyLine>, members: usize, hatches: &[(String, Hatch)]) -> (Vec<AssemblyLine>, Vec<(String, Hatch)>) {
+    let points: Vec<Point2> = placed.split_off(members.min(placed.len())).into_iter().map(|l| l.from).collect();
+    let mut at = points.iter();
+    let mut out = Vec::new();
+    for (layer, h) in hatches {
+        let mut next = || at.next().copied();
+        let mut loops = Vec::new();
+        for l in &h.loops {
+            let mut vertices = Vec::new();
+            for v in &l.vertices {
+                let Some(p) = next() else { return (placed, out) };
+                vertices.push(PolyVertex { p: Vec2::new(p.x, p.y), ..*v });
+            }
+            loops.push(HatchLoop { vertices, outer: l.outer, sources: Vec::new() });
+        }
+        let (Some(o), Some(u)) = (next(), next()) else { return (placed, out) };
+        let angle = norm_angle((u.y - o.y).atan2(u.x - o.x));
+        out.push((layer.clone(), Hatch { loops, associative: false, angle, origin: Vec2::new(o.x, o.y), ..h.clone() }));
+    }
+    (placed, out)
 }
 
 /// Every entity in `detail`'s block except `reference` and repeat members ([`crate::repeats`]) that
@@ -712,6 +789,8 @@ pub struct CornerAssembly {
     pub junction: usize,
     pub detail: Option<Id>,
     pub lines: Vec<AssemblyLine>,
+    /// The detail's hatches placed with its lines (LAMB T691), with their layers; empty when skipped.
+    pub hatches: Vec<(String, Hatch)>,
     pub skipped: Option<String>,
 }
 
@@ -768,24 +847,28 @@ fn corner_lines(
     quadrant: Option<usize>,
     runs: &[WallRun],
     sides: &[lamb_core::derivation::wall_spaces::RunSides],
-) -> Result<Vec<AssemblyLine>, String> {
+) -> Result<(Vec<AssemblyLine>, Vec<(String, Hatch)>), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
     let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| !r.handles().contains(h)).collect();
     let lines = member_segments(d, detail, &others);
+    let hatches = junction_hatches(d, detail)?;
+    let all: Vec<_> = lines.iter().cloned().chain(hatch_points(&hatches)).collect();
     if j.arms.len() == 4 {
         let k = quadrant.ok_or("pick the quadrant's corner, not the crossing")?;
         let (l, quadrant_sides) = x_corner(j, k, runs, sides)?;
         let arms = [Some(l.arms[0].run), Some(l.arms[1].run)];
         let (_, insets, outward) = junction_placement(d, view, &r, &lines, &arms, runs, &quadrant_sides)?;
         let inset = |i: usize| insets.get(i).copied().unwrap_or(0.0);
-        return place_corner_x(j, k, runs, sides, (r.from, r.to), &lines, [inset(0), inset(1)], outward);
+        let placed = place_corner_x(j, k, runs, sides, (r.from, r.to), &all, [inset(0), inset(1)], outward)?;
+        return Ok(split_placed(placed, lines.len(), &hatches));
     }
     // A T's branch arm carries no reference, so it needs no grid line.
     let branch = if j.arms.len() == 3 { lamb_core::derivation::assembly::tee_butt(j, runs).map(|(b, _, _)| b) } else { None };
     let arms: Vec<Option<usize>> = j.arms.iter().enumerate().map(|(k, a)| (Some(k) != branch).then_some(a.run)).collect();
     let (face, insets, outward) = junction_placement(d, view, &r, &lines, &arms, runs, sides)?;
-    place_corner(j, runs, sides, face, (r.from, r.to), &lines, &insets, outward)
+    let placed = place_corner(j, runs, sides, face, (r.from, r.to), &all, &insets, outward)?;
+    Ok(split_placed(placed, lines.len(), &hatches))
 }
 
 /// Every junction of `view`'s wall graph whose corner detail resolves (`Tagged`, `Spread` or
@@ -815,14 +898,15 @@ pub fn corner_assembly(d: &Drawing, view: Id) -> Result<Vec<CornerAssembly>, Str
             RunDetail::Tagged(id) | RunDetail::Spread(id) | RunDetail::Gap(id) => id,
             RunDetail::Conflict | RunDetail::Untyped => continue,
         };
-        let skip = |why: String, detail: Option<Id>| CornerAssembly { junction: i, detail, lines: Vec::new(), skipped: Some(why) };
+        let skip =
+            |why: String, detail: Option<Id>| CornerAssembly { junction: i, detail, lines: Vec::new(), hatches: Vec::new(), skipped: Some(why) };
         let Ok(detail) = id.parse::<u64>().map(Id) else {
             out.push(skip("detail id is not a number".into(), None));
             continue;
         };
         let quadrant = if j.arms.len() == 4 { quadrant_of(i, id) } else { None };
         out.push(match corner_lines(d, view, detail, j, quadrant, &graph.runs, &sides.runs) {
-            Ok(lines) => CornerAssembly { junction: i, detail: Some(detail), lines, skipped: None },
+            Ok((lines, hatches)) => CornerAssembly { junction: i, detail: Some(detail), lines, hatches, skipped: None },
             Err(e) => skip(e, Some(detail)),
         });
     }
@@ -839,6 +923,9 @@ pub struct OpeningAssembly {
     /// `Some(at_b)`: that end only — a section's head or sill (LAMB T505).
     pub end: Option<bool>,
     pub lines: Vec<AssemblyLine>,
+    /// The detail's hatches placed with its lines (LAMB T691), with their layers — in a plan jamb
+    /// `a`'s, then jamb `b`'s; empty when skipped.
+    pub hatches: Vec<(String, Hatch)>,
     pub skipped: Option<String>,
 }
 
@@ -852,20 +939,27 @@ fn opening_lines(
     end: Option<bool>,
     runs: &[WallRun],
     sides: &[lamb_core::derivation::wall_spaces::RunSides],
-) -> Result<Vec<AssemblyLine>, String> {
+) -> Result<(Vec<AssemblyLine>, Vec<(String, Hatch)>), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
     let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| !r.handles().contains(h)).collect();
     let lines = member_segments(d, detail, &others);
+    let hatches = junction_hatches(d, detail)?;
+    let all: Vec<_> = lines.iter().cloned().chain(hatch_points(&hatches)).collect();
     let (face, insets, outward) = junction_placement(d, view, &r, &lines, &[Some(bridge.a.0), Some(bridge.b.0)], runs, sides)?;
     match end {
         None => {
-            let [a, b] = place_opening(bridge, runs, sides, face, (r.from, r.to), &lines, &insets, outward)?;
-            Ok(a.into_iter().chain(b).collect())
+            let [a, b] = place_opening(bridge, runs, sides, face, (r.from, r.to), &all, &insets, outward)?;
+            let (mut lines_a, mut hatches_a) = split_placed(a, lines.len(), &hatches);
+            let (lines_b, hatches_b) = split_placed(b, lines.len(), &hatches);
+            lines_a.extend(lines_b);
+            hatches_a.extend(hatches_b);
+            Ok((lines_a, hatches_a))
         }
         Some(at_b) => {
             let inset = insets.get(usize::from(at_b)).copied().unwrap_or(0.0);
-            place_opening_end(bridge, at_b, runs, sides, face, (r.from, r.to), &lines, inset, outward)
+            let placed = place_opening_end(bridge, at_b, runs, sides, face, (r.from, r.to), &all, inset, outward)?;
+            Ok(split_placed(placed, lines.len(), &hatches))
         }
     }
 }
@@ -889,13 +983,14 @@ pub fn opening_assembly(d: &Drawing, view: Id) -> Result<Vec<OpeningAssembly>, S
             RunDetail::Tagged(id) | RunDetail::Spread(id) | RunDetail::Gap(id) => id,
             RunDetail::Conflict | RunDetail::Untyped => continue,
         };
-        let skip = |why: String, detail: Option<Id>| OpeningAssembly { bridge: i, detail, end, lines: Vec::new(), skipped: Some(why) };
+        let skip =
+            |why: String, detail: Option<Id>| OpeningAssembly { bridge: i, detail, end, lines: Vec::new(), hatches: Vec::new(), skipped: Some(why) };
         let Ok(detail) = id.parse::<u64>().map(Id) else {
             out.push(skip("detail id is not a number".into(), None));
             continue;
         };
         out.push(match opening_lines(d, view, detail, b, end, &graph.runs, &sides.runs) {
-            Ok(lines) => OpeningAssembly { bridge: i, detail: Some(detail), end, lines, skipped: None },
+            Ok((lines, hatches)) => OpeningAssembly { bridge: i, detail: Some(detail), end, lines, hatches, skipped: None },
             Err(e) => skip(e, Some(detail)),
         });
     }
@@ -909,6 +1004,8 @@ pub struct EndAssembly {
     pub end: usize,
     pub detail: Option<Id>,
     pub lines: Vec<AssemblyLine>,
+    /// The detail's hatches placed with its lines (LAMB T691), with their layers; empty when skipped.
+    pub hatches: Vec<(String, Hatch)>,
     pub skipped: Option<String>,
 }
 
@@ -920,15 +1017,18 @@ fn end_lines(
     (i, end): (usize, RunEnd),
     runs: &[WallRun],
     sides: &[lamb_core::derivation::wall_spaces::RunSides],
-) -> Result<Vec<AssemblyLine>, String> {
+) -> Result<(Vec<AssemblyLine>, Vec<(String, Hatch)>), String> {
     let r = detail_reference(d, detail)?.ok_or("detail has no reference line")?;
     let Some(block) = d.block(&view_block_name(detail)) else { return Err("detail has no block".into()) };
     let others: Vec<cadcraft_doc::Handle> = block.entities.iter().map(|e| e.handle).filter(|h| !r.handles().contains(h)).collect();
     let lines = member_segments(d, detail, &others);
+    let hatches = junction_hatches(d, detail)?;
+    let all: Vec<_> = lines.iter().cloned().chain(hatch_points(&hatches)).collect();
     let (face, insets, outward) = junction_placement(d, view, &r, &lines, &[Some(i)], runs, sides)?;
     let run = runs.get(i).ok_or("the free end names no run")?;
     let side = sides.get(i).ok_or("the free end's run has no sides")?;
-    place_run_end(run, side, end, face, (r.from, r.to), &lines, insets.first().copied().unwrap_or(0.0), outward)
+    let placed = place_run_end(run, side, end, face, (r.from, r.to), &all, insets.first().copied().unwrap_or(0.0), outward)?;
+    Ok(split_placed(placed, lines.len(), &hatches))
 }
 
 /// Every free end of a plan `view`'s wall graph whose termination detail resolves
@@ -947,13 +1047,13 @@ pub fn end_assembly(d: &Drawing, view: Id) -> Result<Vec<EndAssembly>, String> {
             RunDetail::Tagged(id) | RunDetail::Spread(id) | RunDetail::Gap(id) => id,
             RunDetail::Conflict | RunDetail::Untyped => continue,
         };
-        let skip = |why: String, detail: Option<Id>| EndAssembly { end: i, detail, lines: Vec::new(), skipped: Some(why) };
+        let skip = |why: String, detail: Option<Id>| EndAssembly { end: i, detail, lines: Vec::new(), hatches: Vec::new(), skipped: Some(why) };
         let Ok(detail) = id.parse::<u64>().map(Id) else {
             out.push(skip("detail id is not a number".into(), None));
             continue;
         };
         out.push(match end_lines(d, view, detail, *key, &graph.runs, &sides.runs) {
-            Ok(lines) => EndAssembly { end: i, detail: Some(detail), lines, skipped: None },
+            Ok((lines, hatches)) => EndAssembly { end: i, detail: Some(detail), lines, hatches, skipped: None },
             Err(e) => skip(e, Some(detail)),
         });
     }
@@ -1138,7 +1238,7 @@ fn line_entity(l: &AssemblyLine) -> EntityKind {
 
 /// Replaces the block [`assembly_block_name`]`(plan)` with one LINE or ARC ([`line_entity`]) per
 /// line of `runs`, then of `corners`, then of `openings`, then of `ends`, then one HATCH per
-/// [`BandHatch`] of `runs`.
+/// [`BandHatch`] of `runs`, then the placed hatches of `corners`, `openings` and `ends`.
 fn replace_block(
     d: &mut Drawing,
     plan: Id,
@@ -1154,7 +1254,7 @@ fn replace_block(
         let common = Common { layer: l.layer.clone(), ..Common::default() };
         d.add(&space, common, line_entity(l)).map_err(|e| e.to_string())?;
     }
-    for (layer, hatch) in block_hatches_of(runs) {
+    for (layer, hatch) in block_hatches_of(runs, corners, openings, ends) {
         let common = Common { layer: layer.to_string(), ..Common::default() };
         d.add(&space, common, EntityKind::Hatch(hatch)).map_err(|e| e.to_string())?;
     }
@@ -1208,7 +1308,7 @@ pub fn write_assembly_block(
 /// `true` when `block` holds exactly the lines of `runs`, `corners`, `openings` then `ends`, in write order: same count, each pair on
 /// the same layer and of the same kind ([`line_entity`]) — a LINE's ends within
 /// [`TOLERANCE`]`.coincidence_mm`; an ARC's centre and radius within that, its start and end angles
-/// within `TOLERANCE.angle_deg` — then the runs' hatches: each on the same layer with the same pattern,
+/// within `TOLERANCE.angle_deg` — then every hatch ([`block_hatches_of`]): each on the same layer with the same pattern,
 /// solidity and scale, its angle within `TOLERANCE.angle_deg` and its loop vertices within
 /// `coincidence_mm`.
 fn block_matches(block: &Block, runs: &[RunAssembly], corners: &[CornerAssembly], openings: &[OpeningAssembly], ends: &[EndAssembly]) -> bool {
@@ -1235,7 +1335,7 @@ fn block_matches(block: &Block, runs: &[RunAssembly], corners: &[CornerAssembly]
             return false;
         }
     }
-    for (layer, w) in block_hatches_of(runs) {
+    for (layer, w) in block_hatches_of(runs, corners, openings, ends) {
         let Some(e) = got.next() else { return false };
         let EntityKind::Hatch(h) = &e.kind else { return false };
         let same_loops = h.loops.len() == w.loops.len()
@@ -4490,6 +4590,150 @@ pub(crate) mod tests {
         s.undo()?;
         s.undo()?;
         assert!(block_hatches(&s, &name)?.iter().all(|(_, h)| h.pattern == "ANSI31"), "regeneration rode the edit's step");
+        Ok(())
+    }
+
+    /// Into `view`: on `INSUL`, a closed polyline through `vertices` hatched `ANSI31` at `angle`
+    /// degrees. Back in `back`. Returns the hatch's handle (LAMB T691).
+    fn hatch_in(s: &mut Session, view: Id, back: Id, vertices: Value, angle: f64) -> T<String> {
+        s.execute("editview", &json!({ "viewId": view.0 }))?;
+        if s.execute("layer.new", &json!({ "name": "INSUL", "current": true })).is_err() {
+            s.execute("layer.current", &json!({ "name": "INSUL" }))?;
+        }
+        let before = all_handles(s)?;
+        s.execute("pline", &json!({ "vertices": vertices, "closed": true }))?;
+        let edge = all_handles(s)?.into_iter().find(|h| !before.contains(h)).ok_or("no boundary")?;
+        let r = s.execute("hatch", &json!({ "handles": [edge.hex()], "pattern": "ANSI31", "angle": angle }))?;
+        s.execute("editview", &json!({ "viewId": back.0 }))?;
+        Ok(r["handle"].as_str().ok_or("no hatch")?.to_string())
+    }
+
+    fn degrees(a: f64) -> f64 {
+        r6(a.rem_euclid(std::f64::consts::TAU).to_degrees())
+    }
+
+    #[test]
+    fn a_corner_detail_s_hatch_is_placed_at_every_corner_with_its_angle_turned() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        let cd = corner_detail(&mut s, plan, "exterior_face", false, (0.0, 0.0))?;
+        hatch_in(&mut s, cd, plan, json!([[-300, 100], [-100, 100], [-100, 150], [-300, 150]]), 30.0)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let corners = corner_assembly(s.doc()?, plan)?;
+        assert_eq!(corners.len(), 4);
+        assert!(corners.iter().all(|c| c.hatches.len() == 1), "{corners:?}");
+        let got = block_hatches(&s, &assembly_block_name(plan))?;
+        assert_eq!(got.len(), 4, "one per placed corner");
+        assert!(got.iter().all(|(l, h)| l == "INSUL" && h.pattern == "ANSI31" && !h.associative && h.loops[0].sources.is_empty()));
+        // The bottom-left corner maps the detail's (x, y) to (y, -x): a quarter turn clockwise.
+        let (_, bl) = got.iter().find(|(_, h)| loop_points(h).iter().all(|p| p.0 < 1000.0 && p.1 < 1000.0)).ok_or("no bottom-left hatch")?;
+        assert_eq!(loop_points(bl), [(100.0, 300.0), (100.0, 100.0), (150.0, 100.0), (150.0, 300.0)]);
+        assert_eq!(degrees(bl.angle), 300.0);
+        // Hatches follow every line, and lines never include them.
+        let b = s.doc()?.block(&assembly_block_name(plan)).ok_or("no block")?;
+        let first = b.entities.iter().position(|e| matches!(e.kind, EntityKind::Hatch(_))).ok_or("no hatch")?;
+        assert!(b.entities.iter().skip(first).all(|e| matches!(e.kind, EntityKind::Hatch(_))));
+        assert_eq!(first, block_lines_of(&assembly_lines(s.doc()?, plan)?, &corners, &[], &[]).count());
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_jamb_detail_s_hatch_is_placed_at_both_jambs_the_second_mirrored() -> R {
+        let (mut s, plan) = window_room(false, true)?;
+        let jd = read_document(s.doc()?)?.views.iter().find(|v| v.name() == "JD").ok_or("no JD")?.id();
+        hatch_in(&mut s, jd, plan, json!([[-40, 50], [-10, 50], [-10, 150], [-40, 150]]), 30.0)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let openings = opening_assembly(s.doc()?, plan)?;
+        assert_eq!(openings.len(), 1);
+        let hs = &openings[0].hatches;
+        assert_eq!(hs.len(), 2, "{hs:?}");
+        assert_eq!(loop_points(&hs[0].1), [(1960.0, 50.0), (1990.0, 50.0), (1990.0, 150.0), (1960.0, 150.0)]);
+        assert_eq!(loop_points(&hs[1].1), [(3040.0, 50.0), (3010.0, 50.0), (3010.0, 150.0), (3040.0, 150.0)], "the mirror image");
+        assert_eq!((degrees(hs[0].1.angle), degrees(hs[1].1.angle)), (30.0, 150.0));
+        assert_eq!(block_hatches(&s, &assembly_block_name(plan))?, *hs);
+        Ok(())
+    }
+
+    #[test]
+    fn a_section_head_detail_s_hatch_is_placed_once() -> R {
+        let (mut s, sec, _) = window_section(true)?;
+        let h = read_document(s.doc()?)?.views.iter().find(|v| v.name() == "H").ok_or("no H")?.id();
+        hatch_in(&mut s, h, sec, json!([[-40, 50], [-10, 50], [-10, 150], [-40, 150]]), 0.0)?;
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let got = block_hatches(&s, &assembly_block_name(sec))?;
+        let placed: usize = opening_assembly(s.doc()?, sec)?.iter().map(|o| o.hatches.len()).sum();
+        assert_eq!((got.len(), placed), (1, 1), "{got:?}");
+        assert!(loop_points(&got[0].1).iter().all(|p| p.1 > 2100.0), "at the head: {got:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_free_end_detail_s_hatch_is_placed_as_at_a_jamb() -> R {
+        let (mut s, plan, jd) = gap_room()?;
+        hatch_in(&mut s, jd, plan, json!([[-40, 50], [-10, 50], [-10, 150], [-40, 150]]), 30.0)?;
+        s.execute("layer.current", &json!({ "name": "TAGS" }))?;
+        s.execute("detailtag", &json!({ "detailViewId": jd.0, "corner": true, "tip": {"x": 2000, "y": 100}, "bubble": {"x": 1500, "y": -400} }))?;
+        let ends = end_assembly(s.doc()?, plan)?;
+        assert!(ends.len() == 2 && ends.iter().all(|e| e.hatches.len() == 1), "{ends:?}");
+        let mut got: Vec<_> = ends.iter().map(|e| loop_points(&e.hatches[0].1)).collect();
+        got.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        assert_eq!(
+            got,
+            [
+                vec![(1960.0, 50.0), (1990.0, 50.0), (1990.0, 150.0), (1960.0, 150.0)],
+                vec![(3040.0, 50.0), (3010.0, 50.0), (3010.0, 150.0), (3040.0, 150.0)]
+            ]
+        );
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(block_hatches(&s, &assembly_block_name(plan))?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_arc_edged_or_repeat_member_hatch_is_not_carried_nor_a_skipped_corner_s() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        let cd = corner_detail(&mut s, plan, "exterior_face", false, (0.0, 0.0))?;
+        hatch_in(&mut s, cd, plan, json!([[-300, 100], [-100, 100], [-100, 150], [-300, 150]]), 0.0)?;
+        hatch_in(&mut s, cd, plan, json!([[-300, 300], {"p": [-100, 300], "bulge": 0.5}, [-100, 400], [-300, 400]]), 0.0)?;
+        let member = hatch_in(&mut s, cd, plan, json!([[-300, 500], [-100, 500], [-100, 600], [-300, 600]]), 0.0)?;
+        s.execute("editview", &json!({ "viewId": cd.0 }))?;
+        let before = all_handles(&s)?;
+        s.execute("dimaligned", &json!({ "p1": [-300, 500], "p2": [-300, 900], "at": [-600, 700] }))?;
+        let pitch = all_handles(&s)?.into_iter().find(|h| !before.contains(h)).ok_or("no dimension")?;
+        s.execute("repeat", &json!({ "dimension": pitch.hex(), "handles": [member] }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let corners = corner_assembly(s.doc()?, plan)?;
+        assert!(corners.len() == 4 && corners.iter().all(|c| c.skipped.is_none() && c.hatches.len() == 1), "{corners:?}");
+        assert!(corners.iter().all(|c| loop_points(&c.hatches[0].1).len() == 4));
+
+        // A grid corner detail with no datum line is skipped, and carries nothing.
+        let (mut s, plan) = room("exterior_face", true)?;
+        let cd = corner_detail(&mut s, plan, "grid", false, (0.0, 0.0))?;
+        hatch_in(&mut s, cd, plan, json!([[-300, 100], [-100, 100], [-100, 150], [-300, 150]]), 0.0)?;
+        let corners = corner_assembly(s.doc()?, plan)?;
+        assert!(!corners.is_empty() && corners.iter().all(|c| c.skipped.is_some() && c.hatches.is_empty()), "{corners:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn hatchedit_of_a_corner_detail_s_hatch_rewrites_the_block_in_its_step() -> R {
+        let (mut s, plan) = room("exterior_face", true)?;
+        crate::maintain::install(&mut s);
+        let cd = corner_detail(&mut s, plan, "exterior_face", false, (0.0, 0.0))?;
+        let hatch = hatch_in(&mut s, cd, plan, json!([[-300, 100], [-100, 100], [-100, 150], [-300, 150]]), 0.0)?;
+        s.execute("assemblyplan", &json!({ "viewId": plan.0 }))?;
+        let name = assembly_block_name(plan);
+        assert!(block_matches_view(s.doc()?, plan));
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes())?;
+        assert!(block_matches_view(&back, plan), "DXF round trip");
+        s.execute("editview", &json!({ "viewId": cd.0 }))?;
+        let n = undo_len(&s)?;
+        s.execute("hatchedit", &json!({ "handles": [hatch], "scale": 3 }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        let got = block_hatches(&s, &name)?;
+        assert!(got.len() == 4 && got.iter().all(|(_, h)| h.scale == 3.0), "{got:?}");
+        assert!(block_matches_view(s.doc()?, plan));
+        s.undo()?;
+        assert!(block_hatches(&s, &name)?.iter().all(|(_, h)| h.scale == 1.0), "undo restores");
         Ok(())
     }
 }
