@@ -15,9 +15,10 @@
 //!
 //! Above `PROJECT` is the ISSUES area: a heading row (`No.`, `Date`, `Description`, in the block) over
 //! [`ISSUE_ROWS`] rows, the attributes `ISSUE1`…, which hold the latest issues, `ISSUE1` (the bottom
-//! row) the oldest shown, each `<n>  <date>  <description>`; unused rows are empty. Issues are
-//! set-wide: every sheet lists the same ones. The whole strip shrinks by one factor to fit a narrow
-//! strip or a short page.
+//! row) the oldest shown, each `<n>  <date>  <description>`; unused rows are empty. A sheet lists the
+//! set-wide issues and the revisions that touch it: those whose `sheets` name it, and those whose
+//! number is the `REV` of a [`DELTA_BLOCK`] Insert in its paper space. The whole strip shrinks by one
+//! factor to fit a narrow strip or a short page.
 //!
 //! `PROJECT` is `LambDocument.sheet_info.project`, or else the document's name; `CLIENT`,
 //! `ADDRESS`, `DRAWN` and `DATE` are stored text, empty until set. `SCALE` is the common label of
@@ -36,8 +37,19 @@
 //!
 //! `issue {description, date?}` (`iss`) adds an issue numbered one past the highest so far, dated
 //! today (UTC, `YYYY-MM-DD`) unless `date` is given; `issue {remove: n}` removes issue `n`, and the
-//! others keep their numbers. An empty description is refused. One undo step each; returns
-//! `{issues: [{number, date, description}], message}`. Typed, `Issue description:` then `Date <today>:`.
+//! others keep their numbers, and its revision deltas are erased with it. An empty description is
+//! refused. `revision: true` makes it a revision, listed only on the sheets it touches; a non-empty
+//! `sheets` (LAMB sheet layout names, else refused) implies it. One undo step each; returns
+//! `{issues: [{number, date, description, revision, sheets}], message}`. Typed, `Issue description:`
+//! then `Date <today>:`.
+//!
+//! `revdelta {issue, at: [x, y], layout?}` (`rdelta`) marks a change on a sheet: one [`DELTA_BLOCK`]
+//! Insert (an 8 mm triangle, apex up, centred on `at`, its `REV` attribute the revision's number) in
+//! the paper space of `layout` (default the current layout), on layer [`DELTA_LAYER`], for the
+//! drafter to set beside a REVCLOUD. Refused in model space, on a layout that is not a LAMB sheet,
+//! for an unknown issue or a set-wide one. One undo step, the frame's new issue row in it; returns
+//! `{issue, layout, handle, message}`. Typed, `Revision number <latest>:` then `Specify delta
+//! location:`. A delta whose `REV` names no issue is left alone.
 //!
 //! `generalnote {text}` (`gnote`) appends one of the set's general notes, `{remove: n}` removes note
 //! `n` (the rest renumber: a note's number is its position) and `{text, at: n}` replaces it; empty text
@@ -77,6 +89,13 @@ const NOTES_GAP_MM: f64 = 10.0;
 const FRAME_PREFIX: &str = "LAMB_SHEETFRAME_";
 /// The layer frames are placed on.
 pub const FRAME_LAYER: &str = "LAMB-SHEETFRAME";
+const DELTA_CMD: &str = "revdelta";
+/// The revision delta's block, and the layer its Inserts go on.
+pub const DELTA_BLOCK: &str = "LAMB_REVDELTA";
+pub const DELTA_LAYER: &str = "LAMB-REVISION";
+/// The delta triangle's side and its number's text height, paper mm.
+const DELTA_SIDE_MM: f64 = 8.0;
+const DELTA_TEXT_MM: f64 = 3.5;
 
 /// The strip's cells, bottom up: (tag, cell height mm, text height mm).
 const CELLS: [(&str, f64, f64); 8] = [
@@ -252,6 +271,23 @@ fn issue_values(issues: &[Issue]) -> Vec<String> {
     out
 }
 
+/// The revision number a delta Insert carries, when `e` is one.
+fn delta_rev(e: &Entity) -> Option<u32> {
+    match &e.kind {
+        EntityKind::Insert(i) if i.block.eq_ignore_ascii_case(DELTA_BLOCK) => {
+            i.attribs.iter().find(|a| a.tag.eq_ignore_ascii_case("REV")).and_then(|a| a.text.value.trim().parse().ok())
+        }
+        _ => None,
+    }
+}
+
+/// The issues layout `l` lists: the set-wide ones, and the revisions that name it or whose delta it
+/// carries.
+fn sheet_issues(issues: &[Issue], l: &Layout) -> Vec<Issue> {
+    let deltas: Vec<u32> = l.entities.iter().filter_map(|e| delta_rev(e)).collect();
+    issues.iter().filter(|i| !i.revision || i.sheets.contains(&l.name) || deltas.contains(&i.number)).cloned().collect()
+}
+
 fn insert_of(w: &Wanted) -> Insert {
     Insert {
         clip: None,
@@ -403,7 +439,7 @@ fn plan(d: &Drawing) -> std::result::Result<Vec<LayoutPlan>, String> {
             info.client.clone(),
             project.clone(),
         ];
-        values.extend(issue_values(&info.issues));
+        values.extend(issue_values(&sheet_issues(&info.issues, l)));
         let w = wanted(&sheet, values);
         let stale = d.block(&w.block).is_some_and(|b| !block_is(b, &frame_contents(&sheet)));
         let mut lp = LayoutPlan { layout: l.name.clone(), ..LayoutPlan::default() };
@@ -568,7 +604,12 @@ fn today() -> String {
 }
 
 fn issues_json(issues: &[Issue]) -> Value {
-    Value::Array(issues.iter().map(|i| json!({ "number": i.number, "date": i.date, "description": i.description })).collect())
+    Value::Array(
+        issues
+            .iter()
+            .map(|i| json!({ "number": i.number, "date": i.date, "description": i.description, "revision": i.revision, "sheets": i.sheets }))
+            .collect(),
+    )
 }
 
 /// An optional string parameter, trimmed; absent or null is empty.
@@ -579,9 +620,39 @@ fn text_param(p: &Value, key: &str) -> Result<String> {
     }
 }
 
+/// The `sheets` parameter: LAMB sheet layout names, each one checked.
+fn sheets_param(d: &Drawing, p: &Value) -> Result<Vec<String>> {
+    let Some(v) = p.get("sheets").filter(|v| !v.is_null()) else { return Ok(Vec::new()) };
+    let list = v.as_array().ok_or_else(|| bad(ISSUE_CMD, "`sheets` must be a list of sheet names"))?;
+    let mut out: Vec<String> = Vec::new();
+    for n in list {
+        let name = n.as_str().map(str::trim).ok_or_else(|| bad(ISSUE_CMD, "`sheets` must be a list of sheet names"))?;
+        if !d.layout(name).is_some_and(is_lamb_sheet) {
+            return Err(bad(ISSUE_CMD, &format!("{name} is not a LAMB sheet")));
+        }
+        if !out.iter().any(|o| o == name) {
+            out.push(name.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// Erases every delta Insert numbered `n`, on every layout.
+fn erase_deltas(d: &mut Drawing, n: u32) {
+    let found: Vec<(String, Handle)> =
+        d.layouts.iter().flat_map(|l| l.entities.iter().filter(|e| delta_rev(e) == Some(n)).map(|e| (l.name.clone(), e.handle))).collect();
+    for (layout, h) in found {
+        if let Some(store) = d.space_mut(&Space::Paper(layout)) {
+            store.remove(h);
+        }
+    }
+}
+
 pub(crate) fn issue(s: &mut Session, p: &Value) -> Result<Value> {
     let mut doc = read_document(s.doc()?).map_err(other)?;
     let mut info = doc.sheet_info.clone().unwrap_or_default();
+    // Build on a copy and assign it back once: one undo step, erased deltas in it.
+    let mut d = s.doc()?.clone();
     let message = if let Some(v) = p.get("remove").filter(|v| !v.is_null()) {
         let n = v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| bad(ISSUE_CMD, "`remove` must be an issue number"))?;
         let before = info.issues.len();
@@ -589,6 +660,7 @@ pub(crate) fn issue(s: &mut Session, p: &Value) -> Result<Value> {
         if info.issues.len() == before {
             return Err(bad(ISSUE_CMD, &format!("there is no issue {n}")));
         }
+        erase_deltas(&mut d, n);
         format!("Issue {n} removed.")
     } else {
         let description = text_param(p, "description")?;
@@ -597,14 +669,139 @@ pub(crate) fn issue(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let date = text_param(p, "date")?;
         let date = if date.is_empty() { today() } else { date };
+        let sheets = sheets_param(&d, p)?;
+        let revision = match p.get("revision").filter(|v| !v.is_null()) {
+            Some(v) => v.as_bool().ok_or_else(|| bad(ISSUE_CMD, "`revision` must be true or false"))?,
+            None => false,
+        } || !sheets.is_empty();
         let number = info.issues.iter().map(|i| i.number).max().unwrap_or(0) + 1;
-        let m = format!("Issue {number} added: {date} {description}.");
-        info.issues.push(Issue { number, date, description });
+        let word = if revision { "Revision" } else { "Issue" };
+        let m = format!("{word} {number} added: {date} {description}.");
+        info.issues.push(Issue { number, date, description, revision, sheets });
         m
     };
     doc.sheet_info = Some(info.clone());
-    write_document(s.doc_mut()?, &doc).map_err(other)?;
+    write_document(&mut d, &doc).map_err(other)?;
+    *s.doc_mut()? = d;
     Ok(json!({ "issues": issues_json(&info.issues), "message": message }))
+}
+
+/// The delta block: an equilateral triangle, apex up, centred (its centroid) on the origin, on layer `0`.
+fn ensure_delta_block(d: &mut Drawing) -> std::result::Result<(), String> {
+    if d.block(DELTA_BLOCK).is_some() {
+        return Ok(());
+    }
+    d.blocks.insert(DELTA_BLOCK.into(), Arc::new(Block::new(DELTA_BLOCK)));
+    let space = Space::Block(DELTA_BLOCK.into());
+    let (half, h) = (DELTA_SIDE_MM / 2.0, DELTA_SIDE_MM * 3f64.sqrt() / 2.0);
+    let corners = [Vec3::new(-half, -h / 3.0, 0.0), Vec3::new(half, -h / 3.0, 0.0), Vec3::new(0.0, 2.0 * h / 3.0, 0.0)];
+    for k in 0..3 {
+        let (a, b) = (corners[k], corners[(k + 1) % 3]);
+        d.add(&space, Common { layer: "0".into(), ..Common::default() }, EntityKind::Line(Line { a, b })).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn delta_insert(at: Vec3, n: u32) -> Insert {
+    let mut a = attrib("REV", at, DELTA_TEXT_MM, 1.0, &n.to_string());
+    a.text.halign = HAlign::Center;
+    a.text.valign = VAlign::Middle;
+    Insert {
+        clip: None,
+        block: DELTA_BLOCK.into(),
+        insert: at,
+        scale: Vec3::new(1.0, 1.0, 1.0),
+        rotation: 0.0,
+        attribs: vec![a],
+        cols: 1,
+        rows: 1,
+        col_spacing: 0.0,
+        row_spacing: 0.0,
+    }
+}
+
+pub(crate) fn revdelta(s: &mut Session, p: &Value) -> Result<Value> {
+    let n = p
+        .get("issue")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| bad(DELTA_CMD, "`issue` must be an issue number"))?;
+    let at = p.get("at").and_then(Value::as_array).filter(|a| a.len() == 2).and_then(|a| Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)));
+    let (x, y) = at.ok_or_else(|| bad(DELTA_CMD, "`at` must be [x, y]"))?;
+    let layout = match p.get("layout").filter(|v| !v.is_null()) {
+        Some(v) => v.as_str().ok_or_else(|| bad(DELTA_CMD, "`layout` must be a layout name"))?.trim().to_owned(),
+        None => match s.layout_space() {
+            Space::Paper(name) => name,
+            _ => return Err(bad(DELTA_CMD, "a revision delta goes on a sheet: switch to its layout or give `layout`")),
+        },
+    };
+    if !s.doc()?.layout(&layout).is_some_and(is_lamb_sheet) {
+        return Err(bad(DELTA_CMD, &format!("{layout} is not a LAMB sheet")));
+    }
+    let info = read_document(s.doc()?).map_err(other)?.sheet_info.unwrap_or_default();
+    let issue = info.issues.iter().find(|i| i.number == n).ok_or_else(|| bad(DELTA_CMD, &format!("there is no issue {n}")))?;
+    if !issue.revision {
+        return Err(bad(DELTA_CMD, &format!("Issue {n} is set-wide; give it sheets or revision: true")));
+    }
+    let mut d = s.doc()?.clone();
+    ensure_delta_block(&mut d).map_err(other)?;
+    if d.ensure_layer(DELTA_LAYER)
+        && let Some(l) = d.layer_mut(DELTA_LAYER)
+    {
+        l.plot = true;
+    }
+    let common = Common { layer: DELTA_LAYER.into(), ..Common::default() };
+    let handle = d.add(&Space::Paper(layout.clone()), common, EntityKind::Insert(delta_insert(Vec3::new(x, y, 0.0), n))).map_err(other)?;
+    *s.doc_mut()? = d;
+    Ok(json!({ "issue": n, "layout": layout, "handle": handle.hex(), "message": format!("Revision {n} delta on {layout}.") }))
+}
+
+/// The latest revision's number, if any.
+fn latest_revision(s: &Session) -> Option<u32> {
+    let doc = read_document(s.doc().ok()?).ok()?;
+    doc.sheet_info?.issues.iter().filter(|i| i.revision).map(|i| i.number).max()
+}
+
+/// REVDELTA at the command line: the revision (the latest by default), then the delta's location.
+struct RevDelta {
+    latest: u32,
+    issue: Option<u32>,
+}
+
+impl Interactive for RevDelta {
+    fn name(&self) -> &'static str {
+        DELTA_CMD
+    }
+    fn prompt(&self, _s: &Session) -> Prompt {
+        match self.issue {
+            None => Prompt::new("Revision number", Accept::TEXT).default(self.latest.to_string()),
+            Some(_) => Prompt::new("Specify delta location", Accept::POINT),
+        }
+    }
+    fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
+        if i == Input::Cancel {
+            return Ok(Step::Cancel);
+        }
+        let Some(n) = self.issue else {
+            let Some(text) = name_input(i, &self.latest.to_string()) else { return Ok(Step::Continue) };
+            match text.parse::<u32>() {
+                Ok(n) => self.issue = Some(n),
+                Err(_) => s.echo("Requires a revision number.".to_owned()),
+            }
+            return Ok(Step::Continue);
+        };
+        let Input::Point(p) = i else { return Ok(Step::Continue) };
+        let r = revdelta(s, &json!({ "issue": n, "at": [p.x, p.y] }))?;
+        if let Some(m) = r["message"].as_str() {
+            s.echo(m.to_owned());
+        }
+        Ok(Step::Done)
+    }
+}
+
+pub(crate) fn revdelta_machine(s: &Session) -> Result<Box<dyn Interactive>> {
+    let latest = latest_revision(s).ok_or_else(|| other("There is no revision to mark: add one with ISSUE (revision or sheets)."))?;
+    Ok(Box::new(RevDelta { latest, issue: None }))
 }
 
 /// ISSUE at the command line: the description, then the date (today by default).
@@ -1242,7 +1439,7 @@ mod tests {
         let l = back.layout("A501").ok_or("no layout")?;
         assert_eq!(l.entities.iter().filter(|e| frame_of(e).is_some()).count(), 1);
         let issues = read_document(&back)?.sheet_info.ok_or("no info")?.issues;
-        assert_eq!(issues, vec![Issue { number: 1, date: "2026-11-08".into(), description: "Issued for permit".into() }]);
+        assert_eq!(issues, vec![Issue { number: 1, date: "2026-11-08".into(), description: "Issued for permit".into(), ..Issue::default() }]);
         Ok(())
     }
 
@@ -1388,6 +1585,146 @@ mod tests {
         s.input(Input::Enter)?;
         assert!(s.current_prompt().is_none(), "empty cancels");
         assert_eq!(undo_len(&s)?, n);
+        Ok(())
+    }
+
+    /// Layout `name`'s revision deltas: (handle, Insert, layer).
+    fn deltas(s: &Session, name: &str) -> T<Vec<(Handle, Insert, String)>> {
+        let l = s.doc()?.layout(name).ok_or("no layout")?;
+        Ok(l.entities
+            .iter()
+            .filter(|e| delta_rev(e).is_some())
+            .filter_map(|e| match &e.kind {
+                EntityKind::Insert(i) => Some((e.handle, i.clone(), e.common.layer.clone())),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn row(s: &Session, name: &str, tag: &str) -> T<String> {
+        Ok(val(&frames(s, name)?.remove(0).1, tag))
+    }
+
+    /// Two sheets A101 and A102, issue 1 set-wide, revision 2 on A102, revision 3 on no sheet.
+    fn revised() -> T<Session> {
+        let mut s = two_plans()?;
+        s.execute("sheetset", &json!({}))?;
+        s.execute("issue", &json!({ "description": "Issued for permit", "date": "d1" }))?;
+        let r = s.execute("issue", &json!({ "description": "Rev A", "date": "d2", "sheets": ["A102"] }))?;
+        assert_eq!(r["message"], json!("Revision 2 added: d2 Rev A."));
+        assert_eq!((r["issues"][1]["revision"].clone(), r["issues"][1]["sheets"].clone()), (json!(true), json!(["A102"])));
+        s.execute("issue", &json!({ "description": "Rev B", "date": "d3", "revision": true }))?;
+        Ok(s)
+    }
+
+    #[test]
+    fn a_revision_lists_only_on_the_sheets_it_touches() -> R {
+        let mut s = revised()?;
+        assert_eq!((row(&s, "A101", "ISSUE1")?, row(&s, "A101", "ISSUE2")?), ("1  d1  Issued for permit".to_owned(), String::new()));
+        assert_eq!(row(&s, "A102", "ISSUE2")?, "2  d2  Rev A");
+        assert_eq!(row(&s, "A102", "ISSUE3")?, "", "revision 3 names no sheet and has no delta");
+
+        // A delta lists revision 3 on A101 alone, in revdelta's own undo step.
+        let n = undo_len(&s)?;
+        let r = s.execute("revdelta", &json!({ "issue": 3, "at": [100, 120], "layout": "A101" }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert_eq!(r["message"], json!("Revision 3 delta on A101."));
+        assert_eq!(row(&s, "A101", "ISSUE2")?, "3  d3  Rev B");
+        assert_eq!(row(&s, "A102", "ISSUE3")?, "");
+        let d = deltas(&s, "A101")?;
+        assert_eq!(d.len(), 1);
+        let (h, i, layer) = &d[0];
+        assert_eq!(r["handle"], json!(h.hex()));
+        assert_eq!((i.block.as_str(), layer.as_str(), (i.insert.x, i.insert.y)), (DELTA_BLOCK, DELTA_LAYER, (100.0, 120.0)));
+        assert_eq!(i.attribs.iter().map(|a| (a.tag.as_str(), a.text.value.as_str())).collect::<Vec<_>>(), vec![("REV", "3")]);
+        assert_eq!(i.scale, Vec3::new(1.0, 1.0, 1.0));
+        let def = s.doc()?.block(DELTA_BLOCK).ok_or("no delta block")?;
+        let lines: Vec<&Line> = def.entities.iter().filter_map(|e| if let EntityKind::Line(l) = &e.kind { Some(l) } else { None }).collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|l| ((l.a.x - l.b.x).hypot(l.a.y - l.b.y) - DELTA_SIDE_MM).abs() < 1e-9), "equilateral, 8 mm");
+        let (cx, cy) = lines.iter().fold((0.0, 0.0), |(x, y), l| (x + l.a.x / 3.0, y + l.a.y / 3.0));
+        assert!(cx.abs() < 1e-9 && cy.abs() < 1e-9, "centred on the insert point");
+        assert!(lines.iter().any(|l| l.a.x.abs() < 1e-9 && l.a.y > 0.0), "apex up");
+        assert!(s.doc()?.layer(DELTA_LAYER).is_some_and(|l| l.plot));
+
+        // Undo takes the row with it; erasing the delta drops it again.
+        s.undo()?;
+        assert_eq!(row(&s, "A101", "ISSUE2")?, "");
+        s.redo()?;
+        assert_eq!(row(&s, "A101", "ISSUE2")?, "3  d3  Rev B");
+
+        // A DXF round trip keeps the issues, the delta and the listing.
+        let bytes = cadcraft_io::write(s.doc()?, "t.dxf").map_err(|e| format!("{e:?}"))?;
+        let back = cadcraft_io::read(&bytes, "t.dxf").map_err(|e| format!("{e:?}"))?;
+        assert!(super::plan(&back)?.is_empty(), "settled after a round trip");
+        let issues = read_document(&back)?.sheet_info.ok_or("no info")?.issues;
+        assert_eq!(issues, read_document(s.doc()?)?.sheet_info.ok_or("no info")?.issues);
+        assert!(issues[1].revision && issues[1].sheets == ["A102"] && issues[2].revision && !issues[0].revision);
+        let l = back.layout("A101").ok_or("no layout")?;
+        assert_eq!(l.entities.iter().filter_map(|e| delta_rev(e)).collect::<Vec<_>>(), vec![3]);
+
+        let handle = h.hex();
+        s.execute("erase", &json!({ "handles": [handle] }))?;
+        assert_eq!(row(&s, "A101", "ISSUE2")?, "", "erased, unlisted");
+        s.undo()?;
+        assert_eq!(deltas(&s, "A101")?.len(), 1);
+
+        // Removing the revision erases its delta in the same undo step.
+        let n = undo_len(&s)?;
+        s.execute("issue", &json!({ "remove": 3 }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert!(deltas(&s, "A101")?.is_empty());
+        s.undo()?;
+        assert_eq!(deltas(&s, "A101")?.len(), 1, "undo restores it");
+        Ok(())
+    }
+
+    #[test]
+    fn revision_refusals_record_nothing() -> R {
+        let mut s = revised()?;
+        let n = undo_len(&s)?;
+        for p in [
+            json!({ "description": "x", "sheets": ["Nope"] }),
+            json!({ "description": "x", "sheets": "A101" }),
+            json!({ "description": "x", "revision": 1 }),
+        ] {
+            assert!(s.execute("issue", &p).is_err(), "{p}");
+        }
+        let set_wide = s.execute("revdelta", &json!({ "issue": 1, "at": [0, 0], "layout": "A101" }));
+        assert!(set_wide.is_err_and(|e| e.to_string().contains("Issue 1 is set-wide")));
+        for p in [
+            json!({ "issue": 9, "at": [0, 0], "layout": "A101" }),
+            json!({ "issue": 3, "at": [0, 0], "layout": "Nope" }),
+            json!({ "issue": 3, "at": [0, 0] }),
+            json!({ "issue": 3, "layout": "A101" }),
+        ] {
+            assert!(s.execute("revdelta", &p).is_err(), "{p}");
+        }
+        assert_eq!(undo_len(&s)?, n);
+        assert!(s.doc()?.block(DELTA_BLOCK).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn typed_revdelta_places_the_latest_revision_at_a_click() -> R {
+        let mut s = two_plans()?;
+        s.execute("sheetset", &json!({}))?;
+        s.execute("layout", &json!({ "option": "set", "name": "A101" }))?;
+        s.execute("issue", &json!({ "description": "Issued for permit", "date": "d1" }))?;
+        assert!(s.start("rdelta").is_err(), "no revision to mark");
+        assert!(s.current_prompt().is_none());
+        s.execute("issue", &json!({ "description": "Rev A", "date": "d2", "revision": true }))?;
+        s.start("revdelta")?;
+        let p = s.current_prompt().ok_or("no prompt")?;
+        assert_eq!((p.message.as_str(), p.default.as_deref()), ("Revision number", Some("2")));
+        s.input(Input::Enter)?;
+        assert_eq!(s.current_prompt().map(|p| p.message.clone()).as_deref(), Some("Specify delta location"));
+        s.input(Input::Point(cadcraft_geom::Vec2::new(50.0, 60.0)))?;
+        assert!(s.current_prompt().is_none());
+        let d = deltas(&s, "A101")?;
+        assert_eq!((d.len(), d[0].1.insert.x, d[0].1.insert.y), (1, 50.0, 60.0));
+        assert_eq!(row(&s, "A101", "ISSUE2")?, "2  d2  Rev A");
+        assert_eq!(row(&s, "A102", "ISSUE2")?, "");
         Ok(())
     }
 }

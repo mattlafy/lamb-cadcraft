@@ -158,12 +158,18 @@ pub struct SheetInfo {
 }
 
 /// One issue of the drawing set: its number (never reused while it stands), date and what it was for.
+/// A set-wide issue lists on every sheet; a `revision` lists only on the sheets it names in `sheets`
+/// or that carry its `LAMB_REVDELTA` delta ([`crate::titleblock`]).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Issue {
     pub number: u32,
     pub date: String,
     pub description: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub revision: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sheets: Vec<String>,
 }
 
 impl LambDocument {

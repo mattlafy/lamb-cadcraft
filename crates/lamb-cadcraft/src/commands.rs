@@ -30,9 +30,12 @@
 //!   existing sheets keep their size — see [`crate::sheetset`].
 //! - `titleblock {project?, client?, address?, drawnBy?, date?, north?}` (`tblock`): the text every
 //!   sheet's title block shows and project north, in one undo step — see [`crate::titleblock`].
-//! - `issue {description, date?}` / `issue {remove}` (`iss`): adds an issue of the set (numbered one
-//!   past the highest, dated today unless given) or removes one; every sheet's title strip lists the
-//!   latest six — see [`crate::titleblock`].
+//! - `issue {description, date?, revision?, sheets?}` / `issue {remove}` (`iss`): adds an issue of the
+//!   set (numbered one past the highest, dated today unless given) or removes one; a sheet's title
+//!   strip lists the latest six of the set-wide issues and the revisions that touch it — see
+//!   [`crate::titleblock`].
+//! - `revdelta {issue, at, layout?}` (`rdelta`): a numbered revision delta on a sheet, which lists that
+//!   revision there — see [`crate::titleblock`].
 //! - `generalnote {text}` / `{remove}` / `{text, at}` (`gnote`): adds, removes or replaces one of the
 //!   set's numbered general notes, printed on `A001` beside the drawing list — see [`crate::titleblock`].
 //! - `bomtable {layout?, at?}` (`bom`): the framing BOM — repeat copies and placed corner and jamb
@@ -922,8 +925,12 @@ pub fn commands() -> Vec<CommandSpec> {
             .interactive(crate::titleblock::titleblock_machine),
         CommandSpec::new("issue", "Issue", crate::titleblock::issue)
             .alias(&["iss"])
-            .params("{description, date?} | {remove} → {issues, message}")
+            .params("{description, date?, revision?, sheets?} | {remove} → {issues, message}")
             .interactive(crate::titleblock::issue_machine),
+        CommandSpec::new("revdelta", "Revision Delta", crate::titleblock::revdelta)
+            .alias(&["rdelta"])
+            .params("{issue, at, layout?} → {issue, layout, handle, message}")
+            .interactive(crate::titleblock::revdelta_machine),
         CommandSpec::new("generalnote", "General Note", crate::titleblock::generalnote)
             .alias(&["gnote"])
             .params("{text} | {remove} | {text, at} → {notes, message}")
