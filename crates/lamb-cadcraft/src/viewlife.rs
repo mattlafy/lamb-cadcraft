@@ -699,10 +699,12 @@ impl Interactive for PlaceViewMachine {
                 let Some(name) = name_input(i, &default) else { return Ok(Step::Continue) };
                 let levels = doc_of(s)?.levels;
                 if name == "?" {
-                    s.echo(levels.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", "));
+                    let rows: Vec<String> = levels.iter().map(|l| l.name.clone()).collect();
+                    crate::choices::echo_numbered(s, &rows);
                     return Ok(Step::Continue);
                 }
-                match levels.iter().find(|l| l.name == name) {
+                let names: Vec<&str> = levels.iter().map(|l| l.name.as_str()).collect();
+                match crate::choices::pick_numbered(&names, &name).map(|n| &levels[n]) {
                     Some(l) => {
                         self.level = Some((l.id, l.floor_elevation.value));
                         self.step = PvStep::Height;
@@ -1155,6 +1157,42 @@ mod tests {
     }
 
     #[test]
+    fn placeview_level_question_lists_numbered_and_a_number_picks() -> E<()> {
+        let (mut s, p, f) = floating_and_placed()?;
+        let roof =
+            Id(s.execute("level", &json!({ "mode": "create", "name": "Roof", "floorElevationMm": 6000 }))?["levelId"].as_u64().ok_or("no id")?);
+        s.start("pv")?;
+        s.input(Input::Enter)?;
+        s.input(Input::Enter)?;
+        let n = s.log.len();
+        s.input(Input::Keyword("?".into()))?;
+        assert_eq!(&s.log[n..], ["1  Level 1", "2  Roof"], "one numbered line per level");
+        assert_eq!(shown(&s).as_deref(), Some("Enter level name or [?] <Level 1>:"), "the prompt stays");
+        s.input(Input::Text("Nowhere".into()))?;
+        assert_eq!(s.log.last().map(String::as_str), Some("No such level: Nowhere"));
+        s.input(Input::Text("2".into()))?;
+        assert!(shown(&s).is_some_and(|p| p.starts_with("Specify cut height")), "{:?}", shown(&s));
+        s.input(Input::Enter)?;
+        s.input(pt(0.0, 0.0))?;
+        s.input(pt(1000.0, 0.0))?;
+        enter_space(&mut s, Space::Block(view_block_name(p)))?;
+        s.input(pt(100.0, 200.0))?;
+        s.input(pt(100.0, 1200.0))?;
+        assert!(s.running.is_none(), "{:?}", shown(&s));
+        assert!(matches!(view_by_id(&s, f)?, AnyView::Plan(PlanView { placement: Some(Placement::Plan { level_id, .. }), .. }) if level_id == roof));
+
+        // A name still works, now in any case.
+        s.undo()?;
+        s.execute("editview", &json!({ "viewId": f.0 }))?;
+        s.start("pv")?;
+        s.input(Input::Enter)?;
+        s.input(Input::Enter)?;
+        s.input(Input::Text("roof".into()))?;
+        assert!(shown(&s).is_some_and(|p| p.starts_with("Specify cut height")), "{:?}", shown(&s));
+        Ok(())
+    }
+
+    #[test]
     fn placeview_machine_aligns_two_point_pairs_with_the_target_clicked_in_a_placed_plan() -> E<()> {
         let (mut s, p, f) = floating_and_placed()?;
         let steps = undo_len(&s)?;
@@ -1165,7 +1203,7 @@ mod tests {
         s.input(Input::Enter)?;
         assert_eq!(shown(&s).as_deref(), Some("Enter level name or [?] <Level 1>:"));
         s.input(Input::Text("?".into()))?;
-        assert!(s.log.iter().any(|l| l == "Level 1"), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l == "1  Level 1"), "{:?}", s.log);
         s.input(Input::Enter)?;
         let height = read_document(s.doc()?)?.defaults.default_cut_height_mm;
         assert_eq!(shown(&s), Some(format!("Specify cut height above the level <{height}>:")));

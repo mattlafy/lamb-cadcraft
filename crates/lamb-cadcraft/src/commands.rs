@@ -684,14 +684,14 @@ impl Interactive for EditView {
         }
         let doc = read_document(s.doc()?).map_err(other)?;
         if text == "?" {
-            for v in &doc.views {
-                s.echo(format!("{}  {}  {}", v.id().0, kind_word(v), v.name()));
-            }
+            let rows: Vec<String> = doc.views.iter().map(|v| format!("{}  {}", kind_word(v), v.name())).collect();
+            crate::choices::echo_numbered(s, &rows);
             return Ok(Step::Continue);
         }
-        let by_name = doc.views.iter().find(|v| v.name().eq_ignore_ascii_case(&text));
+        let names: Vec<&str> = doc.views.iter().map(AnyView::name).collect();
+        let picked = crate::choices::pick_numbered(&names, &text).map(|n| &doc.views[n]);
         let by_id = || text.parse::<u64>().ok().and_then(|n| doc.views.iter().find(|v| v.id() == Id(n)));
-        match by_name.or_else(by_id).map(AnyView::id) {
+        match picked.or_else(by_id).map(AnyView::id) {
             Some(id) => {
                 enter_space(s, Space::Block(view_block_name(id)))?;
                 Ok(Step::Done)
@@ -1409,7 +1409,12 @@ mod tests {
         assert!(s.log[n..].iter().any(|l| l.contains("No such view")), "{:?}", &s.log[n..]);
         assert!(s.running.is_some(), "re-prompts");
         s.input(Input::Keyword("?".into()))?;
-        assert!(s.log.iter().any(|l| l == &format!("{}  Plan  Ground", ground.0)), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l == "1  Plan  Ground"), "{:?}", s.log);
+        assert!(s.log.iter().any(|l| l == "2  Plan  First"), "{:?}", s.log);
+        assert!(s.running.is_some(), "the prompt stays");
+        text(&mut s, "2")?;
+        assert_eq!(space(&s)?, Space::Block(view_block_name(first)), "a number picks that option");
+        s.start("editview")?;
         s.input(Input::Keyword("Model".into()))?;
         assert_eq!(space(&s)?, Space::Model);
         assert!(s.running.is_none());

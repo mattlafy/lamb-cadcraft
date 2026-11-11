@@ -235,14 +235,14 @@ impl Interactive for RefPane {
         let doc = read_document(s.doc()?).map_err(other)?;
         let views: Vec<&AnyView> = eligible.iter().filter_map(|id| doc.views.iter().find(|v| v.id() == *id)).collect();
         if text == "?" {
-            for v in &views {
-                s.echo(format!("{}  {}  {}", v.id().0, kind_word(v), v.name()));
-            }
+            let rows: Vec<String> = views.iter().map(|v| format!("{}  {}", kind_word(v), v.name())).collect();
+            crate::choices::echo_numbered(s, &rows);
             return Ok(Step::Continue);
         }
-        let by_name = views.iter().find(|v| v.name().eq_ignore_ascii_case(&text));
+        let names: Vec<&str> = views.iter().map(|v| v.name()).collect();
+        let picked = crate::choices::pick_numbered(&names, &text).map(|n| &views[n]);
         let by_id = || text.parse::<u64>().ok().and_then(|n| views.iter().find(|v| v.id() == Id(n)));
-        match by_name.or_else(by_id) {
+        match picked.or_else(by_id) {
             Some(v) => Self::run(s, &json!({ "viewId": v.id().0 })),
             None => Err(other(format!("Not a reference view for {}", view_name(s.doc()?, edit)))),
         }
@@ -395,8 +395,10 @@ pub(crate) mod tests {
         let (mut s, plan, a, b) = project()?;
         s.start("refpane")?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter reference view name or [Off/?] <A-A>:"));
+        let n = s.log.len();
         s.input(Input::Keyword("?".into()))?;
-        assert!(s.log.iter().any(|l| l == &format!("{}  Section  B-B", b.0)), "{:?}", s.log);
+        assert_eq!(&s.log[n..], ["1  Section  A-A", "2  Section  B-B"], "numbered");
+        assert!(s.running.is_some(), "the prompt stays");
         let n = s.log.len();
         s.input(Input::Text("Ground Floor".into()))?;
         assert!(s.log[n..].iter().any(|l| l.contains("Not a reference view for Ground Floor")), "{:?}", &s.log[n..]);
@@ -410,6 +412,11 @@ pub(crate) mod tests {
         assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("B-B"), "the remembered choice is the default");
         s.input(Input::Keyword("Off".into()))?;
         assert!(!shown(&s));
+        s.start("refpane")?;
+        s.input(Input::Text("1".into()))?;
+        assert_eq!(s.tile_spaces(), [block(plan), block(a)], "a number picks that option");
+        s.start("refpane")?;
+        s.input(Input::Keyword("Off".into()))?;
 
         s.execute("editview", &json!({ "viewId": a.0 }))?;
         s.start("refpane")?;

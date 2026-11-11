@@ -36,6 +36,7 @@ pub mod assistant_lint;
 pub mod autodim;
 pub mod bom;
 pub mod bubbles;
+mod choices;
 pub mod cli;
 pub mod commands;
 pub mod convert;

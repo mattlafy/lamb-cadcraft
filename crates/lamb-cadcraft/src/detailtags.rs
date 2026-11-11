@@ -12,9 +12,10 @@
 //!   vertex; a placed tag echoes `Tagged run 2 of "Ground" with "D1"` and the view's report line,
 //!   and a view's first tag writes its assembly block ([`crate::assembly::write_assembly_block`])
 //!   in the same undo step. Returns `{"handle": <hex>, "attached": {"run"|"junction"|"opening"|"end": n}}`.
-//!   Interactive (LAMB T591): `Select detail [D1/Corner_Detail/Corner]:` — one keyword per detail
+//!   Interactive (LAMB T591): `Select detail [D1/Corner_Detail/?/Corner]:` — one keyword per detail
 //!   drawn in the edited view's direction (name with `/[]` and spaces as `_`; a typed name or id
-//!   also selects; none ends the command) → `Specify tag point on a wall face:` (`at a wall
+//!   also selects, `?` lists them numbered and a number picks that one (LAMB T663); none ends
+//!   the command) → `Specify tag point on a wall face:` (`at a wall
 //!   corner` in Corner mode; asked again after a refused point) → `Specify bubble point or [Box]:`.
 //! - A callout-box tag (LAMB T594): `detailtag {…, tip, box: {a:{x,y}, b:{x,y}}}` in place of
 //!   `bubble` (both or neither is a bad-params error) makes one closed 4-vertex `LwPolyline`,
@@ -885,7 +886,7 @@ impl Interactive for DetailTagM {
         match (self.detail, self.tip) {
             (None, _) => {
                 let msg = if self.corner { "Select anchored detail" } else { "Select detail" };
-                let kws: Vec<&str> = self.listed().map(|o| o.keyword.as_str()).chain(["Corner"]).collect();
+                let kws: Vec<&str> = self.listed().map(|o| o.keyword.as_str()).chain(["?", "Corner"]).collect();
                 let p = Prompt::new(msg, Accept::TEXT).kw(&kws).options_only();
                 match self.default_name() {
                     Some(n) => p.default(n),
@@ -964,6 +965,16 @@ impl Interactive for DetailTagM {
             };
             if text.eq_ignore_ascii_case("corner") || text.eq_ignore_ascii_case("c") {
                 self.corner = !self.corner;
+                return Ok(Step::Continue);
+            }
+            if text == "?" {
+                let rows: Vec<String> = self.listed().map(|o| o.name.clone()).collect();
+                crate::choices::echo_numbered(s, &rows);
+                return Ok(Step::Continue);
+            }
+            let names: Vec<&str> = self.listed().map(|o| o.name.as_str()).collect();
+            if let Some(id) = crate::choices::pick_numbered(&names, &text).and_then(|n| self.listed().nth(n)).map(|o| o.id) {
+                self.pick(id);
                 return Ok(Step::Continue);
             }
             let by_name = self.offered.iter().find(|o| o.keyword.eq_ignore_ascii_case(&text) || o.name.eq_ignore_ascii_case(&text));
@@ -1332,7 +1343,7 @@ mod tests {
     fn the_interactive_form_places_the_same_tag_as_the_parameter_form() -> R {
         let (mut s, plan, detail) = room()?;
         s.start("dtag")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [D1/Corner] <D1>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [D1/?/Corner] <D1>:"));
         s.input(Input::Keyword("Corner".into()))?;
         assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Select anchored detail"));
         s.input(Input::Text("d1".into()))?;
@@ -1459,8 +1470,12 @@ mod tests {
         s.execute("newdetail", &json!({ "name": "S1", "cutDirection": "vertical" }))?;
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
         s.start("dtag")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [D1/Corner_Detail/Corner]:"));
-        s.input(Input::Keyword("Corner_Detail".into()))?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [D1/Corner_Detail/?/Corner]:"));
+        let n = s.log.len();
+        s.input(Input::Keyword("?".into()))?;
+        assert_eq!(&s.log[n..], ["1  D1", "2  Corner Detail"], "the offered details, numbered");
+        assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Select detail"), "the prompt stays");
+        s.input(Input::Text("2".into()))?;
         assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point on a wall face"));
         s.input(Input::Point(Vec2::new(2500.0, 0.0)))?;
         s.input(Input::Point(Vec2::new(1500.0, -1000.0)))?;
@@ -1483,7 +1498,7 @@ mod tests {
         )?;
         s.execute("editview", &json!({ "viewId": r["viewId"].as_u64().ok_or("no id")? }))?;
         s.start("dtag")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [S1/Corner] <S1>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select detail [S1/?/Corner] <S1>:"));
         Ok(())
     }
 
@@ -1702,10 +1717,10 @@ mod tests {
     fn corner_mode_lists_anchored_details_and_a_linear_pick_asks_for_a_face() -> R {
         let (mut s, _plan) = crate::assembly::tests::window_room(false, false)?;
         s.start("dtag")?;
-        assert_eq!(s.current_prompt().map(|p| p.keywords.clone()), Some(vec!["D1".to_owned(), "JD".to_owned(), "Corner".to_owned()]));
+        assert_eq!(s.current_prompt().map(|p| p.keywords.clone()), Some(vec!["D1".to_owned(), "JD".to_owned(), "?".to_owned(), "Corner".to_owned()]));
         s.input(Input::Keyword("Corner".into()))?;
         let p = s.current_prompt().ok_or("no prompt")?;
-        assert_eq!((p.message.as_str(), p.keywords.clone()), ("Select anchored detail", vec!["JD".to_owned(), "Corner".to_owned()]));
+        assert_eq!((p.message.as_str(), p.keywords.clone()), ("Select anchored detail", vec!["JD".to_owned(), "?".to_owned(), "Corner".to_owned()]));
         s.input(Input::Text("D1".into()))?;
         assert_eq!(s.current_prompt().map(|p| p.message).as_deref(), Some("Specify tag point on a wall face"));
         s.input(Input::Cancel)?;
