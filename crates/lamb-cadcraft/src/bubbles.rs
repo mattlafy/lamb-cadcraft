@@ -97,6 +97,13 @@ fn attrib(tag: &str, at: Vec3, dy: f64, value: &str, k: f64) -> Attrib {
 }
 
 fn insert_of(w: &Wanted) -> Insert {
+    bubble_insert(w.at, &w.detail, &w.sheet, w.k)
+}
+
+/// A bubble [`Insert`] of [`BUBBLE_BLOCK`] at `at`, its lengths × `k`, with `DETAIL` and `SHEET`
+/// attributes `detail` and `sheet`. (Its layer is the entity's, not the insert's.)
+pub(crate) fn bubble_insert(at: Vec3, detail: &str, sheet: &str, k: f64) -> Insert {
+    let w = Wanted { at, layer: String::new(), detail: detail.into(), sheet: sheet.into(), k };
     Insert {
         clip: None,
         block: BUBBLE_BLOCK.into(),

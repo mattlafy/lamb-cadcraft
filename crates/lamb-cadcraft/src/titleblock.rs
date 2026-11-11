@@ -702,7 +702,7 @@ fn ensure_delta_block(d: &mut Drawing) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn delta_insert(at: Vec3, n: u32) -> Insert {
+pub(crate) fn delta_insert(at: Vec3, n: u32) -> Insert {
     let mut a = attrib("REV", at, DELTA_TEXT_MM, 1.0, &n.to_string());
     a.text.halign = HAlign::Center;
     a.text.valign = VAlign::Middle;

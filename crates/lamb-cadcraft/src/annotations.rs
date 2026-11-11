@@ -76,7 +76,7 @@ const LAYER: &str = "0";
 
 /// One generated entity, in view-local coordinates.
 #[derive(Clone, Debug, PartialEq)]
-enum Item {
+pub(crate) enum Item {
     Line(Vec3, Vec3),
     /// A cut symbol's name and its height: centred.
     Text(Vec3, String, f64),
@@ -112,6 +112,57 @@ fn enlarged_boxes(d: &Drawing, id: Id, scale: f64) -> Vec<Item> {
     out
 }
 
+/// A section cut symbol from `from` to `to` looking along unit `gaze`, with every length its 1:50
+/// value × `f`: the cut line, then at each end a gaze arrow (shaft and two head strokes), then at
+/// each end `name` beyond the arrow's tip and `sheet` (when given) below it.
+pub(crate) fn cut_symbol(from: Vec3, to: Vec3, gaze: (f64, f64), name: &str, sheet: Option<&str>, f: f64) -> Vec<Item> {
+    let (arrow, head, height) = (CUT_ARROW_MM * f, CUT_HEAD_MM * f, CUT_TEXT_MM * f);
+    let g = gaze;
+    let mut out = vec![Item::Line(from, to)];
+    for end in [from, to] {
+        let tip = v(end.x + g.0 * arrow, end.y + g.1 * arrow);
+        out.push(Item::Line(v(end.x, end.y), tip));
+        for a in [30f64, -30f64] {
+            let (s, co) = a.to_radians().sin_cos();
+            // Back from the tip: -gaze rotated by ±30°.
+            let (bx, by) = (-(g.0 * co - g.1 * s), -(g.0 * s + g.1 * co));
+            out.push(Item::Line(tip, v(tip.x + bx * head, tip.y + by * head)));
+        }
+    }
+    for end in [from, to] {
+        let beyond = arrow + CUT_TEXT_GAP_MM * f;
+        let at = v(end.x + g.0 * beyond, end.y + g.1 * beyond);
+        out.push(Item::Text(at, name.to_owned(), height));
+        if let Some(sheet) = sheet {
+            out.push(Item::Text(v(at.x, at.y - 1.5 * height), sheet.to_owned(), height));
+        }
+    }
+    out
+}
+
+/// A wall type tag: a flat-topped hexagon of circumradius 0.9 × `height` round `centre`, and `mark`
+/// in it at 0.6 × `height`.
+pub(crate) fn wall_tag_symbol(centre: Vec3, mark: &str, height: f64) -> Vec<Item> {
+    let (c, r) = (centre, 0.9 * height);
+    let corner = |i: usize| {
+        let (s, co) = (i as f64 * std::f64::consts::FRAC_PI_3).sin_cos();
+        v(c.x + r * co, c.y + r * s)
+    };
+    let mut out: Vec<Item> = (0..6).map(|i| Item::Line(corner(i), corner((i + 1) % 6))).collect();
+    out.push(Item::Text(c, mark.to_owned(), 0.6 * height));
+    out
+}
+
+/// A room tag: `name`, `number` and `area` centred on `at`, 0.35 × `height` apart.
+pub(crate) fn room_tag_items(at: Vec3, name: &str, number: &str, area: &str, height: f64) -> Vec<Item> {
+    let step = 1.35 * height;
+    vec![
+        Item::Text(v(at.x, at.y + step), name.to_owned(), height),
+        Item::Text(v(at.x, at.y), number.to_owned(), height),
+        Item::Text(v(at.x, at.y - step), area.to_owned(), height),
+    ]
+}
+
 /// What view `id` wants, in write order: a plan its cut symbols, opening marks and room tags, a vertical view
 /// its level lines, and either the box of each enlarged area; a detail in `detail_note_views` its layer
 /// notes ([`crate::detailnotes`]); nothing for an unplaced plan or vertical view or any other detail.
@@ -145,52 +196,22 @@ fn wanted(
     }
     let plan = id;
     let f = k(scale);
-    let (arrow, head, height) = (CUT_ARROW_MM * f, CUT_HEAD_MM * f, CUT_TEXT_MM * f);
+    let height = CUT_TEXT_MM * f;
     let mut out = Vec::new();
     for c in compute_cut_lines_for_view(&dp, plan)? {
-        let (g, n) = ((c.gaze_dir.x, c.gaze_dir.y), c.name);
-        out.push(Item::Line(v(c.from.x, c.from.y), v(c.to.x, c.to.y)));
-        for end in [c.from, c.to] {
-            let tip = v(end.x + g.0 * arrow, end.y + g.1 * arrow);
-            out.push(Item::Line(v(end.x, end.y), tip));
-            for a in [30f64, -30f64] {
-                let (s, co) = a.to_radians().sin_cos();
-                // Back from the tip: -gaze rotated by ±30°.
-                let (bx, by) = (-(g.0 * co - g.1 * s), -(g.0 * s + g.1 * co));
-                out.push(Item::Line(tip, v(tip.x + bx * head, tip.y + by * head)));
-            }
-        }
-        for end in [c.from, c.to] {
-            let beyond = arrow + CUT_TEXT_GAP_MM * f;
-            let at = v(end.x + g.0 * beyond, end.y + g.1 * beyond);
-            out.push(Item::Text(at, n.clone(), height));
-            if let Some(sheet) = sheet_of(c.source_view_id) {
-                out.push(Item::Text(v(at.x, at.y - 1.5 * height), sheet, height));
-            }
-        }
+        let sheet = sheet_of(c.source_view_id);
+        out.extend(cut_symbol(v(c.from.x, c.from.y), v(c.to.x, c.to.y), (c.gaze_dir.x, c.gaze_dir.y), &c.name, sheet.as_deref(), f));
     }
     for m in marks.iter().filter(|m| m.plan == plan) {
         let off = MARK_OFFSET_MM * f;
         out.push(Item::Text(v(m.at.x + m.out.x * off, m.at.y + m.out.y * off), m.mark.clone(), height));
     }
-    // Each wall type tag: a flat-topped hexagon of circumradius 0.9 × height round its mark.
     for t in tags.iter().filter(|t| t.plan == plan) {
         let off = t.half_width + MARK_OFFSET_MM * f;
-        let c = v(t.at.x + t.inward.x * off, t.at.y + t.inward.y * off);
-        let r = 0.9 * height;
-        let corner = |i: usize| {
-            let (s, co) = (i as f64 * std::f64::consts::FRAC_PI_3).sin_cos();
-            v(c.x + r * co, c.y + r * s)
-        };
-        out.extend((0..6).map(|i| Item::Line(corner(i), corner((i + 1) % 6))));
-        out.push(Item::Text(c, t.mark.clone(), 0.6 * height));
+        out.extend(wall_tag_symbol(v(t.at.x + t.inward.x * off, t.at.y + t.inward.y * off), &t.mark, height));
     }
-    // Each room: name, number and area, centred on its point, 0.35 × height apart.
     for r in rooms.iter().filter(|r| r.plan == plan) {
-        let step = 1.35 * height;
-        out.push(Item::Text(v(r.at.x, r.at.y + step), r.name.clone(), height));
-        out.push(Item::Text(v(r.at.x, r.at.y), r.number.clone(), height));
-        out.push(Item::Text(v(r.at.x, r.at.y - step), area_text(r.area_m2), height));
+        out.extend(room_tag_items(v(r.at.x, r.at.y), &r.name, &r.number, &area_text(r.area_m2), height));
     }
     if dp.document().auto_dim_plans.contains(&plan) {
         let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
@@ -261,7 +282,7 @@ fn text(at: Vec3, value: &str, height: f64, halign: HAlign) -> Text {
     }
 }
 
-fn entity_of(i: &Item) -> EntityKind {
+pub(crate) fn entity_of(i: &Item) -> EntityKind {
     match i {
         Item::Line(a, b) => EntityKind::Line(Line { a: *a, b: *b }),
         Item::Text(at, s, h) => EntityKind::Text(text(*at, s, *h, HAlign::Center)),

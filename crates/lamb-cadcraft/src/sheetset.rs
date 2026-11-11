@@ -27,7 +27,8 @@
 //! openings, `A603` the [`crate::rooms`] room schedule (LAMB T657) when a plan has named rooms, and
 //! `A604` the [`crate::walltypes`] Wall Types legend (LAMB T688) when a wall has an edge detail.
 //! The set's general notes ([`crate::titleblock`], `generalnote`) go on `A001` too, as a `General
-//! Notes` table right of the Drawing List. Each table is compared with what it would become and replaced, at its own corner, only when its
+//! Notes` table right of the Drawing List. Below the Drawing List `A001` carries a `Legend` of the generated
+//! symbols the set uses ([`crate::legend`], LAMB T696), made, updated or removed the same way. Each table is compared with what it would become and replaced, at its own corner, only when its
 //! text differs. A table taller than the sheet is written whole and the message says it runs off.
 //! All of it is one undo step; nothing to change changes nothing.
 //!
@@ -39,7 +40,7 @@
 //!
 //! `sheetset {pdf?}` (`sset`) returns `{sheets: [{layout, group, viewIds}], alreadyOnSheets,
 //! refit: [{layout, view, scale}], weighted, pdf?, message}`, `weighted` counting the lines this run
-//! stamped with a lineweight and `group` being `list`, `bom` or `schedule` for a table made
+//! stamped with a lineweight and `group` being `list`, `notes`, `legend`, `bom` or `schedule` for a table made
 //! or updated, with no `viewIds`.
 //! With `pdf`, every set sheet in tab order is plotted to that one PDF, a page and a bookmark
 //! per sheet, whether or not this run placed anything, and `proposedLines` counts the unaccepted
@@ -267,6 +268,22 @@ fn table_report(layout: &str, group: &str, title: &str, change: Refreshed) -> (S
     (part, json!({ "layout": layout, "group": group, "viewIds": [] }))
 }
 
+/// Brings `A001` up to date — its Drawing List, General Notes and Legend, in that order — and puts
+/// what changed at the front of what is reported.
+fn refresh_cover(d: &mut Drawing, known: &[String], parts: &mut Vec<String>, sheets: &mut Vec<Value>) -> Result<()> {
+    let changes = [
+        ("list", LIST_TITLE, refresh_list(d, known)?),
+        ("notes", NOTES_TITLE, refresh_notes(d)?),
+        ("legend", crate::legend::LEGEND_TITLE, crate::legend::refresh_legend(d)?),
+    ];
+    for (k, (group, title, change)) in changes.into_iter().filter_map(|(g, t, c)| Some((g, t, c?))).enumerate() {
+        let (part, sheet) = table_report(LIST_SHEET, group, title, change);
+        parts.insert(k, part);
+        sheets.insert(k, sheet);
+    }
+    Ok(())
+}
+
 /// Brings sheets made before they plotted as drawings along: LAMB viewports on layer `0` move to
 /// [`VPORT_LAYER`] and set sheets without a plot style table take monochrome. Returns how many
 /// sheets changed.
@@ -486,17 +503,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         parts.push(part);
         sheets.push(sheet);
     }
-    // A001's tables lead what is reported: the list, then the notes.
-    let mut first = 0;
-    for (title, change) in [(LIST_TITLE, refresh_list(&mut d, &known)?), (NOTES_TITLE, refresh_notes(&mut d)?)] {
-        if let Some(change) = change {
-            let group = if title == LIST_TITLE { "list" } else { "notes" };
-            let (part, sheet) = table_report(LIST_SHEET, group, title, change);
-            parts.insert(first, part);
-            sheets.insert(first, sheet);
-            first += 1;
-        }
-    }
+    refresh_cover(&mut d, &known, &mut parts, &mut sheets)?;
     let mut off_sheet: Vec<String> = Vec::new();
     for (layout, title) in [
         (LIST_SHEET, LIST_TITLE),
@@ -509,6 +516,9 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         if bom::table_runs_off(&d, layout, title)? {
             off_sheet.push(format!("{layout} {title}"));
         }
+    }
+    if crate::legend::legend_runs_off(&d) {
+        off_sheet.push(format!("{LIST_SHEET} {}", crate::legend::LEGEND_TITLE));
     }
     let before = s.state()?.doc.clone();
     let changed = updated > 0 || weighted > 0 || !sheets.is_empty() || !refit.is_empty();
@@ -1039,6 +1049,7 @@ mod tests {
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
         let want = [
             ("A001".to_owned(), "list".to_owned(), vec![]),
+            ("A001".to_owned(), "legend".to_owned(), vec![]),
             ("A101".to_owned(), "plan".to_owned(), vec![ground.0]),
             ("A102".to_owned(), "plan".to_owned(), vec![first.0]),
             ("A201".to_owned(), "elevation".to_owned(), vec![elev.0]),
@@ -1049,7 +1060,7 @@ mod tests {
         assert_eq!(laid(&r), want, "{r}");
         assert_eq!(
             r["message"],
-            "Sheet set: A001 Drawing List, A101 Ground Floor, A102 First, A201 North, A301 Section A, A401 Ground Floor framing, A501 (2 details); 8 lines weighted by role."
+            "Sheet set: A001 Drawing List, A001 Legend, A101 Ground Floor, A102 First, A201 North, A301 Section A, A401 Ground Floor framing, A501 (2 details); 8 lines weighted by role."
         );
         assert_eq!(view_sheet_ref(s.doc()?, ground), Some((1, "A101".to_owned())));
         let mut want_tabs: Vec<String> = ["A001", "A101", "A102", "A201", "A301", "A401", "A501"].map(String::from).to_vec();
@@ -1256,7 +1267,7 @@ mod tests {
         s.execute("newsheet", &json!({ "name": "Mine", "viewIds": [elev.0] }))?;
         let r = s.execute("sheetset", &json!({}))?;
         let names: Vec<String> = laid(&r).into_iter().map(|(l, _, _)| l).collect();
-        assert_eq!(names, ["A001", "A101", "A102", "A301", "A401", "A501"], "{r}");
+        assert_eq!(names, ["A001", "A001", "A101", "A102", "A301", "A401", "A501"], "{r}");
         assert_eq!(r["alreadyOnSheets"], 1);
         assert!(r["message"].as_str().unwrap_or_default().contains("; 1 already on sheets;"), "{r}");
         assert_eq!(view_sheet_ref(s.doc()?, elev), Some((1, "Mine".to_owned())));
