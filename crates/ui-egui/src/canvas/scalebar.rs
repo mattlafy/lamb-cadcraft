@@ -26,7 +26,7 @@ pub fn register_scale_bar(f: ScaleBarPredicate) -> Result<(), &'static str> {
 }
 
 /// True when a predicate is registered, a drawing is open and the predicate holds.
-pub(super) fn wanted(app: &CadApp) -> bool {
+pub(crate) fn wanted(app: &CadApp) -> bool {
     WANTED.get().is_some_and(|f| app.session.doc().is_ok_and(*f))
 }
 

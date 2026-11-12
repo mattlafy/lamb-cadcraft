@@ -650,7 +650,9 @@ fn paint_pointer_overlay(
         draw_ucs_icon(painter, rect);
         crate::viewcube::ucs_icon(app, ui, rect);
     }
-    if app.ui.show_viewcube && sheet.is_none() {
+    // LAMB (fork, T662): LAMB views have their own ViewCube setting, off by default.
+    let lamb = scalebar::wanted(app);
+    if *crate::viewcube_flag(&mut app.ui, lamb) && sheet.is_none() {
         draw_viewcube(app, ui, rect);
     }
     viewport_label(painter, rect);

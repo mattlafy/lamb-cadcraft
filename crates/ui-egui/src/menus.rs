@@ -310,7 +310,8 @@ fn run_ui_toggle_command(app: &mut CadApp, id: &str, params: &Value) -> Option<R
             Ok(Value::Null)
         }
         "ui.toggle.viewcube" => {
-            toggle(&mut app.ui.show_viewcube, params);
+            let lamb = crate::canvas::scalebar::wanted(app); // LAMB (fork): T662
+            toggle(crate::viewcube_flag(&mut app.ui, lamb), params);
             Ok(Value::Null)
         }
         "ui.toggle.ucsicon" => {

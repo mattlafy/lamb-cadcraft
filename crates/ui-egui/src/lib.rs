@@ -105,6 +105,9 @@ pub struct UiState {
     pub show_status_bar: bool,
     pub show_command_line: bool,
     pub show_viewcube: bool,
+    /// LAMB (fork, T662): the ViewCube setting for drawings the registered scale-bar predicate
+    /// marks as LAMB views; off by default. [`viewcube_flag`] picks which setting applies.
+    pub show_viewcube_lamb: bool,
     pub show_ucs_icon: bool,
     pub show_layer_list: bool,
     /// Keep the system cursor visible over the drawing area (a small crosshair at the centre of the
@@ -203,6 +206,7 @@ impl Default for UiState {
             show_status_bar: true,
             show_command_line: true,
             show_viewcube: true,
+            show_viewcube_lamb: false,
             show_ucs_icon: true,
             show_layer_list: false,
             system_cursor: false,
@@ -1200,10 +1204,29 @@ fn is_lisp_file(name: impl AsRef<Path>) -> bool {
     name.as_ref().extension().is_some_and(|e| e.eq_ignore_ascii_case("lsp"))
 }
 
+/// LAMB (fork, T662): the ViewCube setting that applies — `show_viewcube_lamb` in a LAMB view
+/// (`lamb`: the scale-bar predicate holds), `show_viewcube` everywhere else.
+pub(crate) fn viewcube_flag(ui: &mut UiState, lamb: bool) -> &mut bool {
+    if lamb { &mut ui.show_viewcube_lamb } else { &mut ui.show_viewcube }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use theme::{ThemePref, Tokens};
+
+    #[test]
+    fn viewcube_defaults_off_in_lamb_views_only() {
+        let mut ui = UiState::default();
+        assert!(!*viewcube_flag(&mut ui, true));
+        assert!(*viewcube_flag(&mut ui, false));
+        *viewcube_flag(&mut ui, true) = true;
+        assert!(ui.show_viewcube_lamb && ui.show_viewcube);
+        *viewcube_flag(&mut ui, true) = false;
+        assert!(!ui.show_viewcube_lamb && ui.show_viewcube);
+        let old: UiState = serde_json::from_str(r#"{"showViewcube": true}"#).unwrap();
+        assert!(!old.show_viewcube_lamb && old.show_viewcube);
+    }
 
     fn app() -> CadApp {
         CadApp::new(Session::empty(), Services::default())
