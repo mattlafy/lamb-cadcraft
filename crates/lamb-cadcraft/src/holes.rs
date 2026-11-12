@@ -38,7 +38,8 @@ use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{Id, LineRole};
 use serde_json::{Value, json};
 
-use crate::commands::{bad, edited_view, id_value, other};
+use crate::choices::{echo_numbered, pick_numbered};
+use crate::commands::{bad, edited_view, id_value, kind_word, other};
 use crate::convert::to_polyline;
 use crate::project::DrawingProject;
 use crate::schema::{EntityData, HoleTag, hole_block_name, read_document, read_entity_data, set_entity_data, view_block_name};
@@ -436,7 +437,7 @@ impl Interactive for ViewHoleM {
         match self.phase {
             Phase::Boundary => Prompt::new("Select hole boundary", Accept::SELECT).kw(&["Remove", "List"]),
             Phase::Remove => Prompt::new("Select hole boundary to remove", Accept::SELECT),
-            Phase::Source(_) => Prompt::new("Enter source view name", Accept::TEXT).kw(&["Nearest"]).default("Nearest".to_owned()),
+            Phase::Source(_) => Prompt::new("Enter source view name", Accept::TEXT).kw(&["Nearest", "?"]).default("Nearest".to_owned()),
         }
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
@@ -475,11 +476,14 @@ impl Interactive for ViewHoleM {
                     Self::run(s, &json!({ "boundary": h.hex() }));
                     return Ok(Step::Done);
                 }
-                let found = s
-                    .doc()
-                    .ok()
-                    .and_then(|d| read_document(d).ok())
-                    .and_then(|doc| doc.views.iter().find(|v| v.name().eq_ignore_ascii_case(&text)).map(lamb_core::model::AnyView::id));
+                let views = s.doc().ok().and_then(|d| read_document(d).ok()).map(|doc| doc.views).unwrap_or_default();
+                if text == "?" {
+                    let rows: Vec<String> = views.iter().map(|v| format!("{}  {}", kind_word(v), v.name())).collect();
+                    echo_numbered(s, &rows);
+                    return Ok(Step::Continue);
+                }
+                let names: Vec<&str> = views.iter().map(lamb_core::model::AnyView::name).collect();
+                let found = pick_numbered(&names, &text).and_then(|n| views.get(n)).map(lamb_core::model::AnyView::id);
                 match found {
                     Some(id) => {
                         Self::run(s, &json!({ "boundary": h.hex(), "source": id.0 }));
@@ -729,7 +733,7 @@ mod tests {
         f.s.start("vhole")?;
         assert_eq!(f.s.current_prompt().map(|p| p.display()).as_deref(), Some("Select hole boundary or [Remove/List]:"));
         f.s.input(Input::Pick(vec![f.rect]))?;
-        assert_eq!(f.s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter source view name or [Nearest] <Nearest>:"));
+        assert_eq!(f.s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter source view name or [Nearest/?] <Nearest>:"));
         f.s.input(Input::Enter)?;
         assert!(f.s.running.is_none());
         assert!(f.s.log.iter().any(|l| l == "Hole shows \"B-B\""), "{:?}", f.s.log);
@@ -737,6 +741,37 @@ mod tests {
         f.s.start("viewhole")?;
         f.s.input(Input::Keyword("List".into()))?;
         assert!(f.s.log.iter().any(|l| l == &format!("{}  shows \"B-B\"", f.rect.hex())), "{:?}", f.s.log);
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_question_mark_lists_every_view_numbered_and_a_number_or_name_picks() -> R {
+        let mut f = fixture()?;
+        let views = read_document(f.s.doc()?)?.views;
+        let rows: Vec<String> = views.iter().enumerate().map(|(n, v)| format!("{}  {}  {}", n + 1, kind_word(v), v.name())).collect();
+        assert!(rows.len() >= 5 && rows[1] == "2  Section  A-A" && rows[3] == "4  Section  C-C", "{rows:?}");
+        f.s.start("viewhole")?;
+        f.s.input(Input::Pick(vec![f.rect]))?;
+        let before = f.s.log.len();
+        f.s.input(Input::Keyword("?".into()))?;
+        assert_eq!(f.s.log[before..], rows[..], "{:?}", f.s.log);
+        assert_eq!(f.s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter source view name or [Nearest/?] <Nearest>:"));
+        f.s.input(Input::Text("4".into()))?;
+        assert!(f.s.running.is_none());
+        assert_eq!(hole_of(&f.s, f.rect)?.hole, Some(HoleTag { source: f.c }));
+
+        f.s.start("viewhole")?;
+        f.s.input(Input::Pick(vec![f.rect]))?;
+        f.s.input(Input::Text("b-b".into()))?;
+        assert_eq!(hole_of(&f.s, f.rect)?.hole, Some(HoleTag { source: f.b }));
+
+        f.s.start("viewhole")?;
+        f.s.input(Input::Pick(vec![f.rect]))?;
+        f.s.input(Input::Text("9".into()))?;
+        assert!(f.s.log.iter().any(|l| l == "No view named \"9\""), "{:?}", f.s.log);
+        f.s.input(Input::Keyword("Nearest".into()))?;
+        assert!(f.s.running.is_none());
+        assert_eq!(hole_of(&f.s, f.rect)?.hole, Some(HoleTag { source: f.b }));
         Ok(())
     }
 }

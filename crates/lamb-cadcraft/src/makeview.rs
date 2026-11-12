@@ -25,7 +25,8 @@ use cadcraft_geom::{Mat3, Vec2};
 use lamb_core::model::{AnyView, Id, Placement, PlanView};
 use serde_json::{Value, json};
 
-use crate::commands::{bad, create, id_value, name_input, other};
+use crate::choices::{echo_numbered, pick_numbered};
+use crate::commands::{bad, create, id_value, kind_word, name_input, other};
 use crate::schema::{read_document, view_block_name};
 
 const CMD: &str = "makeview";
@@ -146,7 +147,7 @@ impl Interactive for MakeViewM {
     fn prompt(&self, s: &Session) -> Prompt {
         match (&self.picked, self.naming) {
             (None, _) => self.sel.prompt(),
-            (Some(_), false) => Prompt::new("Enter target view name", Accept::TEXT).kw(&["New"]).default("New".to_owned()),
+            (Some(_), false) => Prompt::new("Enter target view name", Accept::TEXT).kw(&["New", "?"]).default("New".to_owned()),
             (Some(_), true) => Prompt::new("Enter view name", Accept::TEXT).default(free_name(s)),
         }
     }
@@ -179,10 +180,15 @@ impl Interactive for MakeViewM {
             return Ok(Step::Continue);
         }
         let doc = read_document(s.doc()?).map_err(other)?;
-        let plan = |exact: bool| {
-            doc.views.iter().find(|v| matches!(v, AnyView::Plan(_)) && if exact { v.name() == text } else { v.name().eq_ignore_ascii_case(&text) })
-        };
-        match plan(true).or_else(|| plan(false)) {
+        let plans: Vec<&AnyView> = doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_))).collect();
+        if text == "?" {
+            let rows: Vec<String> = plans.iter().map(|v| format!("{}  {}", kind_word(v), v.name())).collect();
+            echo_numbered(s, &rows);
+            return Ok(Step::Continue);
+        }
+        let names: Vec<&str> = plans.iter().map(|v| v.name()).collect();
+        let found = plans.iter().position(|v| v.name() == text).or_else(|| pick_numbered(&names, &text)).and_then(|n| plans.get(n).copied());
+        match found {
             Some(v) => {
                 self.run(s, json!({ "viewId": v.id().0 }));
                 Ok(Step::Done)
@@ -387,7 +393,7 @@ mod tests {
         s.start("mkv")?;
         s.input(Input::Pick(vec![h]))?;
         s.input(Input::Enter)?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter target view name or [New] <New>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter target view name or [New/?] <New>:"));
         s.input(Input::Enter)?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter view name <View 1>:"));
         s.input(Input::Text("Site".into()))?;
@@ -418,6 +424,34 @@ mod tests {
         s.input(Input::Text("ground".into()))?;
         assert!(s.current_prompt().is_none());
         assert_eq!(lines_of(&s, plan)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_question_mark_lists_plans_only_numbered_and_a_number_picks() -> R {
+        let mut s = session()?;
+        let ground = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
+        let first = Id(s.execute("newplan", &json!({ "name": "First" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("newsectionline", &json!({ "name": "A-A", "hostViewId": ground.0, "cutFrom": {"x": 0, "y": 0}, "cutTo": {"x": 5000, "y": 0} }))?;
+        enter_space(&mut s, Space::Model)?;
+        let doc = read_document(s.doc()?)?;
+        assert!(doc.views.iter().any(|v| v.name() == "A-A"), "the drawing holds a section");
+        let rows: Vec<String> =
+            doc.views.iter().filter(|v| matches!(v, AnyView::Plan(_))).enumerate().map(|(n, v)| format!("{}  Plan  {}", n + 1, v.name())).collect();
+        let at = rows.iter().position(|r| r.ends_with("  First")).ok_or("First not listed")?;
+        let h = line(&mut s, [0.0, 0.0], [10.0, 0.0])?;
+        s.start(CMD)?;
+        s.input(Input::Pick(vec![h]))?;
+        s.input(Input::Enter)?;
+        let before = s.log.len();
+        s.input(Input::Keyword("?".into()))?;
+        assert_eq!(s.log[before..], rows[..], "{:?}", s.log);
+        assert!(!s.log[before..].iter().any(|l| l.contains("A-A")), "a section is not listed");
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter target view name or [New/?] <New>:"));
+        s.input(Input::Text((at + 1).to_string()))?;
+        assert!(s.current_prompt().is_none());
+        assert_eq!(lines_of(&s, first)?.len(), 1);
+        assert!(lines_of(&s, ground)?.is_empty());
         Ok(())
     }
 
