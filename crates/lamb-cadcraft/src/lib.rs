@@ -51,6 +51,7 @@ mod entitycmds;
 pub mod export;
 pub mod fillet;
 pub mod fillet_matrix;
+mod gridname;
 pub mod holes;
 pub mod import;
 mod lambopen;

@@ -82,7 +82,7 @@ fn rows(d: &Drawing) -> Vec<(Sample, &'static str)> {
         let s = vec![Item::Line(v(-20.0, 0.0), v(0.0, 0.0)), Item::Label(v(-20.0, LEVEL_TEXT_MM * f), "Level 1 +0".into(), LEVEL_TEXT_MM * f)];
         out.push((Sample::Items(s), "Level — name and floor elevation"));
     }
-    if named_grids(&dp, &[]).is_ok_and(|g| !g.is_empty()) {
+    if named_grids(&dp, &crate::gridname::overrides(doc)).is_ok_and(|g| !g.is_empty()) {
         let mut s = vec![Item::Line(v(-20.0, 0.0), v(0.0, 0.0))];
         s.extend(grid_bubble(v(0.0, 0.0), (1.0, 0.0), "1", f));
         out.push((Sample::Items(s), "Grid line — the same name on every plan, section and elevation"));

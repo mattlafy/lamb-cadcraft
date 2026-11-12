@@ -132,6 +132,19 @@ pub struct LambDocument {
     /// `layerhatches`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layer_hatch_views: Vec<Id>,
+    /// Explicit grid names, at most one per grid ([`crate::gridname`], `gridname`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grid_names: Vec<GridNameRecord>,
+}
+
+/// An explicit name for the building grid that datum segment `segment_index` of `entity_id` in
+/// `view_id` draws; every other member of that grid reads it too.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GridNameRecord {
+    pub view_id: Id,
+    pub entity_id: Id,
+    pub segment_index: usize,
+    pub name: String,
 }
 
 /// A named room: the space of plan `plan` containing `at` (plan-local).
@@ -210,6 +223,7 @@ impl LambDocument {
             sheet_info: None,
             rooms: Vec::new(),
             layer_hatch_views: Vec::new(),
+            grid_names: Vec::new(),
         }
     }
 }

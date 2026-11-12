@@ -56,6 +56,9 @@
 //!   [`crate::walltypes`].
 //! - `walltags {viewId?, off?}` (`wtag`): tags each wall of a placed plan with its wall type mark in a
 //!   hexagon, generated into its annotation block — see [`crate::walltypes`].
+//! - `gridname {viewId?, entityId, segmentIndex, name}` / `{grid, name}` (`gn`, LAMB ▸ Levels & Cuts
+//!   ▸ Grid Name): names one building grid, and every bubble on every view and sheet reads it; `""`
+//!   returns it to automatic naming — see [`crate::gridname`].
 //! - `vpview {handle, viewId | null}`: binds a layout viewport to a view — its `view_id`, every other
 //!   view's layer frozen in it, zoomed to the view; `null` unbinds it. One undo step; the
 //!   Properties palette's View row runs it ([`crate::props`]).
@@ -1004,6 +1007,11 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{boundary?, source?, remove?: bool} → {holes} | {boundary, source, sourceName}")
             .menu(MENU_LEVELS)
             .interactive(crate::holes::viewhole_machine),
+        CommandSpec::new("gridname", "Grid Name", crate::gridname::gridname)
+            .alias(&["gn"])
+            .params("{viewId?, entityId, segmentIndex, name} | {grid, name} → {grid, name, message}")
+            .menu(MENU_LEVELS)
+            .interactive(crate::gridname::gridname_machine),
         CommandSpec::new("refpane", "Reference Pane", crate::refpane::refpane)
             .params("{on?: bool, viewId?}")
             .noundo()
@@ -1197,7 +1205,7 @@ mod tests {
                 ],
             ),
             ("View Setup", &["editview", "viewprops", "unplaceview", "placeview"]),
-            ("Levels & Cuts", &["level", "levelline", "cutline", "viewhole"]),
+            ("Levels & Cuts", &["level", "levelline", "cutline", "viewhole", "gridname"]),
             ("Display", &["refpane", "underlay", "detailsnap", "panelock", "ucsalign", "ghosthide", "ghostshow"]),
             ("Links", &["link", "unlink", "showlinks"]),
             ("Details", &["detailtag", "detailtags", "detailref", "repeat", "detailflip"]),

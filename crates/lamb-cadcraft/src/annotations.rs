@@ -166,7 +166,7 @@ pub(crate) fn grid_bubble(end: Vec3, out: (f64, f64), name: &str, f: f64) -> Vec
 /// its bubbles; then per datum segment of `id`'s own that is a grid, its bubbles. Bubbles go at both
 /// ends in a plan and at the upper end in a vertical view.
 fn grid_items(d: &Drawing, dp: &DrawingProject, id: Id, vertical: bool, f: f64) -> Result<Vec<Item>, String> {
-    let grids = named_grids(dp, &[])?;
+    let grids = named_grids(dp, &crate::gridname::overrides(dp.document()))?;
     if grids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1265,7 +1265,7 @@ pub(crate) mod tests {
     /// [`fixture`] plus `Level 2` with a second placed plan `Upper`, a 4000 × 3000 rectangle in the
     /// section, and in the ground plan a N–S datum at x = 2000 (crossing A-A) and an E–W one at
     /// y = 4000. Returns (session, plan, upper, section, the N–S datum).
-    fn gridded() -> T<(Session, Id, Id, Id, Id)> {
+    pub(crate) fn gridded() -> T<(Session, Id, Id, Id, Id)> {
         let (mut s, plan, sec) = fixture()?;
         let l2 =
             Id(s.execute("level", &json!({ "mode": "create", "name": "Level 2", "floorElevationMm": 3000 }))?["levelId"].as_u64().ok_or("no id")?);
@@ -1281,7 +1281,7 @@ pub(crate) mod tests {
     }
 
     /// The view's bubbles: (centre, radius, name), each circle with the text centred on it.
-    fn bubbles_of(s: &Session, view: Id) -> T<Vec<(Vec3, f64, String)>> {
+    pub(crate) fn bubbles_of(s: &Session, view: Id) -> T<Vec<(Vec3, f64, String)>> {
         let it = items(s, view)?;
         let mut out = Vec::new();
         for w in it.windows(2) {
