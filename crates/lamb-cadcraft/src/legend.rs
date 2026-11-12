@@ -1,11 +1,11 @@
 //! The drawing set's symbol legend (LAMB T696): SHEETSET puts one on the cover sheet `A001`, below
 //! the Drawing List, showing each kind of generated symbol the set's sheets actually carry, in this
-//! order — section or elevation cut symbol, level line, detail bubble, enlarged-area box, wall type
+//! order — section or elevation cut symbol, level line, grid line, detail bubble, enlarged-area box, wall type
 //! tag, opening mark, room tag, revision delta — each beside a one-line description naming the
 //! schedule sheet where one applies. A kind nothing in the drawing uses gets no row.
 //!
 //! Each sample is drawn by the code that draws the symbol on the sheets
-//! ([`crate::annotations::cut_symbol`], [`crate::annotations::wall_tag_symbol`],
+//! ([`crate::annotations::cut_symbol`], [`crate::annotations::grid_bubble`], [`crate::annotations::wall_tag_symbol`],
 //! [`crate::annotations::room_tag_items`], [`crate::bubbles::bubble_insert`],
 //! [`crate::titleblock::delta_insert`]) at its size on paper, with fixed generic sample text.
 //!
@@ -20,10 +20,11 @@ use std::sync::Arc;
 use cadcraft_doc::{Block, Common, Drawing, EntityKind, HAlign, Insert, Space, Text, VAlign};
 use cadcraft_engine::Result;
 use cadcraft_geom::Vec3;
+use lamb_core::derivation::datums::named_grids;
 use lamb_core::derivation::markers::compute_cut_lines_for_view;
 use lamb_core::derivation::read::{ProjectRead, ViewKind};
 
-use crate::annotations::{CUT_TEXT_MM, Item, LEVEL_TEXT_MM, cut_symbol, entity_of, k, room_tag_items, wall_tag_symbol};
+use crate::annotations::{CUT_TEXT_MM, Item, LEVEL_TEXT_MM, cut_symbol, entity_of, grid_bubble, k, room_tag_items, wall_tag_symbol};
 use crate::bom::{self, Refreshed};
 use crate::bubbles::{BUBBLE_BLOCK, BUBBLE_RADIUS_MM, bubble_insert};
 use crate::commands::other;
@@ -81,6 +82,11 @@ fn rows(d: &Drawing) -> Vec<(Sample, &'static str)> {
         let s = vec![Item::Line(v(-20.0, 0.0), v(0.0, 0.0)), Item::Label(v(-20.0, LEVEL_TEXT_MM * f), "Level 1 +0".into(), LEVEL_TEXT_MM * f)];
         out.push((Sample::Items(s), "Level — name and floor elevation"));
     }
+    if named_grids(&dp, &[]).is_ok_and(|g| !g.is_empty()) {
+        let mut s = vec![Item::Line(v(-20.0, 0.0), v(0.0, 0.0))];
+        s.extend(grid_bubble(v(0.0, 0.0), (1.0, 0.0), "1", f));
+        out.push((Sample::Items(s), "Grid line — the same name on every plan, section and elevation"));
+    }
     let is_bubble = |e: &cadcraft_doc::Entity| matches!(&e.kind, EntityKind::Insert(i) if i.block.eq_ignore_ascii_case(BUBBLE_BLOCK));
     let bubble_used = d.model.iter().any(|e| is_bubble(e))
         || d.blocks.iter().filter(|(n, _)| !n.eq_ignore_ascii_case(LEGEND_BLOCK)).any(|(_, b)| b.entities.iter().any(|e| is_bubble(e)))
@@ -127,6 +133,7 @@ fn y_range(items: &[Item]) -> (f64, f64) {
             Item::Line(a, b) => add(a.y.min(b.y), a.y.max(b.y)),
             Item::Text(at, _, h) | Item::Label(at, _, h) => add(at.y - h / 2.0, at.y + h / 2.0),
             Item::Dim(a, b, ..) => add(a.y.min(b.y), a.y.max(b.y)),
+            Item::Circle(c, r) => add(c.y - r, c.y + r),
         }
     }
     if r.0 > r.1 { (0.0, 0.0) } else { r }
@@ -139,6 +146,7 @@ fn shifted(i: &Item, dx: f64, dy: f64) -> Item {
         Item::Text(at, s, h) => Item::Text(m(at), s.clone(), *h),
         Item::Label(at, s, h) => Item::Label(m(at), s.clone(), *h),
         Item::Dim(a, b, r, l, sc) => Item::Dim(m(a), m(b), *r, m(l), *sc),
+        Item::Circle(c, r) => Item::Circle(m(c), *r),
     }
 }
 
@@ -286,6 +294,7 @@ mod tests {
     const BUBBLE: &str = "Detail — detail name, and the sheet that shows it";
     const WALL: &str = "Wall type — see A604";
     const ROOM: &str = "Room — name, number and area — see A603";
+    const GRID: &str = "Grid line — the same name on every plan, section and elevation";
 
     /// `assembly.rs`'s tagged room (a placed plan, edge detail `D1` tagged on its bottom wall) plus
     /// the observers, section `A-A` drawn along y = 2000 and room `Living`. Returns (session, plan).
@@ -374,6 +383,19 @@ mod tests {
         s.execute("sheetset", &json!({}))?;
         assert!(s.doc()?.layout(LIST_SHEET).is_some(), "A001 made");
         assert!(s.doc()?.block(LEGEND_BLOCK).is_none() && legend_insert(s.doc()?).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_set_with_a_grid_line_gets_its_row_after_the_levels() -> R {
+        let (mut s, plan) = set()?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        crate::annotations::tests::datum_line(&mut s, plan, [1000.0, -1000.0], [1000.0, 4000.0])?;
+        s.execute("editview", &json!({}))?;
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(legend_rows(s.doc()?), [CUT, LEVEL, GRID, BUBBLE, ROOM]);
+        let b = s.doc()?.block(LEGEND_BLOCK).ok_or("no block")?;
+        assert!(b.entities.iter().any(|e| matches!(&e.kind, EntityKind::Circle(c) if (c.radius - 5.0).abs() < 1e-9)), "the bubble at paper size");
         Ok(())
     }
 }

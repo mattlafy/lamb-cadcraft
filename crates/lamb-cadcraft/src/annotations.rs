@@ -16,6 +16,10 @@
 //! and one per repeat ([`crate::detailnotes`], LAMB T689).
 //! A placed plan, section or elevation with an enlarged sheet gets a box around each enlarged area and
 //! `<n>/<layout>` above its top-left corner ([`crate::sheets::enlarged_windows`], LAMB T655).
+//! Every building grid ([`named_grids`], LAMB T703) a placed plan, section or elevation shows gets
+//! its name in a bubble ([`grid_bubble`]) at both ends in a plan and at the top in a vertical view;
+//! a grid drawn in another view also gets its line, a section's clipped to the view block's
+//! extents ±[`LEVEL_OVERRUN_MM`].
 //!
 //! The annotation lives in its own block per view, [`annotation_block_name`]`(view)`, never in the
 //! view block, so derivation, the wall graph, links and LAMBSAVE never see them. The block's one
@@ -33,13 +37,15 @@
 
 use std::sync::Arc;
 
-use cadcraft_doc::{Block, Common, DimKind, DimStyle, Dimension, Drawing, Entity, EntityKind, HAlign, Insert, Line, Space, Text, VAlign};
+use cadcraft_doc::{Block, Circle, Common, DimKind, DimStyle, Dimension, Drawing, Entity, EntityKind, HAlign, Insert, Line, Space, Text, VAlign};
 use cadcraft_engine::Session;
 use cadcraft_geom::{Bounds2, Vec3};
 use cadcraft_render::{DisplayList, Options};
+use lamb_core::derivation::datums::{GridMember, compute_datum_lines_for_view, named_grids};
 use lamb_core::derivation::markers::compute_cut_lines_for_view;
 use lamb_core::derivation::projection::{Uz, vertical_uz_to_local};
 use lamb_core::derivation::read::{ProjectRead, ViewKind};
+use lamb_core::geometry::polyline::resolved_segments;
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id};
 
@@ -71,6 +77,10 @@ const LEVEL_TEXT_GAP_MM: f64 = 200.0;
 pub const LEVEL_DIM_OFFSET_MM: f64 = 1200.0;
 /// An opening's mark sits this far from the opening's midpoint, on the outside.
 pub const MARK_OFFSET_MM: f64 = 400.0;
+/// A grid bubble's radius; its name is 0.8 × this high.
+pub const GRID_BUBBLE_MM: f64 = 250.0;
+/// From a grid line's end to its bubble's edge.
+pub const GRID_GAP_MM: f64 = 500.0;
 /// Every generated entity's layer inside the block.
 const LAYER: &str = "0";
 
@@ -85,6 +95,8 @@ pub(crate) enum Item {
     /// A rotated-linear dimension: its two measured points, its rotation in radians, a point on its
     /// dimension line, and the view scale that is its DIMSCALE.
     Dim(Vec3, Vec3, f64, Vec3, f64),
+    /// A circle: its centre and radius.
+    Circle(Vec3, f64),
 }
 
 /// What a length constant is multiplied by at 1:`scale`.
@@ -140,6 +152,74 @@ pub(crate) fn cut_symbol(from: Vec3, to: Vec3, gaze: (f64, f64), name: &str, she
     out
 }
 
+/// A grid bubble past a grid line's `end`, along unit `out`, with every length its 1:50 value ×
+/// `f`: the line on from `end` to the bubble's edge, the circle, and `name` centred in it.
+pub(crate) fn grid_bubble(end: Vec3, out: (f64, f64), name: &str, f: f64) -> Vec<Item> {
+    let (r, gap) = (GRID_BUBBLE_MM * f, GRID_GAP_MM * f);
+    let edge = v(end.x + out.0 * gap, end.y + out.1 * gap);
+    let c = v(end.x + out.0 * (gap + r), end.y + out.1 * (gap + r));
+    vec![Item::Line(v(end.x, end.y), edge), Item::Circle(c, r), Item::Text(c, name.to_owned(), 0.8 * r)]
+}
+
+/// Placed view `id`'s grid items at length factor `f`: per grid line another view draws that `id`
+/// shows, the line (an infinite one clipped to the view block's extents ±[`LEVEL_OVERRUN_MM`]) and
+/// its bubbles; then per datum segment of `id`'s own that is a grid, its bubbles. Bubbles go at both
+/// ends in a plan and at the upper end in a vertical view.
+fn grid_items(d: &Drawing, dp: &DrawingProject, id: Id, vertical: bool, f: f64) -> Result<Vec<Item>, String> {
+    let grids = named_grids(dp, &[])?;
+    if grids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let name_of = |m: GridMember| grids.iter().find(|g| g.members.contains(&m)).map(|g| g.name.clone());
+    let bubbles = |a: Vec3, b: Vec3, name: &str, out: &mut Vec<Item>| {
+        let len = (b.x - a.x).hypot(b.y - a.y);
+        if len <= TOLERANCE.coincidence_mm {
+            return;
+        }
+        let u = ((b.x - a.x) / len, (b.y - a.y) / len);
+        if vertical {
+            let (top, dir) = if b.y >= a.y { (b, u) } else { (a, (-u.0, -u.1)) };
+            out.extend(grid_bubble(top, dir, name, f));
+        } else {
+            out.extend(grid_bubble(a, (-u.0, -u.1), name, f));
+            out.extend(grid_bubble(b, u, name, f));
+        }
+    };
+    let mut out = Vec::new();
+    let ext = d.extents(&Space::Block(view_block_name(id)));
+    for o in compute_datum_lines_for_view(dp, id)? {
+        let member = GridMember { view_id: o.source_view_id, entity_id: o.source_entity_id, segment_index: o.source_segment_index };
+        let Some(name) = name_of(member) else { continue };
+        let (a, b) = if o.infinite {
+            let (dx, dy) = (o.to.x - o.from.x, o.to.y - o.from.y);
+            let len = dx.hypot(dy);
+            if ext.is_empty() || len <= 0.0 {
+                continue;
+            }
+            let dir = (dx / len, dy / len);
+            let ts = [(ext.min.x, ext.min.y), (ext.max.x, ext.min.y), (ext.max.x, ext.max.y), (ext.min.x, ext.max.y)]
+                .map(|(x, y)| (x - o.from.x) * dir.0 + (y - o.from.y) * dir.1);
+            let over = LEVEL_OVERRUN_MM * f;
+            let t0 = ts.iter().copied().fold(f64::INFINITY, f64::min) - over;
+            let t1 = ts.iter().copied().fold(f64::NEG_INFINITY, f64::max) + over;
+            (v(o.from.x + dir.0 * t0, o.from.y + dir.1 * t0), v(o.from.x + dir.0 * t1, o.from.y + dir.1 * t1))
+        } else {
+            (v(o.from.x, o.from.y), v(o.to.x, o.to.y))
+        };
+        out.push(Item::Line(a, b));
+        bubbles(a, b, &name, &mut out);
+    }
+    for g in &grids {
+        for m in g.members.iter().filter(|m| m.view_id == id) {
+            let Some(e) = dp.entity(m.entity_id) else { continue };
+            let Some(poly) = e.polyline.as_deref() else { continue };
+            let Some(seg) = resolved_segments(poly).into_iter().find(|s| s.index == m.segment_index) else { continue };
+            bubbles(v(seg.from.x, seg.from.y), v(seg.to.x, seg.to.y), &g.name, &mut out);
+        }
+    }
+    Ok(out)
+}
+
 /// A wall type tag: a flat-topped hexagon of circumradius 0.9 × `height` round `centre`, and `mark`
 /// in it at 0.6 × `height`.
 pub(crate) fn wall_tag_symbol(centre: Vec3, mark: &str, height: f64) -> Vec<Item> {
@@ -191,6 +271,7 @@ fn wanted(
     let scale = view_scale(d, dp.document(), id);
     if view.kind == ViewKind::Vertical {
         let mut out = level_lines(d, &dp, id, scale);
+        out.extend(grid_items(d, &dp, id, true, k(scale))?);
         out.extend(enlarged_boxes(d, id, scale));
         return Ok(out);
     }
@@ -225,6 +306,7 @@ fn wanted(
         let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
         out.extend(crate::autodim::locate(&dp, plan).into_iter().map(|d| Item::Dim(at(d.a), at(d.b), d.rotation, at(d.line_at), scale)));
     }
+    out.extend(grid_items(d, &dp, plan, false, f)?);
     out.extend(enlarged_boxes(d, id, scale));
     Ok(out)
 }
@@ -288,6 +370,7 @@ pub(crate) fn entity_of(i: &Item) -> EntityKind {
         Item::Text(at, s, h) => EntityKind::Text(text(*at, s, *h, HAlign::Center)),
         Item::Label(at, s, h) => EntityKind::Text(text(*at, s, *h, HAlign::Left)),
         Item::Dim(a, b, rotation, line_at, scale) => EntityKind::Dimension(rotated_dim(*a, *b, *rotation, *line_at, *scale)),
+        Item::Circle(center, radius) => EntityKind::Circle(Circle { center: *center, radius: *radius }),
     }
 }
 
@@ -363,6 +446,7 @@ fn block_matches(block: &Block, want: &[Item]) -> bool {
                             && dm.text.is_empty()
                             && same_size(DimStyle::default().with_overrides(&dm.overrides).scale, *scale)
                     }
+                    (EntityKind::Circle(c), Item::Circle(at, r)) => near(c.center, *at) && same_size(c.radius, *r),
                     _ => false,
                 }
         })
@@ -512,6 +596,7 @@ pub(crate) mod tests {
                 }
                 match &e.kind {
                     EntityKind::Line(l) => Ok(Item::Line(l.a, l.b)),
+                    EntityKind::Circle(c) => Ok(Item::Circle(c.center, c.radius)),
                     EntityKind::Text(t) if t.halign == HAlign::Left => Ok(Item::Label(t.align_pt.unwrap_or(t.insert), t.value.clone(), t.height)),
                     EntityKind::Text(t) => Ok(Item::Text(t.align_pt.unwrap_or(t.insert), t.value.clone(), t.height)),
                     EntityKind::Dimension(dm) if is_vertical(&dm.kind) => {
@@ -1164,6 +1249,108 @@ pub(crate) mod tests {
         let (with, without) = (build_plot(d, &paper, &opts).prims.len(), build_plot(&bare, &paper, &opts).prims.len());
         assert!(with > without && with - without <= edited, "{with} {without} {edited}");
         assert!(cadcraft_render::overlays(d, &paper, &opts).iter().all(|l| l.prims.is_empty()));
+        Ok(())
+    }
+
+    /// T703: a LINE drawn in the edited `view` and given the `datum` role; its entity id.
+    pub(crate) fn datum_line(s: &mut Session, view: Id, a: [f64; 2], b: [f64; 2]) -> T<Id> {
+        let ids = |s: &Session| -> T<Vec<Id>> { Ok(DrawingProject::new(s.doc()?)?.entities(view).map(|e| e.id).collect()) };
+        let before = ids(s)?;
+        s.execute("line", &json!({ "points": [a, b] }))?;
+        let id = ids(s)?.into_iter().find(|i| !before.contains(i)).ok_or("line not drawn in the view")?;
+        s.execute("setrole", &json!({ "handles": [format!("{:X}", id.0)], "role": "datum" }))?;
+        Ok(id)
+    }
+
+    /// [`fixture`] plus `Level 2` with a second placed plan `Upper`, a 4000 × 3000 rectangle in the
+    /// section, and in the ground plan a N–S datum at x = 2000 (crossing A-A) and an E–W one at
+    /// y = 4000. Returns (session, plan, upper, section, the N–S datum).
+    fn gridded() -> T<(Session, Id, Id, Id, Id)> {
+        let (mut s, plan, sec) = fixture()?;
+        let l2 =
+            Id(s.execute("level", &json!({ "mode": "create", "name": "Level 2", "floorElevationMm": 3000 }))?["levelId"].as_u64().ok_or("no id")?);
+        let upper = Id(s.execute("newplan", &json!({ "name": "Upper" }))?["viewId"].as_u64().ok_or("no id")?);
+        let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
+        s.execute("placeview", &json!({ "viewId": upper.0, "kind": "plan", "levelId": l2.0, "cutElevation": 4200, "transform": t }))?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let ns = datum_line(&mut s, plan, [2000.0, -2000.0], [2000.0, 3000.0])?;
+        datum_line(&mut s, plan, [-1000.0, 4000.0], [6000.0, 4000.0])?;
+        Ok((s, plan, upper, sec, ns))
+    }
+
+    /// The view's bubbles: (centre, radius, name), each circle with the text centred on it.
+    fn bubbles_of(s: &Session, view: Id) -> T<Vec<(Vec3, f64, String)>> {
+        let it = items(s, view)?;
+        let mut out = Vec::new();
+        for w in it.windows(2) {
+            if let [Item::Circle(c, r), Item::Text(at, name, h)] = w {
+                assert!(near(*c, *at) && (h - 0.8 * r).abs() < 1e-9, "{w:?}");
+                out.push((*c, *r, name.clone()));
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn grid_lines_are_named_and_bubbled_on_every_plan_and_section_they_cross() -> R {
+        let (s, plan, upper, sec, _ns) = gridded()?;
+        let b = bubbles_of(&s, plan)?;
+        assert_eq!(b.iter().map(|b| b.2.as_str()).collect::<Vec<_>>(), ["1", "1", "A", "A"], "{b:?}");
+        let f = b[0].1 / GRID_BUBBLE_MM;
+        let off = (GRID_GAP_MM + GRID_BUBBLE_MM) * f;
+        assert!(close(b[0].0, 2000.0, -2000.0 - off) && close(b[1].0, 2000.0, 3000.0 + off), "{b:?}");
+        assert!(close(b[2].0, -1000.0 - off, 4000.0) && close(b[3].0, 6000.0 + off, 4000.0), "{b:?}");
+
+        // The other plan draws both lines too, with the same bubbles.
+        let it = items(&s, upper)?;
+        assert!(it.contains(&Item::Line(v(2000.0, -2000.0), v(2000.0, 3000.0))) && it.contains(&Item::Line(v(-1000.0, 4000.0), v(6000.0, 4000.0))));
+        let bu = bubbles_of(&s, upper)?;
+        assert_eq!(bu.len(), 4);
+        assert!(bu.iter().zip(&b).all(|(x, y)| near(x.0, y.0) && x.2 == y.2), "{bu:?}");
+
+        // The section: one vertical line across its block ± the overrun, one bubble at its top.
+        let (x, ext) = section_grid(&s, sec)?;
+        let fs = bubbles_of(&s, sec)?;
+        assert_eq!(fs.len(), 1, "{fs:?}");
+        let over = LEVEL_OVERRUN_MM * fs[0].1 / GRID_BUBBLE_MM;
+        let lines: Vec<_> =
+            items(&s, sec)?.into_iter().filter(|i| matches!(i, Item::Line(a, b) if (a.x - x).abs() < 1e-6 && (b.x - x).abs() < 1e-6)).collect();
+        assert_eq!(lines.len(), 2, "the grid line and the bubble's stub: {lines:?}");
+        let Item::Line(a, top) = &lines[0] else { return Err("no line".into()) };
+        assert!((a.y - (ext.0 - over)).abs() < 1e-6 && (top.y - (ext.1 + over)).abs() < 1e-6, "{a:?} {top:?} {ext:?}");
+        let fsf = fs[0].1 / GRID_BUBBLE_MM;
+        assert!(close(fs[0].0, x, top.y + (GRID_GAP_MM + GRID_BUBBLE_MM) * fsf) && fs[0].2 == "1", "{fs:?}");
+        Ok(())
+    }
+
+    /// The local x of the section's derived grid line and its view block's y-extents.
+    fn section_grid(s: &Session, sec: Id) -> T<(f64, (f64, f64))> {
+        let d = s.doc()?;
+        let dp = DrawingProject::new(d)?;
+        let o = compute_datum_lines_for_view(&dp, sec)?;
+        let g = o.iter().find(|o| (o.to.x - o.from.x).abs() < 1e-9).ok_or("no vertical grid in the section")?;
+        let ext = d.extents(&Space::Block(view_block_name(sec)));
+        Ok((g.from.x, (ext.min.y, ext.max.y)))
+    }
+
+    #[test]
+    fn moving_the_datum_moves_the_sections_grid_in_one_undo_step() -> R {
+        let (mut s, _plan, _upper, sec, ns) = gridded()?;
+        let (x0, _) = section_grid(&s, sec)?;
+        let b0 = bubbles_of(&s, sec)?;
+        let n = undo_len(&s)?;
+        s.execute("move", &json!({ "handles": [format!("{:X}", ns.0)], "delta": [500, 0] }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        let (x1, _) = section_grid(&s, sec)?;
+        assert!(((x1 - x0).abs() - 500.0).abs() < 1e-6, "{x0} {x1}");
+        let b1 = bubbles_of(&s, sec)?;
+        assert!(b1.len() == 1 && (b1[0].0.x - x1).abs() < 1e-6 && (b1[0].0.y - b0[0].0.y).abs() < 1e-6, "{b1:?}");
+        assert!(settled(s.doc()?)?);
+        s.undo()?;
+        assert_eq!(bubbles_of(&s, sec)?, b0);
+        assert!((section_grid(&s, sec)?.0 - x0).abs() < 1e-9);
         Ok(())
     }
 }
