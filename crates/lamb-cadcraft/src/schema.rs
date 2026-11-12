@@ -46,6 +46,12 @@ pub fn annotation_block_name(id: Id) -> String {
     format!("LAMB_ANNO_{}", id.0)
 }
 
+/// The block holding view `id`'s generated layer-hatch fills ([`crate::layerhatch`], LAMB T701):
+/// `LAMB_LHATCH_<id>`, id in decimal. Not a view: it has no entry in [`LambDocument`]`.views`.
+pub fn layer_hatch_block_name(id: Id) -> String {
+    format!("LAMB_LHATCH_{}", id.0)
+}
+
 /// The block holding vertical view `id`'s hole content (the line work its holes reveal,
 /// [`crate::holes`]): `LAMB_HOLE_<id>`, id in decimal. Not a view.
 pub fn hole_block_name(id: Id) -> String {

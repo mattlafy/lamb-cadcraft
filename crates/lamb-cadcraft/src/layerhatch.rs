@@ -9,12 +9,22 @@
 //! an odd number of +X ray crossings against the raw segments, a duplicate counted once per copy.
 //! So a stud's outline is filled, a doubled stud's two outlines fill both halves, and a wall band
 //! drawn as an outer and an inner loop is filled while the room inside stays empty. LAYERFILLS
-//! reports them. Nothing here writes a fill into the drawing.
+//! reports them.
+//!
+//! [`layer_hatch_observer`] (LAMB T701) writes them: each switched-on view's fills are the HATCHes
+//! of its own block, [`layer_hatch_block_name`]`(view)`, whose one model-space INSERT (origin, on the
+//! view's layer, like the annotation INSERT) sits directly before the view block's INSERT, so the
+//! fills draw and plot under the view's and the assembly's lines. A view switched off or deleted
+//! loses the block and the INSERT. The edited view shows them through [`draw`], at least 50 %
+//! transparent, never plotted.
 
-use cadcraft_doc::{Drawing, Hatch, HatchLoop, Layer, library};
+use std::sync::Arc;
+
+use cadcraft_doc::{Block, Common, Drawing, Entity, EntityKind, Handle, Hatch, HatchLoop, Insert, Layer, Space, Transparency, library};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::region::faces;
-use cadcraft_geom::{PolyVertex, Vec2};
+use cadcraft_geom::{Bounds2, PolyVertex, Vec2, Vec3};
+use cadcraft_render::{DisplayList, Options};
 use lamb_core::geometry::polyline::{point_at_param, resolved_segments};
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::Id;
@@ -24,7 +34,7 @@ use serde_json::{Value, json};
 use crate::choices::{echo_numbered, pick_numbered};
 use crate::commands::{bad, edited_view, id_value, other};
 use crate::convert::to_polyline;
-use crate::schema::{EXT_KEY, assembly_block_name, read_document, view_block_name, write_document};
+use crate::schema::{EXT_KEY, assembly_block_name, layer_hatch_block_name, read_document, view_block_name, write_document};
 
 /// The key of the hatch spec inside a layer's `ext["LAMB"]`.
 pub(crate) const HATCH_KEY: &str = "hatch";
@@ -172,6 +182,191 @@ pub(crate) fn layer_fills(d: &Drawing, view: Id) -> std::result::Result<Vec<(Str
         }
     }
     Ok(out)
+}
+
+// ------------------------------------------------------------------- the generated block --
+
+/// The least transparency a fill is drawn with in the edited view.
+const OVERLAY_TRANSPARENCY: u8 = 50;
+
+/// A wanted fill: its layer, hatch and transparency (percent).
+type Fill = (String, Hatch, u8);
+
+/// The fills `view` gets, each with its layer's transparency.
+fn wanted(d: &Drawing, view: Id) -> std::result::Result<Vec<Fill>, String> {
+    Ok(layer_fills(d, view)?
+        .into_iter()
+        .map(|(layer, h)| {
+            let t = d.layer(&layer).and_then(layer_hatch).map_or(0, |s| s.transparency);
+            (layer, h, t)
+        })
+        .collect())
+}
+
+fn same_loops(a: &[HatchLoop], b: &[HatchLoop]) -> bool {
+    let tol = TOLERANCE.coincidence_mm;
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.outer == y.outer
+                && x.vertices.len() == y.vertices.len()
+                && x.vertices.iter().zip(&y.vertices).all(|(p, q)| p.p.dist(q.p) <= tol && (p.bulge - q.bulge).abs() <= 1e-9)
+        })
+}
+
+/// Whether the block's entities are exactly `want`, in order.
+fn block_matches(b: &Block, want: &[Fill]) -> bool {
+    b.entities.len() == want.len()
+        && b.entities.iter().zip(want).all(|(e, (layer, h, t))| match &e.kind {
+            EntityKind::Hatch(g) => {
+                e.common.layer == *layer
+                    && e.common.transparency == Transparency::Percent(*t)
+                    && g.pattern == h.pattern
+                    && g.solid == h.solid
+                    && (g.scale - h.scale).abs() <= 1e-9
+                    && (g.angle - h.angle).abs() <= 1e-9
+                    && same_loops(&g.loops, &h.loops)
+            }
+            _ => false,
+        })
+}
+
+/// Model-space index and handle of the first INSERT of block `name`.
+fn insert_at(d: &Drawing, name: &str) -> Option<(usize, Handle)> {
+    d.model.iter().enumerate().find_map(|(i, e)| matches!(&e.kind, EntityKind::Insert(ins) if ins.block == name).then_some((i, e.handle)))
+}
+
+/// What the observer must do for one view.
+enum Change {
+    /// Rewrite the view's block with these fills, and place its INSERT.
+    Write(Id, Vec<Fill>),
+    /// Only give the block its INSERT, or move it back in front of the view INSERT.
+    Place(Id),
+    /// Remove the block and its INSERTs.
+    Drop(String),
+}
+
+fn changes(d: &Drawing) -> std::result::Result<Vec<Change>, String> {
+    let doc = read_document(d).map_err(|e| e.to_string())?;
+    let on: Vec<Id> = doc.layer_hatch_views.iter().copied().filter(|v| doc.views.iter().any(|w| w.id() == *v)).collect();
+    let mut out = Vec::new();
+    for name in d.blocks.keys().filter(|n| n.starts_with("LAMB_LHATCH_")) {
+        if !on.iter().any(|v| layer_hatch_block_name(*v) == *name) {
+            out.push(Change::Drop(name.clone()));
+        }
+    }
+    for v in on {
+        let want = wanted(d, v)?;
+        let name = layer_hatch_block_name(v);
+        if !d.block(&name).is_some_and(|b| block_matches(b, &want)) {
+            out.push(Change::Write(v, want));
+            continue;
+        }
+        match (insert_at(d, &name), insert_at(d, &view_block_name(v))) {
+            (None, _) => out.push(Change::Place(v)),
+            (Some((f, _)), Some((w, _))) if f > w => out.push(Change::Place(v)),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// `true` when [`layer_hatch_observer`] would change nothing.
+#[cfg(test)]
+pub(crate) fn settled(d: &Drawing) -> std::result::Result<bool, String> {
+    changes(d).map(|c| c.is_empty())
+}
+
+/// Gives `view`'s fill block its one INSERT (origin, unit scale, on the view's layer) and puts it
+/// directly before the view block's INSERT when it is behind it.
+fn place_insert(d: &mut Drawing, view: Id) {
+    let name = layer_hatch_block_name(view);
+    if insert_at(d, &name).is_none() {
+        let layer = view_block_name(view);
+        d.ensure_layer(&layer);
+        let insert = Insert {
+            clip: None,
+            block: name.clone(),
+            insert: Vec3::ZERO,
+            scale: Vec3::new(1.0, 1.0, 1.0),
+            rotation: 0.0,
+            attribs: Vec::new(),
+            cols: 1,
+            rows: 1,
+            col_spacing: 0.0,
+            row_spacing: 0.0,
+        };
+        let handle = d.new_handle();
+        d.model.push(Entity { handle, common: Common { layer, ..Common::default() }, kind: EntityKind::Insert(insert) });
+    }
+    if let (Some((f, fill)), Some((w, anchor))) = (insert_at(d, &name), insert_at(d, &view_block_name(view)))
+        && f > w
+    {
+        d.model.move_next_to(fill, anchor, false);
+    }
+}
+
+fn apply(d: &mut Drawing, c: &Change) -> std::result::Result<(), String> {
+    match c {
+        Change::Drop(name) => {
+            d.blocks.remove(name);
+            let hs: Vec<Handle> = d.model.iter().filter(|e| matches!(&e.kind, EntityKind::Insert(i) if i.block == *name)).map(|e| e.handle).collect();
+            for h in hs {
+                d.model.remove(h);
+            }
+        }
+        Change::Place(v) => place_insert(d, *v),
+        Change::Write(v, fills) => {
+            let name = layer_hatch_block_name(*v);
+            d.blocks.insert(name.clone(), Arc::new(Block::new(&name)));
+            let space = Space::Block(name);
+            for (layer, h, t) in fills {
+                let common = Common { layer: layer.clone(), transparency: Transparency::Percent(*t), ..Common::default() };
+                d.add(&space, common, EntityKind::Hatch(h.clone())).map_err(|e| e.to_string())?;
+            }
+            place_insert(d, *v);
+        }
+    }
+    Ok(())
+}
+
+/// The after-command observer: every view in `layer_hatch_views` gets its [`layer_fills`] as the
+/// HATCHes of its [`layer_hatch_block_name`] block, rewritten only when they differ, with the
+/// block's INSERT directly before the view block's INSERT; a block whose view is off or gone is
+/// removed with its INSERT. Writes the drawing back only when something changed, so the change
+/// lands in the command's own undo step; an error is echoed and changes nothing.
+pub fn layer_hatch_observer(s: &mut Session, _before: &Arc<Drawing>) {
+    let todo = match s.doc().map_err(|e| e.to_string()).and_then(changes) {
+        Ok(t) if t.is_empty() => return,
+        Ok(t) => t,
+        Err(e) => {
+            s.echo(format!("LAMB layer hatches: {e}"));
+            return;
+        }
+    };
+    let Ok(current) = s.doc() else { return };
+    let mut after = current.clone();
+    for c in &todo {
+        if let Err(e) = apply(&mut after, c) {
+            s.echo(format!("LAMB layer hatches: {e}"));
+            return;
+        }
+    }
+    if let Ok(d) = s.doc_mut() {
+        *d = after;
+    }
+}
+
+/// The fills of the view whose block `space` edits, as an overlay in its local coordinates, each
+/// primitive at least [`OVERLAY_TRANSPARENCY`] % transparent so a SOLID never hides the lines being
+/// drawn. Empty for any other space and for a view without fills.
+pub(crate) fn draw(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
+    let block = crate::overlays::view_id(space).and_then(|id| d.block(&layer_hatch_block_name(id)));
+    let Some(block) = block else { return DisplayList { bounds: Bounds2::EMPTY, ..DisplayList::default() } };
+    let mut list = cadcraft_render::build_entities(d, block.entities.iter().map(|e| &**e), &Options { view: None, ..opts.clone() });
+    for p in &mut list.prims {
+        p.transparency = p.transparency.max(OVERLAY_TRANSPARENCY);
+    }
+    list
 }
 
 fn num(cmd: &str, p: &Value, key: &str) -> Result<Option<f64>> {
@@ -470,6 +665,7 @@ pub(crate) fn layerhatches_machine(_s: &Session) -> Result<Box<dyn Interactive>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadcraft_render::Kind;
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
     type T<X> = std::result::Result<X, Box<dyn std::error::Error>>;
@@ -607,6 +803,106 @@ mod tests {
         assert!(read_document(s.doc()?)?.layer_hatch_views.is_empty());
         s.undo()?;
         assert_eq!(s.doc()?.layer("SPF").and_then(layer_hatch), None);
+        Ok(())
+    }
+
+    /// LAMBPROJECT's placed plan, edited, an `SPF` (X hatch) stud drawn in it and layer hatches
+    /// on. Returns (session, plan, stud handle).
+    fn placed() -> T<(Session, Id, cadcraft_doc::Handle)> {
+        crate::commands::install_app()?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        crate::maintain::install(&mut s);
+        let plan = Id(s.execute("lambproject", &json!({}))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "SPF", "current": true }))?;
+        s.execute("layerhatch", &json!({ "layer": "SPF", "pattern": "X" }))?;
+        rect(&mut s, 0.0, 0.0, 38.0, 89.0)?;
+        let stud = s.doc()?.block(&view_block_name(plan)).and_then(|b| b.entities.last().map(|e| e.handle)).ok_or("no stud")?;
+        s.execute("layerhatches", &json!({ "on": true }))?;
+        Ok((s, plan, stud))
+    }
+
+    fn fill_block(s: &Session, plan: Id) -> Option<Arc<Block>> {
+        s.doc().ok()?.blocks.get(&layer_hatch_block_name(plan)).cloned()
+    }
+
+    fn fill_xs(s: &Session, plan: Id) -> T<Vec<f64>> {
+        let b = fill_block(s, plan).ok_or("no fill block")?;
+        let mut xs = Vec::new();
+        for e in b.entities.iter() {
+            let EntityKind::Hatch(h) = &e.kind else { return Err("not a hatch".into()) };
+            xs.push(h.loops[0].vertices.iter().map(|v| v.p.x).fold(f64::INFINITY, f64::min));
+        }
+        Ok(xs)
+    }
+
+    #[test]
+    fn a_switched_on_plan_gets_one_hatch_inserted_before_its_view() -> R {
+        let (s, plan, _) = placed()?;
+        let b = fill_block(&s, plan).ok_or("no fill block")?;
+        assert_eq!(b.entities.len(), 1);
+        let e = b.entities.iter().next().ok_or("empty")?;
+        assert!(matches!(&e.kind, EntityKind::Hatch(h) if h.pattern == "X"));
+        assert_eq!((e.common.layer.as_str(), e.common.transparency), ("SPF", Transparency::Percent(0)));
+        let d = s.doc()?;
+        let (f, fh) = insert_at(d, &layer_hatch_block_name(plan)).ok_or("no fill insert")?;
+        let (w, _) = insert_at(d, &view_block_name(plan)).ok_or("no view insert")?;
+        assert!(f < w, "{f} {w}");
+        assert_eq!(d.model.get(fh).map(|e| e.common.layer.clone()), Some(view_block_name(plan)));
+        assert!(crate::views::model_hidden(d, d.model.get(fh).ok_or("gone")?));
+        assert!(settled(d)?);
+        Ok(())
+    }
+
+    #[test]
+    fn moving_the_stud_moves_its_fill_and_one_undo_puts_both_back() -> R {
+        let (mut s, plan, stud) = placed()?;
+        assert_eq!(fill_xs(&s, plan)?, [0.0]);
+        s.execute("move", &json!({ "handles": [stud.hex()], "delta": [100, 0] }))?;
+        assert_eq!(fill_xs(&s, plan)?, [100.0]);
+        s.undo()?;
+        assert_eq!(fill_xs(&s, plan)?, [0.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn switching_off_drops_the_block_and_an_unrelated_command_rewrites_nothing() -> R {
+        let (mut s, plan, _) = placed()?;
+        let before = fill_block(&s, plan).ok_or("no fill block")?;
+        s.execute("layer.new", &json!({ "name": "UNRELATED" }))?;
+        assert!(fill_block(&s, plan).is_some_and(|b| Arc::ptr_eq(&b, &before)), "rewritten");
+        // The spec off: the block is emptied.
+        s.execute("layerhatch", &json!({ "layer": "SPF", "off": true }))?;
+        assert!(fill_block(&s, plan).is_some_and(|b| b.entities.is_empty()));
+        s.undo()?;
+        assert_eq!(fill_xs(&s, plan)?, [0.0]);
+        // The switch off: block and INSERT gone.
+        s.execute("layerhatches", &json!({ "view": plan.0, "on": false }))?;
+        assert!(fill_block(&s, plan).is_none());
+        assert!(insert_at(s.doc()?, &layer_hatch_block_name(plan)).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_sheet_plots_the_fill_before_the_views_lines_and_the_edited_view_shows_it_pale() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, plan, _) = placed()?;
+        // A SOLID fill plots as triangles; the stud's own outline, on the same layer, as a polyline.
+        s.execute("layerhatch", &json!({ "layer": "SPF", "pattern": "SOLID", "transparency": 70 }))?;
+        s.execute("newsheet", &json!({ "name": "P1", "viewIds": [plan.0] }))?;
+        let d = s.doc()?;
+        let spf = d.layers.iter().position(|l| l.name == "SPF").ok_or("no SPF")? as u32;
+        let plot = cadcraft_render::build_plot(d, &Space::Paper("P1".into()), &Options::default());
+        let on_spf = |i: usize| plot.prim_layers.get(i) == Some(&spf);
+        let first = |want: Kind| plot.prims.iter().enumerate().position(|(i, p)| on_spf(i) && p.kind == want);
+        let (f, v) = (first(Kind::Tris).ok_or("no fill prims")?, first(Kind::Polyline).ok_or("no stud prims")?);
+        assert!(f < v, "{f} {v}");
+        // The edited view's overlay shows the fill at 50 % or more.
+        let hatch = fill_block(&s, plan).and_then(|b| b.entities.iter().next().map(|e| e.handle)).ok_or("no hatch")?;
+        let list = crate::overlays::lamb_overlay(s.doc()?, &Space::Block(view_block_name(plan)), &Options::default());
+        let mine: Vec<_> = list.prims.iter().filter(|p| p.handle == hatch).collect();
+        assert!(!mine.is_empty() && mine.iter().all(|p| p.transparency >= OVERLAY_TRANSPARENCY));
         Ok(())
     }
 

@@ -90,7 +90,8 @@ pub(crate) fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kin
     list.prims.push(DPrim { handle, color, aci7: false, lw: 0.0, transparency: 0, kind, start, len: pts.len() as u32 });
 }
 
-/// The overlay provider: the edited view's underlay ([`underlay`], drawn first, pale), its generated
+/// The overlay provider: the edited view's underlay ([`underlay`], drawn first, pale), its layer
+/// hatch fills ([`crate::layerhatch::draw`], at least 50 % transparent), its generated
 /// annotation ([`crate::annotations::draw`]: cut symbols or level lines), its halos
 /// ([`halo`]: RESOLVE's attention, unaccepted AI lines' glow), the selected detail tag's walls and
 /// placed detail ([`crate::taghighlight`]), a detail's reference line
@@ -100,6 +101,7 @@ pub(crate) fn push(list: &mut DisplayList, handle: Handle, color: Rgb, kind: Kin
 /// coordinates.
 pub fn lamb_overlay(d: &Drawing, space: &Space, opts: &Options) -> DisplayList {
     let mut list = underlay::draw(d, space, opts);
+    append_list(&mut list, crate::layerhatch::draw(d, space, opts));
     append_list(&mut list, crate::annotations::draw(d, space, opts));
     append_list(&mut list, halo::draw(d, space, opts));
     append_list(&mut list, crate::taghighlight::draw(d, space, opts));

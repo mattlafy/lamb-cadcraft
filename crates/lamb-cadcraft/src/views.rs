@@ -227,11 +227,11 @@ pub fn internal_layer(d: &Drawing, name: &str) -> bool {
     id.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())) && d.block(name).is_some()
 }
 
-/// Whether `e` is LAMB's own model-space reference to a view, assembly, annotation or hole block
+/// Whether `e` is LAMB's own model-space reference to a view, assembly, annotation, hole or layer-hatch block
 /// (any case): the Model tab leaves it out, while sheets and DWG/DXF keep it (registered as the
 /// fork's model-hidden hook). A loose reference to any other block stays.
 pub fn model_hidden(d: &Drawing, e: &Entity) -> bool {
-    const PREFIXES: [&str; 4] = ["LAMB_VIEW_", "LAMB_ASSEMBLY_", "LAMB_ANNO_", "LAMB_HOLE_"];
+    const PREFIXES: [&str; 5] = ["LAMB_VIEW_", "LAMB_ASSEMBLY_", "LAMB_ANNO_", "LAMB_HOLE_", "LAMB_LHATCH_"];
     let EntityKind::Insert(insert) = &e.kind else {
         return false;
     };
