@@ -55,6 +55,7 @@ pub mod holes;
 pub mod import;
 mod lambopen;
 mod layered;
+mod layerhatch;
 mod legend;
 mod levellinecmd;
 mod linkcmds;

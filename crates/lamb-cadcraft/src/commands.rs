@@ -25,6 +25,10 @@
 //! - `autodim {view?, off?, interior?, locate?}` (`adim`): a placed plan's generated exterior
 //!   dimension strings, or with `interior: true` its rooms' clear dimensions, or with `locate: true`
 //!   the setting-out strings locating its interior walls, on or off — see [`crate::autodim`].
+//! - `layerhatch {layer, pattern?, scale?, angle?, transparency?, off?}` (`lhatch`), `layerhatches
+//!   {view?, on}` (`lhs`) and the query `layerfills {view?}`: a layer's one hatch, the per-view
+//!   switch that fills every closed shape on hatched layers, and the fills a view gets — see
+//!   [`crate::layerhatch`].
 //! - `detailnotes {viewId?, off?}` (`dnote`): an edge detail's generated layer notes with leaders,
 //!   on or off — see [`crate::detailnotes`].
 //! - `sheetsize {paper}` (`ssize`): the paper new sheets are made on, ARCH D landscape until set;
@@ -912,6 +916,17 @@ pub fn commands() -> Vec<CommandSpec> {
             .alias(&["adim"])
             .params("{view?, off?, interior?, locate?} → {view, dimensions, interior, locate, message}")
             .interactive(crate::autodim::autodim_machine),
+        CommandSpec::new("layerhatch", "Layer Hatch", crate::layerhatch::layerhatch)
+            .alias(&["lhatch"])
+            .params("{layer, pattern?, scale?, angle?, transparency?, off?} → {layer, hatch, message}")
+            .interactive(crate::layerhatch::layerhatch_machine),
+        CommandSpec::new("layerhatches", "Layer Hatches", crate::layerhatch::layerhatches)
+            .alias(&["lhs"])
+            .params("{view?, on} → {view, on, fills, message}")
+            .interactive(crate::layerhatch::layerhatches_machine),
+        CommandSpec::new("layerfills", "Layer Fills", crate::layerhatch::layerfills)
+            .params("{view?} → {view, on, fills: [{layer, pattern, loop, holes}]}")
+            .noundo(),
         CommandSpec::new("detailnotes", "Detail Notes", crate::detailnotes::detailnotes)
             .alias(&["dnote"])
             .params("{viewId?, off?} → {viewId, notes, message}")

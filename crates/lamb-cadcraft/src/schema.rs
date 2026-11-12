@@ -7,7 +7,8 @@
 //! - `Common.ext["LAMB"]` = [`EntityData`]: an entity's line role, AI provenance and virtual
 //!   (fillet/chamfer) corner tags, on a sheet's viewport the view it shows, and on a plan's POINT
 //!   whether it is an outside pick point or the plan's stud grid origin.
-//! - `Layer.ext["LAMB"]` = [`LayerData`]: a layer's default role.
+//! - `Layer.ext["LAMB"]` = [`LayerData`]: a layer's default role; beside it, `"hatch"`, the layer's
+//!   one hatch ([`crate::layerhatch`]).
 //!
 //! A view's entities live in the block [`view_block_name`]`(id)`; an entity's id is its handle.
 //! Writers remove a slot whose value is all-default, so a plain CADCraft drawing's DXF output is
@@ -121,6 +122,10 @@ pub struct LambDocument {
     /// The named rooms of the plans ([`crate::rooms`], `room`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rooms: Vec<RoomRecord>,
+    /// Views whose layers' hatches fill the closed shapes on them ([`crate::layerhatch`],
+    /// `layerhatches`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layer_hatch_views: Vec<Id>,
 }
 
 /// A named room: the space of plan `plan` containing `at` (plan-local).
@@ -198,6 +203,7 @@ impl LambDocument {
             sheet_paper: None,
             sheet_info: None,
             rooms: Vec::new(),
+            layer_hatch_views: Vec::new(),
         }
     }
 }
@@ -444,7 +450,16 @@ pub fn read_layer_data(l: &Layer) -> Result<LayerData, SchemaError> {
     read_slot(&l.ext, || format!("layer {:?}'s ext[\"LAMB\"]", l.name))
 }
 
-/// Stores `data`, or removes the slot when it is all-default.
+/// Stores `data`, or removes the slot when it is all-default and the layer has no hatch; the
+/// layer's hatch (`ext["LAMB"]["hatch"]`, [`crate::layerhatch`]) is kept.
 pub fn set_layer_data(l: &mut Layer, data: &LayerData) -> Result<(), SchemaError> {
-    write_slot(&mut l.ext, data, "Layer.ext[\"LAMB\"]")
+    let hatch = l.ext.get(EXT_KEY).and_then(|v| v.get(crate::layerhatch::HATCH_KEY)).cloned();
+    write_slot(&mut l.ext, data, "Layer.ext[\"LAMB\"]")?;
+    if let Some(h) = hatch {
+        let slot = l.ext.entry(EXT_KEY.to_owned()).or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(o) = slot.as_object_mut() {
+            o.insert(crate::layerhatch::HATCH_KEY.to_owned(), h);
+        }
+    }
+    Ok(())
 }

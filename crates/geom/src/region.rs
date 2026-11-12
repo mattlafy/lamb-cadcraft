@@ -698,20 +698,145 @@ pub fn simple_loops(poly: &[Vec2], tol: f64) -> Vec<Vec<Vec2>> {
     if out.is_empty() { as_is() } else { out }
 }
 
+/// One bounded face of an arrangement of curves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Face {
+    /// Counter-clockwise outer loop.
+    pub outer: Vec<Vec2>,
+    /// Clockwise outlines of the separate groups of curves directly inside `outer` (each group's
+    /// own faces are reported as faces of their own).
+    pub holes: Vec<Vec<Vec2>>,
+}
+
+impl Face {
+    /// A point strictly inside the face: inside `outer`, outside every hole.
+    pub fn interior_point(&self) -> Option<Vec2> {
+        let mut rings: Vec<&[Vec2]> = vec![&self.outer];
+        rings.extend(self.holes.iter().map(Vec::as_slice));
+        interior_point_rings(&rings)
+    }
+}
+
+/// Upper bound on (segment, vertex) pairs tested for collinear overlaps in [`faces`]; past it the
+/// overlap pre-split is skipped (crossings are still found).
+const MAX_OVERLAP_TESTS: usize = 20_000_000;
+
+/// Every segment of `polys` split at each input vertex lying on its interior within `tol`, so
+/// curves that overlap along a line share their vertices (the crossing search finds no
+/// collinear overlaps).
+fn split_on_vertices(polys: &[Vec<Vec2>], tol: f64) -> Vec<Vec<Vec2>> {
+    let verts: Vec<Vec2> = polys.iter().flatten().copied().filter(|p| p.is_finite()).collect();
+    let segs: usize = polys.iter().map(|p| p.len().saturating_sub(1)).sum();
+    if segs.saturating_mul(verts.len()) > MAX_OVERLAP_TESTS {
+        return polys.to_vec();
+    }
+    let mut out = Vec::with_capacity(polys.len());
+    for pl in polys {
+        let mut np: Vec<Vec2> = Vec::with_capacity(pl.len());
+        for w in pl.windows(2) {
+            let [a, b] = w else { continue };
+            if np.is_empty() {
+                np.push(*a);
+            }
+            let d = *b - *a;
+            let len2 = d.dot(d);
+            if len2 > tol * tol && a.is_finite() && b.is_finite() {
+                let len = len2.sqrt();
+                let mut ts: Vec<f64> = verts
+                    .iter()
+                    .filter_map(|q| {
+                        let t = (*q - *a).dot(d) / len2;
+                        let off = (*q - *a).cross(d).abs() / len;
+                        (off <= tol && t * len > tol && (1.0 - t) * len > tol).then_some(t)
+                    })
+                    .collect();
+                ts.sort_by(f64::total_cmp);
+                ts.dedup_by(|x, y| (*x - *y).abs() * len <= tol);
+                np.extend(ts.into_iter().map(|t| *a + d * t));
+            }
+            np.push(*b);
+        }
+        if np.is_empty() {
+            np.clone_from(pl);
+        }
+        out.push(np);
+    }
+    out
+}
+
+/// Every bounded face of the arrangement of `polys`: segments split where they cross or overlap,
+/// vertices merged within `tol`, duplicate edges merged and dangling ends pruned. Each face is its
+/// counter-clockwise outer loop plus, as holes, the outlines of the separate groups of curves
+/// directly inside it; those groups' faces are faces too, so two nested squares give the ring
+/// (the inner square its hole) and the inner square. Which faces are filled is the caller's
+/// question. Empty past [`MAX_SEGMENTS`] segments or when nothing closes.
+pub fn faces(polys: &[Vec<Vec2>], tol: f64) -> Vec<Face> {
+    let tol = tol.max(1e-12);
+    let Some(g) = build(&split_on_vertices(polys, tol), tol) else { return Vec::new() };
+    let core = prune(&g);
+    let comp = components(&core);
+    let max_steps = core.pts.len().saturating_mul(2).max(16);
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    // (loop, component, signed area): positive is a bounded face, negative a group's outside.
+    let mut loops: Vec<(Vec<Vec2>, usize, f64)> = Vec::new();
+    for (u, ns) in core.adj.iter().enumerate() {
+        for &v in ns {
+            if seen.contains(&(u, v)) {
+                continue;
+            }
+            let Some(ids) = trace(&core, u, v, max_steps) else {
+                seen.insert((u, v));
+                continue;
+            };
+            for (a, b) in ids.iter().zip(ids.iter().cycle().skip(1)) {
+                seen.insert((*a, *b));
+            }
+            let Some(lp) = points(&core, &ids) else { continue };
+            let area = shoelace(&lp);
+            if lp.len() >= 3 && area != 0.0 && area.is_finite() {
+                loops.push((lp, comp.get(u).copied().unwrap_or(usize::MAX), area));
+            }
+        }
+    }
+    let (bounded, outsides): (Vec<_>, Vec<_>) = loops.into_iter().partition(|l| l.2 > 0.0);
+    let mut out: Vec<Face> = bounded.iter().map(|(lp, ..)| Face { outer: lp.clone(), holes: Vec::new() }).collect();
+    // Each group's outside is a hole of the smallest face of another group around it.
+    for (lp, c, _) in outsides {
+        let Some(p) = lp.first().copied() else { continue };
+        let host = bounded
+            .iter()
+            .enumerate()
+            .filter(|(_, (outer, oc, _))| *oc != c && point_in_polygon(outer, p))
+            .min_by(|x, y| x.1.2.total_cmp(&y.1.2))
+            .map(|(i, _)| i);
+        if let Some(f) = host.and_then(|i| out.get_mut(i)) {
+            f.holes.push(lp);
+        }
+    }
+    out
+}
+
 /// A point strictly inside a closed polygon (either orientation), for re-finding the face a
 /// loop encloses: the middle of the widest span of a horizontal line through it.
 pub fn interior_point(poly: &[Vec2]) -> Option<Vec2> {
-    let b = Bounds2::from_points(poly.iter().copied().filter(|p| p.is_finite()));
-    if poly.len() < 3 || b.is_empty() || b.height() <= 0.0 {
+    interior_point_rings(&[poly])
+}
+
+/// [`interior_point`] of the region inside an odd number of `rings` (a polygon with holes).
+fn interior_point_rings(rings: &[&[Vec2]]) -> Option<Vec2> {
+    let b = Bounds2::from_points(rings.iter().flat_map(|r| r.iter()).copied().filter(|p| p.is_finite()));
+    if rings.is_empty() || rings.iter().any(|r| r.len() < 3) || b.is_empty() || b.height() <= 0.0 {
         return None;
     }
     let mut best: Option<(f64, Vec2)> = None;
     for f in [0.5, 0.381_966, 0.618_034, 0.25, 0.75] {
         let y = b.min.y + b.height() * f;
         let mut xs: Vec<f64> = Vec::new();
-        for (a, c) in poly.iter().zip(poly.iter().cycle().skip(1)) {
-            if (a.y > y) != (c.y > y) {
-                xs.push(a.x + (c.x - a.x) * (y - a.y) / (c.y - a.y));
+        for poly in rings {
+            for (a, c) in poly.iter().zip(poly.iter().cycle().skip(1)) {
+                if (a.y > y) != (c.y > y) {
+                    xs.push(a.x + (c.x - a.x) * (y - a.y) / (c.y - a.y));
+                }
             }
         }
         xs.sort_by(f64::total_cmp);
@@ -1154,6 +1279,34 @@ mod tests {
         assert!((shoelace(&l) - 20.0).abs() < 1e-6, "{}", shoelace(&l));
         // Too far away: left alone.
         assert_eq!(snap_ends(&polys, 0.01, 1e-9), polys);
+    }
+
+    #[test]
+    fn faces_of_an_arrangement() {
+        let areas = |fs: &[Face]| {
+            let mut a: Vec<f64> = fs.iter().map(|f| shoelace(&f.outer) + f.holes.iter().map(|h| shoelace(h)).sum::<f64>()).collect();
+            a.sort_by(f64::total_cmp);
+            a
+        };
+        // A square: one face, counter-clockwise.
+        let one = faces(&[square(0.0, 0.0, 10.0)], 1e-9);
+        assert_eq!(areas(&one), vec![100.0]);
+        // Two squares sharing an edge (drawn twice): two faces.
+        assert_eq!(areas(&faces(&[square(0.0, 0.0, 10.0), square(10.0, 0.0, 10.0)], 1e-9)), vec![100.0, 100.0]);
+        // A short square against a long rectangle's edge (a collinear overlap, no crossing).
+        let long = vec![Vec2::new(0.0, 0.0), Vec2::new(30.0, 0.0), Vec2::new(30.0, -5.0), Vec2::new(0.0, -5.0), Vec2::new(0.0, 0.0)];
+        assert_eq!(areas(&faces(&[long, square(10.0, 0.0, 10.0)], 1e-9)), vec![100.0, 150.0]);
+        // Nested squares: the ring (the inner square its hole) and the hole.
+        let nested = faces(&[square(0.0, 0.0, 10.0), square(2.0, 2.0, 6.0)], 1e-9);
+        assert_eq!(areas(&nested), vec![36.0, 64.0]);
+        let ring = nested.iter().find(|f| !f.holes.is_empty()).unwrap();
+        let p = ring.interior_point().unwrap();
+        assert!(point_in_polygon(&ring.outer, p) && !point_in_polygon(&square(2.0, 2.0, 6.0), p), "{p:?}");
+        // An open L encloses nothing.
+        assert!(faces(&[vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0)]], 1e-9).is_empty());
+        // Hostile: past the segment cap, nothing.
+        let many: Vec<Vec<Vec2>> = (0..=MAX_SEGMENTS / 4).map(|i| square(i as f64 * 20.0, 0.0, 10.0)).collect();
+        assert!(faces(&many, 1e-9).is_empty());
     }
 
     #[test]
