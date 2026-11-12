@@ -561,7 +561,9 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
         let titles = page_titles(s.doc()?)?;
-        let r = s.execute("plot", &json!({ "layouts": names, "pageTitles": titles, "path": path }))?;
+        let links = crate::sheetlinks::page_links(s.doc()?, &names).map_err(other)?;
+        let n_links = links.len();
+        let r = s.execute("plot", &json!({ "layouts": names, "pageTitles": titles, "pageLinks": links, "path": path }))?;
         let pages = r["pages"].as_u64().unwrap_or_default();
         let proposed = proposed_lines(s.doc()?)?;
         let warning = match proposed {
@@ -572,6 +574,7 @@ pub(crate) fn sheetset(s: &mut Session, p: &Value) -> Result<Value> {
         out["message"] = json!(format!("{message} Plotted {pages} sheet{} to {path}{warning}.", if pages == 1 { "" } else { "s" }));
         out["proposedLines"] = json!(proposed);
         out["pdf"] = r;
+        out["pdf"]["links"] = json!(n_links);
     }
     Ok(out)
 }
@@ -955,7 +958,7 @@ pub(crate) fn enlargedsheet_machine(_s: &Session) -> Result<Box<dyn Interactive>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::bom::tests::{new_handle, stud_room};
     use crate::schema::annotation_block_name;
@@ -972,7 +975,7 @@ mod tests {
     /// A project: Ground (lambproject) and First (offset) plans, but First first in document
     /// order; an elevation and a section on Ground; a 5000 × 4000 room on Ground with D1 and D2
     /// tagged and D3 untagged; a floating plan. Returns (session, [ground, first, elev, sec]).
-    fn set() -> T<(Session, [Id; 4])> {
+    pub(crate) fn set() -> T<(Session, [Id; 4])> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);
@@ -1304,6 +1307,20 @@ mod tests {
         let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
         assert_eq!(r["pdf"]["pages"], 7, "{r}");
         let bytes = std::fs::read(&path)?;
+        // A001's Drawing List rows link to the other sheets' pages.
+        {
+            use craft_pdf::syntax::object::{Array, Dict, Name};
+            let pdf = craft_pdf::open_slice(&bytes, None).map_err(|e| format!("the PDF opens: {e:?}"))?;
+            let first = pdf.pages().iter().next().ok_or("no page")?;
+            let annots = first.raw().get::<Array<'_>>(b"Annots").map(|a| a.iter::<Dict<'_>>().collect::<Vec<_>>()).unwrap_or_default();
+            let goto = annots
+                .iter()
+                .filter(|a| a.get::<Name<'_>>(b"Subtype").is_some_and(|n| n.as_str() == "Link"))
+                .filter(|a| a.get::<Array<'_>>(b"Dest").is_some() || a.get::<Dict<'_>>(b"A").is_some_and(|x| x.get::<Array<'_>>(b"D").is_some()))
+                .count();
+            assert!(goto >= 6, "A001 links to the six other sheets: {goto}");
+            assert!(r["pdf"]["links"].as_u64().is_some_and(|n| n as usize >= goto), "{r}");
+        }
         let pdf = craft_pdf::open_slice(&bytes, None).map_err(|e| format!("the PDF opens: {e:?}"))?;
         assert_eq!(pdf.pages().len(), 7, "the framing and list sheets are pages");
         let marks = bookmarks(&bytes)?;

@@ -111,6 +111,21 @@ pub struct PdfOptions {
     /// A page's label (layout name, `Model` for model space) and the title its bookmark adds
     /// after that label.
     pub page_titles: Vec<(String, String)>,
+    /// Links that go to another page of the file: clicking the area goes to that page's top-left
+    /// corner. File-wide, like [`PdfOptions::links`].
+    pub page_links: Vec<PageLink>,
+}
+
+/// A link area on one page that goes to another page of the same file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageLink {
+    /// The label (layout name, `Model` for model space) of the page the area is on; case is ignored.
+    pub page: String,
+    /// The area, in that page's own drawing units (paper units for a layout).
+    pub rect: Bounds2,
+    /// The label of the page it goes to; case is ignored. A label that is not a page of the file
+    /// makes no link.
+    pub to: String,
 }
 
 impl Default for PdfOptions {
@@ -137,6 +152,7 @@ impl Default for PdfOptions {
             plot_transparency: None,
             bookmarks: None,
             page_titles: Vec::new(),
+            page_links: Vec::new(),
         }
     }
 }
@@ -144,7 +160,8 @@ impl Default for PdfOptions {
 impl PdfOptions {
     /// Parse `{paper?, width?, height?, landscape?, fit?, scale?, center?, offset?: [x,y] mm,
     /// lineweights?, compress?, title?, window?: [[x1, y1], [x2, y2]], margins?: [l, b, r, t] (mm),
-    /// hyperlinks?: bool, plotTransparency?: bool, bookmarks?: bool, pageTitles?: {layout: title}}`.
+    /// hyperlinks?: bool, plotTransparency?: bool, bookmarks?: bool, pageTitles?: {layout: title},
+    /// pageLinks?: [{page, rect: [x0, y0, x1, y1], to}]}`.
     pub fn from_json(v: &Value) -> PdfOptions {
         let num = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite());
         let paper_mm = match (num("width"), num("height")) {
@@ -175,6 +192,7 @@ impl PdfOptions {
             plot_transparency: v.get("plotTransparency").and_then(Value::as_bool),
             bookmarks: v.get("bookmarks").and_then(Value::as_bool),
             page_titles: page_titles(v.get("pageTitles")),
+            page_links: page_links_json(v.get("pageLinks")),
         }
     }
 }
@@ -221,6 +239,24 @@ pub(crate) fn margins(v: Option<&Value>) -> Option<[f64; 4]> {
 fn page_titles(v: Option<&Value>) -> Vec<(String, String)> {
     let Some(m) = v.and_then(Value::as_object) else { return Vec::new() };
     m.iter().filter_map(|(k, t)| Some((k.clone(), t.as_str()?.to_owned()))).take(MAX_PAGES).collect()
+}
+
+/// `[{page, rect: [x0, y0, x1, y1], to}]` → page links; malformed entries and empty or
+/// non-finite rectangles are skipped.
+fn page_links_json(v: Option<&Value>) -> Vec<PageLink> {
+    let Some(a) = v.and_then(Value::as_array) else { return Vec::new() };
+    a.iter()
+        .take(MAX_LINKS)
+        .filter_map(|l| {
+            let label = |k: &str| l.get(k)?.as_str().map(str::trim).filter(|t| !t.is_empty() && t.len() <= MAX_TEXT).map(str::to_string);
+            let r = l.get("rect")?.as_array()?;
+            let n: Vec<f64> = r.iter().filter_map(Value::as_f64).collect();
+            let [x0, y0, x1, y1] = n[..] else { return None };
+            let rect = Bounds2::new(Vec2::new(x0, y0), Vec2::new(x1, y1));
+            (rect.min.is_finite() && rect.max.is_finite() && rect.width() > 0.0 && rect.height() > 0.0).then_some(())?;
+            Some(PageLink { page: label("page")?, rect, to: label("to")? })
+        })
+        .collect()
 }
 
 /// A plot window from `[[x1, y1], [x2, y2]]`: finite corners and a positive size, else `None`.
@@ -379,7 +415,7 @@ fn sheet_name(space: &Space) -> String {
 pub fn pdf_sheets(d: &Drawing, spaces: &[Space], o: &PdfOptions) -> Result<Vec<u8>> {
     // Links are file-wide (`pdf_items` reads them from `o`), so a sheet's own options carry none:
     // a copy of the list per sheet multiplied it by the sheet count.
-    let sheet = PdfOptions { links: Vec::new(), ..o.clone() };
+    let sheet = PdfOptions { links: Vec::new(), page_links: Vec::new(), ..o.clone() };
     let items: Vec<(Space, PdfOptions)> = spaces.iter().take(MAX_PAGES + 1).map(|s| (s.clone(), sheet.clone())).collect();
     pdf_items(d, &items, o)
 }
@@ -479,6 +515,7 @@ fn write_pdf(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions, text_as
         // Link annotations of the whole file: each page keeps its own copy of the targets, so the
         // pages times the links must not multiply without a bound.
         let mut annotations_left = MAX_FILE_ANNOTATIONS;
+        let labels: Vec<String> = items.iter().map(|(s, _)| sheet_name(s)).collect();
         for (s, po) in items {
             // Once the budget is spent no link is built (scanned and cloned) for later pages.
             let mut page = sheet(drawn, s, po, if annotations_left == 0 { &links[..0] } else { &links })?;
@@ -486,6 +523,9 @@ fn write_pdf(d: &Drawing, items: &[(Space, PdfOptions)], o: &PdfOptions, text_as
             page.links.retain(|(_, url)| uri(url).is_some());
             page.links.truncate(annotations_left);
             annotations_left -= page.links.len();
+            page.goto = page_gotos(&page, &labels, &o.page_links);
+            page.goto.truncate(annotations_left.min(MAX_LINKS));
+            annotations_left -= page.goto.len();
             let doc = writer.document_mut();
             // Groups are added to the document, so they must exist before the page starts.
             groups.add(doc, d, &page.layers);
@@ -554,6 +594,8 @@ struct SheetPage {
     links: Vec<(Bounds2, String)>,
     /// Page label: the layout name.
     label: String,
+    /// Links to other pages: rectangle in points and the index of the page it goes to.
+    goto: Vec<(Bounds2, usize)>,
 }
 
 /// `o` with a layout's saved page setup filled in where the options don't say: its plot window,
@@ -653,7 +695,7 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         }
     }
     let links = links(&list, &map, &clip_pt, links_to);
-    Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space) })
+    Ok(SheetPage { media, list, map, clip_pt, layers, links, label: sheet_name(space), goto: Vec::new() })
 }
 
 /// Source and destination origins for the shared model-space PDF/PNG placement behavior.
@@ -745,6 +787,26 @@ fn links(list: &cadcraft_render::DisplayList, map: &Map, clip_pt: &Bounds2, link
     out
 }
 
+/// The page links on page `p`: each one whose `page` is this page's label and whose `to` is a
+/// page of the file (`labels`, in page order), its area mapped to points, given 1 pt of slack and
+/// clipped to the plot area.
+fn page_gotos(p: &SheetPage, labels: &[String], links: &[PageLink]) -> Vec<(Bounds2, usize)> {
+    let mut out = Vec::new();
+    for l in links.iter().filter(|l| l.page.eq_ignore_ascii_case(&p.label)) {
+        let Some(to) = labels.iter().position(|n| n.eq_ignore_ascii_case(&l.to)) else { continue };
+        let (a, b) = (p.map.pt(l.rect.min), p.map.pt(l.rect.max));
+        if !(a.is_finite() && b.is_finite()) {
+            continue;
+        }
+        let b = Bounds2::new(a, b).expand(1.0);
+        let r = Bounds2 { min: b.min.max(p.clip_pt.min), max: b.max.min(p.clip_pt.max) };
+        if r.min.x < r.max.x && r.min.y < r.max.y {
+            out.push((r, to));
+        }
+    }
+    out
+}
+
 /// Paper units per drawing unit for a plot.
 pub(crate) fn plot_scale(b: &Bounds2, sheet: &Sheet, fit: bool, scale: Option<f64>) -> f64 {
     if let Some(s) = scale.filter(|s| s.is_finite() && *s > 0.0)
@@ -809,6 +871,13 @@ fn write_page(doc: &mut kr::Document, p: &SheetPage, groups: &Groups, fonts: &mu
         // Annotation rectangles are given top-down, like the writer's page surface.
         let Some(rect) = Rect::from_ltrb(r.min.x as f32, h - r.max.y as f32, r.max.x as f32, h - r.min.y as f32) else { continue };
         let link = LinkAnnotation::new(rect, Target::Action(LinkAction::new(uri).into()));
+        page.add_annotation(Annotation::new_link(link, None));
+    }
+    for (r, to) in &p.goto {
+        let Some(rect) = Rect::from_ltrb(r.min.x as f32, h - r.max.y as f32, r.max.x as f32, h - r.min.y as f32) else { continue };
+        // The writer's page coordinates run down from the top-left corner, as for bookmarks.
+        let dest = XyzDestination::new(*to, Point::from_xy(0.0, 0.0));
+        let link = LinkAnnotation::new(rect, Target::Destination(dest.into()));
         page.add_annotation(Annotation::new_link(link, None));
     }
     let mut surface = page.surface();

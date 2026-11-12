@@ -85,6 +85,7 @@ pub mod schedule;
 pub mod schema;
 pub mod script_cli;
 pub mod session_cli;
+mod sheetlinks;
 pub mod sheets;
 pub mod sheetset;
 pub mod solids_cli;
