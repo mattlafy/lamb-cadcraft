@@ -652,6 +652,52 @@ pub fn outline(polys: &[Vec<Vec2>], tol: f64, gap: f64) -> Option<Vec<Vec2>> {
     (lp.len() >= 3 && shoelace(&lp) > 0.0).then_some(lp)
 }
 
+/// The simple loops a closed polygon `poly` (closing edge implied) splits into where it crosses
+/// or touches itself, counter-clockwise: an hourglass drawn as one four-segment loop gives its two
+/// triangles. Only faces inside `poly` (even-odd) are kept. A loop that never meets itself, one
+/// past the region limits, or one whose graph can't be built is returned as it is.
+pub fn simple_loops(poly: &[Vec2], tol: f64) -> Vec<Vec<Vec2>> {
+    let as_is = || vec![poly.to_vec()];
+    if poly.len() < 4 {
+        return as_is();
+    }
+    let mut closed = poly.to_vec();
+    if let Some(&first) = poly.first() {
+        closed.push(first);
+    }
+    let Some(g) = build(&[closed], tol.max(1e-12)) else { return as_is() };
+    // No vertex where more than two edges meet: the loop never crosses or touches itself.
+    if g.adj.iter().all(|ns| ns.len() <= 2) {
+        return as_is();
+    }
+    let max_steps = g.pts.len().saturating_mul(2).max(16);
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (u, ns) in g.adj.iter().enumerate() {
+        for &v in ns {
+            if seen.contains(&(u, v)) {
+                continue;
+            }
+            let Some(ids) = trace(&g, u, v, max_steps) else {
+                seen.insert((u, v));
+                continue;
+            };
+            for (a, b) in ids.iter().zip(ids.iter().cycle().skip(1)) {
+                seen.insert((*a, *b));
+            }
+            let Some(lp) = points(&g, &ids) else { continue };
+            if lp.len() >= 3
+                && shoelace(&lp) > 0.0
+                && let Some(p) = interior_point(&lp)
+                && point_in_polygon(poly, p)
+            {
+                out.push(lp);
+            }
+        }
+    }
+    if out.is_empty() { as_is() } else { out }
+}
+
 /// A point strictly inside a closed polygon (either orientation), for re-finding the face a
 /// loop encloses: the middle of the widest span of a horizontal line through it.
 pub fn interior_point(poly: &[Vec2]) -> Option<Vec2> {
@@ -865,6 +911,21 @@ mod tests {
             assert_eq!(old.adj, new.adj, "seed {seed}");
             assert_eq!(old.src, new.src, "seed {seed}");
             assert_eq!(old.edge_src, new.edge_src, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn simple_loops_keeps_a_square_and_splits_a_figure_eight() {
+        let sq = square(0.0, 0.0, 10.0);
+        assert_eq!(simple_loops(&sq, 1e-9), vec![sq.clone()]);
+        // One loop through (0,0) (10,10) (10,0) (0,10): two triangles meeting at (5,5).
+        let eight = vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0), Vec2::new(10.0, 0.0), Vec2::new(0.0, 10.0)];
+        let parts = simple_loops(&eight, 1e-9);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        for p in &parts {
+            assert_eq!(p.len(), 3, "{p:?}");
+            assert!((shoelace(p) - 25.0).abs() < 1e-9, "{p:?}");
+            assert!(p.iter().any(|v| v.near(Vec2::new(5.0, 5.0), 1e-9)));
         }
     }
 

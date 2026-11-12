@@ -100,6 +100,8 @@ fn pl(angle: f64, origin: (f64, f64), delta: (f64, f64), dashes: &[f64]) -> Patt
 pub fn standard_patterns() -> Vec<HatchPattern> {
     vec![
         HatchPattern { name: "SOLID", description: "Solid fill", lines: vec![] },
+        HatchPattern { name: "X", description: "X across each region's bounding box", lines: vec![] },
+        HatchPattern { name: "X_ALIGNED", description: "X between a quadrilateral's opposite corners", lines: vec![] },
         HatchPattern { name: "ANSI31", description: "Iron, brick, stone masonry", lines: vec![pl(45.0, (0.0, 0.0), (0.0, 0.125), &[])] },
         HatchPattern {
             name: "ANSI32",
@@ -237,6 +239,30 @@ pub fn standard_patterns() -> Vec<HatchPattern> {
     ]
 }
 
+/// How an X pattern places its two lines in each region of a hatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XMode {
+    /// Corner to corner across the region's bounding box (pattern `X`).
+    Bounds,
+    /// Between a quadrilateral region's opposite corners; any other region uses its bounding
+    /// box (pattern `X_ALIGNED`).
+    Aligned,
+}
+
+/// The X mode of the pattern `name` (case-insensitive), or `None` for any other pattern. X
+/// patterns have no line families: their lines come from each region's shape, so scale, angle
+/// and origin do not apply to them.
+pub fn is_x_pattern(name: &str) -> Option<XMode> {
+    let n = name.trim();
+    if n.eq_ignore_ascii_case("X") {
+        Some(XMode::Bounds)
+    } else if n.eq_ignore_ascii_case("X_ALIGNED") {
+        Some(XMode::Aligned)
+    } else {
+        None
+    }
+}
+
 pub fn pattern(name: &str) -> Option<HatchPattern> {
     standard_patterns().into_iter().find(|p| p.name.eq_ignore_ascii_case(name))
 }
@@ -273,5 +299,13 @@ mod tests {
         assert_eq!(imp, Some(0.125));
         assert!(met.is_some_and(|m| (m - 0.125 * 25.4).abs() < 1e-12), "{met:?}");
         assert!(pattern_for(&Drawing::new_metric(), "NOPE").is_none());
+    }
+
+    #[test]
+    fn x_patterns_are_named_case_insensitively() {
+        assert_eq!(is_x_pattern("x"), Some(XMode::Bounds));
+        assert_eq!(is_x_pattern("X_Aligned"), Some(XMode::Aligned));
+        assert_eq!(is_x_pattern("ANSI31"), None);
+        assert!(pattern("X").is_some_and(|p| p.lines.is_empty()));
     }
 }

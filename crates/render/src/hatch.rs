@@ -10,10 +10,12 @@
 
 use super::{Builder, Ctx, Ink, fill, ink, max_scale};
 use cadcraft_color::{Color, Rgb};
-use cadcraft_doc::library::{PatternLine, pattern_for};
+use cadcraft_doc::library::{PatternLine, is_x_pattern, pattern_for};
 use cadcraft_doc::{Drawing, Entity, Gradient, Hatch};
 use cadcraft_geom::{Bounds2, PolyVertex, Polyline, Vec2, point_in_polygon};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+mod xmode;
 
 /// Draw a hatch entity: `rgb` is its resolved colour, `tol` the chord tolerance.
 /// Whether a build's cancel flag has been set.
@@ -451,6 +453,10 @@ fn pattern_lines_within(
     max_runs: usize,
     work_limit: u64,
 ) -> Vec<Vec<Vec2>> {
+    // X patterns draw two lines per region, from its shape; level of detail and view don't apply.
+    if let Some(mode) = is_x_pattern(&h.pattern) {
+        return xmode::x_lines(loops, mode, max_runs);
+    }
     let lines = lines_of(d, h);
     let scale = scale_of(h);
     let px = if px.is_finite() && px > 0.0 { px } else { 0.0 };

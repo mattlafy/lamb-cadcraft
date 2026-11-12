@@ -51,6 +51,11 @@ fn swatches() -> Arc<Vec<Swatch>> {
 }
 
 fn swatch(c: PatternChoice) -> Swatch {
+    // An X pattern has no line families: its swatch is the unit square's two diagonals.
+    if cadcraft_engine::doc::library::is_x_pattern(&c.name).is_some() {
+        let runs = vec![vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)], vec![Vec2::new(0.0, 1.0), Vec2::new(1.0, 0.0)]];
+        return Swatch { runs, name: c.name, description: c.description, solid: false };
+    }
     let solid = c.lines.is_empty();
     Swatch { runs: cadcraft_engine::render::pattern_swatch(&c.lines, 1.0), name: c.name, description: c.description, solid }
 }
