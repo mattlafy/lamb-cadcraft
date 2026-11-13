@@ -39,11 +39,19 @@
 //! conditions — a head and a sill — so [`resolve_opening_end_details`] resolves each end as its own
 //! item, classed by the bridge's class plus its [`EndLevel`]. A head tag spreads to heads, never to
 //! a sill; a level bridge's two ends share one class.
+//!
+//! **Free ends** (LAMB T617, T709) resolve per end of [`WallGraph::free_ends`]
+//! ([`resolve_end_details`]) by rules 1 and 2 only, classed by the end's run's class plus its
+//! [`EndLevel`] ([`free_end_levels`]): in a section a wall top's termination spreads to tops, a
+//! base's to bases, never across. A plan passes no levels, so every end there is `Level`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::wall_junctions::{RunEnd, WallGraph};
 use super::wall_spaces::{SideKind, WallSides};
+use super::walls::RunCurve;
+use crate::geometry::Point2;
+use crate::geometry::tolerance::TOLERANCE;
 
 /// An edge-detail tag placed on one run: `run` indexes [`WallGraph::runs`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,12 +304,50 @@ pub struct EndTag {
     pub end: usize,
 }
 
+/// A run's centreline end point at `end`: a line's end, an arc's point at its start or end angle.
+pub fn run_end_point(c: &RunCurve, end: RunEnd) -> Point2 {
+    match (*c, end) {
+        (RunCurve::Line { from, .. }, RunEnd::Start) => from,
+        (RunCurve::Line { to, .. }, RunEnd::End) => to,
+        (RunCurve::Arc { center, radius, start_angle, sweep }, e) => {
+            let a = if e == RunEnd::Start { start_angle } else { start_angle + sweep };
+            Point2 { x: center.x + radius * a.cos(), y: center.y + radius * a.sin() }
+        }
+    }
+}
+
+/// One [`EndLevel`] per [`WallGraph::free_ends`] entry of a vertical view's graph (local y is z):
+/// `Upper` when the end's centreline point is higher than its run's other end by more than
+/// `TOLERANCE.coincidence_mm`, `Lower` when lower, `Level` otherwise (a horizontal run, e.g. a
+/// slab edge) or when the run is missing.
+pub fn free_end_levels(graph: &WallGraph) -> Vec<EndLevel> {
+    graph
+        .free_ends
+        .iter()
+        .map(|&(r, end)| {
+            let Some(run) = graph.runs.get(r) else { return EndLevel::Level };
+            let other = if end == RunEnd::Start { RunEnd::End } else { RunEnd::Start };
+            let dz = run_end_point(&run.centreline, end).y - run_end_point(&run.centreline, other).y;
+            if dz > TOLERANCE.coincidence_mm {
+                EndLevel::Upper
+            } else if dz < -TOLERANCE.coincidence_mm {
+                EndLevel::Lower
+            } else {
+                EndLevel::Level
+            }
+        })
+        .collect()
+}
+
 /// One [`RunDetail`] per free end of `graph` (LAMB T617): rules 1 and 2 of the module docs over
-/// each end's run's [`RunClass`], with no neighbours — a termination tag spreads to every free end
-/// of its class, never by gaps. Tags naming an end that is not in the graph are ignored.
-pub fn resolve_end_details(graph: &WallGraph, sides: &WallSides, tags: &[EndTag]) -> Vec<RunDetail> {
+/// each end's run's [`RunClass`] plus its [`EndLevel`] from `levels` (parallel to `free_ends`; a
+/// missing entry is `Level`, so a plan passes `&[]`), with no neighbours — a termination tag
+/// spreads to every free end of its class and level, never by gaps. Tags naming an end that is not
+/// in the graph are ignored.
+pub fn resolve_end_details(graph: &WallGraph, sides: &WallSides, tags: &[EndTag], levels: &[EndLevel]) -> Vec<RunDetail> {
     let rc = run_classes(graph, sides);
-    let classes: Vec<Option<RunClass>> = graph.free_ends.iter().map(|(r, _)| rc.get(*r).copied()).collect();
+    let classes: Vec<(Option<RunClass>, EndLevel)> =
+        graph.free_ends.iter().enumerate().map(|(i, (r, _))| (rc.get(*r).copied(), levels.get(i).copied().unwrap_or(EndLevel::Level))).collect();
     let tags: Vec<(usize, &str)> = tags.iter().map(|t| (t.end, t.detail.as_str())).collect();
     resolve_greedy(&classes, &vec![BTreeSet::new(); classes.len()], &tags)
 }
@@ -483,8 +529,38 @@ mod tests {
     fn an_end_tag_spreads_to_free_ends_of_its_class_only() {
         let (g, s) = ended(&[200.0, 200.0, 90.0]);
         let t = |d: &str, end| EndTag { detail: d.into(), end };
-        assert_eq!(resolve_end_details(&g, &s, &[t("E1", 0)]), [RunDetail::Tagged("E1".into()), RunDetail::Spread("E1".into()), RunDetail::Untyped]);
-        assert_eq!(resolve_end_details(&g, &s, &[t("E1", 0), t("E2", 0)])[0], RunDetail::Conflict);
-        assert_eq!(resolve_end_details(&g, &s, &[t("E1", 9)]), [RunDetail::Untyped, RunDetail::Untyped, RunDetail::Untyped]);
+        assert_eq!(
+            resolve_end_details(&g, &s, &[t("E1", 0)], &[]),
+            [RunDetail::Tagged("E1".into()), RunDetail::Spread("E1".into()), RunDetail::Untyped]
+        );
+        assert_eq!(resolve_end_details(&g, &s, &[t("E1", 0), t("E2", 0)], &[])[0], RunDetail::Conflict);
+        assert_eq!(resolve_end_details(&g, &s, &[t("E1", 9)], &[]), [RunDetail::Untyped, RunDetail::Untyped, RunDetail::Untyped]);
+    }
+
+    /// Vertical 200 mm runs (0 to 2700) with free ends at both ends, then a horizontal run of the
+    /// same class with free ends at both ends.
+    fn tops_and_bases(walls: usize) -> (WallGraph, WallSides) {
+        let (mut g, s) = bridged(&vec![200.0; walls + 1]);
+        g.bridges.clear();
+        for (k, r) in g.runs.iter_mut().take(walls).enumerate() {
+            let x = 1000.0 * k as f64;
+            r.centreline = RunCurve::Line { from: Point2 { x, y: 0.0 }, to: Point2 { x, y: 2700.0 } };
+        }
+        g.free_ends = (0..=walls).flat_map(|r| [(r, RunEnd::Start), (r, RunEnd::End)]).collect();
+        (g, s)
+    }
+
+    #[test]
+    fn a_top_s_termination_spreads_to_tops_only() {
+        let (g, s) = tops_and_bases(2);
+        let levels = free_end_levels(&g);
+        use EndLevel::*;
+        assert_eq!(levels, [Lower, Upper, Lower, Upper, Level, Level]);
+        let t = |d: &str, end| EndTag { detail: d.into(), end };
+        let r = resolve_end_details(&g, &s, &[t("TOP", 1)], &levels);
+        let (u, sp) = (RunDetail::Untyped, RunDetail::Spread("TOP".into()));
+        assert_eq!(r, [u.clone(), RunDetail::Tagged("TOP".into()), u.clone(), sp, u.clone(), u]);
+        // Without levels (a plan) every end shares the class.
+        assert!(resolve_end_details(&g, &s, &[t("TOP", 1)], &[]).iter().all(|x| x != &RunDetail::Untyped));
     }
 }

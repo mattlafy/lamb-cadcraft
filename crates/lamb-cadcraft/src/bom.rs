@@ -467,7 +467,9 @@ pub(crate) fn bomtable_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::assembly::tests::{corner_detail, d_room, gap_room, line, room_with, undo_len, window_room, window_section, without_assembly};
+    use crate::assembly::tests::{
+        corner_detail, d_room, free_wall_section, gap_room, line, room_with, undo_len, window_room, window_section, without_assembly,
+    };
     use crate::schema::{read_document, write_document};
     use lamb_core::geometry::IDENTITY_TRANSFORM;
     use lamb_core::model::{Actor, authored_field};
@@ -968,6 +970,19 @@ pub(crate) mod tests {
         assert_eq!(got, [("Level 2", 1)], "{rows:?}");
         assert_eq!(count_of(&rows, "H (jamb)"), 1, "{rows:?}");
         assert_eq!(count_of(&rows, "SILL"), 0, "{rows:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_section_wall_top_s_termination_is_one_end_row_at_the_level_under_its_mid_point() -> R {
+        let (mut s, sec, t) = free_wall_section()?;
+        add_level(&mut s, "Level 1", 0.0)?;
+        add_level(&mut s, "Level 2", 2000.0)?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("detailtag", &json!({ "detailViewId": t.0, "corner": true, "tip": {"x": 150, "y": 2700}, "bubble": {"x": 1500, "y": 3200} }))?;
+        let rows = bom_rows(s.doc()?);
+        let got: Vec<(&str, usize)> = rows.iter().filter(|r| r.item == "T (end)").map(|r| (r.level.as_str(), r.count)).collect();
+        assert_eq!(got, [("Level 2", 1)], "{rows:?}");
         Ok(())
     }
 

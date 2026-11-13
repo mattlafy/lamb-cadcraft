@@ -46,11 +46,11 @@ use cadcraft_doc::{Drawing, EntityKind, Handle, Leader, Line, LwPolyline};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::{PolyVertex, Vec2};
 use lamb_core::derivation::detail_tags::{
-    CornerTag, EdgeTag, EndTag, OpeningEndTag, OpeningTag, RunDetail, resolve_corner_details, resolve_edge_details, resolve_end_details,
-    resolve_opening_details, resolve_opening_end_details,
+    CornerTag, EdgeTag, EndTag, OpeningEndTag, OpeningTag, RunDetail, free_end_levels, resolve_corner_details, resolve_edge_details,
+    resolve_end_details, resolve_opening_details, resolve_opening_end_details,
 };
 use lamb_core::derivation::read::ProjectRead;
-use lamb_core::derivation::wall_junctions::{Junction, RunEnd, WallGraph, wall_graph};
+use lamb_core::derivation::wall_junctions::{Junction, WallGraph, wall_graph};
 use lamb_core::derivation::wall_spaces::{SideParams, WallSides, wall_sides};
 use lamb_core::derivation::walls::{RunCurve, WallRunParams};
 use lamb_core::geometry::Point2;
@@ -209,7 +209,8 @@ impl Target {
 
 /// Where a new edge (or `corner`) tag at `tip` attaches in `graph`, or the refusal. A corner tag
 /// that misses every junction and bridge attaches to a free end ([`attach_free_end`]) only when
-/// `ends` — in a plan view; a vertical view's free ends take no tag.
+/// `ends` — always, from a view: a plan's free wall end and a section's free wall top or base
+/// (LAMB T617, T709) both take a termination tag.
 pub(crate) fn place_target(graph: &WallGraph, corner: bool, ends: bool, tip: Point2) -> std::result::Result<Target, String> {
     if graph.runs.is_empty() {
         return Err("No walls here: wall faces are pairs of parallel lines on a WALL* layer (50–800 mm apart)".into());
@@ -238,7 +239,7 @@ pub(crate) fn place_target(graph: &WallGraph, corner: bool, ends: bool, tip: Poi
 fn view_target(s: &Session, view: Id, corner: bool, tip: Point2) -> std::result::Result<Target, String> {
     let p = DrawingProject::new(s.doc().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let graph = wall_graph(&p, view, &wall_params_with(&p, view, &[tip]));
-    place_target(&graph, corner, view_direction(p.drawing(), view) == CutDirection::Plan, tip).map_err(|e| {
+    place_target(&graph, corner, true, tip).map_err(|e| {
         // A tip on a line that makes no wall: say which layer and why (LAMB T681).
         let lone = graph.runs.is_empty() || (!corner && !on_face_corner(&graph, tip) && attach_run(&graph, tip).is_none());
         match lines_at(p.drawing(), view, tip).into_iter().next() {
@@ -248,17 +249,7 @@ fn view_target(s: &Session, view: Id, corner: bool, tip: Point2) -> std::result:
     })
 }
 
-/// A run's centreline end point at `end`.
-pub(crate) fn run_end_point(c: &RunCurve, end: RunEnd) -> Point2 {
-    match (*c, end) {
-        (RunCurve::Line { from, .. }, RunEnd::Start) => from,
-        (RunCurve::Line { to, .. }, RunEnd::End) => to,
-        (RunCurve::Arc { center, radius, start_angle, sweep }, e) => {
-            let a = if e == RunEnd::Start { start_angle } else { start_angle + sweep };
-            Point2 { x: center.x + radius * a.cos(), y: center.y + radius * a.sin() }
-        }
-    }
-}
+pub(crate) use lamb_core::derivation::detail_tags::run_end_point;
 
 /// The free end a corner-shaped tag at `tip` attaches to when no junction or bridge does (LAMB
 /// T617): the nearest [`WallGraph::free_ends`] entry whose centreline end point is within
@@ -447,8 +438,7 @@ fn graph_tags(d: &Drawing, view: Id, graph: &WallGraph) -> std::result::Result<V
                         out.openings.push(OpeningTag { detail, bridge });
                         true
                     }
-                    None if want == CutDirection::Plan => attach_free_end(graph, tip).map(|end| out.ends.push(EndTag { detail, end })).is_some(),
-                    None => false,
+                    None => attach_free_end(graph, tip).map(|end| out.ends.push(EndTag { detail, end })).is_some(),
                 }
             }
         } else {
@@ -507,13 +497,15 @@ pub fn resolve_view_openings(d: &Drawing, view: Id) -> std::result::Result<Vec<R
 }
 
 /// Every free end's termination detail in `view` (parallel to its wall graph's `free_ends`, LAMB
-/// T617). In a vertical view no end carries a tag, so every end is `Untyped`.
+/// T617). In a vertical view each end is classed by its [`free_end_levels`] too (LAMB T709): a
+/// wall top's termination spreads to tops, a base's to bases.
 pub fn resolve_view_ends(d: &Drawing, view: Id) -> std::result::Result<Vec<RunDetail>, String> {
     wall_view(d, view)?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let (graph, sides) = graph_and_sides(&p, view);
     let tags = graph_tags(d, view, &graph)?;
-    Ok(resolve_end_details(&graph, &sides, &tags.ends))
+    let levels = if view_direction(d, view) == CutDirection::Vertical { free_end_levels(&graph) } else { Vec::new() };
+    Ok(resolve_end_details(&graph, &sides, &tags.ends, &levels))
 }
 
 /// Which end of each bridge is higher: `Some(true)` when `from` (the a end) is, `Some(false)` when
@@ -1417,11 +1409,20 @@ mod tests {
         let r = s.execute("detailtags", &json!({}))?;
         assert_eq!(r["message"], FLOOR_REPORT, "{r}");
 
-        // A corner tag at the wall's free top end still refuses in a section (no termination there).
+        // A corner tag in open space refuses with the plan's text and records nothing (LAMB T709).
         let n = s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.len();
-        let e = tag(&mut s, sd, true, (150.0, 3000.0)).err().ok_or("section free end accepted")?;
-        assert_eq!(e.to_string(), "Not at a wall corner: put the tag point on the corner of two walls");
+        let e = tag(&mut s, sd, true, (2000.0, 2500.0)).err().ok_or("open space accepted")?;
+        assert_eq!(e.to_string(), "Not at a wall corner or wall end: put the tag point on the corner of two walls, or on a wall's end");
         assert_eq!(s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.len(), n);
+
+        // A corner tag at the wall's free top attaches to that end; only the top takes it.
+        let r = tag(&mut s, sd, true, (150.0, 3000.0))?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, sec);
+        let top = graph.free_ends.iter().position(|&(r, e)| run_end_point(&graph.runs[r].centreline, e).y > 2999.0).ok_or("no top")?;
+        assert_eq!(r["attached"], json!({ "end": top }), "{r}");
+        let ends = resolve_view_ends(s.doc()?, sec)?;
+        assert_eq!(ends[top], RunDetail::Tagged(sd.0.to_string()));
+        assert!(ends.iter().enumerate().all(|(i, x)| i == top || *x == RunDetail::Untyped), "{ends:?}");
 
         // OUTSIDEPOINT is accepted in the edited section.
         s.execute("outsidepoint", &json!({ "point": {"x": 2000, "y": 2500} }))?;

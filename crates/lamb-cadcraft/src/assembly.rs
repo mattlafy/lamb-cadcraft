@@ -41,8 +41,8 @@
 //! is trimmed back to the detail's reach there ([`jamb_reach`]) as at a corner — on an arc run an
 //! angle ([`jamb_arc_reach`], [`trim_arc_run`]; LAMB T581). In a section each
 //! end — head, sill — resolves and places on its own (LAMB T505, lamb-core's [`place_opening_end`]).
-//! In a plan, a wall's free end whose termination tag resolves (LAMB T617) takes its detail as one
-//! jamb ([`end_assembly`], lamb-core's [`place_run_end`]) and trims its run the same way. The block
+//! A wall's free end — in a plan, or a wall's free top or base in a section (LAMB T709) — whose
+//! termination tag resolves (LAMB T617) takes its detail as one jamb ([`end_assembly`], lamb-core's [`place_run_end`]) and trims its run the same way. The block
 //! holds the run lines, then the corners', then the openings', then the free ends', then one
 //! non-associative HATCH per [`BandHatch`] (LAMB T642): a detail's hatch with one straight-edged loop
 //! spanning two bands, laid as a strip between those bands' final, trimmed lines on each straight
@@ -1148,13 +1148,10 @@ fn end_lines(
     Ok(split_placed(placed, lines.len(), &hatches))
 }
 
-/// Every free end of a plan `view`'s wall graph whose termination detail resolves
+/// Every free end of a plan or section `view`'s wall graph whose termination detail resolves
 /// ([`resolve_view_ends`]), in free-end order, with that detail placed there as one jamb; a failure
-/// is the entry's `skipped` reason, never an error of the view. A vertical view has none.
+/// is the entry's `skipped` reason, never an error of the view.
 pub fn end_assembly(d: &Drawing, view: Id) -> Result<Vec<EndAssembly>, String> {
-    if view_direction(d, view) == lamb_core::model::CutDirection::Vertical {
-        return Ok(Vec::new());
-    }
     let resolved = resolve_view_ends(d, view)?;
     let p = DrawingProject::new(d).map_err(|e| e.to_string())?;
     let (graph, sides) = graph_and_sides(&p, view);
@@ -4437,6 +4434,64 @@ pub(crate) mod tests {
         };
         assert!(of_width(200).iter().all(|x| matches!(x, RunDetail::Tagged(_) | RunDetail::Spread(_))), "{ends:?}");
         assert!(of_width(90).len() == 2 && of_width(90).iter().all(|x| **x == RunDetail::Untyped), "{ends:?}");
+        Ok(())
+    }
+
+    /// A section with one free-standing 300 mm `WALL-EXT` wall (u 0/300, z 0..2700, u 0 exterior) and
+    /// a vertical termination detail `T` drawn like `JD` on layer `TOP`, editing the section with
+    /// `TAGS` current. Returns (session, section, T).
+    pub(crate) fn free_wall_section() -> T<(Session, Id, Id)> {
+        let (mut s, sec) = section_fixture(150.0, Some((-1000.0, 1350.0)), |s| {
+            s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
+            s.execute("pline", &json!({ "vertices": [[0, 0], [0, 2700]] }))?;
+            s.execute("pline", &json!({ "vertices": [[300, 0], [300, 2700]] }))?;
+            Ok(())
+        })?;
+        let t = Id(s.execute("newdetail", &json!({ "name": "T", "cutDirection": "vertical" }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": t.0 }))?;
+        s.execute("layer.current", &json!({ "name": "0" }))?;
+        jamb_ref(&mut s, "exterior_face")?;
+        s.execute("layer.new", &json!({ "name": "TOP", "current": true }))?;
+        line(&mut s, [-50.0, 0.0], [-50.0, 200.0])?;
+        s.execute("layer.current", &json!({ "name": "GYP" }))?;
+        line(&mut s, [-50.0, 200.0], [0.0, 200.0])?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("layer.current", &json!({ "name": "TAGS" }))?;
+        Ok((s, sec, t))
+    }
+
+    #[test]
+    fn a_section_wall_s_free_top_takes_a_termination_and_its_base_does_not() -> R {
+        let (mut s, sec, t) = free_wall_section()?;
+        crate::maintain::install(&mut s);
+        s.execute("assemblyplan", &json!({ "viewId": sec.0 }))?;
+        let (graph, _) = graph_and_sides(&DrawingProject::new(s.doc()?)?, sec);
+        assert_eq!((graph.runs.len(), graph.free_ends.len()), (1, 2), "{:?}", graph.free_ends);
+        let top = graph.free_ends.iter().position(|&(r, e)| run_end_point(&graph.runs[r].centreline, e).y > 2699.0).ok_or("no top")?;
+        let n = undo_len(&s)?;
+        let before = s.doc()?.block(&assembly_block_name(sec)).ok_or("no block")?.clone();
+        let r =
+            s.execute("detailtag", &json!({ "detailViewId": t.0, "corner": true, "tip": {"x": 150, "y": 2700}, "bubble": {"x": 1500, "y": 3200} }))?;
+        assert_eq!(r["attached"], json!({ "end": top }), "{r}");
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        let ends = resolve_view_ends(s.doc()?, sec)?;
+        assert_eq!(ends[top], RunDetail::Tagged(t.0.to_string()));
+        assert_eq!(ends[1 - top], RunDetail::Untyped, "a top's termination never spreads to a base");
+
+        let placed = end_assembly(s.doc()?, sec)?;
+        assert!(placed.len() == 1 && placed[0].skipped.is_none() && placed[0].detail == Some(t), "{placed:?}");
+        let tops: Vec<&AssemblyLine> = placed[0].lines.iter().filter(|l| l.layer == "TOP").collect();
+        assert_eq!(tops.len(), 1, "{placed:?}");
+        assert!(placed[0].lines.iter().all(|l| l.from.y > 2400.0 && l.to.y > 2400.0), "laid at the top: {placed:?}");
+        let d = s.doc()?;
+        let b = d.block(&assembly_block_name(sec)).ok_or("no block")?;
+        assert!(block_matches(b, &assembly_lines(d, sec)?, &corner_assembly(d, sec)?, &opening_assembly(d, sec)?, &placed));
+        assert!(block_xy(&s, &assembly_block_name(sec))?.iter().any(|l| l.4 == "TOP"));
+
+        // Undo of the tag removes them in one step.
+        s.undo()?;
+        assert_eq!(**s.doc()?.block(&assembly_block_name(sec)).ok_or("no block")?, *before);
+        assert!(end_assembly(s.doc()?, sec)?.is_empty());
         Ok(())
     }
 
