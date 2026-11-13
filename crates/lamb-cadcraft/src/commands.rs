@@ -497,12 +497,22 @@ pub(crate) fn echo_created(s: &mut Session, word: &str, name: &str, r: &Value) -
 /// tile's view ([`crate::refpane::refresh`]).
 pub(crate) fn enter_space(s: &mut Session, space: Space) -> Result<()> {
     let st = s.state_mut()?;
+    // Switching views drops the selection (and a half-drawn window), as a layout switch does, so
+    // the previous view's grips are not left drawn over the new one. Re-entering the same view
+    // keeps it; `previous_selection` is untouched, so Select > Previous still works.
+    let switching = st.space != space;
+    if switching {
+        st.selection.clear();
+    }
     let first_visit = !st.views.iter().any(|(sp, _)| *sp == space);
     st.space = space;
     st.mspace = None;
     if first_visit {
         // A failed fit (no viewport yet) still enters the space.
         let _ = s.zoom_extents();
+    }
+    if switching {
+        s.pending_window = None;
     }
     s.touch();
     // The reference pane follows the edited view.
@@ -1441,6 +1451,27 @@ mod tests {
         s.input(Input::Keyword("Model".into()))?;
         assert_eq!(space(&s)?, Space::Model);
         assert!(s.running.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn switching_views_clears_the_selection_and_re_entering_the_same_view_keeps_it() -> R {
+        let mut s = session()?;
+        floating_plan(&mut s, "A")?;
+        floating_plan(&mut s, "B")?;
+        let v = views(&s)?;
+        let (a, b) = (v[0].id(), v[1].id());
+        s.execute("editview", &serde_json::json!({ "viewId": a.0 }))?;
+        let r = s.execute("line", &serde_json::json!({ "points": [[0, 0], [1000, 250]] }))?;
+        let h = Handle::parse_hex(r["handles"][0].as_str().ok_or("no handle")?).ok_or("bad handle")?;
+        s.set_selection(vec![h]);
+        s.execute("editview", &serde_json::json!({ "viewId": b.0 }))?;
+        assert!(s.selection().is_empty(), "another view's grips are not kept");
+        assert!(s.pending_window.is_none());
+        s.execute("editview", &serde_json::json!({ "viewId": a.0 }))?;
+        s.set_selection(vec![h]);
+        s.execute("editview", &serde_json::json!({ "viewId": a.0 }))?;
+        assert_eq!(s.selection(), vec![h], "re-entering the same view keeps the selection");
         Ok(())
     }
 
