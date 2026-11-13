@@ -25,6 +25,11 @@
 //! length: their pieces are short and counted as items. A layer that has both members and a band
 //! gets its count and its length on one row.
 //!
+//! A band is a sheet good, so it also has an area per level (LAMB T708): each run's band length
+//! times the plan's storey height, the floor elevation of the next level above (by elevation, not
+//! order) minus its own. A level with no level above it has no area (left blank): the table never
+//! guesses a roof height. Openings are not deducted; the opening schedule gives their sizes.
+//!
 //! A plan's level is its placement's level; a floating plan is skipped. In a vertical view a run
 //! belongs to the level with the greatest floor elevation at or below its centreline's mid-point
 //! height (view-local y is absolute z), a corner or opening to the one below the mid-point of its
@@ -32,13 +37,13 @@
 //! one floor show as two rows, each naming its view — nothing is silently counted twice. Sorted
 //! by level order, then item, then view document order.
 //!
-//! `bomtable {layout?, at?}` (`bom`): the table (`Level | Item | Count | Length | View`, titled
-//! `Framing BOM`, a zero count or length left blank, a length written `12.4 m`) on layout `layout` (default `A601`, the BOM's sheet in the set
+//! `bomtable {layout?, at?}` (`bom`): the table (`Level | Item | Count | Length | Area | View`, titled
+//! `Framing BOM`, a zero count, length or area left blank, a length written `12.4 m`, an area `37.2 m²`) on layout `layout` (default `A601`, the BOM's sheet in the set
 //! ([`crate::sheetset`]), created without viewports when absent) at
 //! paper point `at` (default the top-left corner of the sheet's
 //! [`crate::sheets::usable_area`]). A table on that
 //! layout titled `Framing BOM` is replaced; one undo step. Nothing to count is refused, nothing
-//! changed. Returns `{layout, handle, rows: [{level, item, count, lengthMm, view}], message}`.
+//! changed. Returns `{layout, handle, rows: [{level, item, count, lengthMm, areaM2, view}], message}`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -69,16 +74,17 @@ pub(crate) const DEFAULT_LAYOUT: &str = "A601";
 const NO_LEVEL: &str = "—";
 const TEXT_HEIGHT: f64 = 2.5;
 const ROW_HEIGHT: f64 = 7.0;
-const COL_WIDTHS: [f64; 5] = [30.0, 45.0, 15.0, 20.0, 45.0];
+const COL_WIDTHS: [f64; 6] = [30.0, 45.0, 15.0, 20.0, 15.0, 30.0];
 
-/// One BOM row: `count` of `item` and `length_mm` of it as a continuous band (0 when there is
-/// none) on `level`, as laid in view `view`.
+/// One BOM row: `count` of `item`, `length_mm` of it as a continuous band and `area_m2` of that
+/// band over the level's storey height (each 0 when there is none) on `level`, as laid in `view`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BomRow {
     pub level: String,
     pub item: String,
     pub count: usize,
     pub length_mm: f64,
+    pub area_m2: f64,
     pub view: String,
 }
 
@@ -88,6 +94,12 @@ fn level_at(levels: &[Level], z: f64) -> Option<&Level> {
         .iter()
         .filter(|l| l.floor_elevation.value <= z + TOLERANCE.coincidence_mm)
         .max_by(|a, b| a.floor_elevation.value.total_cmp(&b.floor_elevation.value))
+}
+
+/// The height from `level`'s floor to the next floor above it by elevation; none for the top level.
+fn storey_height(levels: &[Level], level: &Level) -> Option<f64> {
+    let floor = level.floor_elevation.value;
+    levels.iter().map(|l| l.floor_elevation.value).filter(|&z| z > floor + TOLERANCE.coincidence_mm).min_by(f64::total_cmp).map(|z| z - floor)
 }
 
 fn curve_mid(c: &RunCurve) -> Point2 {
@@ -178,13 +190,14 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
     };
     let laid: Vec<Option<Vec<RunAssembly>>> = doc.views.iter().map(|v| assembly_lines(d, v.id()).ok()).collect();
     let members = member_layers(d, &doc.views, &laid);
-    // (level name, item, view index) → (level order, count, length).
-    let mut counts: HashMap<(String, String, usize), (f64, usize, f64)> = HashMap::new();
-    let mut bump = |level: Option<&Level>, item: String, view: usize, n: usize, length: f64| {
+    // (level name, item, view index) → (level order, count, length, area).
+    let mut counts: HashMap<(String, String, usize), (f64, usize, f64, f64)> = HashMap::new();
+    let mut bump = |level: Option<&Level>, item: String, view: usize, n: usize, length: f64, area: f64| {
         let (order, name) = level.map_or((f64::INFINITY, NO_LEVEL.to_owned()), |l| (l.order, l.name.clone()));
-        let entry = counts.entry((name, item, view)).or_insert((order, 0, 0.0));
+        let entry = counts.entry((name, item, view)).or_insert((order, 0, 0.0, 0.0));
         entry.1 += n;
         entry.2 += length;
+        entry.3 += area;
     };
     for (vi, v) in doc.views.iter().enumerate() {
         let id = v.id();
@@ -207,11 +220,12 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
             for r in runs {
                 let level = graph.runs.get(r.run).and_then(|run| level_of(curve_mid(&run.centreline)));
                 for layer in copy_layers(r) {
-                    bump(level, layer.to_owned(), vi, 1, 0.0);
+                    bump(level, layer.to_owned(), vi, 1, 0.0, 0.0);
                 }
                 if vertical.is_none() {
+                    let storey = level.and_then(|l| storey_height(levels, l));
                     for (layer, length) in band_lengths(r) {
-                        bump(level, layer.to_owned(), vi, 0, length);
+                        bump(level, layer.to_owned(), vi, 0, length, storey.map_or(0.0, |h| length * h / 1e6));
                     }
                 }
             }
@@ -219,9 +233,9 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
         // A placed detail: its own row, plus the members drawn inside it, at one level.
         let mut place = |item: String, n: usize, lines: &[AssemblyLine]| {
             let level = level_of(lines_mid(lines));
-            bump(level, item, vi, n, 0.0);
+            bump(level, item, vi, n, 0.0, 0.0);
             for (layer, c) in member_counts(lines, &members) {
-                bump(level, layer.to_owned(), vi, c, 0.0);
+                bump(level, layer.to_owned(), vi, c, 0.0, 0.0);
             }
         };
         if let Ok(corners) = corner_assembly(d, id) {
@@ -241,18 +255,19 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
             }
         }
     }
-    let mut rows: Vec<((f64, String, String, usize), (usize, f64))> = counts
+    let mut rows: Vec<((f64, String, String, usize), (usize, f64, f64))> = counts
         .into_iter()
-        .filter(|(_, (_, n, length))| *n > 0 || *length > 0.0)
-        .map(|((level, item, view), (order, n, length))| ((order, level, item, view), (n, length)))
+        .filter(|(_, (_, n, length, area))| *n > 0 || *length > 0.0 || *area > 0.0)
+        .map(|((level, item, view), (order, n, length, area))| ((order, level, item, view), (n, length, area)))
         .collect();
     rows.sort_by(|a, b| a.0.0.total_cmp(&b.0.0).then_with(|| a.0.1.cmp(&b.0.1)).then_with(|| a.0.2.cmp(&b.0.2)).then_with(|| a.0.3.cmp(&b.0.3)));
     rows.into_iter()
-        .map(|((_, level, item, view), (count, length_mm))| BomRow {
+        .map(|((_, level, item, view), (count, length_mm, area_m2))| BomRow {
             level,
             item,
             count,
             length_mm,
+            area_m2,
             view: doc.views.get(view).map(|v| v.name().to_owned()).unwrap_or_default(),
         })
         .collect()
@@ -284,9 +299,10 @@ pub(crate) fn schedule_table(title: &str, header: &[&str], col_widths: &[f64], r
 pub fn bom_table(rows: &[BomRow], at: Point2) -> Table {
     let count = |n: usize| if n > 0 { n.to_string() } else { String::new() };
     let length = |mm: f64| if mm > 0.0 { format!("{:.1} m", mm / 1000.0) } else { String::new() };
+    let area = |m2: f64| if m2 > 0.0 { format!("{m2:.1} m²") } else { String::new() };
     let rows: Vec<Vec<String>> =
-        rows.iter().map(|r| vec![r.level.clone(), r.item.clone(), count(r.count), length(r.length_mm), r.view.clone()]).collect();
-    schedule_table(BOM_TITLE, &["Level", "Item", "Count", "Length", "View"], &COL_WIDTHS, &rows, at)
+        rows.iter().map(|r| vec![r.level.clone(), r.item.clone(), count(r.count), length(r.length_mm), area(r.area_m2), r.view.clone()]).collect();
+    schedule_table(BOM_TITLE, &["Level", "Item", "Count", "Length", "Area", "View"], &COL_WIDTHS, &rows, at)
 }
 
 /// Whether `e` is a table titled `title`.
@@ -416,7 +432,7 @@ pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({
         "layout": layout,
         "handle": format!("{:X}", handle.0),
-        "rows": rows.iter().map(|r| json!({ "level": r.level, "item": r.item, "count": r.count, "lengthMm": r.length_mm, "view": r.view })).collect::<Vec<_>>(),
+        "rows": rows.iter().map(|r| json!({ "level": r.level, "item": r.item, "count": r.count, "lengthMm": r.length_mm, "areaM2": r.area_m2, "view": r.view })).collect::<Vec<_>>(),
         "message": message,
     }))
 }
@@ -461,11 +477,16 @@ pub(crate) mod tests {
 
     /// Adds level `name` at `floor` (order = floor) and returns its id.
     fn add_level(s: &mut Session, name: &str, floor: f64) -> T<Id> {
+        add_level_ordered(s, name, floor, floor)
+    }
+
+    /// Adds level `name` at `floor` with sort order `order` and returns its id.
+    fn add_level_ordered(s: &mut Session, name: &str, floor: f64, order: f64) -> T<Id> {
         let d = s.doc_mut()?;
         let id = Id(d.new_handle().0);
         let mut doc = read_document(d)?;
         let floor_elevation = authored_field(floor, Id(0), Actor::User { user_id: "local".into() }, "2026-11-02T00:00:00Z");
-        doc.levels.push(Level { id, name: name.into(), order: floor, floor_elevation });
+        doc.levels.push(Level { id, name: name.into(), order, floor_elevation });
         write_document(d, &doc)?;
         Ok(id)
     }
@@ -572,16 +593,30 @@ pub(crate) mod tests {
         assert!(close(laid, 2.0 * 3600.0 + 2.0 * 2600.0), "{laid}");
         let rows = bom_rows(d);
         assert!(
-            rows.contains(&BomRow { level: "Level 1".into(), item: "SHEATHING".into(), count: 0, length_mm: laid, view: "Ground".into() }),
+            rows.contains(&BomRow {
+                level: "Level 1".into(),
+                item: "SHEATHING".into(),
+                count: 0,
+                length_mm: laid,
+                area_m2: 0.0,
+                view: "Ground".into()
+            }),
             "{rows:?}"
         );
         assert!(
-            rows.contains(&BomRow { level: "Level 1".into(), item: "STUD".into(), count: copies(d, plan)?, length_mm: 0.0, view: "Ground".into() }),
+            rows.contains(&BomRow {
+                level: "Level 1".into(),
+                item: "STUD".into(),
+                count: copies(d, plan)?,
+                length_mm: 0.0,
+                area_m2: 0.0,
+                view: "Ground".into()
+            }),
             "{rows:?}"
         );
         let cells = bom_table(&rows, Point2 { x: 0.0, y: 0.0 }).cells;
         let texts: Vec<Vec<&str>> = cells.iter().map(|r| r.iter().map(|c| c.text.as_str()).collect()).collect();
-        assert!(texts.contains(&vec!["Level 1", "SHEATHING", "", "12.4 m", "Ground"]), "{texts:?}");
+        assert!(texts.contains(&vec!["Level 1", "SHEATHING", "", "12.4 m", "", "Ground"]), "{texts:?}");
         Ok(())
     }
 
@@ -678,10 +713,54 @@ pub(crate) mod tests {
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
         let t = boms(&s)?;
         assert_eq!(t.len(), 1);
-        assert_eq!(t[0].cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Level", "Item", "Count", "Length", "View"]);
+        assert_eq!(t[0].cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Level", "Item", "Count", "Length", "Area", "View"]);
         assert_eq!((t[0].insert.x, t[0].insert.y, t[0].col_widths.clone()), (50.0, 100.0, COL_WIDTHS.to_vec()), "it stays where it stood");
         s.execute("sheetset", &json!({}))?;
         assert_eq!(undo_len(&s)?, n + 1, "a rerun adds no undo step");
+        Ok(())
+    }
+
+    #[test]
+    fn a_band_s_area_is_its_length_times_the_storey_height_and_the_top_level_has_none() -> R {
+        let (mut s, plan) = sheathed_room()?;
+        let l2 = add_level(&mut s, "Level 2", 3000.0)?;
+        let r = s.execute("duplicateview", &json!({ "viewId": plan.0, "name": "Upper" }))?;
+        place(&mut s, Id(r["viewId"].as_u64().ok_or("no id")?), l2)?;
+        let rows = bom_rows(s.doc()?);
+        let sheathing = |level: &str| rows.iter().find(|r| r.item == "SHEATHING" && r.level == level).map(|r| (r.length_mm, r.area_m2));
+        let (len1, area1) = sheathing("Level 1").ok_or("no Level 1 sheathing")?;
+        assert!(close(len1, 12400.0) && close(area1, 37.2), "12.4 m x 3 m: {rows:?}");
+        assert_eq!(sheathing("Level 2"), Some((12400.0, 0.0)), "the top level: its length, no area: {rows:?}");
+        assert!(rows.iter().filter(|r| r.item == "STUD").all(|r| r.area_m2 == 0.0), "members have no area: {rows:?}");
+        let texts: Vec<Vec<String>> =
+            bom_table(&rows, Point2 { x: 0.0, y: 0.0 }).cells.iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect();
+        assert_eq!(texts[1].len(), 6);
+        assert_eq!(texts[1][4], "Area");
+        let row = |cells: [&str; 6]| cells.map(str::to_owned).to_vec();
+        assert!(texts.contains(&row(["Level 1", "SHEATHING", "", "12.4 m", "37.2 m²", "Ground"])), "{texts:?}");
+        assert!(texts.contains(&row(["Level 2", "SHEATHING", "", "12.4 m", "", "Upper"])), "{texts:?}");
+        let out = s.execute("bomtable", &json!({}))?;
+        let rows = out["rows"].as_array().ok_or("no rows")?;
+        let area = |level: &str| rows.iter().find(|r| r["item"] == "SHEATHING" && r["level"] == level).and_then(|r| r["areaM2"].as_f64());
+        assert!(area("Level 1").is_some_and(|a| close(a, 37.2)), "{out}");
+        assert_eq!(area("Level 2"), Some(0.0), "{out}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_storey_height_is_taken_by_elevation_not_by_order() -> R {
+        let (mut s, _) = sheathed_room()?;
+        // sheathed_room's Level 1 is at 0 with order 0; the next floor up by elevation is 2700,
+        // though its order puts it after the 6000 one.
+        add_level_ordered(&mut s, "Roof", 6000.0, 1.0)?;
+        add_level_ordered(&mut s, "Level 2", 2700.0, 2.0)?;
+        let doc = read_document(s.doc()?)?;
+        let level = |name: &str| doc.levels.iter().find(|l| l.name == name).ok_or("no level");
+        assert_eq!(storey_height(&doc.levels, level("Level 2")?), Some(3300.0));
+        assert_eq!(storey_height(&doc.levels, level("Roof")?), None);
+        let rows = bom_rows(s.doc()?);
+        let area = rows.iter().find(|r| r.item == "SHEATHING").map(|r| r.area_m2).ok_or("no sheathing")?;
+        assert!(close(area, 12.4 * 2.7), "{rows:?}");
         Ok(())
     }
 
@@ -728,7 +807,7 @@ pub(crate) mod tests {
         assert!(n > 10, "studs laid round the room: {n}");
         let rows = bom_rows(d);
         let studs: Vec<&BomRow> = rows.iter().filter(|r| r.item == "STUD").collect();
-        assert_eq!(studs, [&BomRow { level: "Level 1".into(), item: "STUD".into(), count: n, length_mm: 0.0, view: "Ground".into() }]);
+        assert_eq!(studs, [&BomRow { level: "Level 1".into(), item: "STUD".into(), count: n, length_mm: 0.0, area_m2: 0.0, view: "Ground".into() }]);
         Ok(())
     }
 
@@ -740,7 +819,14 @@ pub(crate) mod tests {
         s.execute("detailtag", &json!({ "detailViewId": jd.0, "corner": true, "tip": {"x": 2000, "y": 100}, "bubble": {"x": 1500, "y": -400} }))?;
         let rows = bom_rows(s.doc()?);
         assert!(
-            rows.contains(&BomRow { level: "Level 1".into(), item: "JD (end)".into(), count: 2, length_mm: 0.0, view: "Ground".into() }),
+            rows.contains(&BomRow {
+                level: "Level 1".into(),
+                item: "JD (end)".into(),
+                count: 2,
+                length_mm: 0.0,
+                area_m2: 0.0,
+                view: "Ground".into()
+            }),
             "{rows:?}"
         );
         assert!(!rows.iter().any(|r| r.item.ends_with("(jamb)")), "{rows:?}");
@@ -756,14 +842,28 @@ pub(crate) mod tests {
         assert_eq!(bridges, 1);
         let rows = bom_rows(s.doc()?);
         assert!(
-            rows.contains(&BomRow { level: "Level 1".into(), item: "JD (jamb)".into(), count: 2, length_mm: 0.0, view: "Ground".into() }),
+            rows.contains(&BomRow {
+                level: "Level 1".into(),
+                item: "JD (jamb)".into(),
+                count: 2,
+                length_mm: 0.0,
+                area_m2: 0.0,
+                view: "Ground".into()
+            }),
             "{rows:?}"
         );
         // One corner tag spreads to all four corners of the room.
         corner_detail(&mut s, plan, "exterior_face", false, (0.0, 4000.0))?;
         let rows = bom_rows(s.doc()?);
         assert!(
-            rows.contains(&BomRow { level: "Level 1".into(), item: "CD (corner)".into(), count: 4, length_mm: 0.0, view: "Ground".into() }),
+            rows.contains(&BomRow {
+                level: "Level 1".into(),
+                item: "CD (corner)".into(),
+                count: 4,
+                length_mm: 0.0,
+                area_m2: 0.0,
+                view: "Ground".into()
+            }),
             "{rows:?}"
         );
         Ok(())
@@ -814,7 +914,14 @@ pub(crate) mod tests {
         let n = copies(d, plan)?;
         let rows = bom_rows(d);
         assert!(
-            rows.contains(&BomRow { level: "Level 1".into(), item: "STUD".into(), count: n + 2 * 4, length_mm: 0.0, view: "Ground".into() }),
+            rows.contains(&BomRow {
+                level: "Level 1".into(),
+                item: "STUD".into(),
+                count: n + 2 * 4,
+                length_mm: 0.0,
+                area_m2: 0.0,
+                view: "Ground".into()
+            }),
             "{n}: {rows:?}"
         );
         assert_eq!(count_of(&rows, "CD (corner)"), 4, "{rows:?}");
@@ -911,9 +1018,9 @@ pub(crate) mod tests {
         let t = boms(&s)?;
         assert_eq!(t.len(), 1);
         let texts: Vec<Vec<&str>> = t[0].cells.iter().map(|r| r.iter().map(|c| c.text.as_str()).collect()).collect();
-        assert_eq!(texts[1], ["Level", "Item", "Count", "Length", "View"]);
-        assert_eq!(texts[2], ["Level 1", "CLAD", "", "16.4 m", "Ground"]);
-        assert_eq!(texts[4], ["Level 1", "STUD", studs.to_string().as_str(), "", "Ground"]);
+        assert_eq!(texts[1], ["Level", "Item", "Count", "Length", "Area", "View"]);
+        assert_eq!(texts[2], ["Level 1", "CLAD", "", "16.4 m", "", "Ground"]);
+        assert_eq!(texts[4], ["Level 1", "STUD", studs.to_string().as_str(), "", "", "Ground"]);
         assert_eq!((t[0].title, t[0].header, t[0].text_height, t[0].col_widths.clone()), (true, true, 2.5, COL_WIDTHS.to_vec()));
         assert_eq!(t[0].row_heights, [7.0; 5]);
         let first = t[0].clone();
