@@ -769,7 +769,8 @@ pub fn travel_box_observer(s: &mut Session, handles: &[Handle], crossing: bool) 
     s.set_travel(ids);
 }
 
-/// Registers [`crate::corners::corner_observer`], [`link_observer`],
+/// Registers [`crate::flatz::flatz_observer`] (every view block entity flattened to Z = 0, LAMB T588,
+/// first so everything after it sees flat geometry), [`crate::corners::corner_observer`], [`link_observer`],
 /// [`crate::tagfollow::tag_follow_observer`] (detail tag tips follow their walls, LAMB T495),
 /// [`crate::sweeps::sweep_observer`], [`crate::asmview::assembly_edit_observer`], [`crate::repeats::repeat_parameter_observer`] (a
 /// repeat's pitch follows its named parameter, LAMB T503), [`crate::assembly::assembly_observer`], [`crate::sheets::sheet_freeze_observer`], [`crate::bubbles::bubble_observer`], [`crate::vptitles::vptitle_observer`], [`crate::titleblock::titleblock_observer`] then
@@ -779,7 +780,8 @@ pub fn travel_box_observer(s: &mut Session, handles: &[Handle], crossing: bool) 
 /// of it; and [`travel_box_observer`] once per process.
 pub fn install(s: &mut Session) {
     let _ = cadcraft_engine::travel::register_box_observer(travel_box_observer);
-    let fs: [cadcraft_engine::AfterCommand; 14] = [
+    let fs: [cadcraft_engine::AfterCommand; 15] = [
+        crate::flatz::flatz_observer,
         crate::corners::corner_observer,
         link_observer,
         crate::tagfollow::tag_follow_observer,

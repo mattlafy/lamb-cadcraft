@@ -29,6 +29,7 @@ mod mleader_edit;
 mod modify;
 pub(crate) use modify::Erased;
 mod modify2;
+pub use modify2::flatten_kind;
 mod mtext_opts;
 mod overkill;
 mod pline_opts;

@@ -93,8 +93,8 @@ fn link_observer_maintains_links() -> R {
     install(&mut s);
     assert_eq!(
         s.observers.len(),
-        14,
-        "install is idempotent: corner, link, tag follow, sweep, assembly edit, repeat parameter, assembly, sheet freeze, bubble, viewport title, title block, annotation, layer hatch, then hole observer"
+        15,
+        "install is idempotent: flatten-Z, corner, link, tag follow, sweep, assembly edit, repeat parameter, assembly, sheet freeze, bubble, viewport title, title block, annotation, layer hatch, then hole observer"
     );
     install_link_maintenance(&mut s);
 

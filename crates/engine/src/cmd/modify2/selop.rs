@@ -41,7 +41,7 @@ pub(super) fn run_reverse(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Zero every z coordinate; 3D polylines become 2D polylines.
-pub(crate) fn flatten_kind(k: &mut EntityKind) {
+pub fn flatten_kind(k: &mut EntityKind) {
     let z = |p: &mut cadcraft_geom::Vec3| p.z = 0.0;
     match k {
         EntityKind::Line(l) => {

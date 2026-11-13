@@ -153,6 +153,7 @@ use ncopy::{NcopyM, run_ncopy};
 pub(super) use patharray::PathArrayM;
 use patharray::run_arraypath;
 use pedit::{PPhase, PeditM, run_pedit};
+pub use selop::flatten_kind;
 use selop::{SelKind, SelOp, run_chspace, run_flatten, run_reverse};
 use textedit::{TextEditM, run_textedit};
 use trimext::{ellipse_kind, ellipse_of};
