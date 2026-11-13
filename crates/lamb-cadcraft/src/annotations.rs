@@ -11,7 +11,8 @@
 //! in `auto_dim_interior_plans` its rooms' clear dimensions (LAMB T686), one in `auto_dim_locate_plans`
 //! the setting-out strings locating its interior walls (LAMB T694), one in `auto_dim_grid_plans` its
 //! grid strings (LAMB T705),
-//! and every placed plan a text of each opening's schedule mark outside it ([`crate::schedule`], LAMB T639).
+//! and every placed plan a text of each opening's schedule mark outside it ([`crate::schedule`], LAMB T639),
+//! and every placed elevation the marks of the openings facing it (LAMB T710); sections get none.
 //! A plan in `wall_tag_plans` gets each wall type tag, its mark in a hexagon inside the run
 //! ([`crate::walltypes::wall_tags`], LAMB T690).
 //! An edge detail in `detail_note_views` gets a leader and a `<thickness> <material>` note per layer
@@ -53,7 +54,7 @@ use lamb_core::model::{AnyView, Id, VerticalIntent};
 
 use crate::project::DrawingProject;
 use crate::rooms::{RoomTag, area_text, room_tags};
-use crate::schedule::{PlanMark, plan_marks};
+use crate::schedule::{ElevationMark, PlanMark, elevation_marks, plan_marks};
 use crate::schema::{annotation_block_name, read_document, view_block_name};
 use crate::sheets::{enlarged_windows, sheet_refs, view_scale};
 use crate::walltypes::{WallTag, wall_tags};
@@ -300,13 +301,14 @@ pub(crate) fn room_tag_items(at: Vec3, name: &str, number: &str, area: &str, hei
 }
 
 /// What view `id` wants, in write order: a plan its cut symbols, opening marks and room tags, a vertical view
-/// its level lines, and either the box of each enlarged area; a detail in `detail_note_views` its layer
+/// its level lines (an elevation then its opening marks), and either the box of each enlarged area; a detail in `detail_note_views` its layer
 /// notes ([`crate::detailnotes`]); nothing for an unplaced plan or vertical view or any other detail.
 fn wanted(
     d: &Drawing,
     id: Id,
     sheet_of: &dyn Fn(Id) -> Option<String>,
     marks: &[PlanMark],
+    elevation: &[ElevationMark],
     rooms: &[RoomTag],
     tags: &[WallTag],
 ) -> Result<Vec<Item>, String> {
@@ -327,6 +329,8 @@ fn wanted(
     let scale = view_scale(d, dp.document(), id);
     if view.kind == ViewKind::Vertical {
         let mut out = level_lines(d, &dp, id, scale);
+        let height = CUT_TEXT_MM * k(scale);
+        out.extend(elevation.iter().filter(|m| m.view == id).map(|m| Item::Text(v(m.at.x, m.at.y), m.mark.clone(), height)));
         out.extend(grid_items(d, &dp, id, true, k(scale))?);
         out.extend(enlarged_boxes(d, id, scale));
         return Ok(out);
@@ -593,11 +597,12 @@ fn plan_changes(d: &Drawing) -> Result<Vec<(Id, Vec<Item>)>, String> {
     let refs = sheet_refs(d, &blocks);
     let sheet_of = |id: Id| refs.iter().find(|(v, _, _)| *v == id).map(|(_, n, l)| format!("{n}/{l}"));
     let marks = plan_marks(d);
+    let elevation = elevation_marks(d);
     let rooms = room_tags(d);
     let tags = wall_tags(d);
     let mut out = Vec::new();
     for p in doc.views.iter().map(AnyView::id) {
-        let want = wanted(d, p, &sheet_of, &marks, &rooms, &tags)?;
+        let want = wanted(d, p, &sheet_of, &marks, &elevation, &rooms, &tags)?;
         let changed = match d.block(&annotation_block_name(p)) {
             Some(b) => !block_matches(b, &want),
             None => !want.is_empty(),

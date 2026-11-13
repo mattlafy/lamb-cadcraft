@@ -15,10 +15,17 @@
 //! plan's wall is wide, whose sill stands on the row's level (the level's floor up to the next
 //! floor, so a window above another in one cut is read at its own level). Height is head z minus
 //! sill z, Sill is sill z minus the floor. No such section, or no such bridge in it, shows `—` in
-//! both; nothing is guessed from defaults. Elevations and blocks used as openings are not read.
+//! both; nothing is guessed from defaults. Elevations are read for marks only, and blocks used as
+//! openings are not read.
 //!
 //! [`crate::annotations`] writes each [`plan_marks`] entry into the plan's annotation block, so the
-//! plan and the schedule agree.
+//! plan and the schedule agree, and each [`elevation_marks`] entry into its elevation's (LAMB T710).
+//! An elevation marks an opening whose plan `out` faces the viewer (within 45° of the reverse gaze),
+//! whose midpoint projects onto the cut line (`0 ≤ u ≤ length`), and which is not hidden: another
+//! such opening on the same level within [`HIDE_U_MM`] in `u` and nearer the viewer hides it. The
+//! mark sits at the opening's centre, `floor + sill + height / 2`, when its row has both, else at
+//! `floor +` [`UNREAD_MARK_Z_MM`] — a first try, so a wing hiding a wall further back can still
+//! leave a wrong mark. An opening on no level is not marked.
 //!
 //! `openingschedule {layout?, at?}` (`osch`): the table (`Mark | Type | Level | Width | Height |
 //! Sill | Jamb detail`, titled `Opening Schedule`) on layout `layout` (default `A602`, its sheet in
@@ -34,13 +41,13 @@ use cadcraft_doc::{Drawing, EntityKind, Handle, Table};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use cadcraft_geom::Vec3;
 use lamb_core::derivation::markers::compute_cut_lines_for_view;
-use lamb_core::derivation::projection::vertical_local_to_uz;
+use lamb_core::derivation::projection::{Uz, plan_local_to_global_xy, vertical_basis, vertical_gaze_dir, vertical_local_to_uz, vertical_uz_to_local};
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::derivation::wall_junctions::{RunEnd, wall_graph};
 use lamb_core::derivation::wall_spaces::outside_on_left;
 use lamb_core::derivation::walls::{RunCurve, WallRun};
 use lamb_core::geometry::Point2;
-use lamb_core::geometry::point::{cross2, dist2, dot2, lerp2, normalize2, sub2};
+use lamb_core::geometry::point::{add2, cross2, dist2, dot2, lerp2, normalize2, sub2};
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id, Level, Placement, VerticalIntent};
 use serde_json::{Value, json};
@@ -55,6 +62,10 @@ use crate::schema::read_document;
 pub const OPENING_TITLE: &str = "Opening Schedule";
 pub(crate) const DEFAULT_LAYOUT: &str = "A602";
 const NONE: &str = "—";
+/// An elevation's mark height above the floor for an opening no section reads (LAMB T710).
+pub const UNREAD_MARK_Z_MM: f64 = 1200.0;
+/// How near in `u` a nearer facing opening hides one behind it on an elevation.
+pub const HIDE_U_MM: f64 = 300.0;
 const HEADER: [&str; 7] = ["Mark", "Type", "Level", "Width", "Height", "Sill", "Jamb detail"];
 const COL_WIDTHS: [f64; 7] = [15.0, 20.0, 30.0, 20.0, 20.0, 20.0, 45.0];
 
@@ -81,6 +92,14 @@ pub struct PlanMark {
     /// Unit vector square to the bridge, to the outside, or to the left of the wall run's direction
     /// when the outside is undecided.
     pub out: Point2,
+}
+
+/// Where an elevation shows an opening's mark, in the elevation's local coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElevationMark {
+    pub view: Id,
+    pub mark: String,
+    pub at: Point2,
 }
 
 /// One opening before its section and detail are read.
@@ -225,6 +244,63 @@ pub fn opening_rows(d: &Drawing) -> Vec<OpeningRow> {
         });
     }
     rows
+}
+
+/// Every placed elevation's marks of the openings facing it, in the elevations' document order,
+/// then row order. An unreadable drawing has none.
+pub fn elevation_marks(d: &Drawing) -> Vec<ElevationMark> {
+    let (found, levels) = openings(d);
+    if found.is_empty() {
+        return Vec::new();
+    }
+    let rows = opening_rows(d);
+    let (Ok(doc), Ok(p)) = (read_document(d), DrawingProject::new(d)) else { return Vec::new() };
+    // Each opening in global XY: (row index, level, global midpoint, global out, z).
+    let placed: Vec<(usize, usize, Point2, Point2, f64)> = found
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| {
+            let level = o.level?;
+            let floor = levels.get(level)?.floor_elevation.value;
+            let plan = p.view(o.mark.plan)?;
+            let at = plan_local_to_global_xy(&plan, o.mark.at).ok()?;
+            let out = sub2(plan_local_to_global_xy(&plan, add2(o.mark.at, o.mark.out)).ok()?, at);
+            let row = rows.get(i)?;
+            let z = match (row.sill, row.height) {
+                (Some(sill), Some(height)) => floor + sill + height / 2.0,
+                _ => floor + UNREAD_MARK_Z_MM,
+            };
+            Some((i, level, at, out, z))
+        })
+        .collect();
+    let mut marks = Vec::new();
+    for v in &doc.views {
+        let AnyView::Vertical(e) = v else { continue };
+        if e.intent != VerticalIntent::Elevation {
+            continue;
+        }
+        let Some(view) = p.view(e.id) else { continue };
+        let Some(host) = view.host_view_id().and_then(|h| p.view(h)) else { continue };
+        let Ok(b) = vertical_basis(&view, &host) else { continue };
+        let gaze = vertical_gaze_dir(b.c_hat, b.flipped);
+        let tol = TOLERANCE.coincidence_mm;
+        // (row index, level, u, depth, z) of each facing opening inside the cut line.
+        let facing: Vec<(usize, usize, f64, f64, f64)> = placed
+            .iter()
+            .filter(|(.., out, _)| dot2(*out, gaze) <= -std::f64::consts::FRAC_1_SQRT_2)
+            .map(|&(i, level, at, _, z)| (i, level, dot2(sub2(at, b.origin_xy), b.c_hat), dot2(sub2(at, b.origin_xy), gaze), z))
+            .filter(|&(_, _, u, ..)| u >= -tol && u <= b.length_mm + tol)
+            .collect();
+        for &(i, level, u, depth, z) in &facing {
+            let hidden = facing.iter().any(|&(j, l, u2, d2, _)| j != i && l == level && (u2 - u).abs() <= HIDE_U_MM && d2 < depth - tol);
+            if hidden {
+                continue;
+            }
+            let Some(o) = found.get(i) else { continue };
+            marks.push(ElevationMark { view: e.id, mark: o.mark.mark.clone(), at: vertical_uz_to_local(&view, Uz { u, z }) });
+        }
+    }
+    marks
 }
 
 /// Whole millimetres, never `-0`.
@@ -393,8 +469,13 @@ mod tests {
     /// Draws a 5000 × 4000, 200-thick room on the edited plan: a `(lo, hi)` gap in its south wall
     /// (y 0..200), and one in its north wall (y 3800..4000) when given.
     fn walls(s: &mut Session, south: (f64, f64), north: Option<(f64, f64)>) -> R {
+        walls_at(s, 0.0, south, north)
+    }
+
+    /// [`walls`] moved `dy` north.
+    fn walls_at(s: &mut Session, dy: f64, south: (f64, f64), north: Option<(f64, f64)>) -> R {
         layer(s, "WALL-EXT")?;
-        for (y0, x0, x1, y1) in [(0.0, 0.0, 5000.0, 4000.0), (200.0, 200.0, 4800.0, 3800.0)] {
+        for (y0, x0, x1, y1) in [(dy, 0.0, 5000.0, 4000.0 + dy), (200.0 + dy, 200.0, 4800.0, 3800.0 + dy)] {
             match north {
                 Some(n) => {
                     s.execute("pline", &json!({ "vertices": [[south.0, y0], [x0, y0], [x0, y1], [n.0, y1]] }))?;
@@ -668,6 +749,60 @@ mod tests {
         assert_eq!(s.current_prompt().and_then(|p| p.default).as_deref(), Some("A602"));
         s.input(Input::Text("Sched".into()))?;
         assert!(s.doc()?.layout("Sched").is_some());
+        Ok(())
+    }
+
+    /// Elevation `name` on `plan`, cut from `from` to `to` (it looks to the left of that direction).
+    fn elevation(s: &mut Session, plan: Id, name: &str, from: (f64, f64), to: (f64, f64)) -> T<Id> {
+        let r = s.execute(
+            "newelevationline",
+            &json!({ "name": name, "hostViewId": plan.0, "cutFrom": {"x": from.0, "y": from.1}, "cutTo": {"x": to.0, "y": to.1} }),
+        )?;
+        id(&r)
+    }
+
+    /// A room with window W01 at x 2000..3000 in its south wall, the plan edited.
+    fn window_south() -> T<(Session, Id)> {
+        let (mut s, plan) = project()?;
+        walls(&mut s, (2000.0, 3000.0), None)?;
+        opening(&mut s, "WINDOW", (2000.0, 100.0), (3000.0, 100.0))?;
+        Ok((s, plan))
+    }
+
+    #[test]
+    fn an_elevation_marks_the_window_facing_it_at_1200_or_at_its_section_read_centre() -> R {
+        let (mut s, plan) = window_south()?;
+        let south = elevation(&mut s, plan, "South", (-500.0, -1000.0), (5500.0, -1000.0))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(elevation_marks(s.doc()?).iter().map(|m| (m.view, m.mark.as_str())).collect::<Vec<_>>(), [(south, "W01")]);
+        assert_eq!(mark_texts(&s, south)?, [("W01".to_owned(), 3000.0, UNREAD_MARK_Z_MM)], "in the elevation's annotation block");
+        assert!(crate::annotations::settled(s.doc()?)?, "a second pass changes nothing");
+        let sec = section_through(&mut s, plan, &[(900.0, 2100.0)], 3000.0)?;
+        assert_eq!(mark_texts(&s, south)?, [("W01".to_owned(), 3000.0, 1500.0)]);
+        assert!(mark_texts(&s, sec)?.is_empty(), "a section gets no marks");
+        assert!(crate::annotations::settled(s.doc()?)?);
+        Ok(())
+    }
+
+    #[test]
+    fn an_elevation_from_inside_one_off_the_window_and_one_square_to_its_wall_mark_nothing() -> R {
+        let (mut s, plan) = window_south()?;
+        elevation(&mut s, plan, "Inside", (5000.0, 2000.0), (0.0, 2000.0))?;
+        elevation(&mut s, plan, "Short", (3500.0, -1000.0), (5500.0, -1000.0))?;
+        elevation(&mut s, plan, "West", (-1000.0, 5000.0), (-1000.0, -1000.0))?;
+        assert_eq!(elevation_marks(s.doc()?), []);
+        Ok(())
+    }
+
+    #[test]
+    fn a_window_behind_a_nearer_one_within_300_in_u_is_not_marked() -> R {
+        let (mut s, plan) = window_south()?;
+        walls_at(&mut s, 6000.0, (2100.0, 3100.0), None)?;
+        opening(&mut s, "WINDOW", (2100.0, 6100.0), (3100.0, 6100.0))?;
+        let south = elevation(&mut s, plan, "South", (-500.0, -1000.0), (5500.0, -1000.0))?;
+        let marks = elevation_marks(s.doc()?);
+        assert_eq!(opening_rows(s.doc()?).len(), 2);
+        assert_eq!(marks, [ElevationMark { view: south, mark: "W01".to_owned(), at: Point2 { x: 3000.0, y: UNREAD_MARK_Z_MM } }]);
         Ok(())
     }
 }
