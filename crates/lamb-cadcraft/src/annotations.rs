@@ -87,11 +87,18 @@ pub const GRID_GAP_MM: f64 = 500.0;
 pub const ELEV_MARK_MM: f64 = 300.0;
 /// Every generated entity's layer inside the block.
 const LAYER: &str = "0";
+/// The linetype of every grid line the block generates ([`Item::CenterLine`]).
+pub const GRID_LINETYPE: &str = "CENTER";
+/// A generated grid line's entity linetype scale. The plot scales a viewport's model-space dashes
+/// by 1/scale (PSLTSCALE), so this one value gives the same dash on paper at every view scale.
+pub const GRID_LTSCALE: f64 = 0.5;
 
 /// One generated entity, in view-local coordinates.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Item {
     Line(Vec3, Vec3),
+    /// A grid line or bubble stem: a LINE in [`GRID_LINETYPE`] at [`GRID_LTSCALE`].
+    CenterLine(Vec3, Vec3),
     /// A cut symbol's name and its height: centred.
     Text(Vec3, String, f64),
     /// A level label and its height: left-aligned.
@@ -185,7 +192,7 @@ pub(crate) fn grid_bubble(end: Vec3, out: (f64, f64), name: &str, f: f64) -> Vec
     let (r, gap) = (GRID_BUBBLE_MM * f, GRID_GAP_MM * f);
     let edge = v(end.x + out.0 * gap, end.y + out.1 * gap);
     let c = v(end.x + out.0 * (gap + r), end.y + out.1 * (gap + r));
-    vec![Item::Line(v(end.x, end.y), edge), Item::Circle(c, r), Item::Text(c, name.to_owned(), 0.8 * r)]
+    vec![Item::CenterLine(v(end.x, end.y), edge), Item::Circle(c, r), Item::Text(c, name.to_owned(), 0.8 * r)]
 }
 
 /// One grid line a placed view shows, in view-local coordinates: `own` when it is one of the
@@ -262,7 +269,7 @@ fn grid_items(d: &Drawing, dp: &DrawingProject, id: Id, vertical: bool, f: f64) 
     let mut out = Vec::new();
     for g in grid_lines(d, dp, id, f)? {
         if !g.own {
-            out.push(Item::Line(g.a, g.b));
+            out.push(Item::CenterLine(g.a, g.b));
         }
         bubbles(g.a, g.b, &g.name, &mut out);
     }
@@ -427,9 +434,28 @@ fn text(at: Vec3, value: &str, height: f64, halign: HAlign) -> Text {
     }
 }
 
+/// The common properties item `i` is written with: layer `0`, and a grid line's linetype and scale.
+pub(crate) fn common_of(i: &Item) -> Common {
+    match i {
+        Item::CenterLine(..) => Common { layer: LAYER.into(), linetype: GRID_LINETYPE.into(), ltscale: GRID_LTSCALE, ..Common::default() },
+        _ => Common { layer: LAYER.into(), ..Common::default() },
+    }
+}
+
+/// Loads [`GRID_LINETYPE`] into `d` from the standard library when any of `items` is an
+/// [`Item::CenterLine`] and `d` lacks it.
+pub(crate) fn ensure_grid_linetype<'a>(d: &mut Drawing, mut items: impl Iterator<Item = &'a Item>) {
+    if !items.any(|i| matches!(i, Item::CenterLine(..))) || d.linetype(GRID_LINETYPE).is_some() {
+        return;
+    }
+    if let Some(lt) = cadcraft_doc::library::standard_linetypes_for(d).into_iter().find(|l| l.name.eq_ignore_ascii_case(GRID_LINETYPE)) {
+        d.linetypes.push(lt);
+    }
+}
+
 pub(crate) fn entity_of(i: &Item) -> EntityKind {
     match i {
-        Item::Line(a, b) => EntityKind::Line(Line { a: *a, b: *b }),
+        Item::Line(a, b) | Item::CenterLine(a, b) => EntityKind::Line(Line { a: *a, b: *b }),
         Item::Text(at, s, h) => EntityKind::Text(text(*at, s, *h, HAlign::Center)),
         Item::Label(at, s, h) => EntityKind::Text(text(*at, s, *h, HAlign::Left)),
         Item::Dim(a, b, rotation, line_at, scale) => EntityKind::Dimension(rotated_dim(*a, *b, *rotation, *line_at, *scale)),
@@ -486,6 +512,11 @@ fn same_size(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-9 * b.abs().max(1.0)
 }
 
+/// `true` when `e` is in [`GRID_LINETYPE`], whatever its case.
+fn is_grid_linetype(e: &Entity) -> bool {
+    e.common.linetype.eq_ignore_ascii_case(GRID_LINETYPE)
+}
+
 /// `true` when `block` holds exactly `want`, in order: each on layer `0`, LINE ends, TEXT
 /// alignment points and DIMENSION points within [`TOLERANCE`]`.coincidence_mm`, the same text
 /// strings and heights, and every dimension at the wanted rotation and line with measured text and
@@ -495,7 +526,10 @@ fn block_matches(block: &Block, want: &[Item]) -> bool {
         && block.entities.iter().zip(want).all(|(e, w)| {
             e.common.layer == LAYER
                 && match (&e.kind, w) {
-                    (EntityKind::Line(l), Item::Line(a, b)) => near(l.a, *a) && near(l.b, *b),
+                    (EntityKind::Line(l), Item::Line(a, b)) => !is_grid_linetype(e) && near(l.a, *a) && near(l.b, *b),
+                    (EntityKind::Line(l), Item::CenterLine(a, b)) => {
+                        is_grid_linetype(e) && same_size(e.common.ltscale, GRID_LTSCALE) && near(l.a, *a) && near(l.b, *b)
+                    }
                     (EntityKind::Text(t), Item::Text(at, s, h)) => {
                         t.halign == HAlign::Center && near(t.align_pt.unwrap_or(t.insert), *at) && t.value == *s && same_size(t.height, *h)
                     }
@@ -544,8 +578,9 @@ fn replace_block(d: &mut Drawing, plan: Id, items: &[Item]) -> Result<(), String
     let name = annotation_block_name(plan);
     d.blocks.insert(name.clone(), Arc::new(Block::new(&name)));
     let space = Space::Block(name);
+    ensure_grid_linetype(d, items.iter());
     for i in items {
-        d.add(&space, Common { layer: LAYER.into(), ..Common::default() }, entity_of(i)).map_err(|e| e.to_string())?;
+        d.add(&space, common_of(i), entity_of(i)).map_err(|e| e.to_string())?;
     }
     ensure_insert(d, plan);
     Ok(())
@@ -658,6 +693,7 @@ pub(crate) mod tests {
                     return Err("not on layer 0".into());
                 }
                 match &e.kind {
+                    EntityKind::Line(l) if is_grid_linetype(e) => Ok(Item::CenterLine(l.a, l.b)),
                     EntityKind::Line(l) => Ok(Item::Line(l.a, l.b)),
                     EntityKind::Circle(c) => Ok(Item::Circle(c.center, c.radius)),
                     EntityKind::Text(t) if t.halign == HAlign::Left => Ok(Item::Label(t.align_pt.unwrap_or(t.insert), t.value.clone(), t.height)),
@@ -1438,7 +1474,10 @@ pub(crate) mod tests {
 
         // The other plan draws both lines too, with the same bubbles.
         let it = items(&s, upper)?;
-        assert!(it.contains(&Item::Line(v(2000.0, -2000.0), v(2000.0, 3000.0))) && it.contains(&Item::Line(v(-1000.0, 4000.0), v(6000.0, 4000.0))));
+        assert!(
+            it.contains(&Item::CenterLine(v(2000.0, -2000.0), v(2000.0, 3000.0)))
+                && it.contains(&Item::CenterLine(v(-1000.0, 4000.0), v(6000.0, 4000.0)))
+        );
         let bu = bubbles_of(&s, upper)?;
         assert_eq!(bu.len(), 4);
         assert!(bu.iter().zip(&b).all(|(x, y)| near(x.0, y.0) && x.2 == y.2), "{bu:?}");
@@ -1449,9 +1488,9 @@ pub(crate) mod tests {
         assert_eq!(fs.len(), 1, "{fs:?}");
         let over = LEVEL_OVERRUN_MM * fs[0].1 / GRID_BUBBLE_MM;
         let lines: Vec<_> =
-            items(&s, sec)?.into_iter().filter(|i| matches!(i, Item::Line(a, b) if (a.x - x).abs() < 1e-6 && (b.x - x).abs() < 1e-6)).collect();
+            items(&s, sec)?.into_iter().filter(|i| matches!(i, Item::CenterLine(a, b) if (a.x - x).abs() < 1e-6 && (b.x - x).abs() < 1e-6)).collect();
         assert_eq!(lines.len(), 2, "the grid line and the bubble's stub: {lines:?}");
-        let Item::Line(a, top) = &lines[0] else { return Err("no line".into()) };
+        let Item::CenterLine(a, top) = &lines[0] else { return Err("no line".into()) };
         assert!((a.y - (ext.0 - over)).abs() < 1e-6 && (top.y - (ext.1 + over)).abs() < 1e-6, "{a:?} {top:?} {ext:?}");
         let fsf = fs[0].1 / GRID_BUBBLE_MM;
         assert!(close(fs[0].0, x, top.y + (GRID_GAP_MM + GRID_BUBBLE_MM) * fsf) && fs[0].2 == "1", "{fs:?}");
@@ -1484,6 +1523,76 @@ pub(crate) mod tests {
         s.undo()?;
         assert_eq!(bubbles_of(&s, sec)?, b0);
         assert!((section_grid(&s, sec)?.0 - x0).abs() < 1e-9);
+        Ok(())
+    }
+
+    /// The view's annotation LINEs: (linetype, ltscale, from, to).
+    fn lines_of(s: &Session, view: Id) -> T<Vec<(String, f64, Vec3, Vec3)>> {
+        let b = block_of(s, view).ok_or("no annotation block")?;
+        Ok(b.entities
+            .iter()
+            .filter_map(|e| if let EntityKind::Line(l) = &e.kind { Some((e.common.linetype.clone(), e.common.ltscale, l.a, l.b)) } else { None })
+            .collect())
+    }
+
+    /// Every bubble's stem (the line ending one gap short of the bubble's edge) is CENTER at 0.5.
+    fn stems_are_center(s: &Session, view: Id) -> T<usize> {
+        let lines = lines_of(s, view)?;
+        let mut n = 0;
+        for (c, r, _) in bubbles_of(s, view)? {
+            let stem = lines
+                .iter()
+                .find(|l| (l.3.x - c.x).hypot(l.3.y - c.y) - r < 1e-6 && (l.3.x - c.x).hypot(l.3.y - c.y) > 0.5 * r)
+                .ok_or("a bubble with no stem")?;
+            assert!(stem.0 == GRID_LINETYPE && stem.1 == GRID_LTSCALE, "{stem:?}");
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    #[test]
+    fn generated_grid_lines_and_stems_are_center_and_the_drawn_datum_keeps_its_linetype() -> R {
+        let (s, plan, upper, sec, ns) = gridded()?;
+        let d = s.doc()?;
+        assert!(d.linetype(GRID_LINETYPE).is_some(), "CENTER is loaded");
+        let derived = lines_of(&s, upper)?;
+        for (a, b) in [(v(2000.0, -2000.0), v(2000.0, 3000.0)), (v(-1000.0, 4000.0), v(6000.0, 4000.0))] {
+            let l = derived.iter().find(|l| near(l.2, a) && near(l.3, b)).ok_or("no derived line")?;
+            assert!(l.0 == GRID_LINETYPE && l.1 == GRID_LTSCALE, "{l:?}");
+        }
+        assert_eq!(stems_are_center(&s, plan)?, 4);
+        assert_eq!(stems_are_center(&s, upper)?, 4);
+        // The plan draws no line of its own grid; the datum it drew keeps its own linetype.
+        assert!(!lines_of(&s, plan)?.iter().any(|l| l.0 == GRID_LINETYPE && (l.3.y - l.2.y).abs() > 4000.0), "no derived copy in plan A");
+        let datum = d.entity(cadcraft_doc::Handle(ns.0)).ok_or("no datum entity")?;
+        assert_eq!(datum.common.linetype, "ByLayer");
+
+        // The section's derived line and its bubble stem.
+        let (x, _) = section_grid(&s, sec)?;
+        let sl: Vec<_> = lines_of(&s, sec)?.into_iter().filter(|l| (l.2.x - x).abs() < 1e-6 && (l.3.x - x).abs() < 1e-6).collect();
+        assert_eq!(sl.len(), 2, "{sl:?}");
+        assert!(sl.iter().all(|l| l.0 == GRID_LINETYPE && l.1 == GRID_LTSCALE), "{sl:?}");
+        assert_eq!(stems_are_center(&s, sec)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_block_with_continuous_grid_lines_regenerates_once() -> R {
+        let (mut s, _plan, upper, _sec, _ns) = gridded()?;
+        let name = annotation_block_name(upper);
+        let d = s.doc_mut()?;
+        let mut old = (**d.blocks.get(&name).ok_or("no block")?).clone();
+        for h in old.entities.handles() {
+            old.entities.modify(h, |e| e.common = Common { layer: LAYER.into(), ..Common::default() });
+        }
+        d.blocks.insert(name.clone(), Arc::new(old));
+        assert!(!settled(s.doc()?)?, "the old block does not match");
+        s.execute("line", &json!({ "points": [[100, 300], [200, 300]] }))?;
+        assert!(settled(s.doc()?)?);
+        assert!(lines_of(&s, upper)?.iter().filter(|l| l.0 == GRID_LINETYPE).count() >= 6, "two lines and four stems");
+        let before = block_of(&s, upper).ok_or("no block")?;
+        s.execute("line", &json!({ "points": [[100, 100], [200, 100]] }))?;
+        assert!(Arc::ptr_eq(&before, &block_of(&s, upper).ok_or("no block")?), "a second command rewrites nothing");
         Ok(())
     }
 }

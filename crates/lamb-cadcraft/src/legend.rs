@@ -25,7 +25,8 @@ use lamb_core::derivation::markers::compute_cut_lines_for_view;
 use lamb_core::derivation::read::{ProjectRead, ViewKind};
 
 use crate::annotations::{
-    CUT_TEXT_MM, Item, LEVEL_TEXT_MM, cut_symbol, elevation_marker, entity_of, grid_bubble, is_elevation, k, room_tag_items, wall_tag_symbol,
+    CUT_TEXT_MM, Item, LEVEL_TEXT_MM, common_of, cut_symbol, elevation_marker, ensure_grid_linetype, entity_of, grid_bubble, is_elevation, k,
+    room_tag_items, wall_tag_symbol,
 };
 use crate::bom::{self, Refreshed};
 use crate::bubbles::{BUBBLE_BLOCK, BUBBLE_RADIUS_MM, bubble_insert};
@@ -94,7 +95,7 @@ fn rows(d: &Drawing) -> Vec<(Sample, &'static str)> {
         out.push((Sample::Items(s), "Level — name and floor elevation"));
     }
     if named_grids(&dp, &crate::gridname::overrides(doc)).is_ok_and(|g| !g.is_empty()) {
-        let mut s = vec![Item::Line(v(-20.0, 0.0), v(0.0, 0.0))];
+        let mut s = vec![Item::CenterLine(v(-20.0, 0.0), v(0.0, 0.0))];
         s.extend(grid_bubble(v(0.0, 0.0), (1.0, 0.0), "1", f));
         out.push((Sample::Items(s), "Grid line — the same name on every plan, section and elevation"));
     }
@@ -141,7 +142,7 @@ fn y_range(items: &[Item]) -> (f64, f64) {
     let mut add = |lo: f64, hi: f64| r = (r.0.min(lo), r.1.max(hi));
     for i in items {
         match i {
-            Item::Line(a, b) => add(a.y.min(b.y), a.y.max(b.y)),
+            Item::Line(a, b) | Item::CenterLine(a, b) => add(a.y.min(b.y), a.y.max(b.y)),
             Item::Text(at, _, h) | Item::Label(at, _, h) => add(at.y - h / 2.0, at.y + h / 2.0),
             Item::Dim(a, b, ..) => add(a.y.min(b.y), a.y.max(b.y)),
             Item::Circle(c, r) => add(c.y - r, c.y + r),
@@ -154,6 +155,7 @@ fn shifted(i: &Item, dx: f64, dy: f64) -> Item {
     let m = |p: &Vec3| v(p.x + dx, p.y + dy);
     match i {
         Item::Line(a, b) => Item::Line(m(a), m(b)),
+        Item::CenterLine(a, b) => Item::CenterLine(m(a), m(b)),
         Item::Text(at, s, h) => Item::Text(m(at), s.clone(), *h),
         Item::Label(at, s, h) => Item::Label(m(at), s.clone(), *h),
         Item::Dim(a, b, r, l, sc) => Item::Dim(m(a), m(b), *r, m(l), *sc),
@@ -185,9 +187,11 @@ fn label(at: Vec3, value: &str, height: f64) -> EntityKind {
     })
 }
 
-/// The legend block's entities for `rows`, in block order, and its total height.
-fn contents(rows: Vec<(Sample, &'static str)>) -> (Vec<EntityKind>, f64) {
-    let mut out = vec![label(v(0.0, -TITLE_MM / 2.0), LEGEND_TITLE, TITLE_MM)];
+/// The legend block's entities for `rows`, in block order, each with its common properties
+/// ([`common_of`] for a generated item, else layer `0`), and its total height.
+fn contents(rows: Vec<(Sample, &'static str)>) -> (Vec<(Common, EntityKind)>, f64) {
+    let plain = || Common { layer: "0".into(), ..Common::default() };
+    let mut out = vec![(plain(), label(v(0.0, -TITLE_MM / 2.0), LEGEND_TITLE, TITLE_MM))];
     let mut top = -(TITLE_MM + ROW_GAP_MM);
     let cx = SYMBOL_COL_MM / 2.0;
     for (sample, text) in rows {
@@ -199,10 +203,10 @@ fn contents(rows: Vec<(Sample, &'static str)>) -> (Vec<EntityKind>, f64) {
         let yc = top - height / 2.0;
         let dy = yc - (lo + hi) / 2.0;
         match sample {
-            Sample::Items(items) => out.extend(items.iter().map(|i| entity_of(&shifted(i, cx, dy)))),
-            Sample::Insert(i, _) => out.push(EntityKind::Insert(shifted_insert(i, cx, dy))),
+            Sample::Items(items) => out.extend(items.iter().map(|i| shifted(i, cx, dy)).map(|i| (common_of(&i), entity_of(&i)))),
+            Sample::Insert(i, _) => out.push((plain(), EntityKind::Insert(shifted_insert(i, cx, dy)))),
         }
-        out.push(label(v(TEXT_X_MM, yc), text, TEXT_MM));
+        out.push((plain(), label(v(TEXT_X_MM, yc), text, TEXT_MM)));
         top -= height;
     }
     (out, -top)
@@ -230,17 +234,22 @@ pub(crate) fn refresh_legend(d: &mut Drawing) -> Result<Option<Refreshed>> {
         }
         return Ok((had_block || existing.is_some()).then_some(Refreshed::Updated));
     }
+    let samples: Vec<Item> = rows.iter().filter_map(|(s, _)| if let Sample::Items(i) = s { Some(i.clone()) } else { None }).flatten().collect();
     let (want, _) = contents(rows);
-    let same = d
-        .block(LEGEND_BLOCK)
-        .is_some_and(|b| b.entities.len() == want.len() && b.entities.iter().zip(&want).all(|(e, w)| e.common.layer == "0" && e.kind == *w));
+    let same = d.block(LEGEND_BLOCK).is_some_and(|b| {
+        b.entities.len() == want.len()
+            && b.entities.iter().zip(&want).all(|(e, (c, w))| {
+                e.common.layer == "0" && e.common.linetype.eq_ignore_ascii_case(&c.linetype) && e.common.ltscale == c.ltscale && e.kind == *w
+            })
+    });
     if same && existing.is_some() {
         return Ok(None);
     }
     d.blocks.insert(LEGEND_BLOCK.into(), Arc::new(Block::new(LEGEND_BLOCK)));
     let space = Space::Block(LEGEND_BLOCK.into());
-    for kind in want {
-        d.add(&space, Common { layer: "0".into(), ..Common::default() }, kind).map_err(other)?;
+    ensure_grid_linetype(d, samples.iter());
+    for (common, kind) in want {
+        d.add(&space, common, kind).map_err(other)?;
     }
     if existing.is_some() {
         return Ok(Some(Refreshed::Updated));
@@ -438,6 +447,10 @@ mod tests {
         assert_eq!(legend_rows(s.doc()?), [CUT, LEVEL, GRID, BUBBLE, ROOM]);
         let b = s.doc()?.block(LEGEND_BLOCK).ok_or("no block")?;
         assert!(b.entities.iter().any(|e| matches!(&e.kind, EntityKind::Circle(c) if (c.radius - 5.0).abs() < 1e-9)), "the bubble at paper size");
+        let center: Vec<_> = b.entities.iter().filter(|e| e.common.linetype == crate::annotations::GRID_LINETYPE).collect();
+        assert_eq!(center.len(), 2, "the grid sample line and its bubble stem");
+        assert!(center.iter().all(|e| matches!(e.kind, EntityKind::Line(_)) && e.common.ltscale == crate::annotations::GRID_LTSCALE));
+        assert!(s.doc()?.linetype(crate::annotations::GRID_LINETYPE).is_some());
         Ok(())
     }
 }
