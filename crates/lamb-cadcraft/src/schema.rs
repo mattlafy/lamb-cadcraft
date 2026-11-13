@@ -112,6 +112,10 @@ pub struct LambDocument {
     /// ([`crate::autodim::locate`], `autodim {locate: true}`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_dim_locate_plans: Vec<Id>,
+    /// Plan views given generated grid dimension strings, bay by bay and overall
+    /// ([`crate::autodim::grid`], `autodim {grid: true}`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_dim_grid_plans: Vec<Id>,
     /// Plan views given wall type tags ([`crate::walltypes::wall_tags`], `walltags`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wall_tag_plans: Vec<Id>,
@@ -217,6 +221,7 @@ impl LambDocument {
             auto_dim_plans: Vec::new(),
             auto_dim_interior_plans: Vec::new(),
             auto_dim_locate_plans: Vec::new(),
+            auto_dim_grid_plans: Vec::new(),
             wall_tag_plans: Vec::new(),
             detail_note_views: Vec::new(),
             sheet_paper: None,

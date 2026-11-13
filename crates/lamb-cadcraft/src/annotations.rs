@@ -8,7 +8,8 @@
 //! pair of consecutive levels by elevation (LAMB T500). Plan cut elevations stay overlay-only. A
 //! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641), one
 //! in `auto_dim_interior_plans` its rooms' clear dimensions (LAMB T686), one in `auto_dim_locate_plans`
-//! the setting-out strings locating its interior walls (LAMB T694),
+//! the setting-out strings locating its interior walls (LAMB T694), one in `auto_dim_grid_plans` its
+//! grid strings (LAMB T705),
 //! and every placed plan a text of each opening's schedule mark outside it ([`crate::schedule`], LAMB T639).
 //! A plan in `wall_tag_plans` gets each wall type tag, its mark in a hexagon inside the run
 //! ([`crate::walltypes::wall_tags`], LAMB T690).
@@ -161,30 +162,25 @@ pub(crate) fn grid_bubble(end: Vec3, out: (f64, f64), name: &str, f: f64) -> Vec
     vec![Item::Line(v(end.x, end.y), edge), Item::Circle(c, r), Item::Text(c, name.to_owned(), 0.8 * r)]
 }
 
-/// Placed view `id`'s grid items at length factor `f`: per grid line another view draws that `id`
-/// shows, the line (an infinite one clipped to the view block's extents ±[`LEVEL_OVERRUN_MM`]) and
-/// its bubbles; then per datum segment of `id`'s own that is a grid, its bubbles. Bubbles go at both
-/// ends in a plan and at the upper end in a vertical view.
-fn grid_items(d: &Drawing, dp: &DrawingProject, id: Id, vertical: bool, f: f64) -> Result<Vec<Item>, String> {
+/// One grid line a placed view shows, in view-local coordinates: `own` when it is one of the
+/// view's own datum segments (already drawn in the view block), else a line another view draws,
+/// an infinite one clipped to the view block's extents ±[`LEVEL_OVERRUN_MM`] × `f`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GridLine {
+    pub a: Vec3,
+    pub b: Vec3,
+    pub name: String,
+    pub own: bool,
+}
+
+/// Placed view `id`'s grid lines at length factor `f`: first those another view draws, then the
+/// view's own grid datum segments, each with its grid's name ([`named_grids`]).
+pub(crate) fn grid_lines(d: &Drawing, dp: &DrawingProject, id: Id, f: f64) -> Result<Vec<GridLine>, String> {
     let grids = named_grids(dp, &crate::gridname::overrides(dp.document()))?;
     if grids.is_empty() {
         return Ok(Vec::new());
     }
     let name_of = |m: GridMember| grids.iter().find(|g| g.members.contains(&m)).map(|g| g.name.clone());
-    let bubbles = |a: Vec3, b: Vec3, name: &str, out: &mut Vec<Item>| {
-        let len = (b.x - a.x).hypot(b.y - a.y);
-        if len <= TOLERANCE.coincidence_mm {
-            return;
-        }
-        let u = ((b.x - a.x) / len, (b.y - a.y) / len);
-        if vertical {
-            let (top, dir) = if b.y >= a.y { (b, u) } else { (a, (-u.0, -u.1)) };
-            out.extend(grid_bubble(top, dir, name, f));
-        } else {
-            out.extend(grid_bubble(a, (-u.0, -u.1), name, f));
-            out.extend(grid_bubble(b, u, name, f));
-        }
-    };
     let mut out = Vec::new();
     let ext = d.extents(&Space::Block(view_block_name(id)));
     for o in compute_datum_lines_for_view(dp, id)? {
@@ -206,16 +202,43 @@ fn grid_items(d: &Drawing, dp: &DrawingProject, id: Id, vertical: bool, f: f64) 
         } else {
             (v(o.from.x, o.from.y), v(o.to.x, o.to.y))
         };
-        out.push(Item::Line(a, b));
-        bubbles(a, b, &name, &mut out);
+        out.push(GridLine { a, b, name, own: false });
     }
     for g in &grids {
         for m in g.members.iter().filter(|m| m.view_id == id) {
             let Some(e) = dp.entity(m.entity_id) else { continue };
             let Some(poly) = e.polyline.as_deref() else { continue };
             let Some(seg) = resolved_segments(poly).into_iter().find(|s| s.index == m.segment_index) else { continue };
-            bubbles(v(seg.from.x, seg.from.y), v(seg.to.x, seg.to.y), &g.name, &mut out);
+            out.push(GridLine { a: v(seg.from.x, seg.from.y), b: v(seg.to.x, seg.to.y), name: g.name.clone(), own: true });
         }
+    }
+    Ok(out)
+}
+
+/// Placed view `id`'s grid items at length factor `f`: per [`grid_lines`] line another view draws,
+/// the line and its bubbles; per line of `id`'s own, its bubbles. Bubbles go at both ends in a plan
+/// and at the upper end in a vertical view.
+fn grid_items(d: &Drawing, dp: &DrawingProject, id: Id, vertical: bool, f: f64) -> Result<Vec<Item>, String> {
+    let bubbles = |a: Vec3, b: Vec3, name: &str, out: &mut Vec<Item>| {
+        let len = (b.x - a.x).hypot(b.y - a.y);
+        if len <= TOLERANCE.coincidence_mm {
+            return;
+        }
+        let u = ((b.x - a.x) / len, (b.y - a.y) / len);
+        if vertical {
+            let (top, dir) = if b.y >= a.y { (b, u) } else { (a, (-u.0, -u.1)) };
+            out.extend(grid_bubble(top, dir, name, f));
+        } else {
+            out.extend(grid_bubble(a, (-u.0, -u.1), name, f));
+            out.extend(grid_bubble(b, u, name, f));
+        }
+    };
+    let mut out = Vec::new();
+    for g in grid_lines(d, dp, id, f)? {
+        if !g.own {
+            out.push(Item::Line(g.a, g.b));
+        }
+        bubbles(g.a, g.b, &g.name, &mut out);
     }
     Ok(out)
 }
@@ -305,6 +328,10 @@ fn wanted(
     if dp.document().auto_dim_locate_plans.contains(&plan) {
         let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
         out.extend(crate::autodim::locate(&dp, plan).into_iter().map(|d| Item::Dim(at(d.a), at(d.b), d.rotation, at(d.line_at), scale)));
+    }
+    if dp.document().auto_dim_grid_plans.contains(&plan) {
+        let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
+        out.extend(crate::autodim::grid(&dp, plan, f).into_iter().map(|d| Item::Dim(at(d.a), at(d.b), d.rotation, at(d.line_at), scale)));
     }
     out.extend(grid_items(d, &dp, plan, false, f)?);
     out.extend(enlarged_boxes(d, id, scale));

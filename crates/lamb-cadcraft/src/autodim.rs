@@ -28,6 +28,15 @@
 //! nearest parallel exterior wall crossing the chain beyond it, or stops at the outermost centreline
 //! when there is none; chains repeat until every run is covered, and a chain of one station gives no
 //! dimension. Arc runs never take part.
+//!
+//! Grid dimensions (LAMB T705) are a fourth opt-in, `autodim {grid: true}`, kept in
+//! `auto_dim_grid_plans`: [`grid`] gives every family of parallel grid lines the plan shows (its own
+//! datum segments and those other views draw, [`crate::annotations::grid_lines`]) with two or more
+//! members a chain, grid to grid, and with three or more an overall dimension too. Both sit at the
+//! bubble end: a numbered family's (within 45° of local Y) top, any other's left. The chain is half
+//! [`GRID_GAP_MM`] past the furthest line end, inside the bubble's stub; the overall one is
+//! [`GRID_OVERALL_GAP_MM`] closer to the building. Each measured point is a grid line's intersection
+//! with its dimension line.
 
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use lamb_core::derivation::read::ProjectRead;
@@ -42,6 +51,7 @@ use lamb_core::model::{AnyView, Id};
 use serde_json::{Value, json};
 use std::f64::consts::FRAC_PI_2;
 
+use crate::annotations::GRID_GAP_MM;
 use crate::commands::{bad, edited_view, id_value, other};
 use crate::detailtags::graph_and_sides;
 use crate::project::DrawingProject;
@@ -51,6 +61,9 @@ use crate::schema::{read_document, write_document};
 pub const INNER_STRING_MM: f64 = 800.0;
 /// The outer string's dimension line sits this far off the face, at 1:50.
 pub const OUTER_STRING_MM: f64 = 1400.0;
+
+/// The overall grid dimension's line sits this far closer to the building than the chain's, at 1:50.
+pub const GRID_OVERALL_GAP_MM: f64 = 600.0;
 
 /// One generated dimension, in view-local coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -376,12 +389,90 @@ pub(crate) fn locate(p: &DrawingProject<'_>, view: Id) -> Vec<DimSpan> {
     out
 }
 
-/// Which of AUTODIM's three independent kinds a call turns on or off.
+/// A grid line in a family: a point on it, its unit direction, and its two ends.
+type GridMemberLine = (Point2, Point2, [Point2; 2]);
+
+/// `view`'s generated grid dimensions with their offsets multiplied by `factor`: per family of
+/// parallel grid lines, in the order of its first line, the chain and then (three or more grids)
+/// the overall dimension (see the module doc).
+pub(crate) fn grid(p: &DrawingProject<'_>, view: Id, factor: f64) -> Vec<DimSpan> {
+    let lines = crate::annotations::grid_lines(p.drawing(), p, view, factor).unwrap_or_default();
+    let tol = TOLERANCE.coincidence_mm;
+    let sin_tol = TOLERANCE.angle_deg.to_radians().sin();
+    // Families: (direction, numbered, members).
+    let mut families: Vec<(Point2, bool, Vec<GridMemberLine>)> = Vec::new();
+    for g in &lines {
+        let (a, b) = (Point2 { x: g.a.x, y: g.a.y }, Point2 { x: g.b.x, y: g.b.y });
+        if dist2(a, b) <= tol {
+            continue;
+        }
+        let u = normalize2(sub2(b, a));
+        match families.iter_mut().find(|f| cross2(f.0, u).abs() <= sin_tol) {
+            Some(f) => f.2.push((a, u, [a, b])),
+            None => {
+                let numbered = u.y.abs() >= u.x.abs();
+                let flip = if numbered { u.y < 0.0 } else { u.x < 0.0 };
+                families.push((if flip { scale2(u, -1.0) } else { u }, numbered, vec![(a, u, [a, b])]));
+            }
+        }
+    }
+    let upright = |mut heading: f64| {
+        if heading > FRAC_PI_2 + 1e-12 {
+            heading -= std::f64::consts::PI;
+        } else if heading <= -FRAC_PI_2 + 1e-12 {
+            heading += std::f64::consts::PI;
+        }
+        heading
+    };
+    let mut out = Vec::new();
+    for (d, numbered, members) in &families {
+        let (d, numbered) = (*d, *numbered);
+        let n = if numbered { Point2 { x: d.y, y: -d.x } } else { Point2 { x: -d.y, y: d.x } };
+        let rotation = upright(n.y.atan2(n.x));
+        // Each grid's intersection with the dimension line `dot(q, d) = t`, by offset along `n`;
+        // coincident grids count once.
+        let stations = |t: f64| {
+            let mut q: Vec<(f64, Point2)> = members
+                .iter()
+                .filter_map(|(a, u, _)| {
+                    let along = dot2(*u, d);
+                    (along.abs() > 0.5).then(|| add2(*a, scale2(*u, (t - dot2(*a, d)) / along)))
+                })
+                .map(|q| (dot2(q, n), q))
+                .collect();
+            q.sort_by(|x, y| x.0.total_cmp(&y.0));
+            q.dedup_by(|b, a| b.0 - a.0 <= tol);
+            q
+        };
+        let ends = members.iter().flat_map(|m| m.2).map(|e| dot2(e, d));
+        let gap = GRID_GAP_MM * factor / 2.0;
+        let t = if numbered { ends.fold(f64::NEG_INFINITY, f64::max) + gap } else { ends.fold(f64::INFINITY, f64::min) - gap };
+        let chain = stations(t);
+        if chain.len() < 2 {
+            continue;
+        }
+        out.extend(chain.windows(2).filter_map(|w| {
+            let (a, b) = (w.first()?.1, w.get(1)?.1);
+            Some(DimSpan { a, b, rotation, line_at: a })
+        }));
+        if chain.len() > 2 {
+            let toward = GRID_OVERALL_GAP_MM * factor;
+            let overall = stations(if numbered { t - toward } else { t + toward });
+            if let (Some(a), Some(b)) = (overall.first(), overall.last()) {
+                out.push(DimSpan { a: a.1, b: b.1, rotation, line_at: a.1 });
+            }
+        }
+    }
+    out
+}
+
+/// Which of AUTODIM's four independent kinds a call turns on or off.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Exterior,
     Interior,
     Locate,
+    Grid,
 }
 
 /// `Ok` when `view` is a placed plan, else why not.
@@ -395,11 +486,11 @@ fn check_plan(s: &Session, view: Id) -> std::result::Result<(), String> {
     }
 }
 
-/// AUTODIM `{view?, off?, interior?, locate?}`: turns the plan's generated dimension strings on, or
-/// off with `off: true`; with `interior: true` the same for its interior clear dimensions instead,
-/// with `locate: true` for its locating dimensions, the three independent (`interior` and `locate`
-/// together refuse). `view` defaults to the edited view. Returns `{view, dimensions, interior,
-/// locate, message}`, `dimensions` counting what the plan now has of that kind. A plan already in
+/// AUTODIM `{view?, off?, interior?, locate?, grid?}`: turns the plan's generated dimension strings
+/// on, or off with `off: true`; with `interior: true` the same for its interior clear dimensions
+/// instead, with `locate: true` for its locating dimensions, with `grid: true` for its grid
+/// dimensions, the four independent (any two of `interior`, `locate` and `grid` together refuse).
+/// `view` defaults to the edited view. Returns `{view, dimensions, interior, locate, grid, message}`, `dimensions` counting what the plan now has of that kind. A plan already in
 /// that state records no undo step.
 pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
     let view = match p.get("view") {
@@ -421,11 +512,17 @@ pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err(bad("autodim", "`locate` must be true or false")),
     };
-    let kind = match (inside, locating) {
-        (true, true) => return Err(bad("autodim", "give interior or locate, not both")),
-        (true, false) => Kind::Interior,
-        (false, true) => Kind::Locate,
-        (false, false) => Kind::Exterior,
+    let gridded = match p.get("grid") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad("autodim", "`grid` must be true or false")),
+    };
+    let kind = match (inside, locating, gridded) {
+        (true, false, false) => Kind::Interior,
+        (false, true, false) => Kind::Locate,
+        (false, false, true) => Kind::Grid,
+        (false, false, false) => Kind::Exterior,
+        _ => return Err(bad("autodim", "give one of interior, locate or grid")),
     };
     check_plan(s, view).map_err(other)?;
     let mut doc = read_document(s.doc()?).map_err(|e| other(e.to_string()))?;
@@ -433,6 +530,7 @@ pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
         Kind::Exterior => &mut doc.auto_dim_plans,
         Kind::Interior => &mut doc.auto_dim_interior_plans,
         Kind::Locate => &mut doc.auto_dim_locate_plans,
+        Kind::Grid => &mut doc.auto_dim_grid_plans,
     };
     if list.contains(&view) == off {
         list.retain(|v| *v != view);
@@ -449,6 +547,7 @@ pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
             Kind::Exterior => strings(&dp, view, 1.0).len(),
             Kind::Interior => interior(&dp, view).len(),
             Kind::Locate => locate(&dp, view).len(),
+            Kind::Grid => grid(&dp, view, 1.0).len(),
         }
     };
     let message = match (kind, off) {
@@ -458,9 +557,11 @@ pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
         (Kind::Interior, false) => format!("{dimensions} interior dimensions"),
         (Kind::Locate, true) => "Locating dimensions off".to_owned(),
         (Kind::Locate, false) => format!("{dimensions} locating dimensions"),
+        (Kind::Grid, true) => "Grid dimensions off".to_owned(),
+        (Kind::Grid, false) => format!("{dimensions} grid dimensions"),
     };
     s.echo(message.clone());
-    Ok(json!({ "view": view.0, "dimensions": dimensions, "interior": inside, "locate": locating, "message": message }))
+    Ok(json!({ "view": view.0, "dimensions": dimensions, "interior": inside, "locate": locating, "grid": gridded, "message": message }))
 }
 
 /// AUTODIM's interactive form, on the edited plan.
@@ -479,8 +580,9 @@ impl Interactive for AutoDimM {
         match self.kind {
             Kind::Interior => on_off("Interior dimensions"),
             Kind::Locate => on_off("Locating dimensions"),
+            Kind::Grid => on_off("Grid dimensions"),
             Kind::Exterior => {
-                Prompt::new("Dimension plan", Accept::TEXT).kw(&["On", "Off", "Interior", "Locate"]).options_only().default("On".to_owned())
+                Prompt::new("Dimension plan", Accept::TEXT).kw(&["On", "Off", "Interior", "Locate", "Grid"]).options_only().default("On".to_owned())
             }
         }
     }
@@ -513,14 +615,18 @@ impl Interactive for AutoDimM {
                     self.kind = Kind::Locate;
                     return Ok(Step::Continue);
                 }
+                "grid" | "g" if self.kind == Kind::Exterior => {
+                    self.kind = Kind::Grid;
+                    return Ok(Step::Continue);
+                }
                 _ => {
-                    s.echo(if self.kind == Kind::Exterior { "On, Off, Interior or Locate" } else { "On or Off" });
+                    s.echo(if self.kind == Kind::Exterior { "On, Off, Interior, Locate or Grid" } else { "On or Off" });
                     return Ok(Step::Continue);
                 }
             },
             _ => return Ok(Step::Continue),
         };
-        let p = json!({ "view": self.view.0, "off": off, "interior": self.kind == Kind::Interior, "locate": self.kind == Kind::Locate });
+        let p = json!({ "view": self.view.0, "off": off, "interior": self.kind == Kind::Interior, "locate": self.kind == Kind::Locate, "grid": self.kind == Kind::Grid });
         if let Err(e) = autodim(s, &p) {
             s.echo(e.to_string());
         }
@@ -872,7 +978,7 @@ mod tests {
     fn the_interactive_interior_option_asks_on_or_off() -> R {
         let (mut s, plan) = room()?;
         s.start("autodim")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Dimension plan [On/Off/Interior/Locate] <On>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Dimension plan [On/Off/Interior/Locate/Grid] <On>:"));
         s.input(Input::Keyword("Interior".into()))?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Interior dimensions [On/Off] <On>:"));
         s.input(Input::Enter)?;
@@ -890,7 +996,7 @@ mod tests {
     fn the_interactive_form_defaults_to_on_and_off_turns_it_off() -> R {
         let (mut s, plan) = room()?;
         s.start("autodim")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Dimension plan [On/Off/Interior/Locate] <On>:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Dimension plan [On/Off/Interior/Locate/Grid] <On>:"));
         s.input(Input::Text("x".into()))?;
         assert!(s.running.is_some(), "re-asks");
         s.input(Input::Enter)?;
@@ -1052,6 +1158,122 @@ mod tests {
         assert!(s.running.is_none());
         assert_eq!(dims(&s, plan)?.len(), 3);
         assert_eq!(read_document(s.doc()?)?.auto_dim_locate_plans, [plan]);
+        Ok(())
+    }
+
+    /// A placed plan with N–S grids at x 0, 6000 and 13500 (y −1000..9000) and E–W grids at y 0
+    /// and 8000 (x −1000..14500), and a second placed plan on Level 2 that shows them all derived.
+    /// Returns (session, plan, the other plan, the middle N–S grid's entity id).
+    fn grids() -> T<(Session, Id, Id, Id)> {
+        let (mut s, plan) = placed()?;
+        let l2 =
+            Id(s.execute("level", &json!({ "mode": "create", "name": "Level 2", "floorElevationMm": 3000 }))?["levelId"].as_u64().ok_or("no id")?);
+        let upper = Id(s.execute("newplan", &json!({ "name": "Upper" }))?["viewId"].as_u64().ok_or("no id")?);
+        let t = json!({ "originX": 0.0, "originY": 0.0, "rotation": 0.0 });
+        s.execute("placeview", &json!({ "viewId": upper.0, "kind": "plan", "levelId": l2.0, "cutElevation": 4200, "transform": t }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        s.execute("layer.new", &json!({ "name": "GRID", "current": true }))?;
+        let datum = crate::annotations::tests::datum_line;
+        datum(&mut s, plan, [0.0, -1000.0], [0.0, 9000.0])?;
+        let middle = datum(&mut s, plan, [6000.0, -1000.0], [6000.0, 9000.0])?;
+        datum(&mut s, plan, [13500.0, -1000.0], [13500.0, 9000.0])?;
+        datum(&mut s, plan, [-1000.0, 0.0], [14500.0, 0.0])?;
+        datum(&mut s, plan, [-1000.0, 8000.0], [14500.0, 8000.0])?;
+        Ok((s, plan, upper, middle))
+    }
+
+    /// The grid dimensions as (measurement, rotation in whole degrees, p13, p14, defpt), sorted.
+    fn grid_dims(s: &Session, view: Id) -> T<Vec<(i64, i64, [i64; 2], [i64; 2], [i64; 2])>> {
+        let xy = |v: cadcraft_geom::Vec3| [v.x.round() as i64, v.y.round() as i64];
+        let mut got = Vec::new();
+        for d in dims(s, view)? {
+            let DimKind::Linear { rotation } = d.kind else { return Err("not a linear dimension".into()) };
+            got.push((measured(s, &d)?.round() as i64, rotation.to_degrees().round() as i64, xy(d.p13), xy(d.p14), xy(d.defpt)));
+        }
+        got.sort();
+        Ok(got)
+    }
+
+    /// Checks [`grids`]' string with the middle N–S grid at `mid`: 1 at the top across x, 1 at the
+    /// left across y, each point on its grid line, the chain between the line ends and the bubbles,
+    /// the overall one closer to the building.
+    fn check_grid_string(got: &[(i64, i64, [i64; 2], [i64; 2], [i64; 2])], mid: i64) -> R {
+        let across: Vec<_> = got.iter().filter(|g| g.1 == 0).collect();
+        let down: Vec<_> = got.iter().filter(|g| g.1 == 90).collect();
+        assert_eq!(across.iter().map(|g| g.0).collect::<Vec<_>>(), {
+            let mut m = vec![mid, 13500 - mid, 13500];
+            m.sort();
+            m
+        });
+        for g in &across {
+            assert!([g.2[0], g.3[0]].iter().all(|x| [0, mid, 13500].contains(x)), "on a N–S grid: {g:?}");
+            assert!(g.2[1] == g.4[1] && g.3[1] == g.4[1], "measured on its dimension line: {g:?}");
+        }
+        let chain_y = across.iter().find(|g| g.0 != 13500).ok_or("no chain")?.4[1];
+        let overall_y = across.iter().find(|g| g.0 == 13500).ok_or("no overall")?.4[1];
+        assert!(9000 < chain_y && chain_y < 9500 && overall_y < chain_y, "{across:?}");
+        assert_eq!(down.len(), 1, "two E–W grids: one dimension, no overall: {down:?}");
+        let g = down[0];
+        assert!(g.0 == 8000 && [g.2[1], g.3[1]].iter().all(|y| [0, 8000].contains(y)), "{g:?}");
+        assert!(g.2[0] == g.4[0] && -1500 < g.4[0] && g.4[0] < -1000, "at the left, before the bubbles: {g:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_gridded_plan_gets_its_bay_and_overall_grid_strings_and_a_derived_plan_the_same() -> R {
+        let (mut s, plan, upper, _) = grids()?;
+        assert!(dims(&s, plan)?.is_empty(), "nothing changes without AUTODIM");
+        let n = undo_len(&s)?;
+        let r = s.execute("autodim", &json!({ "view": plan.0, "grid": true }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "one undo step");
+        assert_eq!((r["dimensions"].as_u64(), r["grid"].as_bool(), r["message"].as_str()), (Some(4), Some(true), Some("4 grid dimensions")));
+        let got = grid_dims(&s, plan)?;
+        check_grid_string(&got, 6000)?;
+        assert!(read_document(s.doc()?)?.auto_dim_plans.is_empty(), "exterior strings untouched");
+
+        // The other plan's grids are all derived from this one: the same string.
+        s.execute("autodim", &json!({ "view": upper.0, "grid": true }))?;
+        assert_eq!(grid_dims(&s, upper)?, got);
+        assert_eq!(read_document(s.doc()?)?.auto_dim_grid_plans, [plan, upper]);
+
+        let back = cadcraft_io::read_dxf(cadcraft_io::write_dxf(s.doc()?).as_bytes()).map_err(|e| format!("{e:?}"))?;
+        assert!(crate::annotations::settled(&back)?, "the observer would change nothing after a round trip");
+        assert_eq!(read_document(&back)?.auto_dim_grid_plans, [plan, upper]);
+        Ok(())
+    }
+
+    #[test]
+    fn moving_a_grid_regenerates_the_string_in_its_undo_step_and_off_removes_it() -> R {
+        let (mut s, plan, upper, middle) = grids()?;
+        s.execute("autodim", &json!({ "view": plan.0, "grid": true }))?;
+        s.execute("autodim", &json!({ "view": upper.0, "grid": true }))?;
+        let before = grid_dims(&s, plan)?;
+        let n = undo_len(&s)?;
+        s.execute("move", &json!({ "handles": [format!("{:X}", middle.0)], "delta": [500, 0] }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        check_grid_string(&grid_dims(&s, plan)?, 6500)?;
+        check_grid_string(&grid_dims(&s, upper)?, 6500)?;
+        s.undo()?;
+        assert_eq!(grid_dims(&s, plan)?, before);
+
+        let n = undo_len(&s)?;
+        for p in [json!({ "view": plan.0, "grid": true, "interior": true }), json!({ "view": plan.0, "grid": true, "locate": true })] {
+            assert!(s.execute("autodim", &p).is_err(), "{p}");
+        }
+        assert_eq!(undo_len(&s)?, n, "a refusal records nothing");
+        let r = s.execute("autodim", &json!({ "view": plan.0, "grid": true, "off": true }))?;
+        assert_eq!((undo_len(&s)?, r["message"].as_str()), (n + 1, Some("Grid dimensions off")));
+        assert!(dims(&s, plan)?.is_empty() && read_document(s.doc()?)?.auto_dim_grid_plans == [upper]);
+        s.execute("autodim", &json!({ "view": plan.0, "grid": true, "off": true }))?;
+        assert_eq!(undo_len(&s)?, n + 1, "already off: no undo step");
+
+        // The interactive form's Grid option.
+        s.start("autodim")?;
+        s.input(Input::Keyword("Grid".into()))?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Grid dimensions [On/Off] <On>:"));
+        s.input(Input::Enter)?;
+        assert!(s.running.is_none());
+        assert_eq!(grid_dims(&s, plan)?, before);
         Ok(())
     }
 }
