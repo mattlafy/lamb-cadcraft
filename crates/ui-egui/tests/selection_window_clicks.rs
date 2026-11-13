@@ -172,9 +172,9 @@ fn a_slow_little_drag_draws_a_little_window() {
     let mut h = harness();
     let p = screen(&h, Vec2::new(55.0, 35.0));
     button(&mut h, p, true);
-    h.event(Event::PointerMoved(p + vec2(3.0, 2.0)));
+    h.event(Event::PointerMoved(p + vec2(8.0, 6.0)));
     h.run_steps(40);
-    button(&mut h, p + vec2(3.0, 2.0), false);
+    button(&mut h, p + vec2(8.0, 6.0), false);
     h.run_steps(1);
     assert!(corner(&h).is_none(), "the slow drag opens and closes its own window");
     assert!(h.state().session.selection().is_empty());
@@ -202,7 +202,7 @@ fn a_shift_press_on_a_grip_dragged_away_is_a_shift_click_where_it_comes_up() {
 }
 
 #[test]
-fn a_fast_click_that_moves_under_40_px_is_a_click_where_it_comes_up() {
+fn a_fast_click_that_moves_under_64_px_is_a_click_where_it_comes_up() {
     let mut h = harness();
     let p = screen(&h, Vec2::new(55.0, 35.0));
     click(&mut h, p, &[vec2(25.0, 10.0)]);
@@ -211,7 +211,7 @@ fn a_fast_click_that_moves_under_40_px_is_a_click_where_it_comes_up() {
 }
 
 #[test]
-fn a_fast_point_click_that_moves_under_40_px_places_the_point_where_it_comes_up() {
+fn a_fast_point_click_that_moves_under_64_px_places_the_point_where_it_comes_up() {
     let mut h = harness();
     h.state_mut().start("line");
     h.run_steps(2);
@@ -230,16 +230,46 @@ fn a_25_px_drag_held_past_the_fast_click_time_is_a_window() {
     let p = screen(&h, Vec2::new(55.0, 35.0));
     button(&mut h, p, true);
     h.event(Event::PointerMoved(p + vec2(25.0, 10.0)));
-    h.run_steps(25);
+    h.run_steps(30);
     button(&mut h, p + vec2(25.0, 10.0), false);
     h.run_steps(1);
     assert!(corner(&h).is_none(), "the drag opens and closes its own window");
 }
 
 #[test]
-fn a_fast_drag_over_40_px_is_a_window() {
+fn a_fast_drag_over_64_px_is_a_window() {
     let mut h = harness();
     let p = screen(&h, Vec2::new(55.0, 35.0));
-    click(&mut h, p, &[vec2(60.0, 10.0)]);
+    click(&mut h, p, &[vec2(70.0, 10.0)]);
     assert!(corner(&h).is_none(), "the drag opens and closes its own window");
+}
+
+#[test]
+fn a_press_held_045_s_wandering_4_px_opens_the_window_where_it_went_down() {
+    let mut h = harness();
+    let p = screen(&h, Vec2::new(55.0, 35.0));
+    button(&mut h, p, true);
+    h.event(Event::PointerMoved(p + vec2(4.0, 0.0)));
+    h.run_steps(27);
+    button(&mut h, p + vec2(4.0, 0.0), false);
+    h.run_steps(1);
+    let c = corner(&h).expect("the click opens a window");
+    assert!(c.near(world(&h, p), 1e-6), "{c:?}");
+}
+
+#[test]
+fn a_fast_click_on_a_showing_snap_lands_on_the_snap_not_where_it_comes_up() {
+    let mut h = harness();
+    h.state_mut().session.settings.osmode = 1; // ENDpoint
+    h.state_mut().start("line");
+    h.run_steps(2);
+    let a = screen(&h, Vec2::new(60.0, 40.0));
+    h.event(Event::PointerMoved(a));
+    h.run_steps(2);
+    click(&mut h, a, &[vec2(30.0, 0.0)]);
+    let b = screen(&h, Vec2::new(10.0, 10.0));
+    click(&mut h, b, &[]);
+    let got = line_ends(&h);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got[1].0.near(Vec2::new(60.0, 40.0), 1e-9), "{got:?}");
 }

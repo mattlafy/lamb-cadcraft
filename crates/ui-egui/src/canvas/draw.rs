@@ -414,13 +414,15 @@ pub(super) struct PressPick {
     pub(super) snap: Option<SnapHit>,
 }
 
-/// How long a press may last and still be a click despite moving (a little), in seconds.
+// LAMB (fork): T678 — a quick click that wanders stays a click; a snap held at mousedown wins.
+/// Past this (seconds) a press is a drag once it is more than `slop` from where it went down.
 const CLICK_TIME: f64 = 0.5;
-/// A press let go faster than this (seconds) is a click unless it moved further than
-/// [`FAST_CLICK_DIST`]: a hand working fast doesn't stop moving to click.
-const FAST_CLICK_TIME: f64 = 0.3;
-/// How far (points) a fast press may move and still be a click, counted where it comes up.
-const FAST_CLICK_DIST: f32 = 40.0;
+/// Under this (seconds) a press is a click unless it moved further than [`FAST_CLICK_DIST`]: a
+/// hand working fast doesn't stop moving to click. From here to [`CLICK_TIME`] it is a drag
+/// beyond twice `slop`.
+const FAST_CLICK_TIME: f64 = 0.4;
+/// How far (points) a fast press may move and still be a click.
+const FAST_CLICK_DIST: f32 = 64.0;
 
 /// The primary button held down on the canvas or a tile: where and when it went down, where the
 /// pointer is now, and whether the press has become a drag (`far`).
@@ -435,11 +437,11 @@ pub(super) struct Press {
 
 impl Press {
     /// A press is a drag once the pointer is more than [`FAST_CLICK_DIST`] from where it went down;
-    /// after [`FAST_CLICK_TIME`], more than `slop`; after [`CLICK_TIME`], any distance at all (a
+    /// from [`FAST_CLICK_TIME`], more than twice `slop`; after [`CLICK_TIME`], more than `slop` (a
     /// slow, deliberate little drag). Held still, however long, it stays a click.
     pub(super) fn drags(&self, at: Pos2, now: f64, slop: f32) -> bool {
         let (d, held) = (self.origin.distance(at), now - self.since);
-        d > FAST_CLICK_DIST || (held >= FAST_CLICK_TIME && d > slop) || (held > CLICK_TIME && d >= 1.0)
+        d > FAST_CLICK_DIST || (held >= FAST_CLICK_TIME && d > 2.0 * slop) || (held > CLICK_TIME && d > slop)
     }
 }
 
@@ -455,15 +457,17 @@ pub(super) struct Release {
 }
 
 impl Release {
-    /// Where this press counts: where it went down for a click that came up near there, where it
-    /// came up for a fast click that moved further, or for a drag.
+    /// Where this press counts: where it went down for a click that came up near there or had a
+    /// snap showing as it went down; where it came up for a fast click that moved further with no
+    /// snap showing, or for a drag.
     pub(super) fn tap_at(&self) -> Pos2 {
         if self.at_origin() { self.origin } else { self.at }
     }
 
-    /// Whether it counts where it went down (with the cursor and snap of that moment).
+    /// Whether it counts where it went down (with the cursor and snap of that moment): a click
+    /// that came up within `slop`, or one that went down on a snap, however far it came up.
     pub(super) fn at_origin(&self) -> bool {
-        !self.far && self.near
+        !self.far && (self.near || self.pick.is_some_and(|p| p.snap.is_some()))
     }
 }
 
@@ -764,5 +768,86 @@ mod zoomed_highlight_tests {
         assert_eq!(dashed_rect(SCREEN, small, stroke, 4.0, 4.0).len(), 10 + 5 + 10 + 5);
         // Off screen, nothing.
         assert!(dashed_rect(SCREEN, small.translate(egui::vec2(5000.0, 0.0)), stroke, 4.0, 4.0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod press_tests {
+    use super::*;
+    use egui::{Event, Modifiers, PointerButton, pos2};
+
+    const SLOP: f32 = 6.0;
+
+    fn press(at: f64) -> Press {
+        Press { origin: pos2(100.0, 100.0), since: at, last: pos2(100.0, 100.0), far: false, pick: None }
+    }
+
+    fn button(pos: Pos2, pressed: bool) -> Event {
+        Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    #[test]
+    fn a_fast_press_is_a_drag_only_beyond_the_fast_click_distance() {
+        let p = press(0.0);
+        assert!(!p.drags(pos2(160.0, 100.0), 0.2, SLOP));
+        assert!(!p.drags(pos2(164.0, 100.0), 0.39, SLOP));
+        assert!(p.drags(pos2(165.0, 100.0), 0.1, SLOP));
+    }
+
+    #[test]
+    fn between_the_fast_and_click_times_a_press_is_a_drag_beyond_twice_slop() {
+        let p = press(0.0);
+        assert!(!p.drags(pos2(112.0, 100.0), 0.45, SLOP));
+        assert!(p.drags(pos2(113.0, 100.0), 0.45, SLOP));
+    }
+
+    #[test]
+    fn past_the_click_time_a_press_is_a_drag_beyond_slop_not_one_point() {
+        let p = press(0.0);
+        assert!(!p.drags(pos2(102.0, 100.0), 0.8, SLOP));
+        assert!(!p.drags(pos2(106.0, 100.0), 0.8, SLOP));
+        assert!(p.drags(pos2(107.0, 100.0), 0.8, SLOP));
+        assert!(!p.drags(pos2(100.0, 100.0), 10.0, SLOP));
+    }
+
+    #[test]
+    fn a_wandering_quick_click_releases_as_a_click_at_its_origin() {
+        let mut state = None;
+        let o = pos2(100.0, 100.0);
+        let (far, rel) = track_press(&mut state, &[button(o, true)], 0.0, SLOP, |_| true);
+        assert!(far.is_none() && rel.is_empty());
+        let (far, rel) = track_press(&mut state, &[Event::PointerMoved(pos2(104.0, 100.0)), button(pos2(104.0, 100.0), false)], 0.45, SLOP, |_| true);
+        assert!(far.is_none());
+        assert_eq!(rel.len(), 1);
+        assert!(!rel[0].far && rel[0].near && rel[0].at_origin());
+        assert_eq!(rel[0].tap_at(), o);
+    }
+
+    #[test]
+    fn a_held_press_off_its_origin_becomes_a_drag_past_the_click_time() {
+        let mut state = None;
+        track_press(&mut state, &[button(pos2(100.0, 100.0), true), Event::PointerMoved(pos2(110.0, 100.0))], 0.0, SLOP, |_| true);
+        let (far, _) = track_press(&mut state, &[], 0.45, SLOP, |_| true);
+        assert!(far.is_none());
+        let (far, _) = track_press(&mut state, &[], 0.6, SLOP, |_| true);
+        assert_eq!(far, Some(pos2(100.0, 100.0)));
+    }
+
+    #[test]
+    fn a_fast_far_click_counts_where_it_came_up_unless_a_snap_showed_at_mousedown() {
+        let far_click = |snap: Option<SnapHit>| {
+            let mut state = None;
+            track_press(&mut state, &[button(pos2(100.0, 100.0), true)], 0.0, SLOP, |_| true);
+            state.as_mut().unwrap().pick = Some(PressPick { cursor: None, raw: None, snap });
+            let (_, rel) = track_press(&mut state, &[button(pos2(130.0, 100.0), false)], 0.1, SLOP, |_| true);
+            rel[0]
+        };
+        let plain = far_click(None);
+        assert!(!plain.far && !plain.near && !plain.at_origin());
+        assert_eq!(plain.tap_at(), pos2(130.0, 100.0));
+        let hit = SnapHit { point: Vec2::new(60.0, 40.0), mode: 1, name: "endpoint", viewport: None, deferred: None };
+        let snapped = far_click(Some(hit));
+        assert!(!snapped.far && snapped.at_origin());
+        assert_eq!(snapped.tap_at(), pos2(100.0, 100.0));
     }
 }
