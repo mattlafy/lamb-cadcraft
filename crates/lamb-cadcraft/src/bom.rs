@@ -27,7 +27,9 @@
 //!
 //! A band is a sheet good, so it also has an area per level (LAMB T708): each run's band length
 //! times the plan's storey height, the floor elevation of the next level above (by elevation, not
-//! order) minus its own. A level with no level above it has no area (left blank): the table never
+//! order) minus its own. A level with no level above it takes its height from the wall itself
+//! (LAMB T712): the tallest member cut length a section or elevation measured on that level, the
+//! `Each` value below. With no vertical view measuring it the area is left blank: the table never
 //! guesses a roof height. Openings are not deducted; the opening schedule gives their sizes.
 //!
 //! A plan's level is its placement's level; a floating plan is skipped. In a vertical view a run
@@ -209,6 +211,23 @@ fn with_cuts(rows: Vec<BomRow>, cut: &Cuts) -> Vec<BomRow> {
     rows.into_iter().map(|r| BomRow { each_mm: cut.get(&(r.level.clone(), r.item.clone())).copied().unwrap_or(0.0), ..r }).collect()
 }
 
+/// `rows` with each band row on a `top` level (one with no level above) that has no area given
+/// one over that level's measured height: the longest cut in `cut` on it, of any layer. A level
+/// with no cut keeps its blank area; rows of other levels are untouched.
+fn top_level_areas(rows: Vec<BomRow>, top: &HashSet<String>, cut: &Cuts) -> Vec<BomRow> {
+    let mut height: HashMap<&str, f64> = HashMap::new();
+    for ((level, _), &each) in cut.iter().filter(|((level, _), _)| top.contains(level)) {
+        let h = height.entry(level.as_str()).or_insert(0.0);
+        *h = h.max(each);
+    }
+    rows.into_iter()
+        .map(|r| match height.get(r.level.as_str()) {
+            Some(&h) if h > 0.0 && r.length_mm > 0.0 && r.area_m2 == 0.0 => BomRow { area_m2: r.length_mm * h / 1e6, ..r },
+            _ => r,
+        })
+        .collect()
+}
+
 /// Every framing count and band length the assembly plans lay, per (level, item, view), sorted.
 pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
     let Ok(doc) = read_document(d) else { return Vec::new() };
@@ -222,6 +241,8 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
     // (level name, item, view index) → (level order, count, length, area).
     let mut counts: HashMap<(String, String, usize), (f64, usize, f64, f64)> = HashMap::new();
     let mut cut = Cuts::new();
+    // The plan levels with no level above them, whose band areas take a measured height.
+    let mut top: HashSet<String> = HashSet::new();
     let mut bump = |level: Option<&Level>, item: String, view: usize, n: usize, length: f64, area: f64| {
         let order = level.map_or(f64::INFINITY, |l| l.order);
         let entry = counts.entry((level_name(level), item, view)).or_insert((order, 0, 0.0, 0.0));
@@ -256,6 +277,11 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
                     add_cuts(&mut cut, level, &r.lines, &members);
                 } else {
                     let storey = level.and_then(|l| storey_height(levels, l));
+                    if let Some(l) = level
+                        && storey.is_none()
+                    {
+                        top.insert(l.name.clone());
+                    }
                     for (layer, length) in band_lengths(r) {
                         bump(level, layer.to_owned(), vi, 0, length, storey.map_or(0.0, |h| length * h / 1e6));
                     }
@@ -305,7 +331,7 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
             view: doc.views.get(view).map(|v| v.name().to_owned()).unwrap_or_default(),
         })
         .collect();
-    with_cuts(rows, &cut)
+    top_level_areas(with_cuts(rows, &cut), &top, &cut)
 }
 
 /// A schedule table with its top-left corner at `at` (paper mm): a merged title row over a header
@@ -560,7 +586,7 @@ pub(crate) mod tests {
     /// Adds to `detail` a 38-wide member on the new layer `layer`, repeated at 400.
     fn repeat_on(s: &mut Session, detail: Id, layer: &str) -> R {
         s.execute("editview", &json!({ "viewId": detail.0 }))?;
-        s.execute("layer.new", &json!({ "name": layer, "current": true }))?;
+        use_layer(s, layer)?;
         let stud = new_handle(s, "pline", json!({ "vertices": [[100, 50], [138, 50], [138, 200], [100, 200]], "closed": true }))?;
         let dim = new_handle(s, "dimaligned", json!({ "p1": [100, 0], "p2": [500, 0], "at": [300, -300] }))?;
         s.execute("repeat", &json!({ "dimension": dim, "handles": [stud] }))?;
@@ -587,33 +613,48 @@ pub(crate) mod tests {
         (a - b).abs() < 1e-6
     }
 
+    /// Makes `name` the current layer, creating it when the drawing has none of that name.
+    fn use_layer(s: &mut Session, name: &str) -> R {
+        if s.execute("layer.new", &json!({ "name": name, "current": true })).is_err() {
+            s.execute("layer.current", &json!({ "name": name }))?;
+        }
+        Ok(())
+    }
+
     /// A 4000 x 3000 room, 200 thick, on `Level 1`, whose detail has a `SHEATHING` band drawn as two
     /// face lines and `STUD` repeats.
     fn sheathed_room() -> T<(Session, Id)> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);
-        let plan = Id(s.execute("newplan", &json!({ "name": "Ground" }))?["viewId"].as_u64().ok_or("no id")?);
-        let detail = Id(s.execute("newdetail", &json!({ "name": "D1" }))?["viewId"].as_u64().ok_or("no id")?);
-        s.execute("editview", &json!({ "viewId": detail.0 }))?;
-        let r = line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
-        s.execute("detailref", &json!({ "handle": format!("{:X}", r.0), "kind": "exterior_face" }))?;
-        s.execute("layer.new", &json!({ "name": "SHEATHING", "current": true }))?;
-        line(&mut s, [0.0, 20.0], [1000.0, 20.0])?;
-        line(&mut s, [0.0, 32.0], [1000.0, 32.0])?;
-        s.execute("layer.new", &json!({ "name": "GYP", "current": true }))?;
-        line(&mut s, [0.0, 200.0], [1000.0, 200.0])?;
-        repeat_on(&mut s, detail, "STUD")?;
-        s.execute("editview", &json!({ "viewId": plan.0 }))?;
-        s.execute("layer.new", &json!({ "name": "WALL-EXT", "current": true }))?;
-        s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
-        s.execute("pline", &json!({ "vertices": [[200, 200], [3800, 200], [3800, 2800], [200, 2800]], "closed": true }))?;
-        s.execute("layer.new", &json!({ "name": "TAGS", "current": true }))?;
-        s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 2000.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
-        without_assembly(&mut s)?;
+        let plan = sheathed_plan(&mut s, "Ground", "D1")?;
         let l1 = add_level(&mut s, "Level 1", 0.0)?;
         place(&mut s, plan, l1)?;
         Ok((s, plan))
+    }
+
+    /// Adds to `s` the unplaced plan `name` of [`sheathed_room`], its detail named `detail_name`.
+    fn sheathed_plan(s: &mut Session, name: &str, detail_name: &str) -> T<Id> {
+        let plan = Id(s.execute("newplan", &json!({ "name": name }))?["viewId"].as_u64().ok_or("no id")?);
+        let detail = Id(s.execute("newdetail", &json!({ "name": detail_name }))?["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": detail.0 }))?;
+        s.execute("layer.current", &json!({ "name": "0" }))?;
+        let r = line(s, [0.0, 0.0], [1000.0, 0.0])?;
+        s.execute("detailref", &json!({ "handle": format!("{:X}", r.0), "kind": "exterior_face" }))?;
+        use_layer(s, "SHEATHING")?;
+        line(s, [0.0, 20.0], [1000.0, 20.0])?;
+        line(s, [0.0, 32.0], [1000.0, 32.0])?;
+        use_layer(s, "GYP")?;
+        line(s, [0.0, 200.0], [1000.0, 200.0])?;
+        repeat_on(s, detail, "STUD")?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        use_layer(s, "WALL-EXT")?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true }))?;
+        s.execute("pline", &json!({ "vertices": [[200, 200], [3800, 200], [3800, 2800], [200, 2800]], "closed": true }))?;
+        use_layer(s, "TAGS")?;
+        s.execute("detailtag", &json!({ "detailViewId": detail.0, "tip": {"x": 2000.0, "y": 0.0}, "bubble": {"x": 1500.0, "y": -1000.0} }))?;
+        without_assembly(s)?;
+        Ok(plan)
     }
 
     #[test]
@@ -834,7 +875,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_band_s_area_is_its_length_times_the_storey_height_and_the_top_level_has_none() -> R {
+    fn a_band_s_area_is_its_length_times_the_storey_height_and_an_unmeasured_top_level_has_none() -> R {
         let (mut s, plan) = sheathed_room()?;
         let l2 = add_level(&mut s, "Level 2", 3000.0)?;
         let r = s.execute("duplicateview", &json!({ "viewId": plan.0, "name": "Upper" }))?;
@@ -843,7 +884,7 @@ pub(crate) mod tests {
         let sheathing = |level: &str| rows.iter().find(|r| r.item == "SHEATHING" && r.level == level).map(|r| (r.length_mm, r.area_m2));
         let (len1, area1) = sheathing("Level 1").ok_or("no Level 1 sheathing")?;
         assert!(close(len1, 12400.0) && close(area1, 37.2), "12.4 m x 3 m: {rows:?}");
-        assert_eq!(sheathing("Level 2"), Some((12400.0, 0.0)), "the top level: its length, no area: {rows:?}");
+        assert_eq!(sheathing("Level 2"), Some((12400.0, 0.0)), "the top level, no section on it: its length, no area: {rows:?}");
         assert!(rows.iter().filter(|r| r.item == "STUD").all(|r| r.area_m2 == 0.0), "members have no area: {rows:?}");
         let texts: Vec<Vec<String>> =
             bom_table(&rows, Point2 { x: 0.0, y: 0.0 }).cells.iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect();
@@ -857,6 +898,53 @@ pub(crate) mod tests {
         let area = |level: &str| rows.iter().find(|r| r["item"] == "SHEATHING" && r["level"] == level).and_then(|r| r["areaM2"].as_f64());
         assert!(area("Level 1").is_some_and(|a| close(a, 37.2)), "{out}");
         assert_eq!(area("Level 2"), Some(0.0), "{out}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_top_level_band_takes_its_area_from_the_tallest_cut_on_its_level() {
+        let row = |level: &str, item: &str, length_mm: f64, area_m2: f64| BomRow {
+            level: level.to_owned(),
+            item: item.to_owned(),
+            count: 0,
+            each_mm: 0.0,
+            length_mm,
+            area_m2,
+            view: "P".to_owned(),
+        };
+        let key = |level: &str, layer: &str| (level.to_owned(), layer.to_owned());
+        let cut: Cuts = HashMap::from([(key("Top", "STUD"), 2400.0), (key("Top", "JOIST"), 2600.0), (key("Lower", "STUD"), 2700.0)]);
+        let top: HashSet<String> = ["Top".to_owned(), "Unmeasured".to_owned()].into();
+        let rows = vec![
+            row("Top", "SHEATHING", 10000.0, 0.0),
+            row("Top", "STUD", 0.0, 0.0),
+            row("Lower", "SHEATHING", 10000.0, 0.0),
+            row("Lower", "OSB", 10000.0, 27.0),
+            row("Unmeasured", "SHEATHING", 10000.0, 0.0),
+        ];
+        let got = top_level_areas(rows.clone(), &top, &cut);
+        assert!(close(got[0].area_m2, 26.0), "the tallest cut on the level, of any layer: {got:?}");
+        assert_eq!(got[1..], rows[1..], "a member row, a lower level and an unmeasured top level are untouched");
+    }
+
+    #[test]
+    fn a_section_on_the_only_level_gives_its_bands_an_area() -> R {
+        let (mut s, sec, _) = window_section(true)?;
+        let l1 = add_level(&mut s, "Level 1", 0.0)?;
+        let plan = sheathed_plan(&mut s, "Upper", "D1")?;
+        place(&mut s, plan, l1)?;
+        let d = s.doc()?;
+        let mut tallest = 0.0_f64;
+        for r in assembly_lines(d, sec)? {
+            for l in r.lines.iter().filter(|l| l.layer == "STUD") {
+                tallest = tallest.max(line_length(l));
+            }
+        }
+        assert!(tallest > 0.0, "the section lays STUD lines");
+        let rows = bom_rows(d);
+        let band = rows.iter().find(|r| r.item == "SHEATHING" && r.level == "Level 1").ok_or("no sheathing")?;
+        assert!(close(band.length_mm, 12400.0), "{rows:?}");
+        assert!(close(band.area_m2, band.length_mm * tallest / 1e6), "{tallest}: {rows:?}");
         Ok(())
     }
 
