@@ -12,7 +12,9 @@
 //! the setting-out strings locating its interior walls (LAMB T694), one in `auto_dim_grid_plans` its
 //! grid strings (LAMB T705),
 //! and every placed plan a text of each opening's schedule mark outside it ([`crate::schedule`], LAMB T639),
-//! and every placed elevation the marks of the openings facing it (LAMB T710); sections get none.
+//! and every placed elevation the marks of the openings facing it (LAMB T710), then, when it is in
+//! `auto_dim_elevations`, each marked opening's floor-to-sill-to-head chain (LAMB T713); sections
+//! get none.
 //! A plan in `wall_tag_plans` gets each wall type tag, its mark in a hexagon inside the run
 //! ([`crate::walltypes::wall_tags`], LAMB T690).
 //! An edge detail in `detail_note_views` gets a leader and a `<thickness> <material>` note per layer
@@ -331,6 +333,12 @@ fn wanted(
         let mut out = level_lines(d, &dp, id, scale);
         let height = CUT_TEXT_MM * k(scale);
         out.extend(elevation.iter().filter(|m| m.view == id).map(|m| Item::Text(v(m.at.x, m.at.y), m.mark.clone(), height)));
+        if dp.document().auto_dim_elevations.contains(&id) {
+            let at = |p: lamb_core::geometry::Point2| v(p.x, p.y);
+            out.extend(
+                crate::autodim::elevation(d, &dp, id, k(scale)).into_iter().map(|d| Item::Dim(at(d.a), at(d.b), d.rotation, at(d.line_at), scale)),
+            );
+        }
         out.extend(grid_items(d, &dp, id, true, k(scale))?);
         out.extend(enlarged_boxes(d, id, scale));
         return Ok(out);

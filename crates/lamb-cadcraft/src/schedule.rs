@@ -100,6 +100,12 @@ pub struct ElevationMark {
     pub view: Id,
     pub mark: String,
     pub at: Point2,
+    /// The opening's midpoint along the elevation's cut line.
+    pub u: f64,
+    /// The opening's level's floor elevation.
+    pub floor: f64,
+    /// The opening's index into [`opening_rows`].
+    pub row: usize,
 }
 
 /// One opening before its section and detail are read.
@@ -255,8 +261,8 @@ pub fn elevation_marks(d: &Drawing) -> Vec<ElevationMark> {
     }
     let rows = opening_rows(d);
     let (Ok(doc), Ok(p)) = (read_document(d), DrawingProject::new(d)) else { return Vec::new() };
-    // Each opening in global XY: (row index, level, global midpoint, global out, z).
-    let placed: Vec<(usize, usize, Point2, Point2, f64)> = found
+    // Each opening in global XY: (row index, level, global midpoint, global out, z, floor).
+    let placed: Vec<(usize, usize, Point2, Point2, f64, f64)> = found
         .iter()
         .enumerate()
         .filter_map(|(i, o)| {
@@ -270,7 +276,7 @@ pub fn elevation_marks(d: &Drawing) -> Vec<ElevationMark> {
                 (Some(sill), Some(height)) => floor + sill + height / 2.0,
                 _ => floor + UNREAD_MARK_Z_MM,
             };
-            Some((i, level, at, out, z))
+            Some((i, level, at, out, z, floor))
         })
         .collect();
     let mut marks = Vec::new();
@@ -284,20 +290,20 @@ pub fn elevation_marks(d: &Drawing) -> Vec<ElevationMark> {
         let Ok(b) = vertical_basis(&view, &host) else { continue };
         let gaze = vertical_gaze_dir(b.c_hat, b.flipped);
         let tol = TOLERANCE.coincidence_mm;
-        // (row index, level, u, depth, z) of each facing opening inside the cut line.
-        let facing: Vec<(usize, usize, f64, f64, f64)> = placed
+        // (row index, level, u, depth, z, floor) of each facing opening inside the cut line.
+        let facing: Vec<(usize, usize, f64, f64, f64, f64)> = placed
             .iter()
-            .filter(|(.., out, _)| dot2(*out, gaze) <= -std::f64::consts::FRAC_1_SQRT_2)
-            .map(|&(i, level, at, _, z)| (i, level, dot2(sub2(at, b.origin_xy), b.c_hat), dot2(sub2(at, b.origin_xy), gaze), z))
+            .filter(|(.., out, _, _)| dot2(*out, gaze) <= -std::f64::consts::FRAC_1_SQRT_2)
+            .map(|&(i, level, at, _, z, floor)| (i, level, dot2(sub2(at, b.origin_xy), b.c_hat), dot2(sub2(at, b.origin_xy), gaze), z, floor))
             .filter(|&(_, _, u, ..)| u >= -tol && u <= b.length_mm + tol)
             .collect();
-        for &(i, level, u, depth, z) in &facing {
-            let hidden = facing.iter().any(|&(j, l, u2, d2, _)| j != i && l == level && (u2 - u).abs() <= HIDE_U_MM && d2 < depth - tol);
+        for &(i, level, u, depth, z, floor) in &facing {
+            let hidden = facing.iter().any(|&(j, l, u2, d2, ..)| j != i && l == level && (u2 - u).abs() <= HIDE_U_MM && d2 < depth - tol);
             if hidden {
                 continue;
             }
             let Some(o) = found.get(i) else { continue };
-            marks.push(ElevationMark { view: e.id, mark: o.mark.mark.clone(), at: vertical_uz_to_local(&view, Uz { u, z }) });
+            marks.push(ElevationMark { view: e.id, mark: o.mark.mark.clone(), at: vertical_uz_to_local(&view, Uz { u, z }), u, floor, row: i });
         }
     }
     marks
@@ -432,7 +438,7 @@ pub(crate) fn openingschedule_machine(_s: &Session) -> Result<Box<dyn Interactiv
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::annotations::tests::mark_texts;
     use crate::schema::{annotation_block_name, view_block_name};
@@ -446,7 +452,7 @@ mod tests {
     }
 
     /// A fresh LAMB project, its observers installed and its plan edited.
-    fn project() -> T<(Session, Id)> {
+    pub(crate) fn project() -> T<(Session, Id)> {
         crate::commands::install_app()?;
         let mut s = Session::new();
         s.new_drawing(true);
@@ -457,7 +463,7 @@ mod tests {
     }
 
     /// Makes layer `name` current, adding it when absent.
-    fn layer(s: &mut Session, name: &str) -> R {
+    pub(crate) fn layer(s: &mut Session, name: &str) -> R {
         if s.doc()?.layers.iter().any(|l| l.name == name) {
             s.execute("layer.current", &json!({ "name": name }))?;
         } else {
@@ -468,7 +474,7 @@ mod tests {
 
     /// Draws a 5000 × 4000, 200-thick room on the edited plan: a `(lo, hi)` gap in its south wall
     /// (y 0..200), and one in its north wall (y 3800..4000) when given.
-    fn walls(s: &mut Session, south: (f64, f64), north: Option<(f64, f64)>) -> R {
+    pub(crate) fn walls(s: &mut Session, south: (f64, f64), north: Option<(f64, f64)>) -> R {
         walls_at(s, 0.0, south, north)
     }
 
@@ -489,7 +495,7 @@ mod tests {
         Ok(())
     }
 
-    fn opening(s: &mut Session, layer: &str, a: (f64, f64), b: (f64, f64)) -> R {
+    pub(crate) fn opening(s: &mut Session, layer: &str, a: (f64, f64), b: (f64, f64)) -> R {
         self::layer(s, layer)?;
         s.execute("line", &json!({ "points": [[a.0, a.1], [b.0, b.1]] }))?;
         Ok(())
@@ -512,7 +518,7 @@ mod tests {
 
     /// A section cut across the south wall at x = 2500 (the wall's centreline at u 1100), with each
     /// `(sill, head)` opening drawn in the wall from z 0 up to `top`.
-    fn section_through(s: &mut Session, plan: Id, windows: &[(f64, f64)], top: f64) -> T<Id> {
+    pub(crate) fn section_through(s: &mut Session, plan: Id, windows: &[(f64, f64)], top: f64) -> T<Id> {
         let r = s.execute(
             "newsectionline",
             &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 2500, "y": -1000}, "cutTo": {"x": 2500, "y": 1000} }),
@@ -753,7 +759,7 @@ mod tests {
     }
 
     /// Elevation `name` on `plan`, cut from `from` to `to` (it looks to the left of that direction).
-    fn elevation(s: &mut Session, plan: Id, name: &str, from: (f64, f64), to: (f64, f64)) -> T<Id> {
+    pub(crate) fn elevation(s: &mut Session, plan: Id, name: &str, from: (f64, f64), to: (f64, f64)) -> T<Id> {
         let r = s.execute(
             "newelevationline",
             &json!({ "name": name, "hostViewId": plan.0, "cutFrom": {"x": from.0, "y": from.1}, "cutTo": {"x": to.0, "y": to.1} }),
@@ -762,7 +768,7 @@ mod tests {
     }
 
     /// A room with window W01 at x 2000..3000 in its south wall, the plan edited.
-    fn window_south() -> T<(Session, Id)> {
+    pub(crate) fn window_south() -> T<(Session, Id)> {
         let (mut s, plan) = project()?;
         walls(&mut s, (2000.0, 3000.0), None)?;
         opening(&mut s, "WINDOW", (2000.0, 100.0), (3000.0, 100.0))?;
@@ -802,7 +808,10 @@ mod tests {
         let south = elevation(&mut s, plan, "South", (-500.0, -1000.0), (5500.0, -1000.0))?;
         let marks = elevation_marks(s.doc()?);
         assert_eq!(opening_rows(s.doc()?).len(), 2);
-        assert_eq!(marks, [ElevationMark { view: south, mark: "W01".to_owned(), at: Point2 { x: 3000.0, y: UNREAD_MARK_Z_MM } }]);
+        assert_eq!(
+            marks,
+            [ElevationMark { view: south, mark: "W01".to_owned(), at: Point2 { x: 3000.0, y: UNREAD_MARK_Z_MM }, u: 3000.0, floor: 0.0, row: 0 }]
+        );
         Ok(())
     }
 }
