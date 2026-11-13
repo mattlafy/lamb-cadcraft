@@ -462,9 +462,13 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
     section_header(ui, "Layers");
     // Layer tools row.
     let mut cmd = None;
+    let mut new_layer = false;
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.spacing_mut().item_spacing = vec2(3.0, 0.0);
+        if icons::button(ui, Icon::Plus, 26.0, "New Layer", false).clicked() {
+            new_layer = true;
+        }
         for (icon, c, tip) in [
             (Icon::LayerProps, "ui.dialog.layers", "Layer Properties"),
             (Icon::MakeCurrent, "laymcur", "Make Object's Layer Current"),
@@ -486,6 +490,14 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
             app.start(c);
         } else {
             let _ = app.run(c, json!({}));
+        }
+    }
+    // New Layer, as in the layer manager: the next free `Layer<n>`, not made current, its name open for renaming.
+    if new_layer && let Ok(d) = app.session.doc() {
+        let next = crate::layers::next_layer_name(d);
+        if app.run("layer.new", json!({ "name": next })).is_ok() {
+            app.ui.show_layer_list = true;
+            app.ui.palette_layer_rename = Some((next.clone(), next));
         }
     }
     ui.add_space(4.0);
@@ -572,6 +584,7 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
             app.ui.show_layer_list = !app.ui.show_layer_list;
         }
     });
+    let mut rename: Option<(String, String)> = None;
     if app.ui.show_layer_list {
         ui.add_space(2.0);
         for ((name, on, frozen, locked, color), cell) in layers.iter().zip(&cells) {
@@ -588,11 +601,35 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
                 }
                 let (sr, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
                 swatch(ui.painter(), sr, *color);
-                let r = ui.selectable_label(name.eq_ignore_ascii_case(&cur), name);
-                if r.clicked() {
-                    set_current = Some(name.clone());
+                match app.ui.palette_layer_rename.clone() {
+                    Some((n, mut buf)) if n.eq_ignore_ascii_case(name) => {
+                        let r = ui
+                            .add(egui::TextEdit::singleline(&mut buf).desired_width(150.0).id(egui::Id::unique(("palette_layer_rename", name))))
+                            .accessible_name(crate::tl!("Name"));
+                        if !r.has_focus() && !r.lost_focus() {
+                            r.request_focus();
+                        }
+                        if r.lost_focus() {
+                            let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if !cancel && buf.trim() != name && !buf.trim().is_empty() {
+                                rename = Some((name.clone(), buf.trim().to_string()));
+                            }
+                            app.ui.palette_layer_rename = None;
+                        } else {
+                            app.ui.palette_layer_rename = Some((n, buf));
+                        }
+                    }
+                    _ => {
+                        let r = ui.selectable_label(name.eq_ignore_ascii_case(&cur), name);
+                        if r.clicked() {
+                            set_current = Some(name.clone());
+                        }
+                        if r.double_clicked() && name != "0" && !name.eq_ignore_ascii_case("Defpoints") {
+                            app.ui.palette_layer_rename = Some((name.clone(), name.clone()));
+                        }
+                        crate::shortcut_menus::attach(app, &r, |app| crate::shortcut_menus::layer_entries(app, name));
+                    }
                 }
-                crate::shortcut_menus::attach(app, &r, |app| crate::shortcut_menus::layer_entries(app, name));
                 if let Some(a) = cell.as_ref().and_then(|c| layer_ext::show(ui, c)) {
                     cell_action = Some(a);
                 }
@@ -604,6 +641,9 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     if let Some((n, k, v)) = toggle {
         let _ = app.run("layer.set", json!({ "name": n, k: v }));
+    }
+    if let Some((old, new)) = rename {
+        let _ = app.run("layer.set", json!({ "name": old, "newName": new }));
     }
     if let Some((id, params)) = cell_action {
         let _ = app.run(&id, params);
@@ -1926,5 +1966,110 @@ mod tests {
         h.state_mut().run("select", json!({ "handles": [handles[0].clone()] })).unwrap();
         h.run_steps(3);
         assert!(h.query_all_by_value("4.0000").count() > 0, "one circle alone shows its radius");
+    }
+}
+
+#[cfg(test)]
+mod layer_new_tests {
+    use super::layers_section;
+    use crate::{CadApp, Services};
+    use cadcraft_engine::Session;
+    use egui::vec2;
+    use egui_kittest::kittest::Queryable;
+    use serde_json::json;
+
+    /// The Layers palette over a drawing that has `Layer1`, a few frames in.
+    fn palette() -> egui_kittest::Harness<'static, CadApp> {
+        let mut app = CadApp::new(Session::default(), Services::default());
+        app.run("layer.new", json!({ "name": "Layer1" })).unwrap();
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(400.0, 900.0))
+            .with_step_dt(1.0 / 60.0)
+            .build_ui_state(|ui, app: &mut CadApp| layers_section(app, ui), app);
+        h.run_steps(3);
+        h
+    }
+
+    fn has_layer(app: &CadApp, name: &str) -> bool {
+        app.session.doc().unwrap().layer(name).is_some()
+    }
+
+    fn current(app: &CadApp) -> String {
+        app.session.doc().unwrap().header.str("CLAYER", "0")
+    }
+
+    fn click_new_layer(h: &mut egui_kittest::Harness<'static, CadApp>) {
+        h.get_by_label("New Layer").click();
+        h.run_steps(3);
+    }
+
+    fn type_name(h: &mut egui_kittest::Harness<'static, CadApp>, text: &str) {
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.run_steps(2);
+        h.get_by_label("Name").type_text(text);
+        h.run_steps(2);
+    }
+
+    /// New Layer adds the next free `Layer<n>`, shows the list, and opens its name for typing.
+    #[test]
+    fn new_layer_adds_the_next_name_ready_to_type() {
+        let mut h = palette();
+        assert!(!h.state().ui.show_layer_list);
+        click_new_layer(&mut h);
+        assert!(has_layer(h.state(), "Layer2"), "Layer2 is created");
+        assert!(h.state().ui.show_layer_list, "the list is shown");
+        let field = h.get_by_label("Name");
+        assert_eq!(field.value().as_deref(), Some("Layer2"));
+        assert!(field.is_focused(), "the Name field has focus");
+        assert_eq!(current(h.state()), "0", "the current layer is unchanged");
+    }
+
+    /// Enter commits the typed name, as one undo step after the create.
+    #[test]
+    fn enter_renames_as_one_more_undo_step() {
+        let mut h = palette();
+        click_new_layer(&mut h);
+        type_name(&mut h, "Walls");
+        h.key_press(egui::Key::Enter);
+        h.run_steps(3);
+        assert!(has_layer(h.state(), "Walls") && !has_layer(h.state(), "Layer2"), "Layer2 is renamed Walls");
+        assert!(h.query_by_label("Name").is_none(), "the rename closes");
+        h.state_mut().run("undo", json!({})).unwrap();
+        assert!(has_layer(h.state(), "Layer2") && !has_layer(h.state(), "Walls"), "one undo restores the name");
+        h.state_mut().run("undo", json!({})).unwrap();
+        assert!(!has_layer(h.state(), "Layer2"), "a second undo removes the layer");
+        assert!(has_layer(h.state(), "Layer1"));
+    }
+
+    /// Escape keeps `Layer<n>`.
+    #[test]
+    fn escape_keeps_the_new_name() {
+        let mut h = palette();
+        click_new_layer(&mut h);
+        type_name(&mut h, "Walls");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        assert!(has_layer(h.state(), "Layer2") && !has_layer(h.state(), "Walls"));
+        assert!(h.query_by_label("Name").is_none(), "the rename closes");
+    }
+
+    fn double_click(h: &mut egui_kittest::Harness<'static, CadApp>, label: &str) {
+        h.get_by_label(label).click();
+        h.step();
+        h.get_by_label(label).click();
+        // Past the double-click delay, so the next pair isn't read as a triple-click.
+        h.run_steps(30);
+    }
+
+    /// A double-click on a layer's name opens the rename; not on layer 0.
+    #[test]
+    fn double_click_opens_the_rename_but_not_on_layer_zero() {
+        let mut h = palette();
+        h.state_mut().ui.show_layer_list = true;
+        h.run_steps(2);
+        double_click(&mut h, "0");
+        assert!(h.query_by_label("Name").is_none(), "layer 0 doesn't rename");
+        double_click(&mut h, "Layer1");
+        assert_eq!(h.get_by_label("Name").value().as_deref(), Some("Layer1"));
     }
 }

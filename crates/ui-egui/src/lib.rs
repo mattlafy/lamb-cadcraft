@@ -110,6 +110,9 @@ pub struct UiState {
     pub show_viewcube_lamb: bool,
     pub show_ucs_icon: bool,
     pub show_layer_list: bool,
+    /// The Layers palette's inline rename: (layer, edit buffer). Session-only, never saved.
+    #[serde(skip)]
+    pub palette_layer_rename: Option<(String, String)>,
     /// Keep the system cursor visible over the drawing area (a small crosshair at the centre of the
     /// drawn one) instead of hiding it. Screen magnifiers (Windows Magnifier "follow the mouse
     /// pointer"), screen readers, recorders and remote desktops track the system cursor and lose it
@@ -209,6 +212,7 @@ impl Default for UiState {
             show_viewcube_lamb: false,
             show_ucs_icon: true,
             show_layer_list: false,
+            palette_layer_rename: None,
             system_cursor: false,
             toolset_tab: "Drafting".into(),
             collapsed_groups: Vec::new(),

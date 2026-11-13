@@ -258,11 +258,7 @@ pub fn dialog(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
             // ----- tool row -----
             ui.horizontal(|ui| {
                 if icons::button(ui, Icon::Plus, 24.0, "New Layer", false).clicked() {
-                    let mut n = 1;
-                    while d.layer(&format!("Layer{n}")).is_some() {
-                        n += 1;
-                    }
-                    let name = format!("Layer{n}");
+                    let name = next_layer_name(d);
                     actions.push(("layer.new", json!({ "name": name })));
                     st.renaming = Some((name.clone(), name.clone()));
                     st.selected = Some(name);
@@ -752,6 +748,15 @@ fn wild(p: &[u8], t: &[u8]) -> bool {
         }
     }
     p.iter().skip(pi).all(|c| *c == b'*')
+}
+
+/// The first `Layer<n>` (n from 1) the drawing doesn't have: the name New Layer gives.
+pub(crate) fn next_layer_name(d: &cadcraft_doc::Drawing) -> String {
+    let mut n = 1;
+    while d.layer(&format!("Layer{n}")).is_some() {
+        n += 1;
+    }
+    format!("Layer{n}")
 }
 
 #[cfg(test)]
