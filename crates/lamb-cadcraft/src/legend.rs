@@ -1,11 +1,11 @@
 //! The drawing set's symbol legend (LAMB T696): SHEETSET puts one on the cover sheet `A001`, below
 //! the Drawing List, showing each kind of generated symbol the set's sheets actually carry, in this
-//! order — section or elevation cut symbol, level line, grid line, detail bubble, enlarged-area box, wall type
+//! order — section cut symbol, elevation marker, level line, grid line, detail bubble, enlarged-area box, wall type
 //! tag, opening mark, room tag, revision delta — each beside a one-line description naming the
 //! schedule sheet where one applies. A kind nothing in the drawing uses gets no row.
 //!
 //! Each sample is drawn by the code that draws the symbol on the sheets
-//! ([`crate::annotations::cut_symbol`], [`crate::annotations::grid_bubble`], [`crate::annotations::wall_tag_symbol`],
+//! ([`crate::annotations::cut_symbol`], [`crate::annotations::elevation_marker`], [`crate::annotations::grid_bubble`], [`crate::annotations::wall_tag_symbol`],
 //! [`crate::annotations::room_tag_items`], [`crate::bubbles::bubble_insert`],
 //! [`crate::titleblock::delta_insert`]) at its size on paper, with fixed generic sample text.
 //!
@@ -24,7 +24,9 @@ use lamb_core::derivation::datums::named_grids;
 use lamb_core::derivation::markers::compute_cut_lines_for_view;
 use lamb_core::derivation::read::{ProjectRead, ViewKind};
 
-use crate::annotations::{CUT_TEXT_MM, Item, LEVEL_TEXT_MM, cut_symbol, entity_of, grid_bubble, k, room_tag_items, wall_tag_symbol};
+use crate::annotations::{
+    CUT_TEXT_MM, Item, LEVEL_TEXT_MM, cut_symbol, elevation_marker, entity_of, grid_bubble, is_elevation, k, room_tag_items, wall_tag_symbol,
+};
 use crate::bom::{self, Refreshed};
 use crate::bubbles::{BUBBLE_BLOCK, BUBBLE_RADIUS_MM, bubble_insert};
 use crate::commands::other;
@@ -74,9 +76,18 @@ fn rows(d: &Drawing) -> Vec<(Sample, &'static str)> {
     let Ok(dp) = DrawingProject::new(d) else { return out };
     let doc = dp.document();
     let placed = |kind: ViewKind| dp.views().filter(move |v| v.kind == kind && v.placement.is_some()).map(|v| v.id).collect::<Vec<_>>();
-    if placed(ViewKind::Plan).into_iter().any(|p| compute_cut_lines_for_view(&dp, p).is_ok_and(|c| !c.is_empty())) {
+    let shown: Vec<bool> = placed(ViewKind::Plan)
+        .into_iter()
+        .flat_map(|p| compute_cut_lines_for_view(&dp, p).unwrap_or_default())
+        .map(|c| is_elevation(&dp, c.source_view_id))
+        .collect();
+    if shown.contains(&false) {
         let s = cut_symbol(v(-10.0, 0.0), v(10.0, 0.0), (0.0, 1.0), "A", Some("1/A301"), f);
-        out.push((Sample::Items(s), "Section or elevation — name, and the sheet that shows it"));
+        out.push((Sample::Items(s), "Section — name, and the sheet that shows it"));
+    }
+    if shown.contains(&true) {
+        let s = elevation_marker(Vec3::ZERO, (0.0, 1.0), "North", Some("1/A201"), f);
+        out.push((Sample::Items(s), "Elevation — name, and the sheet that shows it"));
     }
     if !doc.levels.is_empty() && !placed(ViewKind::Vertical).is_empty() {
         let s = vec![Item::Line(v(-20.0, 0.0), v(0.0, 0.0)), Item::Label(v(-20.0, LEVEL_TEXT_MM * f), "Level 1 +0".into(), LEVEL_TEXT_MM * f)];
@@ -289,7 +300,8 @@ mod tests {
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
     type T<X> = std::result::Result<X, Box<dyn std::error::Error>>;
 
-    const CUT: &str = "Section or elevation — name, and the sheet that shows it";
+    const CUT: &str = "Section — name, and the sheet that shows it";
+    const ELEV: &str = "Elevation — name, and the sheet that shows it";
     const LEVEL: &str = "Level — name and floor elevation";
     const BUBBLE: &str = "Detail — detail name, and the sheet that shows it";
     const WALL: &str = "Wall type — see A604";
@@ -384,6 +396,36 @@ mod tests {
         assert!(s.doc()?.layout(LIST_SHEET).is_some(), "A001 made");
         assert!(s.doc()?.block(LEGEND_BLOCK).is_none() && legend_insert(s.doc()?).is_none());
         Ok(())
+    }
+
+    #[test]
+    fn an_elevation_gets_its_own_row_and_a_plan_with_only_elevations_no_section_row() -> R {
+        let (mut s, plan) = set()?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let r = s.execute(
+            "newelevationline",
+            &json!({ "name": "North", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 6000}, "cutTo": {"x": 5000, "y": 6000} }),
+        )?;
+        let el = Id(r["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": el.0 }))?;
+        s.execute("line", &json!({ "points": [[0, 0], [5000, 0]] }))?;
+        s.execute("editview", &json!({}))?;
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(legend_rows(s.doc()?), [CUT, ELEV, LEVEL, BUBBLE, ROOM]);
+        let b = s.doc()?.block(LEGEND_BLOCK).ok_or("no block")?;
+        assert!(b.entities.iter().any(|e| matches!(&e.kind, EntityKind::Circle(c) if (c.radius - 6.0).abs() < 1e-9)), "the marker at paper size");
+
+        let sec = read_section(&s)?;
+        s.execute("unplaceview", &json!({ "viewId": sec.0 }))?;
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(legend_rows(s.doc()?), [ELEV, LEVEL, BUBBLE, ROOM]);
+        Ok(())
+    }
+
+    /// The id of section `A-A`.
+    fn read_section(s: &Session) -> T<Id> {
+        let doc = crate::schema::read_document(s.doc()?)?;
+        Ok(doc.views.iter().find(|w| w.name() == "A-A").ok_or("no section")?.id())
     }
 
     #[test]

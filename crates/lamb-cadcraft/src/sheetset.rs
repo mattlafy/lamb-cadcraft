@@ -2017,7 +2017,8 @@ pub(crate) mod tests {
         write_document(d, &doc)?;
         let r = s.execute("sheetset", &json!({}))?;
         assert_eq!(r["refit"], json!([]), "{r}");
-        assert!(laid(&r).iter().all(|(_, group, _)| group == "list"), "only the list's rows change: {r}");
+        // The legend loses its Section row with the section (LAMB T706).
+        assert!(laid(&r).iter().all(|(_, group, _)| group == "list" || group == "legend"), "only the list's rows and the legend change: {r}");
         let m = r["message"].as_str().ok_or("no message")?;
         assert!(m.contains("; A102 shows First, which is not placed"), "{m}");
         assert!(m.contains(&format!("; A301 shows view {}, which is not placed", sec.0)), "{m}");

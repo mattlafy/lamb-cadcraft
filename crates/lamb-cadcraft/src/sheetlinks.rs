@@ -1,7 +1,7 @@
 //! The sheet references of a set PDF as page links (LAMB T702): clicking a reference on one sheet
 //! goes to the sheet it names. The references are every row of `A001`'s Drawing List, and on each
 //! shown view's viewport every `<n>/<layout>` text of the view's annotation block (section cut
-//! symbols, enlarged-area boxes) and every detail bubble ([`BUBBLE_BLOCK`]) whose `SHEET` reads
+//! symbols, elevation markers, enlarged-area boxes) and every detail bubble ([`BUBBLE_BLOCK`]) whose `SHEET` reads
 //! `<n>/<layout>`, in the view's own block or its annotation block. A link's area is the
 //! reference's extent box, carried through its block's model-space INSERT and the viewport onto
 //! the sheet, and clipped to the viewport. The printed page is unchanged.
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn a_set_links_its_list_rows_cut_symbols_and_bubbles_to_their_sheets() -> R {
-        let (mut s, [ground, _, _, sec]) = set()?;
+        let (mut s, [ground, _, elev, sec]) = set()?;
         s.execute("sheetset", &json!({}))?;
         let d = s.doc()?;
         let pages: Vec<String> = {
@@ -205,6 +205,19 @@ mod tests {
             let at = vp.model_to_paper(t.insert.xy());
             assert!(on_plan.iter().any(|(_, r, to)| *to == sec_sheet && r.expand(1.0).contains(at)), "{at:?} in {on_plan:?}");
         }
+        // The elevation marker's sheet text links to the elevation's sheet.
+        let elev_sheet = crate::sheets::view_sheet_ref(d, elev).ok_or("elevation not on a sheet")?.1;
+        let marker: Vec<&Text> = anno
+            .entities
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntityKind::Text(t) if sheet_of(&t.value) == Some(elev_sheet.as_str()) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marker.len(), 1, "one marker text");
+        let at = vp.model_to_paper(marker[0].insert.xy());
+        assert!(on_plan.iter().any(|(_, r, to)| *to == elev_sheet && r.expand(1.0).contains(at)), "{at:?} in {on_plan:?}");
         // No sheet links to itself, and an unlisted page gets no links.
         assert!(got.iter().all(|(p, _, to)| p != to));
         assert!(links(d, &[LIST_SHEET.to_owned()]).is_empty());

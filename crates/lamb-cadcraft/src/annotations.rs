@@ -1,7 +1,8 @@
 //! Generated annotation (LAMB's `docs/07-architecture/cadcraft-integration.md` §5, LAMB T474):
 //! every placed plan gets a plotted section cut symbol for each placed vertical view whose cut line
 //! projects into it — the cut LINE, a gaze arrow at each end, and the section's name at each end
-//! (plus `<n>/<layout>` when a sheet shows the section, [`crate::sheets::sheet_refs`]) — and every
+//! (plus `<n>/<layout>` when a sheet shows the section, [`crate::sheets::sheet_refs`]); an elevation
+//! gets an [`elevation_marker`] at its cut line's midpoint instead (LAMB T706) — and every
 //! placed section or elevation gets a plotted level line for each LEVEL (LAMB T473): a LINE at the
 //! level's projected floor elevation spanning the view block's extents ±[`LEVEL_OVERRUN_MM`], and
 //! `"<name> <±elev>"` left-aligned past its right end, plus a vertical floor-to-floor dimension per
@@ -48,7 +49,7 @@ use lamb_core::derivation::projection::{Uz, vertical_uz_to_local};
 use lamb_core::derivation::read::{ProjectRead, ViewKind};
 use lamb_core::geometry::polyline::resolved_segments;
 use lamb_core::geometry::tolerance::TOLERANCE;
-use lamb_core::model::{AnyView, Id};
+use lamb_core::model::{AnyView, Id, VerticalIntent};
 
 use crate::project::DrawingProject;
 use crate::rooms::{RoomTag, area_text, room_tags};
@@ -82,6 +83,8 @@ pub const MARK_OFFSET_MM: f64 = 400.0;
 pub const GRID_BUBBLE_MM: f64 = 250.0;
 /// From a grid line's end to its bubble's edge.
 pub const GRID_GAP_MM: f64 = 500.0;
+/// An elevation marker's circle radius.
+pub const ELEV_MARK_MM: f64 = 300.0;
 /// Every generated entity's layer inside the block.
 const LAYER: &str = "0";
 
@@ -149,6 +152,29 @@ pub(crate) fn cut_symbol(from: Vec3, to: Vec3, gaze: (f64, f64), name: &str, she
         if let Some(sheet) = sheet {
             out.push(Item::Text(v(at.x, at.y - 1.5 * height), sheet.to_owned(), height));
         }
+    }
+    out
+}
+
+/// An elevation marker at `centre` looking along unit `gaze`, with every length its 1:50 value ×
+/// `f`: a circle of radius `r` = [`ELEV_MARK_MM`] × `f`, a triangular pointer (apex 1.6 `r` along the
+/// gaze, base the chord through the centre across it), a horizontal divider, `name` centred above
+/// it and `sheet` (when given) below, both 0.4 `r` high.
+pub(crate) fn elevation_marker(centre: Vec3, gaze: (f64, f64), name: &str, sheet: Option<&str>, f: f64) -> Vec<Item> {
+    let r = ELEV_MARK_MM * f;
+    let (c, g) = (v(centre.x, centre.y), gaze);
+    let apex = v(c.x + g.0 * 1.6 * r, c.y + g.1 * 1.6 * r);
+    let (b1, b2) = (v(c.x - g.1 * r, c.y + g.0 * r), v(c.x + g.1 * r, c.y - g.0 * r));
+    let mut out = vec![
+        Item::Circle(c, r),
+        Item::Line(b1, apex),
+        Item::Line(apex, b2),
+        Item::Line(b2, b1),
+        Item::Line(v(c.x - r, c.y), v(c.x + r, c.y)),
+        Item::Text(v(c.x, c.y + 0.45 * r), name.to_owned(), 0.4 * r),
+    ];
+    if let Some(sheet) = sheet {
+        out.push(Item::Text(v(c.x, c.y - 0.45 * r), sheet.to_owned(), 0.4 * r));
     }
     out
 }
@@ -304,6 +330,11 @@ fn wanted(
     let mut out = Vec::new();
     for c in compute_cut_lines_for_view(&dp, plan)? {
         let sheet = sheet_of(c.source_view_id);
+        if is_elevation(&dp, c.source_view_id) {
+            let mid = v((c.from.x + c.to.x) / 2.0, (c.from.y + c.to.y) / 2.0);
+            out.extend(elevation_marker(mid, (c.gaze_dir.x, c.gaze_dir.y), &c.name, sheet.as_deref(), f));
+            continue;
+        }
         out.extend(cut_symbol(v(c.from.x, c.from.y), v(c.to.x, c.to.y), (c.gaze_dir.x, c.gaze_dir.y), &c.name, sheet.as_deref(), f));
     }
     for m in marks.iter().filter(|m| m.plan == plan) {
@@ -336,6 +367,11 @@ fn wanted(
     out.extend(grid_items(d, &dp, plan, false, f)?);
     out.extend(enlarged_boxes(d, id, scale));
     Ok(out)
+}
+
+/// `true` when view `id` is an elevation.
+pub(crate) fn is_elevation(dp: &DrawingProject, id: Id) -> bool {
+    dp.document().views.iter().any(|w| matches!(w, AnyView::Vertical(x) if x.id == id && x.intent == VerticalIntent::Elevation))
 }
 
 /// `"+0"`, `"+3000"`, `"-2700"`: signed whole millimetres, never `-0`.
@@ -737,6 +773,76 @@ pub(crate) mod tests {
         assert!(close(*b, a.x, a.y - 1.5 * CUT_TEXT_MM));
         s.undo()?;
         assert_eq!(texts(&s, plan)?, ["A-A", "A-A"]);
+        Ok(())
+    }
+
+    /// [`fixture`] plus elevation `North` cut on a diagonal from (0,6000) to (4000,9000), with a line
+    /// drawn in it. Returns (session, plan, section, elevation).
+    fn with_elevation() -> T<(Session, Id, Id, Id)> {
+        let (mut s, plan, sec) = fixture()?;
+        let r = s.execute(
+            "newelevationline",
+            &json!({ "name": "North", "hostViewId": plan.0, "cutFrom": {"x": 0, "y": 6000}, "cutTo": {"x": 4000, "y": 9000} }),
+        )?;
+        let el = Id(r["viewId"].as_u64().ok_or("no id")?);
+        s.execute("editview", &json!({ "viewId": el.0 }))?;
+        s.execute("line", &json!({ "points": [[0, 0], [5000, 0]] }))?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        s.execute("line", &json!({ "points": [[0, 0], [5000, 0]] }))?;
+        s.execute("editview", &json!({}))?;
+        Ok((s, plan, sec, el))
+    }
+
+    #[test]
+    fn an_elevation_gets_a_marker_at_its_line_midpoint_and_a_section_keeps_its_cut_symbol() -> R {
+        let (s, plan, _sec, _el) = with_elevation()?;
+        let it = items(&s, plan)?;
+        // The section's symbol is unchanged: its cut line and arrows come first.
+        let Item::Line(a, b) = &it[0] else { return Err("first is not the cut line".into()) };
+        assert!(close(*a, 0.0, 0.0) && close(*b, 5000.0, 0.0), "{a:?} {b:?}");
+        assert_eq!(it.iter().filter(|i| matches!(i, Item::Text(_, t, _) if t == "A-A")).count(), 2);
+        // No line spans the elevation's cut line.
+        let (from, to) = (v(0.0, 6000.0), v(4000.0, 9000.0));
+        assert!(!it.iter().any(|i| matches!(i, Item::Line(p, q) if (near(*p, from) && near(*q, to)) || (near(*p, to) && near(*q, from)))));
+        // One circle at the midpoint; the apex on the gaze side, the left of from → to.
+        let r = ELEV_MARK_MM;
+        let circles: Vec<_> = it.iter().filter_map(|i| if let Item::Circle(c, rr) = i { Some((*c, *rr)) } else { None }).collect();
+        assert_eq!(circles.len(), 1, "{it:?}");
+        assert!(close(circles[0].0, 2000.0, 7500.0) && (circles[0].1 - r).abs() < 1e-9, "{circles:?}");
+        let (ax, ay) = (2000.0 - 0.6 * 1.6 * r, 7500.0 + 0.8 * 1.6 * r);
+        let apexes = it.iter().filter(|i| matches!(i, Item::Line(p, q) if close(*p, ax, ay) || close(*q, ax, ay))).count();
+        assert_eq!(apexes, 2, "two pointer sides meet at the apex: {it:?}");
+        let (bx, by) = (2000.0 + 0.8 * r, 7500.0 + 0.6 * r);
+        assert!(it.iter().any(|i| matches!(i, Item::Line(p, q) if close(*p, bx, by) || close(*q, bx, by))), "the base spans ±r across the gaze");
+        assert!(it.iter().any(|i| matches!(i, Item::Line(p, q) if close(*p, 2000.0 - r, 7500.0) && close(*q, 2000.0 + r, 7500.0))), "divider");
+        assert!(it.contains(&Item::Text(v(2000.0, 7500.0 + 0.45 * r), "North".into(), 0.4 * r)));
+        assert_eq!(texts(&s, plan)?.iter().filter(|t| *t == "North").count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sheetset_numbers_the_marker_and_a_rename_updates_it_in_one_undo_step() -> R {
+        let (mut s, plan, _sec, el) = with_elevation()?;
+        s.execute("sheetset", &json!({}))?;
+        let r = ELEV_MARK_MM;
+        let below = |s: &Session| -> T<Vec<String>> {
+            Ok(items(s, plan)?
+                .into_iter()
+                .filter_map(|i| if let Item::Text(at, t, _) = i { close(at, 2000.0, 7500.0 - 0.45 * r).then_some(t) } else { None })
+                .collect())
+        };
+        let refs = below(&s)?;
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        let (n, sheet) = refs[0].split_once('/').ok_or("no slash")?;
+        assert!(n.parse::<u32>().is_ok() && sheet.starts_with("A2") && sheet.len() == 4, "{refs:?}");
+
+        let n = undo_len(&s)?;
+        s.execute("viewprops", &json!({ "mode": "rename", "viewId": el.0, "name": "South" }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert!(items(&s, plan)?.contains(&Item::Text(v(2000.0, 7500.0 + 0.45 * r), "South".into(), 0.4 * r)));
+        assert!(!texts(&s, plan)?.iter().any(|t| t == "North"));
+        s.undo()?;
+        assert!(texts(&s, plan)?.iter().any(|t| t == "North"));
         Ok(())
     }
 
