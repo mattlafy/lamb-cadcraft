@@ -37,13 +37,20 @@
 //! one floor show as two rows, each naming its view — nothing is silently counted twice. Sorted
 //! by level order, then item, then view document order.
 //!
-//! `bomtable {layout?, at?}` (`bom`): the table (`Level | Item | Count | Length | Area | View`, titled
-//! `Framing BOM`, a zero count, length or area left blank, a length written `12.4 m`, an area `37.2 m²`) on layout `layout` (default `A601`, the BOM's sheet in the set
+//! Members have a cut length per level (LAMB T711): the longest line on a member layer among the
+//! runs (bands and copies) any section or elevation lays on that level — a section draws a stud as
+//! its height and a joist as its span. It is the longest, not an average: the stock length that
+//! covers the tallest piece. Every row of that layer on that level shows it, plan rows included; a
+//! level no vertical view measures has none (left blank), never a storey-height guess. Plans,
+//! details and placed corners, jambs and ends add no cut length.
+//!
+//! `bomtable {layout?, at?}` (`bom`): the table (`Level | Item | Count | Each | Length | Area | View`, titled
+//! `Framing BOM`, a zero count, cut length, length or area left blank, a cut length written `2.44 m`, a length `12.4 m`, an area `37.2 m²`) on layout `layout` (default `A601`, the BOM's sheet in the set
 //! ([`crate::sheetset`]), created without viewports when absent) at
 //! paper point `at` (default the top-left corner of the sheet's
 //! [`crate::sheets::usable_area`]). A table on that
 //! layout titled `Framing BOM` is replaced; one undo step. Nothing to count is refused, nothing
-//! changed. Returns `{layout, handle, rows: [{level, item, count, lengthMm, areaM2, view}], message}`.
+//! changed. Returns `{layout, handle, rows: [{level, item, count, eachMm, lengthMm, areaM2, view}], message}`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -74,15 +81,17 @@ pub(crate) const DEFAULT_LAYOUT: &str = "A601";
 const NO_LEVEL: &str = "—";
 const TEXT_HEIGHT: f64 = 2.5;
 const ROW_HEIGHT: f64 = 7.0;
-const COL_WIDTHS: [f64; 6] = [30.0, 45.0, 15.0, 20.0, 15.0, 30.0];
+const COL_WIDTHS: [f64; 7] = [30.0, 38.0, 12.0, 15.0, 20.0, 15.0, 25.0];
 
-/// One BOM row: `count` of `item`, `length_mm` of it as a continuous band and `area_m2` of that
-/// band over the level's storey height (each 0 when there is none) on `level`, as laid in `view`.
+/// One BOM row: `count` of `item`, `each_mm` the cut length of one piece, `length_mm` of it as a
+/// continuous band and `area_m2` of that band over the level's storey height (each 0 when there is
+/// none) on `level`, as laid in `view`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BomRow {
     pub level: String,
     pub item: String,
     pub count: usize,
+    pub each_mm: f64,
     pub length_mm: f64,
     pub area_m2: f64,
     pub view: String,
@@ -180,6 +189,26 @@ fn member_counts<'a>(lines: &'a [AssemblyLine], members: &HashSet<String>) -> Ha
     counts
 }
 
+/// The longest member line per (level name, layer): a piece's cut length.
+type Cuts = HashMap<(String, String), f64>;
+
+fn level_name(level: Option<&Level>) -> String {
+    level.map_or_else(|| NO_LEVEL.to_owned(), |l| l.name.clone())
+}
+
+/// Folds the lines of `lines` on a `members` layer into `cut` under `level`, keeping the longest.
+fn add_cuts(cut: &mut Cuts, level: Option<&Level>, lines: &[AssemblyLine], members: &HashSet<String>) {
+    for l in lines.iter().filter(|l| members.contains(&l.layer)) {
+        let each = cut.entry((level_name(level), l.layer.clone())).or_insert(0.0);
+        *each = each.max(line_length(l));
+    }
+}
+
+/// `rows` with each row's cut length from `cut` (0 when its level and item have none).
+fn with_cuts(rows: Vec<BomRow>, cut: &Cuts) -> Vec<BomRow> {
+    rows.into_iter().map(|r| BomRow { each_mm: cut.get(&(r.level.clone(), r.item.clone())).copied().unwrap_or(0.0), ..r }).collect()
+}
+
 /// Every framing count and band length the assembly plans lay, per (level, item, view), sorted.
 pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
     let Ok(doc) = read_document(d) else { return Vec::new() };
@@ -192,9 +221,10 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
     let members = member_layers(d, &doc.views, &laid);
     // (level name, item, view index) → (level order, count, length, area).
     let mut counts: HashMap<(String, String, usize), (f64, usize, f64, f64)> = HashMap::new();
+    let mut cut = Cuts::new();
     let mut bump = |level: Option<&Level>, item: String, view: usize, n: usize, length: f64, area: f64| {
-        let (order, name) = level.map_or((f64::INFINITY, NO_LEVEL.to_owned()), |l| (l.order, l.name.clone()));
-        let entry = counts.entry((name, item, view)).or_insert((order, 0, 0.0, 0.0));
+        let order = level.map_or(f64::INFINITY, |l| l.order);
+        let entry = counts.entry((level_name(level), item, view)).or_insert((order, 0, 0.0, 0.0));
         entry.1 += n;
         entry.2 += length;
         entry.3 += area;
@@ -222,7 +252,9 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
                 for layer in copy_layers(r) {
                     bump(level, layer.to_owned(), vi, 1, 0.0, 0.0);
                 }
-                if vertical.is_none() {
+                if vertical.is_some() {
+                    add_cuts(&mut cut, level, &r.lines, &members);
+                } else {
                     let storey = level.and_then(|l| storey_height(levels, l));
                     for (layer, length) in band_lengths(r) {
                         bump(level, layer.to_owned(), vi, 0, length, storey.map_or(0.0, |h| length * h / 1e6));
@@ -261,16 +293,19 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
         .map(|((level, item, view), (order, n, length, area))| ((order, level, item, view), (n, length, area)))
         .collect();
     rows.sort_by(|a, b| a.0.0.total_cmp(&b.0.0).then_with(|| a.0.1.cmp(&b.0.1)).then_with(|| a.0.2.cmp(&b.0.2)).then_with(|| a.0.3.cmp(&b.0.3)));
-    rows.into_iter()
+    let rows = rows
+        .into_iter()
         .map(|((_, level, item, view), (count, length_mm, area_m2))| BomRow {
             level,
             item,
             count,
+            each_mm: 0.0,
             length_mm,
             area_m2,
             view: doc.views.get(view).map(|v| v.name().to_owned()).unwrap_or_default(),
         })
-        .collect()
+        .collect();
+    with_cuts(rows, &cut)
 }
 
 /// A schedule table with its top-left corner at `at` (paper mm): a merged title row over a header
@@ -298,11 +333,14 @@ pub(crate) fn schedule_table(title: &str, header: &[&str], col_widths: &[f64], r
 /// The BOM table with its top-left corner at `at` (paper mm).
 pub fn bom_table(rows: &[BomRow], at: Point2) -> Table {
     let count = |n: usize| if n > 0 { n.to_string() } else { String::new() };
+    let each = |mm: f64| if mm > 0.0 { format!("{:.2} m", mm / 1000.0) } else { String::new() };
     let length = |mm: f64| if mm > 0.0 { format!("{:.1} m", mm / 1000.0) } else { String::new() };
     let area = |m2: f64| if m2 > 0.0 { format!("{m2:.1} m²") } else { String::new() };
-    let rows: Vec<Vec<String>> =
-        rows.iter().map(|r| vec![r.level.clone(), r.item.clone(), count(r.count), length(r.length_mm), area(r.area_m2), r.view.clone()]).collect();
-    schedule_table(BOM_TITLE, &["Level", "Item", "Count", "Length", "Area", "View"], &COL_WIDTHS, &rows, at)
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| vec![r.level.clone(), r.item.clone(), count(r.count), each(r.each_mm), length(r.length_mm), area(r.area_m2), r.view.clone()])
+        .collect();
+    schedule_table(BOM_TITLE, &["Level", "Item", "Count", "Each", "Length", "Area", "View"], &COL_WIDTHS, &rows, at)
 }
 
 /// Whether `e` is a table titled `title`.
@@ -432,7 +470,7 @@ pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({
         "layout": layout,
         "handle": format!("{:X}", handle.0),
-        "rows": rows.iter().map(|r| json!({ "level": r.level, "item": r.item, "count": r.count, "lengthMm": r.length_mm, "areaM2": r.area_m2, "view": r.view })).collect::<Vec<_>>(),
+        "rows": rows.iter().map(|r| json!({ "level": r.level, "item": r.item, "count": r.count, "eachMm": r.each_mm, "lengthMm": r.length_mm, "areaM2": r.area_m2, "view": r.view })).collect::<Vec<_>>(),
         "message": message,
     }))
 }
@@ -599,6 +637,7 @@ pub(crate) mod tests {
                 level: "Level 1".into(),
                 item: "SHEATHING".into(),
                 count: 0,
+                each_mm: 0.0,
                 length_mm: laid,
                 area_m2: 0.0,
                 view: "Ground".into()
@@ -610,6 +649,7 @@ pub(crate) mod tests {
                 level: "Level 1".into(),
                 item: "STUD".into(),
                 count: copies(d, plan)?,
+                each_mm: 0.0,
                 length_mm: 0.0,
                 area_m2: 0.0,
                 view: "Ground".into()
@@ -618,7 +658,7 @@ pub(crate) mod tests {
         );
         let cells = bom_table(&rows, Point2 { x: 0.0, y: 0.0 }).cells;
         let texts: Vec<Vec<&str>> = cells.iter().map(|r| r.iter().map(|c| c.text.as_str()).collect()).collect();
-        assert!(texts.contains(&vec!["Level 1", "SHEATHING", "", "12.4 m", "", "Ground"]), "{texts:?}");
+        assert!(texts.contains(&vec!["Level 1", "SHEATHING", "", "", "12.4 m", "", "Ground"]), "{texts:?}");
         Ok(())
     }
 
@@ -685,6 +725,77 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_section_s_longest_stud_line_on_a_level_is_each_stud_row_s_cut_length() -> R {
+        let (mut s, sec, _) = window_section(true)?;
+        add_level(&mut s, "Level 1", 0.0)?;
+        add_level(&mut s, "Level 2", 2000.0)?;
+        let d = s.doc()?;
+        let doc = read_document(d)?;
+        let view = doc.views.iter().find(|v| v.id() == sec).ok_or("no section")?;
+        let vr = view_ref(view);
+        let (graph, _) = graph_and_sides(&DrawingProject::new(d)?, sec);
+        let mut want: HashMap<String, f64> = HashMap::new();
+        for r in assembly_lines(d, sec)? {
+            let mid = curve_mid(&graph.runs.get(r.run).ok_or("no run")?.centreline);
+            let level = level_name(level_at(&doc.levels, vertical_local_to_uz(&vr, mid).z));
+            for l in r.lines.iter().filter(|l| l.layer == "STUD") {
+                let w = want.entry(level.clone()).or_insert(0.0);
+                *w = w.max(line_length(l));
+            }
+        }
+        assert!(want.values().any(|&w| w > 0.0), "the section lays STUD lines: {want:?}");
+        let rows = bom_rows(d);
+        let studs: Vec<&BomRow> = rows.iter().filter(|r| r.item == "STUD").collect();
+        assert!(studs.iter().any(|r| r.each_mm > 0.0), "{rows:?}");
+        for r in studs {
+            assert!(close(r.each_mm, want.get(&r.level).copied().unwrap_or(0.0)), "{r:?}: {want:?}");
+        }
+        assert!(rows.iter().filter(|r| r.item != "STUD").all(|r| r.each_mm == 0.0), "only member layers: {rows:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_s_stud_row_takes_the_cut_length_a_section_measured_on_its_level() -> R {
+        let (s, plan) = stud_room()?;
+        let d = s.doc()?;
+        let doc = read_document(d)?;
+        let l1 = doc.levels.iter().find(|l| l.name == "Level 1");
+        let members: HashSet<String> = ["STUD".to_owned()].into();
+        let at =
+            |y1: f64, layer: &str| AssemblyLine { from: Point2 { x: 0.0, y: 0.0 }, to: Point2 { x: 0.0, y: y1 }, layer: layer.to_owned(), arc: None };
+        // As a section's runs on Level 1 would lay them: two runs, and one off every level.
+        let mut cut = Cuts::new();
+        add_cuts(&mut cut, l1, &[at(2440.0, "STUD"), at(38.0, "STUD"), at(3000.0, "SHEATHING")], &members);
+        add_cuts(&mut cut, l1, &[at(2400.0, "STUD")], &members);
+        add_cuts(&mut cut, None, &[at(9000.0, "STUD")], &members);
+        assert_eq!(cut, HashMap::from([(("Level 1".to_owned(), "STUD".to_owned()), 2440.0), ((NO_LEVEL.to_owned(), "STUD".to_owned()), 9000.0)]));
+        let rows = with_cuts(bom_rows(d), &cut);
+        let stud = rows.iter().find(|r| r.item == "STUD" && r.view == "Ground").ok_or("no stud row")?;
+        assert_eq!((stud.count, stud.each_mm), (copies(d, plan)?, 2440.0));
+        assert!(rows.iter().filter(|r| r.item != "STUD").all(|r| r.each_mm == 0.0), "{rows:?}");
+        let texts: Vec<Vec<String>> =
+            bom_table(&rows, Point2 { x: 0.0, y: 0.0 }).cells.iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect();
+        assert!(texts.iter().any(|r| r[1] == "STUD" && r[3] == "2.44 m"), "{texts:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn with_no_vertical_view_a_stud_has_no_cut_length_and_bomtable_says_so() -> R {
+        let (mut s, _) = stud_room()?;
+        let rows = bom_rows(s.doc()?);
+        let stud = rows.iter().find(|r| r.item == "STUD").ok_or("no stud row")?;
+        assert_eq!(stud.each_mm, 0.0);
+        let out = s.execute("bomtable", &json!({}))?;
+        let json_rows = out["rows"].as_array().ok_or("no rows")?;
+        assert!(json_rows.iter().all(|r| r["eachMm"].as_f64() == Some(0.0)), "{out}");
+        let texts: Vec<Vec<String>> = boms(&s)?[0].cells.iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect();
+        assert_eq!(texts[1].len(), 7);
+        assert_eq!(texts[1][3], "Each");
+        assert!(texts.iter().any(|r| r[1] == "STUD" && r[3].is_empty()), "{texts:?}");
+        Ok(())
+    }
+
+    #[test]
     fn a_member_layer_with_a_band_has_its_count_and_length_on_one_row() -> R {
         let (mut s, plan) = stud_room()?;
         let detail = view_named(&s, "D1")?;
@@ -715,7 +826,7 @@ pub(crate) mod tests {
         assert_eq!(undo_len(&s)?, n + 1, "one undo step");
         let t = boms(&s)?;
         assert_eq!(t.len(), 1);
-        assert_eq!(t[0].cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Level", "Item", "Count", "Length", "Area", "View"]);
+        assert_eq!(t[0].cells[1].iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Level", "Item", "Count", "Each", "Length", "Area", "View"]);
         assert_eq!((t[0].insert.x, t[0].insert.y, t[0].col_widths.clone()), (50.0, 100.0, COL_WIDTHS.to_vec()), "it stays where it stood");
         s.execute("sheetset", &json!({}))?;
         assert_eq!(undo_len(&s)?, n + 1, "a rerun adds no undo step");
@@ -736,11 +847,11 @@ pub(crate) mod tests {
         assert!(rows.iter().filter(|r| r.item == "STUD").all(|r| r.area_m2 == 0.0), "members have no area: {rows:?}");
         let texts: Vec<Vec<String>> =
             bom_table(&rows, Point2 { x: 0.0, y: 0.0 }).cells.iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect();
-        assert_eq!(texts[1].len(), 6);
-        assert_eq!(texts[1][4], "Area");
-        let row = |cells: [&str; 6]| cells.map(str::to_owned).to_vec();
-        assert!(texts.contains(&row(["Level 1", "SHEATHING", "", "12.4 m", "37.2 m²", "Ground"])), "{texts:?}");
-        assert!(texts.contains(&row(["Level 2", "SHEATHING", "", "12.4 m", "", "Upper"])), "{texts:?}");
+        assert_eq!(texts[1].len(), 7);
+        assert_eq!(texts[1][5], "Area");
+        let row = |cells: [&str; 7]| cells.map(str::to_owned).to_vec();
+        assert!(texts.contains(&row(["Level 1", "SHEATHING", "", "", "12.4 m", "37.2 m²", "Ground"])), "{texts:?}");
+        assert!(texts.contains(&row(["Level 2", "SHEATHING", "", "", "12.4 m", "", "Upper"])), "{texts:?}");
         let out = s.execute("bomtable", &json!({}))?;
         let rows = out["rows"].as_array().ok_or("no rows")?;
         let area = |level: &str| rows.iter().find(|r| r["item"] == "SHEATHING" && r["level"] == level).and_then(|r| r["areaM2"].as_f64());
@@ -809,7 +920,10 @@ pub(crate) mod tests {
         assert!(n > 10, "studs laid round the room: {n}");
         let rows = bom_rows(d);
         let studs: Vec<&BomRow> = rows.iter().filter(|r| r.item == "STUD").collect();
-        assert_eq!(studs, [&BomRow { level: "Level 1".into(), item: "STUD".into(), count: n, length_mm: 0.0, area_m2: 0.0, view: "Ground".into() }]);
+        assert_eq!(
+            studs,
+            [&BomRow { level: "Level 1".into(), item: "STUD".into(), count: n, each_mm: 0.0, length_mm: 0.0, area_m2: 0.0, view: "Ground".into() }]
+        );
         Ok(())
     }
 
@@ -825,6 +939,7 @@ pub(crate) mod tests {
                 level: "Level 1".into(),
                 item: "JD (end)".into(),
                 count: 2,
+                each_mm: 0.0,
                 length_mm: 0.0,
                 area_m2: 0.0,
                 view: "Ground".into()
@@ -848,6 +963,7 @@ pub(crate) mod tests {
                 level: "Level 1".into(),
                 item: "JD (jamb)".into(),
                 count: 2,
+                each_mm: 0.0,
                 length_mm: 0.0,
                 area_m2: 0.0,
                 view: "Ground".into()
@@ -862,6 +978,7 @@ pub(crate) mod tests {
                 level: "Level 1".into(),
                 item: "CD (corner)".into(),
                 count: 4,
+                each_mm: 0.0,
                 length_mm: 0.0,
                 area_m2: 0.0,
                 view: "Ground".into()
@@ -920,6 +1037,7 @@ pub(crate) mod tests {
                 level: "Level 1".into(),
                 item: "STUD".into(),
                 count: n + 2 * 4,
+                each_mm: 0.0,
                 length_mm: 0.0,
                 area_m2: 0.0,
                 view: "Ground".into()
@@ -1033,9 +1151,9 @@ pub(crate) mod tests {
         let t = boms(&s)?;
         assert_eq!(t.len(), 1);
         let texts: Vec<Vec<&str>> = t[0].cells.iter().map(|r| r.iter().map(|c| c.text.as_str()).collect()).collect();
-        assert_eq!(texts[1], ["Level", "Item", "Count", "Length", "Area", "View"]);
-        assert_eq!(texts[2], ["Level 1", "CLAD", "", "16.4 m", "", "Ground"]);
-        assert_eq!(texts[4], ["Level 1", "STUD", studs.to_string().as_str(), "", "", "Ground"]);
+        assert_eq!(texts[1], ["Level", "Item", "Count", "Each", "Length", "Area", "View"]);
+        assert_eq!(texts[2], ["Level 1", "CLAD", "", "", "16.4 m", "", "Ground"]);
+        assert_eq!(texts[4], ["Level 1", "STUD", studs.to_string().as_str(), "", "", "", "Ground"]);
         assert_eq!((t[0].title, t[0].header, t[0].text_height, t[0].col_widths.clone()), (true, true, 2.5, COL_WIDTHS.to_vec()));
         assert_eq!(t[0].row_heights, [7.0; 5]);
         let first = t[0].clone();
