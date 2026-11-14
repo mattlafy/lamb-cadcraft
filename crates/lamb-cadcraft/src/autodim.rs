@@ -44,6 +44,13 @@
 //! vertical chain from its floor to its sill to its head (floor to head when the sill is zero, as
 //! for a door), its dimension line [`ELEV_DIM_OFFSET_MM`] right of the opening's right jamb. An
 //! opening no section reads gets none.
+//!
+//! The section form (LAMB T714), `autodim {view: <section>}` with no kind flag, kept in
+//! `auto_dim_sections`: [`section`] gives every opening the section's own wall graph reads as a
+//! bridge (cut wall above and below, [`crate::schedule::section_openings`]) one vertical chain from
+//! its floor (the highest level at or below its sill) to its sill to its head. Its dimension line
+//! sits [`ELEV_DIM_OFFSET_MM`] beyond the cut wall's face, on the side away from the middle of the
+//! view block (the outside of an exterior wall). An opening below every level gets none.
 
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use lamb_core::derivation::projection::{Uz, vertical_uz_to_local};
@@ -63,8 +70,8 @@ use crate::annotations::GRID_GAP_MM;
 use crate::commands::{bad, edited_view, id_value, other};
 use crate::detailtags::graph_and_sides;
 use crate::project::DrawingProject;
-use crate::schema::{read_document, write_document};
-use cadcraft_doc::Drawing;
+use crate::schema::{read_document, view_block_name, write_document};
+use cadcraft_doc::{Drawing, Space};
 
 /// The inner string's dimension line sits this far off the face, at 1:50.
 pub const INNER_STRING_MM: f64 = 800.0;
@@ -504,6 +511,45 @@ pub(crate) fn elevation(d: &Drawing, dp: &DrawingProject<'_>, view: Id, factor: 
     out
 }
 
+/// Section `view`'s opening dimensions with their offset multiplied by `factor` (see the module
+/// doc), per cut opening in wall-graph bridge order, bottom up.
+pub(crate) fn section(d: &Drawing, dp: &DrawingProject<'_>, view: Id, factor: f64) -> Vec<DimSpan> {
+    let Some(v) = dp.view(view) else { return Vec::new() };
+    let tol = TOLERANCE.coincidence_mm;
+    let ext = d.extents(&Space::Block(view_block_name(view)));
+    let middle = if ext.is_empty() { None } else { Some((ext.min.x + ext.max.x) / 2.0) };
+    let floors: Vec<f64> = dp.document().levels.iter().map(|l| l.floor_elevation.value).collect();
+    let mut out = Vec::new();
+    for (u, sill, head, width) in crate::schedule::section_openings(dp, view) {
+        let Some(floor) = floors.iter().copied().filter(|z| *z <= sill + tol).reduce(f64::max) else { continue };
+        let jamb = vertical_uz_to_local(&v, Uz { u, z: sill }).x;
+        let side = match middle {
+            Some(m) if jamb < m => -1.0,
+            _ => 1.0,
+        };
+        let x = jamb + side * (width / 2.0 + ELEV_DIM_OFFSET_MM * factor);
+        let mut zs = vec![floor];
+        if sill - floor > tol {
+            zs.push(sill);
+        }
+        zs.push(head);
+        let at = |z: f64| Point2 { x, y: vertical_uz_to_local(&v, Uz { u, z }).y };
+        out.extend(zs.windows(2).filter_map(|w| {
+            let (a, b) = (at(*w.first()?), at(*w.get(1)?));
+            Some(DimSpan { a, b, rotation: FRAC_PI_2, line_at: a })
+        }));
+    }
+    out
+}
+
+/// What a non-plan view AUTODIM accepts is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Plan,
+    Elevation,
+    Section,
+}
+
 /// Which of AUTODIM's four independent kinds a call turns on or off.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -513,22 +559,24 @@ enum Kind {
     Grid,
 }
 
-/// `Ok(true)` when `view` is a placed elevation and `kind` is [`Kind::Exterior`], `Ok(false)` when
-/// it is a placed plan, else why not.
-fn check_plan(s: &Session, view: Id, kind: Kind) -> std::result::Result<bool, String> {
+/// Which kind of placed view `view` is, an elevation or section only for [`Kind::Exterior`], else
+/// why not.
+fn check_plan(s: &Session, view: Id, kind: Kind) -> std::result::Result<Target, String> {
     let doc = read_document(s.doc().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     match doc.views.iter().find(|v| v.id() == view) {
         None => Err("No such view".into()),
-        Some(AnyView::Plan(p)) if p.placement.is_some() => Ok(false),
+        Some(AnyView::Plan(p)) if p.placement.is_some() => Ok(Target::Plan),
         Some(AnyView::Plan(p)) => Err(format!("{} is floating: place it on a level before dimensioning it", p.name)),
-        Some(AnyView::Vertical(e)) if e.intent == VerticalIntent::Elevation && e.placement.is_some() => {
-            if kind == Kind::Exterior {
-                Ok(true)
-            } else {
+        Some(AnyView::Vertical(e)) if e.placement.is_some() && matches!(e.intent, VerticalIntent::Elevation | VerticalIntent::Section) => {
+            if kind != Kind::Exterior {
                 Err("Interior, locate and grid dimensions are for plans".into())
+            } else if e.intent == VerticalIntent::Section {
+                Ok(Target::Section)
+            } else {
+                Ok(Target::Elevation)
             }
         }
-        Some(_) => Err("AUTODIM dimensions plans and elevations only".into()),
+        Some(_) => Err("AUTODIM dimensions plans, sections and elevations only".into()),
     }
 }
 
@@ -570,10 +618,12 @@ pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
         (false, false, false) => Kind::Exterior,
         _ => return Err(bad("autodim", "give one of interior, locate or grid")),
     };
-    let is_elevation = check_plan(s, view, kind).map_err(other)?;
+    let target = check_plan(s, view, kind).map_err(other)?;
+    let vertical = target != Target::Plan;
     let mut doc = read_document(s.doc()?).map_err(|e| other(e.to_string()))?;
     let list = match kind {
-        Kind::Exterior if is_elevation => &mut doc.auto_dim_elevations,
+        Kind::Exterior if target == Target::Elevation => &mut doc.auto_dim_elevations,
+        Kind::Exterior if target == Target::Section => &mut doc.auto_dim_sections,
         Kind::Exterior => &mut doc.auto_dim_plans,
         Kind::Interior => &mut doc.auto_dim_interior_plans,
         Kind::Locate => &mut doc.auto_dim_locate_plans,
@@ -591,7 +641,8 @@ pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         let dp = DrawingProject::new(s.doc()?).map_err(|e| other(e.to_string()))?;
         match kind {
-            Kind::Exterior if is_elevation => elevation(s.doc()?, &dp, view, 1.0).len(),
+            Kind::Exterior if target == Target::Elevation => elevation(s.doc()?, &dp, view, 1.0).len(),
+            Kind::Exterior if target == Target::Section => section(s.doc()?, &dp, view, 1.0).len(),
             Kind::Exterior => strings(&dp, view, 1.0).len(),
             Kind::Interior => interior(&dp, view).len(),
             Kind::Locate => locate(&dp, view).len(),
@@ -599,8 +650,8 @@ pub fn autodim(s: &mut Session, p: &Value) -> Result<Value> {
         }
     };
     let message = match (kind, off) {
-        (Kind::Exterior, true) if is_elevation => "Opening dimensions off".to_owned(),
-        (Kind::Exterior, false) if is_elevation => format!("{dimensions} opening dimensions"),
+        (Kind::Exterior, true) if vertical => "Opening dimensions off".to_owned(),
+        (Kind::Exterior, false) if vertical => format!("{dimensions} opening dimensions"),
         (Kind::Exterior, true) => "Generated dimensions off".to_owned(),
         (Kind::Exterior, false) => format!("{dimensions} generated dimensions"),
         (Kind::Interior, true) => "Interior dimensions off".to_owned(),
@@ -910,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn it_refuses_a_section_and_a_floating_plan_and_sheetset_does_not_turn_it_on() -> R {
+    fn it_refuses_grid_on_a_section_and_a_floating_plan_and_sheetset_does_not_turn_it_on() -> R {
         let (mut s, plan) = room()?;
         let sec = s.execute(
             "newsectionline",
@@ -919,12 +970,14 @@ mod tests {
         let sec = sec["viewId"].as_u64().ok_or("no id")?;
         let floating = s.execute("newplan", &json!({ "name": "Loose" }))?["viewId"].as_u64().ok_or("no id")?;
         let n = undo_len(&s)?;
-        for v in [sec, floating, 99_999] {
+        for v in [floating, 99_999] {
             assert!(s.execute("autodim", &json!({ "view": v })).is_err(), "{v}");
         }
+        assert!(s.execute("autodim", &json!({ "view": sec, "grid": true })).is_err(), "grid on a section");
         assert_eq!(undo_len(&s)?, n, "a refusal records nothing");
         s.execute("sheetset", &json!({}))?;
-        assert!(dims(&s, plan)?.is_empty() && read_document(s.doc()?)?.auto_dim_plans.is_empty());
+        let doc = read_document(s.doc()?)?;
+        assert!(dims(&s, plan)?.is_empty() && doc.auto_dim_plans.is_empty() && doc.auto_dim_sections.is_empty());
         Ok(())
     }
 
@@ -1406,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn an_elevation_refuses_the_plan_kinds_and_a_section_stays_refused() -> R {
+    fn an_elevation_and_a_section_refuse_the_plan_kinds_and_a_floating_vertical_view_is_refused() -> R {
         let (mut s, plan, south) = elevated("WINDOW", Some((900.0, 2100.0)))?;
         let sec = s.execute(
             "newsectionline",
@@ -1414,14 +1467,65 @@ mod tests {
         )?["viewId"]
             .as_u64()
             .ok_or("no id")?;
+        let floating = Id(s.execute("newdetail", &json!({ "name": "Loose", "cutDirection": "vertical" }))?["viewId"].as_u64().ok_or("no id")?);
         let n = undo_len(&s)?;
-        let e = s.execute("autodim", &json!({ "view": sec })).err().ok_or("a section is refused")?;
-        assert!(e.to_string().contains("plans and elevations only"), "{e}");
-        for flag in ["grid", "interior", "locate"] {
-            let e = s.execute("autodim", &json!({ "view": south.0, flag: true })).err().ok_or("refused")?;
-            assert!(e.to_string().contains("are for plans"), "{flag}: {e}");
+        let e = s.execute("autodim", &json!({ "view": floating.0 })).err().ok_or("a floating vertical view is refused")?;
+        assert!(e.to_string().contains("plans, sections and elevations only"), "{e}");
+        for view in [south.0, sec] {
+            for flag in ["grid", "interior", "locate"] {
+                let e = s.execute("autodim", &json!({ "view": view, flag: true })).err().ok_or("refused")?;
+                assert!(e.to_string().contains("are for plans"), "{flag}: {e}");
+            }
         }
         assert_eq!(undo_len(&s)?, n, "a refusal records nothing");
+        Ok(())
+    }
+
+    /// `section_through` the south wall, plus the north wall's cut (u 4800..5000) so the view block
+    /// has a middle, inside the room.
+    fn sectioned(s: &mut Session, plan: Id, windows: &[(f64, f64)], top: f64) -> T<Id> {
+        let sec = crate::schedule::tests::section_through(s, plan, windows, top)?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        crate::schedule::tests::layer(s, "WALL-EXT")?;
+        let before = s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.len();
+        for u in [4800.0, 5000.0] {
+            s.execute("pline", &json!({ "vertices": [[u, 0.0], [u, top]] }))?;
+        }
+        let hs: Vec<String> = s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.iter().skip(before).map(|e| e.handle.hex()).collect();
+        s.execute("setrole", &json!({ "handles": hs, "role": "cut" }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        Ok(sec)
+    }
+
+    #[test]
+    fn an_opted_in_section_chains_each_cut_window_floor_sill_head_outside_its_wall() -> R {
+        let (mut s, plan) = crate::schedule::tests::window_south()?;
+        let sec = sectioned(&mut s, plan, &[(900.0, 2100.0)], 3000.0)?;
+        assert!(opening_dims(&s, sec)?.is_empty(), "nothing before AUTODIM");
+        let n = undo_len(&s)?;
+        let r = s.execute("autodim", &json!({ "view": sec.0 }))?;
+        assert_eq!((undo_len(&s)?, r["message"].as_str()), (n + 1, Some("2 opening dimensions")));
+        assert_eq!(read_document(s.doc()?)?.auto_dim_sections, [sec]);
+        // The wall is u 1000..1200, outside towards u 0; the chain sits 300 beyond its face.
+        assert_eq!(opening_dims(&s, sec)?, [(700, 0, 900), (700, 900, 2100)]);
+        assert!(crate::annotations::settled(s.doc()?)?, "a second pass changes nothing");
+        let r = s.execute("autodim", &json!({ "view": sec.0, "off": true }))?;
+        assert_eq!(r["message"], "Opening dimensions off");
+        assert!(opening_dims(&s, sec)?.is_empty() && read_document(s.doc()?)?.auto_dim_sections.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_section_window_above_a_second_level_measures_from_that_level() -> R {
+        let (mut s, plan) = crate::schedule::tests::window_south()?;
+        s.execute("newoffsetplan", &json!({ "mode": "offset", "fromViewId": plan.0, "floorToFloorMm": 3000, "name": "First" }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        let sec = sectioned(&mut s, plan, &[(900.0, 2100.0), (3900.0, 5100.0)], 6000.0)?;
+        let r = s.execute("autodim", &json!({ "view": sec.0 }))?;
+        assert_eq!(r["message"], "4 opening dimensions");
+        // The floor-to-floor level dimension (0 to 3000) sits clear, further out.
+        let chains: Vec<_> = opening_dims(&s, sec)?.into_iter().filter(|d| d.0 == 700).collect();
+        assert_eq!(chains, [(700, 0, 900), (700, 900, 2100), (700, 3000, 3900), (700, 3900, 5100)]);
         Ok(())
     }
 }

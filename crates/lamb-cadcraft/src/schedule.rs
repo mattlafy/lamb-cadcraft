@@ -194,8 +194,8 @@ fn crossing_u(from: Point2, to: Point2, a: Point2, b: Point2) -> Option<f64> {
     (within(along_cut, cut_len) && within(along_span, span_len)).then_some(along_cut)
 }
 
-/// A section's openings that have a head and a sill: (u, sill z, head z).
-fn section_openings(p: &DrawingProject<'_>, section: Id) -> Vec<(f64, f64, f64)> {
+/// A section's openings that have a head and a sill: (u, sill z, head z, cut wall width).
+pub(crate) fn section_openings(p: &DrawingProject<'_>, section: Id) -> Vec<(f64, f64, f64, f64)> {
     let Some(view) = p.view(section) else { return Vec::new() };
     let graph = wall_graph(p, section, &wall_params(p, section));
     graph
@@ -203,7 +203,8 @@ fn section_openings(p: &DrawingProject<'_>, section: Id) -> Vec<(f64, f64, f64)>
         .iter()
         .filter_map(|b| {
             let (a, c) = (vertical_local_to_uz(&view, b.from), vertical_local_to_uz(&view, b.to));
-            ((a.z - c.z).abs() > TOLERANCE.coincidence_mm).then(|| ((a.u + c.u) / 2.0, a.z.min(c.z), a.z.max(c.z)))
+            let width = graph.runs.get(b.a.0).map_or(0.0, |r| r.width);
+            ((a.z - c.z).abs() > TOLERANCE.coincidence_mm).then(|| ((a.u + c.u) / 2.0, a.z.min(c.z), a.z.max(c.z), width))
         })
         .collect()
 }
@@ -218,7 +219,7 @@ pub fn opening_rows(d: &Drawing) -> Vec<OpeningRow> {
     let Ok(p) = DrawingProject::new(d) else { return Vec::new() };
     let is_section = |id: Id| doc.views.iter().any(|v| matches!(v, AnyView::Vertical(s) if s.id == id && s.intent == VerticalIntent::Section));
     let name_of = |id: Id| doc.views.iter().find(|v| v.id() == id).map(|v| v.name().to_owned());
-    let mut sections: HashMap<Id, Vec<(f64, f64, f64)>> = HashMap::new();
+    let mut sections: HashMap<Id, Vec<(f64, f64, f64, f64)>> = HashMap::new();
     let mut rows = Vec::with_capacity(found.len());
     for o in found {
         let level = o.level.and_then(|i| levels.get(i));
@@ -233,9 +234,9 @@ pub fn opening_rows(d: &Drawing) -> Vec<OpeningRow> {
                 .entry(section)
                 .or_insert_with(|| section_openings(&p, section))
                 .iter()
-                .filter(|(at, sill, _)| (at - u).abs() <= o.wall_width && on_level(*sill))
+                .filter(|(at, sill, _, _)| (at - u).abs() <= o.wall_width && on_level(*sill))
                 .min_by(|a, b| (a.0 - u).abs().total_cmp(&(b.0 - u).abs()))
-                .map(|(_, sill, head)| (head - sill, sill - floor))
+                .map(|(_, sill, head, _)| (head - sill, sill - floor))
         });
         let assembly = opening_assembly(d, o.mark.plan).unwrap_or_default();
         let jamb_detail = assembly.iter().find(|a| a.bridge == o.bridge && a.end.is_none()).and_then(|a| a.detail).and_then(name_of);
