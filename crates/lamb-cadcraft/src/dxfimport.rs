@@ -168,7 +168,6 @@ mod tests {
     use crate::schema::{read_document, read_entity_data};
     use cadcraft_doc::EntityKind;
     use cadcraft_engine::cmd::file::{IoHooks, set_io};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
     type T<X> = std::result::Result<X, Box<dyn std::error::Error>>;
@@ -182,16 +181,14 @@ mod tests {
     }
 
     /// A DXF file built by `draw` in a fresh session, written to a unique temp path.
-    fn dxf_file(stem: &str, draw: impl Fn(&mut Session) -> Result<()>) -> T<std::path::PathBuf> {
-        static N: AtomicUsize = AtomicUsize::new(0);
+    fn dxf_file(stem: &str, draw: impl Fn(&mut Session) -> Result<()>) -> T<(crate::testdir::TempDir, std::path::PathBuf)> {
         let mut src = Session::new();
         src.new_drawing(true);
         draw(&mut src)?;
-        let dir = std::env::temp_dir().join(format!("lamb-dxfimport-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-        std::fs::create_dir_all(&dir)?;
+        let dir = crate::testdir::TempDir::new("dxfimport")?;
         let path = dir.join(format!("{stem}.dxf"));
         std::fs::write(&path, cadcraft_io::write_dxf(src.doc()?))?;
-        Ok(path)
+        Ok((dir, path))
     }
 
     fn walls(s: &mut Session) -> Result<()> {
@@ -236,7 +233,7 @@ mod tests {
     #[test]
     fn line_work_lands_in_a_new_unplaced_plan_scaled_in_one_undo_step() -> R {
         let mut s = session()?;
-        let path = dxf_file("walls", walls)?;
+        let (_tmp, path) = dxf_file("walls", walls)?;
         let space = s.space();
         let undo = s.state()?.undo.len();
         let r = s.execute(CMD, &json!({ "path": path.to_string_lossy(), "unitScale": 10 }))?;
@@ -255,8 +252,8 @@ mod tests {
     #[test]
     fn nothing_supported_a_zero_scale_or_a_missing_file_refuses_and_records_nothing() -> R {
         let mut s = session()?;
-        let text_only = dxf_file("notes", |s| s.execute("text", &json!({ "at": [0, 0], "text": "abc" })).map(|_| ()))?;
-        let walls = dxf_file("walls", walls)?;
+        let (_t1, text_only) = dxf_file("notes", |s| s.execute("text", &json!({ "at": [0, 0], "text": "abc" })).map(|_| ()))?;
+        let (_t2, walls) = dxf_file("walls", walls)?;
         let undo = s.state()?.undo.len();
         let e = s.execute(CMD, &json!({ "path": text_only.to_string_lossy() })).err().ok_or("no refusal")?;
         assert!(e.to_string().contains("No supported entities found in DXF"), "{e}");
@@ -271,7 +268,7 @@ mod tests {
     #[test]
     fn base64_data_takes_its_name_from_file_name() -> R {
         let mut s = session()?;
-        let path = dxf_file("walls", walls)?;
+        let (_tmp, path) = dxf_file("walls", walls)?;
         let data = cadcraft_engine::cmd::file::base64_encode(&std::fs::read(&path)?);
         let r = s.execute(CMD, &json!({ "data": data, "fileName": "site.dxf", "unitScale": 10 }))?;
         check_view(&s, r["viewId"].as_u64().ok_or("no id")?, "site")?;
@@ -283,7 +280,7 @@ mod tests {
     #[test]
     fn the_interactive_form_takes_defaults_and_edits_the_new_view() -> R {
         let mut s = session()?;
-        let path = dxf_file("walls", walls)?;
+        let (_tmp, path) = dxf_file("walls", walls)?;
         s.start(CMD)?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter DXF file path:"));
         s.input(Input::Text(path.to_string_lossy().into_owned()))?;
@@ -305,7 +302,7 @@ mod tests {
     #[test]
     fn interactive_enter_at_every_prompt_imports_unscaled() -> R {
         let mut s = session()?;
-        let path = dxf_file("walls", walls)?;
+        let (_tmp, path) = dxf_file("walls", walls)?;
         s.start(CMD)?;
         s.input(Input::Text(path.to_string_lossy().into_owned()))?;
         s.input(Input::Enter)?;

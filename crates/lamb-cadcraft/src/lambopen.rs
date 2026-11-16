@@ -206,8 +206,8 @@ pub(crate) fn lambsave_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
 mod tests {
     use super::*;
     use crate::schema::read_document;
+    use crate::testdir::TempDir;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     type R = std::result::Result<(), Box<dyn std::error::Error>>;
     type T<X> = std::result::Result<X, Box<dyn std::error::Error>>;
@@ -216,23 +216,21 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamb-core/tests/lamb/u-wall-two-sections.lamb.json")
     }
 
-    fn temp_dir(tag: &str) -> T<PathBuf> {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!("lamb-lambopen-{tag}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir)
+    fn temp_dir(tag: &str) -> T<TempDir> {
+        Ok(TempDir::new(&format!("lambopen-{tag}"))?)
     }
 
     /// The fixture written out as a `.lamb` directory.
-    fn fixture_dir() -> T<PathBuf> {
+    fn fixture_dir() -> T<(TempDir, PathBuf)> {
         let files: BTreeMap<String, String> = serde_json::from_str(&std::fs::read_to_string(fixture())?)?;
-        let dir = temp_dir("dir")?.join("u-wall.lamb");
+        let tmp = temp_dir("dir")?;
+        let dir = tmp.join("u-wall.lamb");
         for (rel, content) in &files {
             let p = dir.join(rel);
             std::fs::create_dir_all(p.parent().ok_or("no parent")?)?;
             std::fs::write(p, content)?;
         }
-        Ok(dir)
+        Ok((tmp, dir))
     }
 
     /// A LAMB session with one drawn line in its own document (so its undo stack is non-empty).
@@ -278,7 +276,8 @@ mod tests {
     fn the_directory_form_opens_identically() -> R {
         let mut s = session()?;
         let a = s.execute(CMD, &json!({ "path": fixture().to_string_lossy() }))?;
-        let b = s.execute(CMD, &json!({ "path": fixture_dir()?.to_string_lossy() }))?;
+        let (_tmp, dir) = fixture_dir()?;
+        let b = s.execute(CMD, &json!({ "path": dir.to_string_lossy() }))?;
         assert_eq!(a["views"], b["views"]);
         assert_eq!(a["entities"], b["entities"]);
         assert!(a["entities"].as_u64().ok_or("no count")? > 0);
@@ -289,7 +288,8 @@ mod tests {
     fn a_missing_path_or_a_directory_without_a_manifest_refuses_and_adds_nothing() -> R {
         let mut s = session()?;
         let before = s.docs.len();
-        let missing = temp_dir("missing")?.join("nope.lamb");
+        let tmp = temp_dir("missing")?;
+        let missing = tmp.join("nope.lamb");
         let e = s.execute(CMD, &json!({ "path": missing.to_string_lossy() })).err().ok_or("no refusal")?;
         assert!(e.to_string().contains("Cannot open"), "{e}");
         let empty = temp_dir("empty")?;
@@ -339,7 +339,8 @@ mod tests {
             let lost_corners: usize = report.flattened.iter().filter(|(_, w)| *w == crate::convert::Flattened::VirtualCorner).count();
             let mut s = session()?;
             s.execute(CMD, &json!({ "path": named(name).to_string_lossy() }))?;
-            let out = temp_dir("save")?.join(format!("{name}.lamb"));
+            let tmp = temp_dir("save")?;
+            let out = tmp.join(format!("{name}.lamb"));
             let r = s.execute(SAVE, &json!({ "path": out.to_string_lossy() }))?;
             let back = lamb_core::persistence::read_lamb_dir(&out).map_err(|e| format!("{e:?}"))?;
             assert_eq!(r["views"], back.views.len(), "{name}");
@@ -364,7 +365,8 @@ mod tests {
         let mut s = session()?;
         s.execute(CMD, &json!({ "path": fixture().to_string_lossy() }))?;
         let (path, title, undo) = (s.state()?.path.clone(), s.state()?.title.clone(), s.state()?.undo.len());
-        let out = temp_dir("keep")?.join("u.lamb");
+        let tmp = temp_dir("keep")?;
+        let out = tmp.join("u.lamb");
         s.execute(SAVE, &json!({ "path": out.to_string_lossy() }))?;
         assert!(out.join("manifest.json").is_file());
         assert_eq!((s.state()?.path.clone(), s.state()?.title.clone(), s.state()?.undo.len()), (path, title, undo));
@@ -391,7 +393,8 @@ mod tests {
     fn the_interactive_form_saves_it() -> R {
         let mut s = session()?;
         s.execute(CMD, &json!({ "path": fixture().to_string_lossy() }))?;
-        let out = temp_dir("interactive")?.join("i.lamb");
+        let tmp = temp_dir("interactive")?;
+        let out = tmp.join("i.lamb");
         s.start(SAVE)?;
         assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter .lamb project path:"));
         s.input(Input::Text(format!("\"{}\"", out.to_string_lossy())))?;

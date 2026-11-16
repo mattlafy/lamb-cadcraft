@@ -95,6 +95,8 @@ mod studgrid;
 pub mod sweeps;
 pub mod tagfollow;
 mod taghighlight;
+#[cfg(test)]
+pub(crate) mod testdir;
 mod titleblock;
 mod viewlife;
 pub mod viewpick;

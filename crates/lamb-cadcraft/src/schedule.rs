@@ -860,14 +860,12 @@ pub(crate) mod tests {
         });
         let (mut s, _plan) = project()?;
         walls(&mut s, (2000.0, 3000.0), None)?;
-        let dir = std::env::temp_dir().join(format!("lamb-openings-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        let dir = crate::testdir::TempDir::new("openings")?;
         let path = dir.join("set.pdf").to_string_lossy().into_owned();
         let before = s.execute("sheetset", &json!({ "pdf": path }))?["pdf"]["pages"].as_u64().ok_or("no pages")?;
         opening(&mut s, "WINDOW", (2000.0, 100.0), (3000.0, 100.0))?;
         let after = s.execute("sheetset", &json!({ "pdf": path }))?["pdf"]["pages"].as_u64().ok_or("no pages")?;
         assert_eq!(after, before + 1);
-        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 

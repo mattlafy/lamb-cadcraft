@@ -1300,8 +1300,7 @@ pub(crate) mod tests {
             plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
         });
         let (mut s, _) = set()?;
-        let dir = std::env::temp_dir().join(format!("lamb-sheetset-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        let dir = crate::testdir::TempDir::new("sheetset")?;
         let path = dir.join("set.pdf");
         let path_s = path.to_string_lossy().into_owned();
         let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
@@ -1348,7 +1347,6 @@ pub(crate) mod tests {
         assert!(names.first().is_some_and(|n| n == "A001") && names.contains(&"A601".to_owned()), "{names:?}");
         assert_eq!(r["pdf"]["pages"], names.len(), "{r}");
         assert_eq!(craft_pdf::open_slice(&std::fs::read(&path)?, None).map_err(|e| format!("{e:?}"))?.pages().len(), names.len());
-        let _ = std::fs::remove_dir_all(&dir);
 
         // A drawing with no set sheets has nothing to plot.
         let mut empty = Session::new();
@@ -1849,8 +1847,7 @@ pub(crate) mod tests {
         };
         let lines = proposals(&s)?;
         assert!(!lines.is_empty(), "the fixture proposes lines");
-        let dir = std::env::temp_dir().join(format!("lamb-sheetset-ai-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        let dir = crate::testdir::TempDir::new("sheetset-ai")?;
         let path = dir.join("set.pdf").to_string_lossy().into_owned();
 
         // Only with a plot: a sheet with no PDF says nothing about it.
@@ -1872,7 +1869,6 @@ pub(crate) mod tests {
         let r = s.execute("sheetset", &json!({ "pdf": path }))?;
         assert_eq!(r["proposedLines"], 0, "{r}");
         assert!(!r["message"].as_str().ok_or("no message")?.contains("proposed"), "{r}");
-        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
@@ -1975,8 +1971,7 @@ pub(crate) mod tests {
         s.execute("sheetset", &json!({}))?;
         let (old, _) = only_viewport(&s, "A101")?;
         far_line(&mut s, ground, old.width * 50.0 * 1.5)?;
-        let dir = std::env::temp_dir().join(format!("lamb-sheetset-refit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        let dir = crate::testdir::TempDir::new("sheetset-refit")?;
         let path = dir.join("set.pdf");
         let path_s = path.to_string_lossy().into_owned();
         let a101_page = |p: &std::path::Path| -> T<Vec<u8>> {
@@ -1992,7 +1987,6 @@ pub(crate) mod tests {
         let r = s.execute("sheetset", &json!({ "pdf": path_s }))?;
         assert_eq!(r["refit"], json!([]), "{r}");
         assert_eq!(first, a101_page(&path)?, "the first PDF already showed the refit, its title and annotation");
-        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
@@ -2159,8 +2153,7 @@ pub(crate) mod tests {
             plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
         });
         let (mut s, _) = set()?;
-        let dir = std::env::temp_dir().join(format!("lamb-sheetset-weights-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        let dir = crate::testdir::TempDir::new("sheetset-weights")?;
         let path = dir.join("set.pdf");
         let path_s = path.to_string_lossy().into_owned();
         s.execute("sheetset", &json!({ "pdf": path_s }))?;
@@ -2168,7 +2161,6 @@ pub(crate) mod tests {
         let n = undo_len(&s)?;
         let again = s.execute("sheetset", &json!({ "pdf": path_s }))?;
         let second = std::fs::read(&path)?;
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(again["weighted"], 0, "{again}");
         assert_eq!(undo_len(&s)?, n, "{again}");
         assert!(first == second, "the PDF bytes are unchanged: {} and {} long", first.len(), second.len());
@@ -2452,14 +2444,12 @@ pub(crate) mod tests {
             plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
         });
         let (mut s, _, _) = drawn_verticals(&FOUR)?;
-        let dir = std::env::temp_dir().join(format!("lamb-sheetset-packed-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        let dir = crate::testdir::TempDir::new("sheetset-packed")?;
         let path = dir.join("set.pdf");
         let r = s.execute("sheetset", &json!({ "pdf": path.to_string_lossy() }))?;
         assert_eq!(set_sheets(s.doc()?), ["A001", "A101", "A201"], "{r}");
         assert_eq!(r["pdf"]["pages"], 3, "{r}");
         assert_eq!(craft_pdf::open_slice(&std::fs::read(&path)?, None).map_err(|e| format!("{e:?}"))?.pages().len(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
@@ -2500,8 +2490,7 @@ pub(crate) mod tests {
 
         // SHEETORDER leaves the Drawing List to the next SHEETSET, and that run keeps the order.
         assert_ne!(listed(&s)?, names, "the list waits");
-        let dir = std::env::temp_dir().join(format!("lamb-sheetorder-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        let dir = crate::testdir::TempDir::new("sheetorder")?;
         let path = dir.join("set.pdf");
         s.execute("sheetset", &json!({ "pdf": path.to_string_lossy() }))?;
         assert_eq!(set_sheets(s.doc()?), names, "a rerun keeps the order");
@@ -2509,7 +2498,6 @@ pub(crate) mod tests {
         let marks = bookmarks(&std::fs::read(&path)?)?;
         let marked: Vec<&str> = marks.iter().filter_map(|m| m.split(' ').next()).collect();
         assert_eq!(marked, names, "bookmarks");
-        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
