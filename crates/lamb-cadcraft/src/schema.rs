@@ -2,7 +2,7 @@
 //! cadcraft-integration.md` §3.1, §4 in the LAMB repo): three extension slots, all keyed
 //! [`EXT_KEY`], never a side table.
 //!
-//! - `Drawing.ext["LAMB"]` = [`LambDocument`]: name, defaults, levels, views (metadata only),
+//! - `Drawing.ext["LAMB"]` = [`LambDocument`]: name, defaults, levels, views (metadata only), hidden views,
 //!   links, suppressed proposals.
 //! - `Common.ext["LAMB"]` = [`EntityData`]: an entity's line role, AI provenance and virtual
 //!   (fillet/chamfer) corner tags, on a sheet's viewport the view it shows, and on a plan's POINT
@@ -147,6 +147,23 @@ pub struct LambDocument {
     /// Explicit grid names, at most one per grid ([`crate::gridname`], `gridname`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grid_names: Vec<GridNameRecord>,
+    /// Views HIDEVIEW set aside ([`crate::hideview`]): out of `views`, so every reader treats them
+    /// as deleted; UNHIDEVIEW puts one back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_views: Vec<HiddenView>,
+}
+
+/// A view HIDEVIEW set aside: the view, the links it had (each with an end on one of its block's
+/// entities) and the prior `on` of each layer it turned off. Its block, layer and generated blocks
+/// stay in the drawing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HiddenView {
+    pub view: AnyView,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers_on: Vec<(String, bool)>,
 }
 
 /// An explicit name for the building grid that datum segment `segment_index` of `entity_id` in
@@ -239,6 +256,7 @@ impl LambDocument {
             rooms: Vec::new(),
             layer_hatch_views: Vec::new(),
             grid_names: Vec::new(),
+            hidden_views: Vec::new(),
         }
     }
 }
@@ -249,8 +267,8 @@ impl Default for LambDocument {
     }
 }
 
-fn clear_entities(views: &mut [AnyView]) {
-    for v in views {
+fn clear_entities(doc: &mut LambDocument) {
+    for v in doc.views.iter_mut().chain(doc.hidden_views.iter_mut().map(|h| &mut h.view)) {
         match v {
             AnyView::Plan(p) => p.entities.clear(),
             AnyView::Vertical(p) => p.entities.clear(),
@@ -456,7 +474,7 @@ pub fn read_document(d: &Drawing) -> Result<LambDocument, SchemaError> {
         return Err(SchemaError::FutureVersion { found, supported: SCHEMA_VERSION });
     }
     let mut doc: LambDocument = serde_json::from_value(v.clone()).map_err(|e| malformed(what, e))?;
-    clear_entities(&mut doc.views);
+    clear_entities(&mut doc);
     Ok(doc)
 }
 
@@ -464,7 +482,7 @@ pub fn read_document(d: &Drawing) -> Result<LambDocument, SchemaError> {
 pub fn write_document(d: &mut Drawing, doc: &LambDocument) -> Result<(), SchemaError> {
     let mut doc = doc.clone();
     doc.schema_version = SCHEMA_VERSION;
-    clear_entities(&mut doc.views);
+    clear_entities(&mut doc);
     let v = serde_json::to_value(&doc).map_err(|e| malformed("Drawing.ext[\"LAMB\"]", e))?;
     d.ext.insert(EXT_KEY.to_owned(), v);
     Ok(())

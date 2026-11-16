@@ -20,7 +20,7 @@
 //! each plan's assembly lines, written by ASSEMBLYPLAN into a block that an after-command observer
 //! keeps regenerated ([`assembly`]), each detail tag's bubble — a `LAMB_DTAG` insert naming its detail — kept by an after-command observer ([`bubbles`]), each sheet viewport's drawing title — number, view name, scale and scale bar, and on a plan a north arrow, in a `LAMB_VTITLE_<n>` insert below it — kept the same way ([`vptitles`]), each sheet's border and title block in a `LAMB_SHEETFRAME_<W>X<H>` insert kept the same way ([`titleblock`]), each placed plan's plotted section cut symbols and each placed vertical view's level lines in a `LAMB_ANNO` block kept by an after-command observer ([`annotations`]), each section or elevation hole's revealed parallel-view line work in a `LAMB_HOLE` block kept the same way ([`holes`]), and ACCEPT /
 //! SETROLE / LAYERROLE ([`entitycmds`]), the read-only SHOWLINKS / QUERY ([`querycmds`]), and
-//! DUPLICATEVIEW / PLACEVIEW / UNPLACEVIEW / LEVEL ([`viewlife`]), and CUTLINE ([`cutlinecmd`]), MAKEVIEW turning loose model-space entities into a plan view ([`makeview`]), and the Properties palette's LAMB group — Role, cut/seen height source per segment ([`props`]), and clicking a cut line in a plan picks that view ([`viewpick`]), and every LAMB view block entity kept at Z = 0 with no thickness by an after-command observer ([`flatz`]).
+//! DUPLICATEVIEW / PLACEVIEW / UNPLACEVIEW / LEVEL ([`viewlife`]), HIDEVIEW / UNHIDEVIEW ([`hideview`]), and CUTLINE ([`cutlinecmd`]), MAKEVIEW turning loose model-space entities into a plan view ([`makeview`]), and the Properties palette's LAMB group — Role, cut/seen height source per segment ([`props`]), and clicking a cut line in a plan picks that view ([`viewpick`]), and every LAMB view block entity kept at Z = 0 with no thickness by an after-command observer ([`flatz`]).
 //! Will hold the remaining LAMB commands and `Interactive` prompts, the after-command observers that maintain cut lines, derived views and tag anchors, and
 //! the remaining overlay display lists (datums, repeat ghosts). Sits above
 //! `cadcraft-engine` and below the UI shells and MCP.
@@ -53,6 +53,7 @@ pub mod fillet;
 pub mod fillet_matrix;
 pub mod flatz;
 mod gridname;
+mod hideview;
 pub mod holes;
 pub mod import;
 mod lambopen;

@@ -105,8 +105,8 @@
 //!   `plan` (default) or `vertical` (section), entered; interactively `Enter detail name or
 //!   [Plan/Section] <Detail N>:`. `detailtag` (`dtag`) / `detailtags` / `detailflip {handle}` (LAMB ▸ Details ▸ Detail Flip):
 //!   detail tags in a plan or section view, their resolution report, and a tag's outside flip — see
-//!   [`crate::detailtags`]. `dxfimport {path | data, fileName?, name?, unitScale?}` (LAMB ▸ Project ▸
-//!   Import DXF as View): a DXF/DWG file's line work as a new unplaced plan view — see
+//!   [`crate::detailtags`]. `dxfimport {path | data, fileName?, name?, unitScale?}` (typed only,
+//!   Import DXF as View; IMPORT into Model space then MAKEVIEW is the menu's path): a DXF/DWG file's line work as a new unplaced plan view — see
 //!   [`crate::dxfimport`]. `lambopen {path}` (typed only, Import TS-app Project): TS-app interchange, not the save format
 //!   (LAMB's data lives in the DWG/DXF and ordinary Save/Open carry it) — a TS-app `.lamb`
 //!   project (directory or its JSON file form) opened as a new document tab — see
@@ -145,8 +145,10 @@
 //!   read-only — an edit's link blast radius, haloed in every view, and the filter lookup; see
 //!   [`crate::querycmds`].
 //! - `duplicateview {viewId?, name?}`, `placeview {viewId, kind, …}` (interactive: PLACEVIEW / `pv`),
-//!   `unplaceview {viewId?}` and `level {mode, …}` (LAMB ▸ View Setup, LAMB ▸ Levels & Cuts): a view's lifecycle and the level
+//!   `unplaceview {viewId?}` (typed only) and `level {mode, …}` (LAMB ▸ View Setup, LAMB ▸ Levels & Cuts): a view's lifecycle and the level
 //!   cascade — see [`crate::viewlife`].
+//! - `hideview {viewId?}` / `unhideview {viewId}` (LAMB ▸ View Setup ▸ Hide View, Unhide View): a
+//!   view set aside as if deleted, and restored — see [`crate::hideview`].
 //! - `cutline {planViewId, elevation}` (`cl`, LAMB ▸ Levels & Cuts ▸ Cut Line): move a placed plan's cut
 //!   elevation by picking its cut line in a placed section, then placing it — see
 //!   [`crate::cutlinecmd`].
@@ -868,7 +870,6 @@ pub fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("lambproject", "Start Project", lambproject).menu(MENU_PROJECT),
         CommandSpec::new("dxfimport", "Import DXF as View", crate::dxfimport::dxfimport)
             .params("{path | data: base64, fileName?, name?, unitScale?} → {viewId, imported, skipped: {TYPE: n}}")
-            .menu(MENU_PROJECT)
             .interactive(crate::dxfimport::dxfimport_machine),
         CommandSpec::new("makeview", "Make View", crate::makeview::makeview)
             .alias(&["mkv"])
@@ -994,9 +995,16 @@ pub fn commands() -> Vec<CommandSpec> {
             .params("{mode: rename|cutElevation|intent|flip|cutOffset, viewId, name | cutElevation | intent: section|elevation | flipped | offsetMm}")
             .menu(MENU_VIEW_SETUP)
             .interactive(crate::viewprops::viewprops_machine),
+        CommandSpec::new("hideview", "Hide View", crate::hideview::hideview)
+            .params("{viewId?} → {droppedLinks}")
+            .menu(MENU_VIEW_SETUP)
+            .interactive(crate::hideview::hideview_machine),
+        CommandSpec::new("unhideview", "Unhide View", crate::hideview::unhideview)
+            .params("{viewId} → {restoredLinks, droppedLinks}")
+            .menu(MENU_VIEW_SETUP)
+            .interactive(crate::hideview::unhideview_machine),
         CommandSpec::new("unplaceview", "Unplace View", crate::viewlife::unplaceview)
             .params("{viewId?}")
-            .menu(MENU_VIEW_SETUP)
             .interactive(crate::viewlife::unplaceview_machine),
         CommandSpec::new("level", "Level", crate::viewlife::level)
             .params("{mode: \"create\", name, floorElevationMm, order?} | {mode: \"rename\", levelId, name} | {mode: \"elevation\", levelId, floorElevationMm}")
@@ -1199,7 +1207,7 @@ mod tests {
     fn the_lamb_menu_groups_every_command_by_task() -> R {
         install_app()?;
         let groups: [(&str, &[&str]); 9] = [
-            ("Project", &["lambproject", "dxfimport", "makeview"]),
+            ("Project", &["lambproject", "makeview"]),
             (
                 "New View",
                 &[
@@ -1214,7 +1222,7 @@ mod tests {
                     "duplicateview",
                 ],
             ),
-            ("View Setup", &["editview", "viewprops", "unplaceview", "placeview"]),
+            ("View Setup", &["editview", "viewprops", "hideview", "unhideview", "placeview"]),
             ("Levels & Cuts", &["level", "levelline", "cutline", "viewhole", "gridname"]),
             ("Display", &["refpane", "underlay", "detailsnap", "panelock", "ucsalign", "ghosthide", "ghostshow"]),
             ("Links", &["link", "unlink", "showlinks"]),
@@ -1234,7 +1242,7 @@ mod tests {
         let menued = specs.iter().filter(|c| !c.menu.is_empty()).count();
         assert_eq!(menued, groups.iter().map(|(_, ids)| ids.len()).sum::<usize>(), "every menu item is in a listed submenu");
         assert!(specs.iter().all(|c| c.menu.first() != Some(&"View")), "View ▸ LAMB is gone");
-        for id in ["lambopen", "lambsave", "newsheet"] {
+        for id in ["lambopen", "lambsave", "newsheet", "unplaceview", "dxfimport"] {
             let c = command_specs().iter().find(|c| c.id == id).ok_or(id)?;
             assert!(c.menu.is_empty(), "{id} is typed only");
             assert!(c.interactive.is_some(), "{id}");
