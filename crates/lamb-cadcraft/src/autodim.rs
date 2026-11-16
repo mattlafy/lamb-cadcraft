@@ -1383,8 +1383,12 @@ mod tests {
     /// The elevation's opening dimensions as `(line x, z from, z to)`, whole mm, bottom up: the
     /// vertical ones right of the window, not the floor-to-floor level dimension.
     fn opening_dims(s: &Session, view: Id) -> T<Vec<(i64, i64, i64)>> {
+        // The level chain (LAMB T500/T715) stands right of the view's extents; opening chains do not.
+        let ext = s.doc()?.extents(&Space::Block(view_block_name(view)));
+        let right = if ext.is_empty() { f64::INFINITY } else { ext.max.x };
         let mut got: Vec<(i64, i64, i64)> = dims(s, view)?
             .iter()
+            .filter(|d| d.p13.x <= right + 1e-6)
             .map(|d| (d.defpt.x.round() as i64, d.p13.y.min(d.p14.y).round() as i64, d.p13.y.max(d.p14.y).round() as i64))
             .collect();
         got.sort_by_key(|g| (g.1, g.2));

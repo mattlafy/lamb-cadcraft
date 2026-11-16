@@ -6,7 +6,8 @@
 //! placed section or elevation gets a plotted level line for each LEVEL (LAMB T473): a LINE at the
 //! level's projected floor elevation spanning the view block's extents ±[`LEVEL_OVERRUN_MM`], and
 //! `"<name> <±elev>"` left-aligned past its right end, plus a vertical floor-to-floor dimension per
-//! pair of consecutive levels by elevation (LAMB T500). Plan cut elevations stay overlay-only. A
+//! pair of consecutive levels by elevation (LAMB T500), a span from the top level to the highest
+//! drawn geometry and an overall dimension from the lowest level to it (LAMB T715). Plan cut elevations stay overlay-only. A
 //! plan in `auto_dim_plans` also gets its exterior dimension strings ([`crate::autodim`], LAMB T641), one
 //! in `auto_dim_interior_plans` its rooms' clear dimensions (LAMB T686), one in `auto_dim_locate_plans`
 //! the setting-out strings locating its interior walls (LAMB T694), one in `auto_dim_grid_plans` its
@@ -408,7 +409,10 @@ fn signed_mm(z: f64) -> String {
 
 /// Placed vertical view `id`'s level lines at 1:`scale`: per LEVEL (by `order`, then id) a LINE at
 /// its projected floor elevation across the view block's x-extents ±[`LEVEL_OVERRUN_MM`], then its
-/// label. An empty view block wants none.
+/// label. Then the floor-to-floor dimensions between consecutive levels, a top span from the top
+/// level to the view block's highest drawn geometry when that is above it, and, when that chain has
+/// two or more spans, an overall dimension from the lowest level to that top (LAMB T715). Geometry
+/// below the lowest level is not dimensioned. An empty view block wants none.
 fn level_lines(d: &Drawing, dp: &DrawingProject, id: Id, scale: f64) -> Vec<Item> {
     let Some(view) = dp.view(id) else { return Vec::new() };
     let ext = d.extents(&Space::Block(view_block_name(id)));
@@ -429,10 +433,26 @@ fn level_lines(d: &Drawing, dp: &DrawingProject, id: Id, scale: f64) -> Vec<Item
     }
     let mut zs: Vec<f64> = levels.iter().map(|l| l.floor_elevation.value).collect();
     zs.sort_by(f64::total_cmp);
+    let mut spans = 0;
     for w in zs.windows(2) {
         if w[1] - w[0] > TOLERANCE.coincidence_mm {
             let (a, b) = (v(x1, y_of(w[0])), v(x1, y_of(w[1])));
             out.push(Item::Dim(a, b, std::f64::consts::FRAC_PI_2, dim_line_pt(b, scale), scale));
+            spans += 1;
+        }
+    }
+    let (Some(&lo), Some(&hi)) = (zs.first(), zs.last()) else { return out };
+    let (y_lo, y_hi) = (y_of(lo), y_of(hi));
+    // The highest drawn geometry, on the side of the top level away from the lowest one.
+    let up = if y_hi >= y_lo { 1.0 } else { -1.0 };
+    let top = if up > 0.0 { ext.max.y } else { ext.min.y };
+    if (top - y_hi) * up > TOLERANCE.coincidence_mm {
+        let (a, b) = (v(x1, y_hi), v(x1, top));
+        out.push(Item::Dim(a, b, std::f64::consts::FRAC_PI_2, dim_line_pt(b, scale), scale));
+        spans += 1;
+        if spans >= 2 {
+            let (a, b) = (v(x1, y_lo), v(x1, top));
+            out.push(Item::Dim(a, b, std::f64::consts::FRAC_PI_2, overall_line_pt(b, scale), scale));
         }
     }
     out
@@ -487,6 +507,12 @@ pub(crate) fn entity_of(i: &Item) -> EntityKind {
 /// [`LEVEL_DIM_OFFSET_MM`] right.
 fn dim_line_pt(b: Vec3, scale: f64) -> Vec3 {
     v(b.x + LEVEL_DIM_OFFSET_MM * k(scale), b.y)
+}
+
+/// Where the overall-height dimension's line, lowest level to the view's top (LAMB T715), passes at
+/// 1:`scale`: level with `b`, twice [`LEVEL_DIM_OFFSET_MM`] right, outside the floor-to-floor chain.
+fn overall_line_pt(b: Vec3, scale: f64) -> Vec3 {
+    v(b.x + 2.0 * LEVEL_DIM_OFFSET_MM * k(scale), b.y)
 }
 
 /// A linear dimension from `a` to `b` at `rotation` and 1:`scale`, as DIMLINEAR draws one: `defpt`
@@ -1089,6 +1115,55 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The view's level dimensions as (from y, to y, dimension-line x, measured), in block order.
+    fn spans_of(s: &Session, view: Id) -> T<Vec<(f64, f64, f64, f64)>> {
+        dims_of(s, view)?.iter().map(|d| Ok((d.p13.y, d.p14.y, d.defpt.x, measured(s, d)?))).collect()
+    }
+
+    fn assert_spans(s: &Session, view: Id, want: &[(f64, f64, f64, f64)]) -> R {
+        let got = spans_of(s, view)?;
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        let x1 = x1_of(s, view)?;
+        for (g, w) in got.iter().zip(want) {
+            let (wa, wb) = (local_y(s, view, w.0)?, local_y(s, view, w.1)?);
+            assert!(
+                (g.0 - wa).abs() < 1e-6
+                    && (g.1 - wb).abs() < 1e-6
+                    && (g.2 - (x1 + w.2 * LEVEL_DIM_OFFSET_MM)).abs() < 1e-6
+                    && (g.3 - w.3).abs() < 1e-6,
+                "{got:?} vs {want:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn walls_above_the_top_level_get_a_top_span_and_an_overall_height() -> R {
+        let (mut s, _plan, sec, _l1, _l2) = levelled()?;
+        // Walls drawn only to the top level: the one floor-to-floor span and no overall.
+        assert_spans(&s, sec, &[(0.0, 3000.0, 1.0, 3000.0)])?;
+        let top = local_y(&s, sec, 5400.0)?;
+        s.execute("line", &json!({ "points": [[0, 0], [0, top]] }))?;
+        assert_spans(&s, sec, &[(0.0, 3000.0, 1.0, 3000.0), (3000.0, 5400.0, 1.0, 2400.0), (0.0, 5400.0, 2.0, 5400.0)])?;
+        // Stretched taller, the top span and the overall follow.
+        let n = undo_len(&s)?;
+        s.execute("stretch", &json!({ "window": [[-100, top - 100.0], [100, top + 100.0]], "delta": [0, 600] }))?;
+        assert_eq!(undo_len(&s)?, n + 1);
+        assert_spans(&s, sec, &[(0.0, 3000.0, 1.0, 3000.0), (3000.0, 6000.0, 1.0, 3000.0), (0.0, 6000.0, 2.0, 6000.0)])?;
+        s.undo()?;
+        assert_spans(&s, sec, &[(0.0, 3000.0, 1.0, 3000.0), (3000.0, 5400.0, 1.0, 2400.0), (0.0, 5400.0, 2.0, 5400.0)])?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_single_level_gets_one_top_span_and_no_overall() -> R {
+        let (mut s, _plan, sec) = fixture()?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        let top = local_y(&s, sec, 2700.0)?;
+        s.execute("pline", &json!({ "vertices": [[0, 0], [4000, 0], [4000, top], [0, top]], "closed": true }))?;
+        assert_spans(&s, sec, &[(0.0, 2700.0, 1.0, 2700.0)])
+    }
+
     #[test]
     fn levels_out_of_order_are_dimensioned_by_elevation() -> R {
         let (mut s, _plan, sec) = fixture()?;
@@ -1125,7 +1200,8 @@ pub(crate) mod tests {
         assert_eq!(dims_of(&s, sec)?, before);
 
         s.execute("level", &json!({ "mode": "elevation", "levelId": l2.0, "floorElevationMm": 0 }))?;
-        assert!(dims_of(&s, sec)?.is_empty(), "two levels at one elevation get no dimension");
+        // Two levels at one elevation get no floor-to-floor dimension, only the top span to the walls' 3000.
+        assert_spans(&s, sec, &[(0.0, 3000.0, 1.0, 3000.0)])?;
         assert_eq!(levels_of(&s, sec)?.len(), 2, "but keep both level lines");
         Ok(())
     }
