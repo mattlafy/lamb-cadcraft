@@ -39,6 +39,13 @@
 //! one floor show as two rows, each naming its view — nothing is silently counted twice. Sorted
 //! by level order, then item, then view document order.
 //!
+//! Each level ends with a total per item (LAMB T718, [`level_totals`]), the number to order from:
+//! counted from the item's plan rows on that level when there are any, else from its one section or
+//! elevation row with the greatest count, since two sections through one floor cut the same
+//! members and summing them would double count. Its `Each` is the item's cut length on the level.
+//! The table writes a `"<level> total"` row (View blank) after the level's rows only for an item
+//! with two or more rows there; a single row is its own total.
+//!
 //! Members have a cut length per level (LAMB T711): the longest line on a member layer among the
 //! runs (bands and copies) any section or elevation lays on that level — a section draws a stud as
 //! its height and a joist as its span. It is the longest, not an average: the stock length that
@@ -52,7 +59,9 @@
 //! paper point `at` (default the top-left corner of the sheet's
 //! [`crate::sheets::usable_area`]). A table on that
 //! layout titled `Framing BOM` is replaced; one undo step. Nothing to count is refused, nothing
-//! changed. Returns `{layout, handle, rows: [{level, item, count, eachMm, lengthMm, areaM2, view}], message}`.
+//! changed. Returns `{layout, handle, rows: [{level, item, count, eachMm, lengthMm, areaM2, view}],
+//! totals: [{level, item, count, eachMm, lengthMm, areaM2}], message}`, the message's item count
+//! summing the totals.
 
 use std::collections::{HashMap, HashSet};
 
@@ -97,6 +106,8 @@ pub struct BomRow {
     pub length_mm: f64,
     pub area_m2: f64,
     pub view: String,
+    /// Whether `view` is a plan (a total row: whether it was counted from plans).
+    pub plan: bool,
 }
 
 /// The level whose floor is the highest at or below `z`.
@@ -329,6 +340,7 @@ pub fn bom_rows(d: &Drawing) -> Vec<BomRow> {
             length_mm,
             area_m2,
             view: doc.views.get(view).map(|v| v.name().to_owned()).unwrap_or_default(),
+            plan: matches!(doc.views.get(view), Some(AnyView::Plan(_))),
         })
         .collect();
     top_level_areas(with_cuts(rows, &cut), &top, &cut)
@@ -356,16 +368,71 @@ pub(crate) fn schedule_table(title: &str, header: &[&str], col_widths: &[f64], r
     }
 }
 
-/// The BOM table with its top-left corner at `at` (paper mm).
+/// One total per (level, item) of `rows`, in row order: counted from the item's plan rows on that
+/// level (summed), else from its one vertical-view row with the greatest count (first on a tie),
+/// since two sections through one floor cut the same members. `each_mm` is the longest over all
+/// the item's rows on the level; `view` is empty and `plan` says whether plans were the source.
+pub fn level_totals(rows: &[BomRow]) -> Vec<BomRow> {
+    let mut keys: Vec<(&str, &str)> = Vec::new();
+    for r in rows {
+        if !keys.contains(&(r.level.as_str(), r.item.as_str())) {
+            keys.push((r.level.as_str(), r.item.as_str()));
+        }
+    }
+    keys.into_iter()
+        .map(|(level, item)| {
+            let of: Vec<&BomRow> = rows.iter().filter(|r| r.level == level && r.item == item).collect();
+            let plans: Vec<&BomRow> = of.iter().copied().filter(|r| r.plan).collect();
+            let source = if plans.is_empty() {
+                of.iter()
+                    .copied()
+                    .fold(None, |best: Option<&BomRow>, r| match best {
+                        Some(b) if b.count >= r.count => Some(b),
+                        _ => Some(r),
+                    })
+                    .into_iter()
+                    .collect()
+            } else {
+                plans
+            };
+            BomRow {
+                level: level.to_owned(),
+                item: item.to_owned(),
+                count: source.iter().map(|r| r.count).sum(),
+                each_mm: of.iter().map(|r| r.each_mm).fold(0.0, f64::max),
+                length_mm: source.iter().map(|r| r.length_mm).sum(),
+                area_m2: source.iter().map(|r| r.area_m2).sum(),
+                view: String::new(),
+                plan: source.iter().any(|r| r.plan),
+            }
+        })
+        .collect()
+}
+
+/// The BOM table with its top-left corner at `at` (paper mm): `rows` in order, each level's rows
+/// followed by a `"<level> total"` row for every item with two or more rows on it.
 pub fn bom_table(rows: &[BomRow], at: Point2) -> Table {
     let count = |n: usize| if n > 0 { n.to_string() } else { String::new() };
     let each = |mm: f64| if mm > 0.0 { format!("{:.2} m", mm / 1000.0) } else { String::new() };
     let length = |mm: f64| if mm > 0.0 { format!("{:.1} m", mm / 1000.0) } else { String::new() };
     let area = |m2: f64| if m2 > 0.0 { format!("{m2:.1} m²") } else { String::new() };
-    let rows: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| vec![r.level.clone(), r.item.clone(), count(r.count), each(r.each_mm), length(r.length_mm), area(r.area_m2), r.view.clone()])
-        .collect();
+    let cells = |level: String, r: &BomRow, view: String| {
+        vec![level, r.item.clone(), count(r.count), each(r.each_mm), length(r.length_mm), area(r.area_m2), view]
+    };
+    let totals = level_totals(rows);
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        out.push(cells(r.level.clone(), r, r.view.clone()));
+        if rows.get(i + 1).is_some_and(|n| n.level == r.level) {
+            continue;
+        }
+        for t in totals.iter().filter(|t| t.level == r.level) {
+            if rows.iter().filter(|o| o.level == t.level && o.item == t.item).count() >= 2 {
+                out.push(cells(format!("{} total", t.level), t, String::new()));
+            }
+        }
+    }
+    let rows = out;
     schedule_table(BOM_TITLE, &["Level", "Item", "Count", "Each", "Length", "Area", "View"], &COL_WIDTHS, &rows, at)
 }
 
@@ -491,12 +558,14 @@ pub(crate) fn bomtable(s: &mut Session, p: &Value) -> Result<Value> {
     let mut d = d0.clone();
     let handle = write_table(&mut d, &layout, BOM_TITLE, at, &|at| bom_table(&rows, at))?;
     *s.doc_mut()? = d;
-    let items: usize = rows.iter().map(|r| r.count).sum();
+    let totals = level_totals(&rows);
+    let items: usize = totals.iter().map(|t| t.count).sum();
     let message = format!("{BOM_TITLE} on \"{layout}\": {} rows, {items} items.", rows.len());
     Ok(json!({
         "layout": layout,
         "handle": format!("{:X}", handle.0),
         "rows": rows.iter().map(|r| json!({ "level": r.level, "item": r.item, "count": r.count, "eachMm": r.each_mm, "lengthMm": r.length_mm, "areaM2": r.area_m2, "view": r.view })).collect::<Vec<_>>(),
+        "totals": totals.iter().map(|t| json!({ "level": t.level, "item": t.item, "count": t.count, "eachMm": t.each_mm, "lengthMm": t.length_mm, "areaM2": t.area_m2 })).collect::<Vec<_>>(),
         "message": message,
     }))
 }
@@ -681,7 +750,8 @@ pub(crate) mod tests {
                 each_mm: 0.0,
                 length_mm: laid,
                 area_m2: 0.0,
-                view: "Ground".into()
+                view: "Ground".into(),
+                plan: true
             }),
             "{rows:?}"
         );
@@ -693,7 +763,8 @@ pub(crate) mod tests {
                 each_mm: 0.0,
                 length_mm: 0.0,
                 area_m2: 0.0,
-                view: "Ground".into()
+                view: "Ground".into(),
+                plan: true
             }),
             "{rows:?}"
         );
@@ -911,6 +982,7 @@ pub(crate) mod tests {
             length_mm,
             area_m2,
             view: "P".to_owned(),
+            plan: true,
         };
         let key = |level: &str, layer: &str| (level.to_owned(), layer.to_owned());
         let cut: Cuts = HashMap::from([(key("Top", "STUD"), 2400.0), (key("Top", "JOIST"), 2600.0), (key("Lower", "STUD"), 2700.0)]);
@@ -946,6 +1018,86 @@ pub(crate) mod tests {
         assert!(close(band.length_mm, 12400.0), "{rows:?}");
         assert!(close(band.area_m2, band.length_mm * tallest / 1e6), "{tallest}: {rows:?}");
         Ok(())
+    }
+
+    #[test]
+    fn a_level_s_stud_total_counts_the_plan_not_the_section_too_and_takes_the_section_s_cut() -> R {
+        let (mut s, sec, _) = window_section(true)?;
+        let l1 = add_level(&mut s, "Level 1", 0.0)?;
+        let plan = sheathed_plan(&mut s, "Upper", "D1")?;
+        place(&mut s, plan, l1)?;
+        let d = s.doc()?;
+        let tallest =
+            assembly_lines(d, sec)?.iter().flat_map(|r| r.lines.clone()).filter(|l| l.layer == "STUD").map(|l| line_length(&l)).fold(0.0, f64::max);
+        let rows = bom_rows(d);
+        let studs: Vec<&BomRow> = rows.iter().filter(|r| r.item == "STUD" && r.level == "Level 1").collect();
+        assert!(studs.iter().any(|r| r.plan) && studs.iter().any(|r| !r.plan), "a plan row and a section row: {rows:?}");
+        let n = copies(d, plan)?;
+        let totals = level_totals(&rows);
+        let stud = totals.iter().find(|t| t.item == "STUD" && t.level == "Level 1").ok_or("no stud total")?;
+        assert_eq!((stud.count, stud.view.as_str(), stud.plan), (n, "", true), "{totals:?}");
+        assert!(close(stud.each_mm, tallest), "{tallest}: {stud:?}");
+        let texts: Vec<Vec<String>> =
+            bom_table(&rows, Point2 { x: 0.0, y: 0.0 }).cells.iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect();
+        let at = texts.iter().position(|r| r[0] == "Level 1 total" && r[1] == "STUD").ok_or("no total row")?;
+        assert_eq!(texts[at][2], n.to_string());
+        assert_eq!(texts[at][6], "");
+        assert!(texts[at + 1..].iter().all(|r| r[0].ends_with("total")), "after Level 1's rows: {texts:?}");
+        let out = s.execute("bomtable", &json!({}))?;
+        let sum: u64 = out["totals"].as_array().ok_or("no totals")?.iter().filter_map(|t| t["count"].as_u64()).sum();
+        let rows_n = out["rows"].as_array().ok_or("no rows")?.len();
+        assert_eq!(out["message"], format!("Framing BOM on \"A601\": {rows_n} rows, {sum} items."));
+        assert!(sum < out["rows"].as_array().ok_or("no rows")?.iter().filter_map(|r| r["count"].as_u64()).sum::<u64>(), "{out}");
+        Ok(())
+    }
+
+    #[test]
+    fn totals_take_the_larger_section_count_with_no_plan_and_singletons_get_no_table_row() {
+        let row = |level: &str, item: &str, count: usize, each_mm: f64, view: &str, plan: bool| BomRow {
+            level: level.to_owned(),
+            item: item.to_owned(),
+            count,
+            each_mm,
+            length_mm: 0.0,
+            area_m2: 0.0,
+            view: view.to_owned(),
+            plan,
+        };
+        let rows = vec![
+            row("Level 1", "STUD", 6, 2400.0, "A-A", false),
+            row("Level 1", "STUD", 9, 2440.0, "B-B", false),
+            row("Level 1", "JOIST", 4, 0.0, "A-A", false),
+            row("Level 2", "STUD", 20, 0.0, "Upper", true),
+            row("Level 2", "STUD", 3, 2700.0, "C-C", false),
+        ];
+        let got: Vec<(String, String, usize, f64, bool)> =
+            level_totals(&rows).into_iter().map(|t| (t.level, t.item, t.count, t.each_mm, t.plan)).collect();
+        assert_eq!(
+            got,
+            [
+                ("Level 1".to_owned(), "STUD".to_owned(), 9, 2440.0, false),
+                ("Level 1".to_owned(), "JOIST".to_owned(), 4, 0.0, false),
+                ("Level 2".to_owned(), "STUD".to_owned(), 20, 2700.0, true),
+            ]
+        );
+        let texts: Vec<Vec<String>> =
+            bom_table(&rows, Point2 { x: 0.0, y: 0.0 }).cells.iter().map(|r| r.iter().map(|c| c.text.clone()).collect()).collect();
+        let firsts: Vec<(&str, &str)> = texts[2..].iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+        assert_eq!(
+            firsts,
+            [
+                ("Level 1", "STUD"),
+                ("Level 1", "STUD"),
+                ("Level 1", "JOIST"),
+                ("Level 1 total", "STUD"),
+                ("Level 2", "STUD"),
+                ("Level 2", "STUD"),
+                ("Level 2 total", "STUD"),
+            ],
+            "{texts:?}"
+        );
+        assert_eq!(texts[5], ["Level 1 total", "STUD", "9", "2.44 m", "", "", ""]);
+        assert_eq!(texts[8], ["Level 2 total", "STUD", "20", "2.70 m", "", "", ""]);
     }
 
     #[test]
@@ -1010,7 +1162,16 @@ pub(crate) mod tests {
         let studs: Vec<&BomRow> = rows.iter().filter(|r| r.item == "STUD").collect();
         assert_eq!(
             studs,
-            [&BomRow { level: "Level 1".into(), item: "STUD".into(), count: n, each_mm: 0.0, length_mm: 0.0, area_m2: 0.0, view: "Ground".into() }]
+            [&BomRow {
+                level: "Level 1".into(),
+                item: "STUD".into(),
+                count: n,
+                each_mm: 0.0,
+                length_mm: 0.0,
+                area_m2: 0.0,
+                view: "Ground".into(),
+                plan: true
+            }]
         );
         Ok(())
     }
@@ -1030,7 +1191,8 @@ pub(crate) mod tests {
                 each_mm: 0.0,
                 length_mm: 0.0,
                 area_m2: 0.0,
-                view: "Ground".into()
+                view: "Ground".into(),
+                plan: true
             }),
             "{rows:?}"
         );
@@ -1054,7 +1216,8 @@ pub(crate) mod tests {
                 each_mm: 0.0,
                 length_mm: 0.0,
                 area_m2: 0.0,
-                view: "Ground".into()
+                view: "Ground".into(),
+                plan: true
             }),
             "{rows:?}"
         );
@@ -1069,7 +1232,8 @@ pub(crate) mod tests {
                 each_mm: 0.0,
                 length_mm: 0.0,
                 area_m2: 0.0,
-                view: "Ground".into()
+                view: "Ground".into(),
+                plan: true
             }),
             "{rows:?}"
         );
@@ -1128,7 +1292,8 @@ pub(crate) mod tests {
                 each_mm: 0.0,
                 length_mm: 0.0,
                 area_m2: 0.0,
-                view: "Ground".into()
+                view: "Ground".into(),
+                plan: true
             }),
             "{n}: {rows:?}"
         );
