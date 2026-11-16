@@ -139,7 +139,9 @@ const GROUPS: [(&str, &str); 4] = [("Plans", "Plan"), ("Sections", "Section"), (
 /// pane on), the on one `refpane {on: false}`; **Underlay** for its underlay candidates — on while
 /// it is one of the underlays (any number), a click runs `underlay {viewId}` (toggle), the tip
 /// noting `(mirrored)`. Cell tips name the view as `"<name> — <kind>"`. The edited view's own row
-/// has neither. On [`SHEETS_TAB`]: one row per LAMB sheet in tab order, which is plot order,
+/// has neither. While UNHIDEVIEW runs (LAMB T719) the tab ends with a `Hidden` heading and one row
+/// per hidden view, `"<name> (hidden)"`, Level field `hidden`, no cells, running `unhideview
+/// {viewId}`. On [`SHEETS_TAB`]: one row per LAMB sheet in tab order, which is plot order,
 /// labelled with the layout name, field **Title** (`titleblock::sheet_title`), the current one
 /// active, each running `layout set`, with two cells that run `sheetorder` by a step: move up,
 /// `None` on the first, and move down, `None` on the last. An unreadable LAMB slot gives just the
@@ -185,6 +187,15 @@ pub fn browser_rows(d: &Drawing, edit: &Space) -> Vec<BrowserRow> {
     }
     if doc.views.is_empty() {
         rows.push(row("Start LAMB project".into(), false, "lambproject", serde_json::json!({})));
+    }
+    // LAMB T719: while UNHIDEVIEW runs, the hidden views close the Views tab, a click restoring one.
+    if crate::hideview::unhiding() && !doc.hidden_views.is_empty() {
+        rows.push(heading("Hidden"));
+        for h in &doc.hidden_views {
+            let mut r = row(format!("{} (hidden)", h.view.name()), false, "unhideview", serde_json::json!({ "viewId": h.view.id().0 }));
+            r.fields = vec!["hidden".into(), String::new()];
+            rows.push(r);
+        }
     }
     let mut sheets: Vec<_> = d.layouts.iter().filter(|l| crate::titleblock::is_lamb_sheet(l)).collect();
     sheets.sort_by_key(|l| l.tab_order);
@@ -509,6 +520,40 @@ mod tests {
         assert!(!bb.fields[1].is_empty(), "{bb:?}");
         assert_eq!(bb.cells[0].as_ref().map(|c| c.tip.as_str()), Some("Show B-B — Section in the reference pane"));
         assert_eq!(bb.cells[1].as_ref().map(|c| c.tip.as_str()), Some("Underlay B-B — Section"));
+        Ok(())
+    }
+
+    /// LAMB T719.
+    #[test]
+    fn hidden_views_list_only_while_unhideview_runs() -> R {
+        let _g = crate::overlays::underlay::tests::lock();
+        let mut s = session()?;
+        s.execute("lambproject", &json!({}))?;
+        let id = s.execute("newplan", &json!({ "name": "Sketch" }))?["viewId"].as_u64().ok_or("no id")?;
+        s.execute("hideview", &json!({ "viewId": id }))?;
+        let hidden_rows = |s: &Session| -> std::result::Result<Vec<BrowserRow>, Box<dyn std::error::Error>> {
+            Ok(full(s)?.into_iter().skip_while(|r| r.label != "Hidden").collect())
+        };
+        assert!(hidden_rows(&s)?.is_empty(), "not outside the command");
+        s.start("unhideview")?;
+        let r = hidden_rows(&s)?;
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r[0].heading && r[0].tab == VIEWS_TAB);
+        assert_eq!((r[1].label.as_str(), r[1].fields.clone(), r[1].tab), ("Sketch (hidden)", vec!["hidden".to_owned(), String::new()], VIEWS_TAB));
+        assert!(r[1].cells.is_empty() && !r[1].active);
+        assert_eq!(r[1].command, Some(("unhideview".into(), json!({ "viewId": id }))));
+        let views_tab_last = full(&s)?.into_iter().rfind(|r| r.tab == VIEWS_TAB).map(|r| r.label);
+        assert_eq!(views_tab_last.as_deref(), Some("Sketch (hidden)"), "the group ends the Views tab");
+        s.cancel();
+        assert!(s.running.is_none() && hidden_rows(&s)?.is_empty(), "gone after Esc");
+
+        // A click on the row restores the view.
+        s.start("unhideview")?;
+        let (cmd, params) = hidden_rows(&s)?[1].command.clone().ok_or("no command")?;
+        s.execute(&cmd, &params)?;
+        assert!(read_document(s.doc()?)?.views.iter().any(|v| v.id().0 == id));
+        s.cancel();
+        assert!(!crate::hideview::unhiding());
         Ok(())
     }
 

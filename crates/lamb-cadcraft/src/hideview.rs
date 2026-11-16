@@ -14,13 +14,23 @@
 //!
 //! Refusals are decided on a read, before `doc_mut`, so they record no undo step: `No such view`; a
 //! plan hosting a visible section or elevation's cut line; `View is not hidden`. Each command is
-//! one undo step. Interactively HIDEVIEW acts on the edited view; UNHIDEVIEW asks `Enter hidden
-//! view name or [?]:`, `?` listing the hidden views numbered.
+//! one undo step. Interactively HIDEVIEW acts on the edited view; UNHIDEVIEW asks `Select a hidden
+//! view or enter its name [?]:`, `?` listing the hidden views numbered.
+//!
+//! While UNHIDEVIEW runs in a placed plan `P` (LAMB T719) it ghosts the hidden views
+//! ([`ghosts`]): each hidden section's or elevation's cut line, and every entity of each hidden
+//! plan on `P`'s level, in `P`'s local coordinates, drawn ACI 8 on layer `0` with the view's name
+//! as a TEXT 12 px high. A click within 8 px of a ghost's linework restores the nearest one. The
+//! Views palette lists the hidden views in a `Hidden` group while the command runs ([`unhiding`]).
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use cadcraft_doc::{Drawing, Space};
+use cadcraft_doc::color::Color;
+use cadcraft_doc::{Common, Drawing, Entity, EntityKind, HAlign, Handle, Line, Prim, Space, Text, VAlign};
 use cadcraft_engine::{Accept, Input, Interactive, Prompt, Result, Session, Step};
+use cadcraft_geom::{Mat3, Vec2};
+use lamb_core::geometry::transform2d::{Transform2D, local_to_world2, world_to_local2};
 use lamb_core::model::{AnyView, Id, Placement};
 use serde_json::{Value, json};
 
@@ -154,26 +164,184 @@ pub(crate) fn hideview_machine(_s: &Session) -> Result<Box<dyn Interactive>> {
     Ok(Box::new(HideView))
 }
 
-/// UNHIDEVIEW: `Enter hidden view name or [?]:`.
+/// Whether UNHIDEVIEW is the running command (the Views palette's `Hidden` group).
+static UNHIDING: AtomicBool = AtomicBool::new(false);
+
+/// Whether UNHIDEVIEW is running: the Views palette then lists the hidden views.
+pub(crate) fn unhiding() -> bool {
+    UNHIDING.load(Ordering::Relaxed)
+}
+
+fn set_unhiding(on: bool) {
+    UNHIDING.store(on, Ordering::Relaxed);
+}
+
+/// One hidden view drawn in the edited plan: its linework and its name's position, in the plan's
+/// local coordinates.
+pub(crate) struct Ghost {
+    pub id: Id,
+    pub name: String,
+    pub lines: Vec<EntityKind>,
+    pub label_at: Vec2,
+}
+
+/// A plan transform's local -> global matrix (the inverse of `makeview.rs`'s `global_to_local`).
+fn local_to_global(t: &Transform2D) -> Mat3 {
+    Mat3::translate(Vec2::new(t.origin_x, t.origin_y)).then_before(Mat3::rotate(t.rotation))
+}
+
+fn global_to_local(t: &Transform2D) -> Mat3 {
+    Mat3::rotate(-t.rotation).then_before(Mat3::translate(Vec2::new(-t.origin_x, -t.origin_y)))
+}
+
+fn plan_transform(v: &AnyView) -> Option<(Id, Transform2D)> {
+    match v.placement() {
+        Some(Placement::Plan { level_id, transform, .. }) => Some((*level_id, *transform)),
+        _ => None,
+    }
+}
+
+/// The hidden views ghosted while the edited space is a placed plan `P`: each hidden vertical view's
+/// cut line (host-local -> global -> `P` local) and each hidden plan on `P`'s level (its block's
+/// entities, hidden-local -> global -> `P` local). Hidden details, unplaced views and any other edit
+/// space ghost nothing.
+pub(crate) fn ghosts(s: &Session) -> Vec<Ghost> {
+    let (Some(edited), Ok(doc), Ok(d)) = (edited_view(s), doc_of(s), s.doc()) else { return Vec::new() };
+    let Some((level, pt)) = doc.views.iter().find(|v| v.id() == edited).and_then(plan_transform) else { return Vec::new() };
+    let mut out = Vec::new();
+    for h in &doc.hidden_views {
+        let v = &h.view;
+        let (lines, label_at) = match v.placement() {
+            Some(Placement::Vertical { cut_line, host_view_id, .. }) => {
+                let Some((_, ht)) = doc.views.iter().find(|x| x.id() == *host_view_id).and_then(plan_transform) else { continue };
+                let pts: Vec<Vec2> = std::iter::once(cut_line.start)
+                    .chain(cut_line.segments.iter().map(|g| g.to))
+                    .map(|p| world_to_local2(&pt, local_to_world2(&ht, p)))
+                    .map(|p| Vec2::new(p.x, p.y))
+                    .collect();
+                let lines: Vec<EntityKind> = pts.windows(2).map(|w| EntityKind::Line(Line { a: w[0].to3(0.0), b: w[1].to3(0.0) })).collect();
+                (lines, pts[0])
+            }
+            Some(Placement::Plan { level_id, transform: ht, .. }) if *level_id == level => {
+                let m = global_to_local(&pt).then_before(local_to_global(ht));
+                let lines: Vec<EntityKind> = d
+                    .block(&view_block_name(v.id()))
+                    .into_iter()
+                    .flat_map(|b| b.entities.iter())
+                    .map(|e| {
+                        let mut k = e.kind.clone();
+                        k.transform(&m);
+                        k
+                    })
+                    .collect();
+                let grips: Vec<Vec2> = lines.iter().flat_map(EntityKind::grips).collect();
+                let Some(x) = grips.iter().map(|p| p.x).reduce(f64::min) else { continue };
+                let y = grips.iter().map(|p| p.y).fold(f64::MIN, f64::max);
+                (lines, Vec2::new(x, y))
+            }
+            _ => continue,
+        };
+        if !lines.is_empty() {
+            out.push(Ghost { id: v.id(), name: v.name().to_owned(), lines, label_at });
+        }
+    }
+    out
+}
+
+/// The distance from `p` to `k`'s linework (segments and circles; other primitives are ignored).
+fn distance(k: &EntityKind, p: Vec2) -> f64 {
+    k.prims()
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Seg(g) => Some(g.closest(p).dist(p)),
+            Prim::Circle(c) => Some(c.closest(p).dist(p)),
+            _ => None,
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The ghost whose linework is nearest `p` within `aperture`.
+fn ghost_at(ghosts: &[Ghost], p: Vec2, aperture: f64) -> Option<&Ghost> {
+    ghosts
+        .iter()
+        .map(|g| (g, g.lines.iter().map(|k| distance(k, p)).fold(f64::INFINITY, f64::min)))
+        .filter(|(_, d)| *d <= aperture)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(g, _)| g)
+}
+
+/// UNHIDEVIEW: `Select a hidden view or enter its name [?]:`.
 struct UnhideView;
+
+impl UnhideView {
+    fn restore(s: &mut Session, id: Id, name: &str) -> Result<Step> {
+        set_unhiding(false);
+        match unhideview(s, &json!({ "viewId": id.0 })) {
+            Ok(r) => {
+                let n = r["restoredLinks"].as_u64().unwrap_or(0) as usize;
+                s.echo(format!("{name} restored; {n} link{} restored.", plural(n)));
+            }
+            Err(e) => s.echo(e.to_string()),
+        }
+        Ok(Step::Done)
+    }
+}
 
 impl Interactive for UnhideView {
     fn name(&self) -> &'static str {
         "unhideview"
     }
     fn prompt(&self, _s: &Session) -> Prompt {
-        Prompt::new("Enter hidden view name or [?]", Accept::TEXT)
+        Prompt::new("Select a hidden view or enter its name [?]", Accept { point: true, text: true, enter: true, ..Accept::default() })
     }
     fn begin(&mut self, s: &mut Session) -> Result<Step> {
         if doc_of(s)?.hidden_views.is_empty() {
             s.echo("No hidden views.");
             return Ok(Step::Done);
         }
+        set_unhiding(true);
         Ok(Step::Continue)
+    }
+    fn cancelled(&mut self, _s: &mut Session) {
+        set_unhiding(false);
+    }
+    fn preview_objects(&self, s: &Session, _cursor: Vec2) -> Vec<Entity> {
+        let common = Common { layer: "0".into(), color: Color::Index(8), ..Common::default() };
+        let height = 12.0 * s.pixel_size();
+        let mut out = Vec::new();
+        for g in ghosts(s) {
+            let label = Text {
+                insert: g.label_at.to3(0.0),
+                align_pt: None,
+                height,
+                value: g.name.clone(),
+                rotation: 0.0,
+                width_factor: 1.0,
+                oblique: 0.0,
+                style: "Standard".into(),
+                halign: HAlign::Left,
+                valign: VAlign::Baseline,
+            };
+            let kinds = g.lines.into_iter().chain([EntityKind::Text(label)]);
+            out.extend(kinds.map(|kind| Entity { handle: Handle(0), common: common.clone(), kind }));
+        }
+        out
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         let text = match i {
-            Input::Cancel => return Ok(Step::Cancel),
+            Input::Cancel => {
+                set_unhiding(false);
+                return Ok(Step::Cancel);
+            }
+            Input::Point(p) => {
+                let all = ghosts(s);
+                let Some(g) = ghost_at(&all, p, 8.0 * s.pixel_size()) else {
+                    s.echo("No hidden view there");
+                    return Ok(Step::Continue);
+                };
+                let (id, name) = (g.id, g.name.clone());
+                return Self::restore(s, id, &name);
+            }
             Input::Text(t) | Input::Keyword(t) => t.trim().to_owned(),
             _ => return Ok(Step::Continue),
         };
@@ -188,15 +356,8 @@ impl Interactive for UnhideView {
             s.echo("No such hidden view");
             return Ok(Step::Continue);
         };
-        let name = h.view.name().to_owned();
-        match unhideview(s, &json!({ "viewId": h.view.id().0 })) {
-            Ok(r) => {
-                let n = r["restoredLinks"].as_u64().unwrap_or(0) as usize;
-                s.echo(format!("{name} restored; {n} link{} restored.", plural(n)));
-            }
-            Err(e) => s.echo(e.to_string()),
-        }
-        Ok(Step::Done)
+        let (id, name) = (h.view.id(), h.view.name().to_owned());
+        Self::restore(s, id, &name)
     }
 }
 
@@ -340,6 +501,7 @@ mod tests {
 
     #[test]
     fn typed_hideview_leaves_the_view_and_unhideview_lists_and_picks() -> E<()> {
+        let _g = crate::overlays::underlay::tests::lock();
         let mut s = u_wall()?;
         let legs = id_of(&s, "Legs")?;
         let crossbar = id_of(&s, "Crossbar")?;
@@ -353,7 +515,7 @@ mod tests {
         assert_eq!(s.state()?.space, Space::Model);
 
         s.start("unhideview")?;
-        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Enter hidden view name or [?]:"));
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select a hidden view or enter its name [?]:"));
         s.input(Input::Text("?".into()))?;
         assert!(s.log.iter().any(|l| l == "1  Section  Crossbar"), "{:?}", s.log);
         assert!(s.log.iter().any(|l| l == "2  Section  Legs"), "{:?}", s.log);
@@ -365,6 +527,140 @@ mod tests {
         let doc = read_document(s.doc()?)?;
         assert!(doc.views.iter().any(|v| v.id() == crossbar));
         assert_eq!(doc.hidden_views.iter().map(|h| h.view.id()).collect::<Vec<_>>(), vec![legs]);
+        Ok(())
+    }
+
+    /// LAMB T719: plan `Ground Floor` placed rotated and translated, hosting section `A-A`; plan
+    /// `Same` on its level and `Other` on another, each holding one line; all three hidden, the
+    /// ground plan edited. Returns (session, ground, A-A, Same).
+    fn ghost_project() -> E<(Session, Id, Id, Id)> {
+        install_app().map_err(|e| e.to_string())?;
+        let mut s = Session::new();
+        s.new_drawing(true);
+        crate::maintain::install(&mut s);
+        let ground = Id(s.execute("lambproject", &json!({}))?["viewId"].as_u64().ok_or("no id")?);
+        let level = read_document(s.doc()?)?.levels[0].id;
+        let place = |s: &mut Session, v: Id, level: Id, x: f64, y: f64, r: f64| {
+            let t = json!({ "originX": x, "originY": y, "rotation": r });
+            s.execute("placeview", &json!({ "viewId": v.0, "kind": "plan", "levelId": level.0, "cutElevation": 1200, "transform": t }))
+        };
+        s.execute("unplaceview", &json!({ "viewId": ground.0 }))?;
+        place(&mut s, ground, level, 1000.0, 2000.0, std::f64::consts::FRAC_PI_2)?;
+        let r = s.execute(
+            "newsectionline",
+            &json!({ "name": "A-A", "hostViewId": ground.0, "cutFrom": {"x": 0, "y": 2000}, "cutTo": {"x": 5000, "y": 2000} }),
+        )?;
+        let section = Id(r["viewId"].as_u64().ok_or("no section")?);
+        let same = Id(s.execute("newplan", &json!({ "name": "Same" }))?["viewId"].as_u64().ok_or("no id")?);
+        place(&mut s, same, level, 500.0, -300.0, 0.3)?;
+        let l2 = Id(s.execute("level", &json!({ "mode": "create", "name": "L2", "floorElevationMm": 3000 }))?["levelId"].as_u64().ok_or("no id")?);
+        let other = Id(s.execute("newplan", &json!({ "name": "Other" }))?["viewId"].as_u64().ok_or("no id")?);
+        place(&mut s, other, l2, 0.0, 0.0, 0.0)?;
+        for v in [same, other] {
+            s.execute("editview", &json!({ "viewId": v.0 }))?;
+            crate::assembly::tests::line(&mut s, [0.0, 0.0], [1000.0, 0.0])?;
+        }
+        for v in [section, same, other] {
+            s.execute("hideview", &json!({ "viewId": v.0 }))?;
+        }
+        s.execute("editview", &json!({ "viewId": ground.0 }))?;
+        Ok((s, ground, section, same))
+    }
+
+    fn near(a: Vec2, b: Vec2) -> bool {
+        a.dist(b) < 1e-6
+    }
+
+    fn ghost_lines(s: &Session) -> Vec<(Vec2, Vec2)> {
+        s.preview(Vec2::ZERO)
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EntityKind::Line(l) => Some((l.a.xy(), l.b.xy())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn texts(s: &Session) -> Vec<String> {
+        s.preview(Vec2::ZERO)
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EntityKind::Text(t) => Some(t.value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unhideview_ghosts_hidden_views_in_the_edited_plan() -> E<()> {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, ground, section, same) = ghost_project()?;
+        let doc = read_document(s.doc()?)?;
+        let pt = doc.views.iter().find(|v| v.id() == ground).and_then(plan_transform).ok_or("ground unplaced")?.1;
+        let placement = doc.hidden_views.iter().find(|h| h.view.id() == section).and_then(|h| h.view.placement().cloned());
+        let Some(Placement::Vertical { cut_line, .. }) = placement else { return Err("no cut line".into()) };
+        let st = doc.hidden_views.iter().find(|h| h.view.id() == same).and_then(|h| plan_transform(&h.view)).ok_or("Same unplaced")?.1;
+        // The authority: lamb-core's transforms, point by point.
+        let to_p = |from: &Transform2D, x: f64, y: f64| {
+            let q = world_to_local2(&pt, local_to_world2(from, lamb_core::geometry::point::Point2 { x, y }));
+            Vec2::new(q.x, q.y)
+        };
+        let end = cut_line.segments.first().ok_or("empty cut line")?.to;
+        let cut = (to_p(&pt, cut_line.start.x, cut_line.start.y), to_p(&pt, end.x, end.y));
+        let same_line = (to_p(&st, 0.0, 0.0), to_p(&st, 1000.0, 0.0));
+        assert!(!near(same_line.0, Vec2::ZERO) && !near(same_line.1, Vec2::new(1000.0, 0.0)), "the transforms do not cancel");
+
+        s.start("unhideview")?;
+        assert_eq!(s.current_prompt().map(|p| p.display()).as_deref(), Some("Select a hidden view or enter its name [?]:"));
+        let ghosts = s.preview(Vec2::ZERO);
+        assert!(ghosts.iter().all(|e| e.common.color == Color::Index(8) && e.common.layer == "0"), "ACI 8 on layer 0");
+        let lines = ghost_lines(&s);
+        assert_eq!(lines.len(), 2, "the cut line and Same's line; Other is on another level: {lines:?}");
+        assert!(lines.iter().any(|l| near(l.0, cut.0) && near(l.1, cut.1)), "{lines:?} vs {cut:?}");
+        assert!(lines.iter().any(|l| near(l.0, same_line.0) && near(l.1, same_line.1)), "{lines:?} vs {same_line:?}");
+        let mut names = texts(&s);
+        names.sort();
+        assert_eq!(names, ["A-A", "Same"]);
+        let label = ghosts
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntityKind::Text(t) if t.value == "A-A" => Some(t.clone()),
+                _ => None,
+            })
+            .ok_or("no A-A label")?;
+        assert!(near(label.insert.xy(), cut.0) && (label.height - 12.0 * s.pixel_size()).abs() < 1e-9, "{label:?}");
+
+        // Model space ghosts nothing; the prompt still works.
+        s.cancel();
+        s.execute("editview", &json!({}))?;
+        s.start("unhideview")?;
+        assert!(s.running.is_some() && s.preview(Vec2::ZERO).is_empty(), "no ghosts in Model space");
+        s.cancel();
+        assert!(!unhiding());
+        Ok(())
+    }
+
+    #[test]
+    fn a_click_on_a_ghost_restores_it_and_a_miss_says_so() -> E<()> {
+        let _g = crate::overlays::underlay::tests::lock();
+        let (mut s, _ground, section, _same) = ghost_project()?;
+        s.start("unhideview")?;
+        let g = ghosts(&s).into_iter().find(|g| g.id == section).ok_or("no section ghost")?;
+        let EntityKind::Line(l) = g.lines.first().ok_or("no line")? else { return Err("not a line".into()) };
+        let (a, b) = (l.a.xy(), l.b.xy());
+        let hidden = |s: &Session| -> E<bool> { Ok(read_document(s.doc()?)?.hidden_views.iter().any(|h| h.view.id() == section)) };
+        let px = s.pixel_size();
+        let mid = a.mid(b);
+        let off = (b - a).normalized().perp();
+        s.input(Input::Point(mid + off * (40.0 * px)))?;
+        assert!(s.log.iter().any(|l| l == "No hidden view there"), "{:?}", s.log);
+        assert!(s.running.is_some() && hidden(&s)?, "still hidden, re-prompts");
+        s.input(Input::Point(mid + off * (5.0 * px)))?;
+        assert!(s.running.is_none());
+        assert!(!hidden(&s)? && read_document(s.doc()?)?.views.iter().any(|v| v.id() == section), "restored");
+        assert!(!unhiding(), "the flag is cleared");
+        s.undo()?;
+        assert!(hidden(&s)?, "one undo step");
         Ok(())
     }
 }
