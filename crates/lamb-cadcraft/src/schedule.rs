@@ -11,8 +11,10 @@
 //! `Width` is the bridge's length. `Jamb detail` is the name of the detail
 //! [`crate::assembly::opening_assembly`] resolves for the bridge. `Height` and `Sill` come from the
 //! first placed section, in document order, whose cut line crosses the bridge: of that section's
-//! bridges with a head and a sill, the nearest to the crossing's `u`, no further from it than the
-//! plan's wall is wide, whose sill stands on the row's level (the level's floor up to the next
+//! openings with a head and a sill ([`section_openings`]: its bridges, and each door standing on
+//! the floor under a wall with no wall drawn below it, read from its bottom — LAMB T717), the
+//! nearest to the crossing's `u`, no further from it than the plan's wall is wide, whose sill
+//! stands on the row's level (the level's floor up to the next
 //! floor, so a window above another in one cut is read at its own level). Height is head z minus
 //! sill z, Sill is sill z minus the floor. No such section, or no such bridge in it, shows `—` in
 //! both; nothing is guessed from defaults. Elevations are read for marks only, and blocks used as
@@ -48,6 +50,7 @@ use lamb_core::derivation::wall_spaces::outside_on_left;
 use lamb_core::derivation::walls::{RunCurve, WallRun};
 use lamb_core::geometry::Point2;
 use lamb_core::geometry::point::{add2, cross2, dist2, dot2, lerp2, normalize2, sub2};
+use lamb_core::geometry::polyline::{ResolvedSegment, closest_point_on_segment, resolved_segments};
 use lamb_core::geometry::tolerance::TOLERANCE;
 use lamb_core::model::{AnyView, Id, Level, Placement, VerticalIntent};
 use serde_json::{Value, json};
@@ -195,10 +198,17 @@ fn crossing_u(from: Point2, to: Point2, a: Point2, b: Point2) -> Option<f64> {
 }
 
 /// A section's openings that have a head and a sill: (u, sill z, head z, cut wall width).
+///
+/// Its bridges first, then by `u` each opening standing under a wall with no wall drawn below it
+/// (LAMB T717): a downward-facing free end of a straight run whose cap (the segment `run.width`
+/// long square to the run through the end) an opening-layer entity touches within
+/// `TOLERANCE.grouping_mm`. Its head is that end's z, its sill the lowest z of the entity's
+/// connected opening cluster. A cluster touching two free-end caps is left to the bridges.
 pub(crate) fn section_openings(p: &DrawingProject<'_>, section: Id) -> Vec<(f64, f64, f64, f64)> {
     let Some(view) = p.view(section) else { return Vec::new() };
-    let graph = wall_graph(p, section, &wall_params(p, section));
-    graph
+    let params = wall_params(p, section);
+    let graph = wall_graph(p, section, &params);
+    let mut out: Vec<(f64, f64, f64, f64)> = graph
         .bridges
         .iter()
         .filter_map(|b| {
@@ -206,7 +216,77 @@ pub(crate) fn section_openings(p: &DrawingProject<'_>, section: Id) -> Vec<(f64,
             let width = graph.runs.get(b.a.0).map_or(0.0, |r| r.width);
             ((a.z - c.z).abs() > TOLERANCE.coincidence_mm).then(|| ((a.u + c.u) / 2.0, a.z.min(c.z), a.z.max(c.z), width))
         })
-        .collect()
+        .collect();
+    // The cap of every downward-facing free end of a straight run: (end, cap, run width).
+    let down = -TOLERANCE.angle_deg.to_radians().cos();
+    let caps: Vec<(Point2, ResolvedSegment, f64)> = graph
+        .free_ends
+        .iter()
+        .filter_map(|&(i, end)| {
+            let run = graph.runs.get(i)?;
+            let RunCurve::Line { from, to } = run.centreline else { return None };
+            let (at, away) = if end == RunEnd::Start { (from, to) } else { (to, from) };
+            let (a, b) = (vertical_local_to_uz(&view, at), vertical_local_to_uz(&view, away));
+            let outward = normalize2(Point2 { x: a.u - b.u, y: a.z - b.z });
+            if outward.y >= down {
+                return None;
+            }
+            let dir = normalize2(sub2(at, away));
+            let half = Point2 { x: -dir.y * run.width / 2.0, y: dir.x * run.width / 2.0 };
+            Some((at, ResolvedSegment { index: 0, from: sub2(at, half), to: add2(at, half), bulge: 0.0 }, run.width))
+        })
+        .collect();
+    if caps.is_empty() {
+        return out;
+    }
+    let clusters = opening_clusters(p, section, &params.opening_layer_ids);
+    let touches = |a: &[ResolvedSegment], b: &[ResolvedSegment]| {
+        a.iter().flat_map(|s| [s.from, s.to]).any(|pt| b.iter().any(|t| closest_point_on_segment(t, pt).distance <= TOLERANCE.grouping_mm))
+    };
+    let mut found: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for (at, cap, width) in &caps {
+        let cap = std::slice::from_ref(cap);
+        let Some(cluster) = clusters.iter().find(|c| touches(c, cap) || touches(cap, c)) else { continue };
+        let capped = caps
+            .iter()
+            .filter(|(_, other, _)| touches(cluster, std::slice::from_ref(other)) || touches(std::slice::from_ref(other), cluster))
+            .count();
+        if capped > 1 {
+            continue;
+        }
+        let head = vertical_local_to_uz(&view, *at);
+        let sill = cluster.iter().flat_map(|s| [s.from, s.to]).map(|pt| vertical_local_to_uz(&view, pt).z).fold(f64::INFINITY, f64::min);
+        if head.z - sill > TOLERANCE.coincidence_mm {
+            found.push((head.u, sill, head.z, *width));
+        }
+    }
+    found.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out.extend(found);
+    out
+}
+
+/// The segments of each connected group of `view`'s entities on `layers`, touching within
+/// `TOLERANCE.grouping_mm`, in entity id order.
+fn opening_clusters(p: &DrawingProject<'_>, view: Id, layers: &[String]) -> Vec<Vec<ResolvedSegment>> {
+    let mut ents: Vec<(Id, Vec<ResolvedSegment>)> = p
+        .entities(view)
+        .filter(|e| layers.iter().any(|id| id == e.layer_id))
+        .filter_map(|e| e.polyline.as_ref().map(|poly| (e.id, resolved_segments(poly))))
+        .filter(|(_, segs)| !segs.is_empty())
+        .collect();
+    ents.sort_by_key(|(id, _)| *id);
+    let near = |a: &[ResolvedSegment], b: &[ResolvedSegment]| {
+        a.iter().flat_map(|s| [s.from, s.to]).any(|pt| b.iter().any(|t| closest_point_on_segment(t, pt).distance <= TOLERANCE.grouping_mm))
+    };
+    let mut groups: Vec<Vec<ResolvedSegment>> = Vec::new();
+    for (_, segs) in ents {
+        let (joined, rest): (Vec<_>, Vec<_>) = groups.into_iter().partition(|g| near(g, &segs) || near(&segs, g));
+        let mut merged = segs;
+        merged.extend(joined.into_iter().flatten());
+        groups = rest;
+        groups.push(merged);
+    }
+    groups
 }
 
 /// Every opening of every placed plan, in row order.
@@ -542,6 +622,94 @@ pub(crate) mod tests {
         s.execute("setrole", &json!({ "handles": hs, "role": "cut" }))?;
         s.execute("editview", &json!({ "viewId": plan.0 }))?;
         Ok(sec)
+    }
+
+    /// [`section_through`]'s cut with a door: wall from `head` to `top` (and from `footing` up to
+    /// z 0 when given), a `DOOR` line at u 1100 from z 0 to `head`, nothing else below it.
+    fn door_section_through(s: &mut Session, plan: Id, head: f64, top: f64, footing: Option<f64>) -> T<Id> {
+        let r = s.execute(
+            "newsectionline",
+            &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 2500, "y": -1000}, "cutTo": {"x": 2500, "y": 1000} }),
+        )?;
+        let sec = id(&r)?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        layer(s, "WALL-EXT")?;
+        for (z0, z1) in footing.map(|f| (f, 0.0)).into_iter().chain([(head, top)]) {
+            for u in [1000.0, 1200.0] {
+                s.execute("pline", &json!({ "vertices": [[u, z0], [u, z1]] }))?;
+            }
+        }
+        layer(s, "DOOR")?;
+        s.execute("pline", &json!({ "vertices": [[1100.0, 0.0], [1100.0, head]] }))?;
+        let hs: Vec<String> = s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.iter().map(|e| e.handle.hex()).collect();
+        s.execute("setrole", &json!({ "handles": hs, "role": "cut" }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        Ok(sec)
+    }
+
+    /// A room with door D01 at x 2000..3000 in its south wall, the plan edited.
+    fn door_south() -> T<(Session, Id)> {
+        let (mut s, plan) = project()?;
+        walls(&mut s, (2000.0, 3000.0), None)?;
+        opening(&mut s, "DOOR", (2000.0, 100.0), (3000.0, 100.0))?;
+        Ok((s, plan))
+    }
+
+    fn openings_of(s: &Session, section: Id) -> T<Vec<(f64, f64, f64, f64)>> {
+        let d = s.doc()?;
+        Ok(section_openings(&DrawingProject::new(d)?, section))
+    }
+
+    #[test]
+    fn a_door_with_no_wall_below_reads_from_its_bottom_on_a602() -> R {
+        let (mut s, plan) = door_south()?;
+        let sec = door_section_through(&mut s, plan, 2100.0, 2700.0, None)?;
+        assert_eq!(openings_of(&s, sec)?, [(1100.0, 0.0, 2100.0, 200.0)]);
+        s.execute("sheetset", &json!({}))?;
+        assert_eq!(body(&s)?, [["D01", "Door", "Level 1", "1000", "2100", "0", "—"]]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_door_on_a_footing_reads_once() -> R {
+        let (mut s, plan) = door_south()?;
+        let sec = door_section_through(&mut s, plan, 2100.0, 2700.0, Some(-300.0))?;
+        assert_eq!(openings_of(&s, sec)?.len(), 1, "{:?}", openings_of(&s, sec)?);
+        assert_eq!(rows(&s)?, [["D01", "Door", "Level 1", "1000", "2100", "0", "—"]]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_window_with_wall_below_and_none_above_stays_unread() -> R {
+        let (mut s, plan) = window_south()?;
+        let sec = s.execute(
+            "newsectionline",
+            &json!({ "name": "A-A", "hostViewId": plan.0, "cutFrom": {"x": 2500, "y": -1000}, "cutTo": {"x": 2500, "y": 1000} }),
+        )?;
+        let sec = id(&sec)?;
+        s.execute("editview", &json!({ "viewId": sec.0 }))?;
+        layer(&mut s, "WALL-EXT")?;
+        for u in [1000.0, 1200.0] {
+            s.execute("pline", &json!({ "vertices": [[u, 0.0], [u, 900.0]] }))?;
+        }
+        layer(&mut s, "WINDOW")?;
+        s.execute("pline", &json!({ "vertices": [[1100.0, 900.0], [1100.0, 2100.0]] }))?;
+        let hs: Vec<String> = s.doc()?.block(&view_block_name(sec)).ok_or("no block")?.entities.iter().map(|e| e.handle.hex()).collect();
+        s.execute("setrole", &json!({ "handles": hs, "role": "cut" }))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        assert_eq!(openings_of(&s, sec)?, []);
+        assert_eq!(rows(&s)?, [["W01", "Window", "Level 1", "1000", "—", "—", "—"]]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_elevation_facing_a_door_with_no_wall_below_marks_its_centre() -> R {
+        let (mut s, plan) = door_south()?;
+        let south = elevation(&mut s, plan, "South", (-500.0, -1000.0), (5500.0, -1000.0))?;
+        s.execute("editview", &json!({ "viewId": plan.0 }))?;
+        door_section_through(&mut s, plan, 2100.0, 2700.0, None)?;
+        assert_eq!(mark_texts(&s, south)?, [("D01".to_owned(), 3000.0, 1050.0)]);
+        Ok(())
     }
 
     fn rows(s: &Session) -> T<Vec<Vec<String>>> {
