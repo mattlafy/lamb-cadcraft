@@ -24,6 +24,9 @@ pub struct ViewRef<'a> {
     pub name: &'a str,
     pub kind: ViewKind,
     pub placement: Option<&'a Placement>,
+    /// True only for a vertical view whose intent is an elevation (LAMB T720: only elevations
+    /// carry seen markers).
+    pub elevation: bool,
 }
 
 impl<'a> ViewRef<'a> {
@@ -172,7 +175,8 @@ pub fn view_ref(v: &AnyView) -> ViewRef<'_> {
         AnyView::Vertical(_) => ViewKind::Vertical,
         AnyView::Detail(_) => ViewKind::Detail,
     };
-    ViewRef { id: v.id(), name: v.name(), kind, placement: v.placement() }
+    let elevation = matches!(v, AnyView::Vertical(vv) if vv.intent == crate::model::VerticalIntent::Elevation);
+    ViewRef { id: v.id(), name: v.name(), kind, placement: v.placement(), elevation }
 }
 
 /// For exports that take an entity argument.

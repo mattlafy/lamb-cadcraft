@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
-use super::markers::{Marker, compute_markers_for_view};
+use super::markers::{Marker, compute_link_markers_for_view};
 use super::read::{EntityRef, ProjectRead};
 use crate::geometry::polyline::{closest_point_on_segment, point_at_param, resolved_segments};
 use crate::geometry::tolerance::TOLERANCE;
@@ -21,7 +21,7 @@ pub fn find_auto_links(
     let Some(view) = doc.view(entity.view_id) else { return Ok(Vec::new()) };
     let Some(poly) = entity.polyline.as_deref() else { return Ok(Vec::new()) };
 
-    let markers = compute_markers_for_view(doc, view.id)?;
+    let markers = compute_link_markers_for_view(doc, view.id)?;
     let tolerance_mm = TOLERANCE.coincidence_mm + 2.0; // small drafting slack beyond pure coincidence
     let mut created = Vec::new();
     let mut already_linked: HashSet<(Id, usize)> = HashSet::new();
@@ -86,7 +86,7 @@ fn coincides_one_way(doc: &impl ProjectRead, drawn: &LinkAnchor, source: &LinkAn
     let Some(poly) = entity.polyline.as_deref() else { return Ok(false) };
     let Some(seg) = resolved_segments(poly).into_iter().find(|s| s.index == drawn.segment_index) else { return Ok(false) };
     let point = point_at_param(&seg, drawn.segment_param);
-    let markers = compute_markers_for_view(doc, entity.view_id)?;
+    let markers = compute_link_markers_for_view(doc, entity.view_id)?;
     let Some(marker) = markers.iter().find(|m| m.source_entity_id == source.entity_id && m.source_segment_index == source.segment_index) else {
         return Ok(false);
     };

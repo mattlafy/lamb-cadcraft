@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::projection::{plan_local_to_global_xy, vertical_basis, vertical_local_to_uz};
 use super::read::{EntityRef, ProjectRead, ViewKind, ViewRef};
 use super::tilt::signed_tilt_deg;
-use crate::geometry::intersect::crossing_angle_deg;
+use crate::geometry::intersect::{crossing_angle_deg, intersect_segment_with_infinite_line};
 use crate::geometry::polyline::{point_at_param, resolved_segments, tangent_at_param};
 use crate::geometry::tolerance::TOLERANCE;
 use crate::geometry::{Point2, Point3, ResolvedSegment};
@@ -139,9 +139,37 @@ fn authored_or_proposed(proposed: bool) -> ProvenanceKind {
     if proposed { ProvenanceKind::Proposed } else { ProvenanceKind::Authored }
 }
 
+/// A seen link (LAMB T720, `line-model-and-linking.md` §5b): `vert_view` is an elevation and the
+/// plan segment, in global XY, does not reach its infinite cut line, so the elevation line linked to
+/// it sees the segment end-on rather than cutting it. It sets that segment's extent only, never a
+/// whole polyline's height.
+fn is_seen_link(project: &impl ProjectRead, plan_entity: &EntityRef<'_>, plan_seg_index: usize, vert_view: &ViewRef<'_>) -> bool {
+    if !vert_view.elevation {
+        return false;
+    }
+    let Some(plan_view) = project.view(plan_entity.view_id) else { return false };
+    let Some(host_view) = vert_view.host_view_id().and_then(|h| project.view(h)) else { return false };
+    let Ok(basis) = vertical_basis(vert_view, &host_view) else { return false };
+    let Some(seg) = plan_entity.polyline.as_deref().and_then(|p| resolved_segments(p).get(plan_seg_index).copied()) else { return false };
+    let (Ok(from), Ok(to)) = (plan_local_to_global_xy(&plan_view, seg.from), plan_local_to_global_xy(&plan_view, seg.to)) else { return false };
+    let global_seg = ResolvedSegment { index: seg.index, from, to, bulge: seg.bulge };
+    let line_to = Point2 { x: basis.origin_xy.x + basis.c_hat.x, y: basis.origin_xy.y + basis.c_hat.y };
+    intersect_segment_with_infinite_line(&global_seg, basis.origin_xy, line_to, 1e-6).is_empty()
+}
+
 /// One segment of a `cut` line: XY path from the plan that drew it, contour elevation the plan's
-/// cut elevation, vertical extent and tilt from linked vertical-view lines.
+/// cut elevation, vertical extent and tilt from linked vertical-view lines, seen links included.
 pub fn resolve_cut_segment(project: &impl ProjectRead, entity: &EntityRef<'_>, segment_index: usize) -> Result<Vec<ResolvedSpan>, String> {
+    resolve_cut_segment_with(project, entity, segment_index, true)
+}
+
+/// [`resolve_cut_segment`], counting seen links only when `seen` is set.
+fn resolve_cut_segment_with(
+    project: &impl ProjectRead,
+    entity: &EntityRef<'_>,
+    segment_index: usize,
+    seen: bool,
+) -> Result<Vec<ResolvedSpan>, String> {
     let Some(view) = project.view(entity.view_id).filter(|v| v.kind == ViewKind::Plan && v.placement.is_some()) else {
         return Ok(vec![ResolvedSpan::bare(0.0, 1.0, ProvenanceKind::Defaulted)]);
     };
@@ -153,6 +181,9 @@ pub fn resolve_cut_segment(project: &impl ProjectRead, entity: &EntityRef<'_>, s
     let mut contributions: Vec<CrossingContribution> = Vec::new();
     for l in project.links_for_segment(entity.id, segment_index) {
         let Some((other_view, other_seg, proposed)) = linked_vertical_segment(project, l.other.entity_id, l.other.segment_index) else { continue };
+        if !seen && is_seen_link(project, entity, segment_index, &other_view) {
+            continue;
+        }
         if let Some(mut c) = contribution_from_crossing(project, &view, &plan_seg, &other_view, &other_seg, l.mine.segment_param)? {
             c.proposed = proposed;
             contributions.push(c);
@@ -224,7 +255,8 @@ pub fn resolve_cut_segment_inherited(project: &impl ProjectRead, entity: &Entity
         if seg.index == segment_index {
             continue;
         }
-        for span in resolve_cut_segment(project, entity, seg.index)? {
+        // A seen link sets its own segment's extent only, never the polyline's (T720).
+        for span in resolve_cut_segment_with(project, entity, seg.index, false)? {
             match (span.provenance, span.extent) {
                 (ProvenanceKind::Defaulted, _) => {}
                 (ProvenanceKind::Authored | ProvenanceKind::Proposed, Some(extent)) => sources.push((extent, span.provenance)),
@@ -263,6 +295,9 @@ fn polyline_crossings(project: &impl ProjectRead, entity: &EntityRef<'_>) -> Res
         links.sort_by(|a, b| a.mine.segment_param.total_cmp(&b.mine.segment_param));
         for l in links {
             let Some((vert_view, vert_seg, _)) = linked_vertical_segment(project, l.other.entity_id, l.other.segment_index) else { continue };
+            if is_seen_link(project, entity, seg.index, &vert_view) {
+                continue;
+            }
             let Some(host_view) = vert_view.host_view_id().and_then(|h| project.view(h)) else { continue };
             let basis = vertical_basis(&vert_view, &host_view)?;
             let from = vertical_local_to_uz(&vert_view, vert_seg.from);
@@ -470,5 +505,35 @@ mod tests {
         let p = ceiling_with_perpendicular_flat(3000.0);
         let (at, _) = polyline_height_conflict(&p, &ceiling(&p)).expect("conflict").expect("reported");
         assert_eq!((at.x, at.y), (8000.0, 2000.0));
+    }
+
+    #[test]
+    fn a_seen_link_sets_its_own_segments_extent_and_never_the_polylines() {
+        // Segment 1, (8000, 0)-(8000, 5000), seen end-on by an elevation along y = -1000.
+        let mut p = project(FLAT_2700, FLAT_2700, FLAT_2700, vec![]);
+        let placement = Placement::Vertical {
+            cut_line: poly(&[(-1000.0, -1000.0), (9000.0, -1000.0)]),
+            host_view_id: PLAN,
+            transform: IDENTITY_TRANSFORM,
+            flipped: None,
+        };
+        let jamb = ent(Id(31), Id(400), poly(&[(9000.0, 900.0), (9000.0, 2100.0)]));
+        p.views.push(AnyView::Vertical(VerticalView {
+            id: Id(400),
+            name: "South".into(),
+            intent: VerticalIntent::Elevation,
+            entities: vec![jamb],
+            placement: Some(placement),
+        }));
+        p.links = vec![link(1, 1, 0.0, Id(31), 0.0)];
+        let own = resolve_cut_segment(&p, &ceiling(&p), 1).expect("own");
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].provenance, ProvenanceKind::Authored);
+        assert_eq!(own[0].extent, Some(VerticalExtent { bottom: 900.0, top: 2100.0 }));
+        for seg in [0, 2] {
+            let spans = resolve_cut_segment_inherited(&p, &ceiling(&p), seg).expect("inherited");
+            assert_eq!(spans[0].provenance, ProvenanceKind::Defaulted, "segment {seg}");
+        }
+        assert_eq!(polyline_height_conflict(&p, &ceiling(&p)).expect("conflict"), None);
     }
 }

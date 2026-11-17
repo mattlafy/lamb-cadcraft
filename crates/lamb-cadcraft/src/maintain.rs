@@ -69,7 +69,7 @@ use std::sync::Arc;
 use cadcraft_doc::{Drawing, EntityKind, Handle};
 use cadcraft_engine::Session;
 use lamb_core::derivation::linking::{find_auto_links, link_still_coincides};
-use lamb_core::derivation::markers::{Marker, compute_markers_for_view};
+use lamb_core::derivation::markers::{Marker, compute_link_markers_for_view, compute_markers_for_view, compute_seen_markers_for_vertical_view};
 use lamb_core::derivation::read::ProjectRead;
 use lamb_core::derivation::read::{EntityRef, ViewKind};
 use lamb_core::derivation::travel::travel_segment_move;
@@ -560,7 +560,7 @@ fn auto_link(after: &mut Drawing, id: Id, now: &str, widened: bool, report: &mut
         let mut found = find_auto_links(&p, &entity, &actor, now, &mut mint).map_err(derivation_error)?;
         found.retain(|r| !already_joined(&doc.links, r) && !doc.unlinked.iter().any(|u| unlink_covers(&p, u, r)));
         if !found.is_empty() {
-            let markers = compute_markers_for_view(&p, entity.view_id).map_err(derivation_error)?;
+            let markers = compute_link_markers_for_view(&p, entity.view_id).map_err(derivation_error)?;
             found.retain(|r| {
                 let Some(m) = marker_of(&markers, &r.b) else { return false };
                 let settled = widened && (m.filled || p.entity(m.source_entity_id).is_some_and(|e| is_proposal(&e)));
@@ -583,12 +583,15 @@ fn auto_link(after: &mut Drawing, id: Id, now: &str, widened: bool, report: &mut
 
 /// Step 3c: [`auto_link`], as step 3b, for the one line left at each hollow marker the command
 /// changed the company of. A marker qualifies when its source is in `touched`, or when it lies within
-/// reach of where a touched or removed entity of its view was. Nothing to do when the command touched
-/// and removed nothing that existed before.
+/// reach of where a touched or removed entity of its view was. A seen marker (LAMB T720) also
+/// qualifies when its source is `new`: a new plan line makes no marker in its own view, so a line
+/// already in the elevation links when the plan segment it sees end-on is drawn after it. Nothing to
+/// do when the command created, touched and removed nothing.
 fn sweep_markers(
     before_entities: &EntityMap,
     after: &mut Drawing,
     touched: &[Id],
+    new: &[Id],
     now: &str,
     report: &mut MaintenanceReport,
 ) -> Result<(), SchemaError> {
@@ -600,12 +603,17 @@ fn sweep_markers(
             .filter(|(id, _)| touched.contains(id) || !after_entities.contains_key(id))
             .map(|(_, (view, poly))| (*view, poly.as_ref().map(resolved_segments).unwrap_or_default()))
             .collect();
-        if changed.is_empty() {
+        if changed.is_empty() && new.is_empty() {
             return Ok(());
         }
         let mut lines = BTreeSet::new();
         for view in p.views() {
-            for m in compute_markers_for_view(&p, view.id).map_err(derivation_error)? {
+            let mut markers: Vec<(Marker, bool)> =
+                compute_markers_for_view(&p, view.id).map_err(derivation_error)?.into_iter().map(|m| (m, false)).collect();
+            if view.kind == ViewKind::Vertical {
+                markers.extend(compute_seen_markers_for_vertical_view(&p, &view).map_err(derivation_error)?.into_iter().map(|m| (m, true)));
+            }
+            for (m, seen) in markers {
                 let was_there = || {
                     changed
                         .iter()
@@ -613,7 +621,8 @@ fn sweep_markers(
                         .flat_map(|(_, segments)| segments)
                         .any(|seg| closest_point_on_segment(seg, m.position).distance <= marker_reach())
                 };
-                if m.filled || !(touched.contains(&m.source_entity_id) || was_there()) {
+                let sourced = touched.contains(&m.source_entity_id) || (seen && new.contains(&m.source_entity_id));
+                if m.filled || !(sourced || was_there()) {
                     continue;
                 }
                 if let [(line, _)] = lines_at_marker(&p, view.id, &m)[..] {
@@ -716,7 +725,7 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
     report.stamped = stamp_roles(after, &new_entities)?;
 
     // 3: auto-link each new entity, in handle order, each seeing the links of the ones before it.
-    for id in new_entities {
+    for &id in &new_entities {
         auto_link(after, id, now, false, &mut report)?;
     }
     // 3b: then each entity the command touched, so a line that came to meet a marker links too.
@@ -724,7 +733,7 @@ pub fn maintain_links(before: &Drawing, after: &mut Drawing, now: &str, travel_s
         auto_link(after, id, now, true, &mut report)?;
     }
     // 3c: then the lines left at a marker the command changed the company of.
-    sweep_markers(&before_entities, after, &touched_entities, now, &mut report)?;
+    sweep_markers(&before_entities, after, &touched_entities, &new_entities, now, &mut report)?;
 
     // 4: a layer change carries the entity's automatic-link component with it.
     report.relayered = crate::relayer::cascade_layers(before, after)?;
@@ -843,5 +852,191 @@ mod tests {
         assert_eq!(format_utc_ms(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(format_utc_ms(951_782_400_123), "2000-02-29T00:00:00.123Z");
         assert_eq!(format_utc_ms(1_791_793_845_678), "2026-10-12T08:30:45.678Z");
+    }
+
+    // ------------------------------------------- LAMB T720: seen links in an elevation (§5b) --
+
+    mod seen_links {
+        use cadcraft_doc::Handle;
+        use cadcraft_engine::Session;
+        use lamb_core::derivation::markers::compute_link_markers_for_view;
+        use lamb_core::derivation::projection::{Uz, vertical_local_to_uz, vertical_uz_to_local};
+        use lamb_core::derivation::read::ProjectRead;
+        use lamb_core::derivation::resolve::{ProvenanceKind, ResolvedSpan, VerticalExtent, resolve_cut_segment, resolve_cut_segment_inherited};
+        use lamb_core::geometry::Point2;
+        use lamb_core::geometry::polyline::resolved_segments;
+        use lamb_core::model::{Id, LinkRecord};
+        use serde_json::json;
+
+        use crate::project::DrawingProject;
+        use crate::schedule::tests::{elevation, layer, window_south};
+        use crate::schema::read_document;
+
+        type T<X> = std::result::Result<X, Box<dyn std::error::Error>>;
+        type R = T<()>;
+
+        struct Fx {
+            s: Session,
+            plan: Id,
+            elev: Id,
+            cap: Option<Id>,
+        }
+
+        fn line(s: &mut Session, a: Point2, b: Point2) -> T<Id> {
+            let r = s.execute("line", &json!({ "points": [[a.x, a.y], [b.x, b.y]] }))?;
+            let h = Handle::parse_hex(r["handles"][0].as_str().ok_or("no handle")?).ok_or("bad handle")?;
+            Ok(Id(h.0))
+        }
+
+        /// `window_south` cut at 1200, the South elevation along y = -1000 (u = x + 500), and,
+        /// when `caps`, WALL-EXT caps (2000,0)-(2000,200) and (3000,0)-(3000,200). The plan edited.
+        fn fixture(caps: bool) -> T<Fx> {
+            let (mut s, plan) = window_south()?;
+            s.execute("cutline", &json!({ "planViewId": plan.0, "elevation": 1200 }))?;
+            let elev = elevation(&mut s, plan, "South", (-500.0, -1000.0), (5500.0, -1000.0))?;
+            s.execute("editview", &json!({ "viewId": plan.0 }))?;
+            layer(&mut s, "WALL-EXT")?;
+            let cap = if caps {
+                let c = line(&mut s, Point2 { x: 2000.0, y: 0.0 }, Point2 { x: 2000.0, y: 200.0 })?;
+                line(&mut s, Point2 { x: 3000.0, y: 0.0 }, Point2 { x: 3000.0, y: 200.0 })?;
+                Some(c)
+            } else {
+                None
+            };
+            Ok(Fx { s, plan, elev, cap })
+        }
+
+        /// A point in the elevation's local space.
+        fn at(s: &Session, elev: Id, u: f64, z: f64) -> T<Point2> {
+            let dp = DrawingProject::new(s.doc()?)?;
+            let v = dp.view(elev).ok_or("no elevation")?;
+            Ok(vertical_uz_to_local(&v, Uz { u, z }))
+        }
+
+        fn round(v: f64) -> f64 {
+            (v * 1e6).round() / 1e6
+        }
+
+        fn uz_of_line(s: &Session, elev: Id, id: Id) -> T<Vec<(f64, f64)>> {
+            let dp = DrawingProject::new(s.doc()?)?;
+            let v = dp.view(elev).ok_or("no elevation")?;
+            let e = dp.entity(id).ok_or("no line")?;
+            let seg = *resolved_segments(e.polyline.as_deref().ok_or("no polyline")?).first().ok_or("no segment")?;
+            Ok([seg.from, seg.to].iter().map(|p| vertical_local_to_uz(&v, *p)).map(|q| (round(q.u), round(q.z))).collect())
+        }
+
+        fn links_between(s: &Session, a: Id, b: Id) -> T<Vec<LinkRecord>> {
+            Ok(read_document(s.doc()?)?
+                .links
+                .into_iter()
+                .filter(|l| (l.a.entity_id == a && l.b.entity_id == b) || (l.a.entity_id == b && l.b.entity_id == a))
+                .collect())
+        }
+
+        /// Every segment's inherited spans of the room's outer wall polyline.
+        fn outer_wall_spans(s: &Session, plan: Id) -> T<Vec<Vec<ResolvedSpan>>> {
+            let dp = DrawingProject::new(s.doc()?)?;
+            let wall = dp
+                .entities(plan)
+                .find(|e| e.polyline.as_deref().is_some_and(|p| p.segments.len() == 5 && p.start == Point2 { x: 2000.0, y: 0.0 }))
+                .ok_or("no outer wall")?;
+            let n = resolved_segments(wall.polyline.as_deref().ok_or("no polyline")?).len();
+            Ok((0..n).map(|i| resolve_cut_segment_inherited(&dp, &wall, i)).collect::<Result<_, _>>()?)
+        }
+
+        /// A WALL-EXT line in the elevation at the 2000 cap's u, z 900..2100.
+        fn draw_jamb(fx: &mut Fx) -> T<Id> {
+            fx.s.execute("editview", &json!({ "viewId": fx.elev.0 }))?;
+            layer(&mut fx.s, "WALL-EXT")?;
+            let (a, b) = (at(&fx.s, fx.elev, 2500.0, 900.0)?, at(&fx.s, fx.elev, 2500.0, 2100.0)?);
+            line(&mut fx.s, a, b)
+        }
+
+        fn cap_points(s: &Session, cap: Id) -> T<Vec<(f64, f64)>> {
+            let dp = DrawingProject::new(s.doc()?)?;
+            let e = dp.entity(cap).ok_or("no cap")?;
+            let seg = *resolved_segments(e.polyline.as_deref().ok_or("no polyline")?).first().ok_or("no segment")?;
+            Ok(vec![(round(seg.from.x), round(seg.from.y)), (round(seg.to.x), round(seg.to.y))])
+        }
+
+        /// The elevation-local delta for `du` along u and `dz` up.
+        fn delta(s: &Session, elev: Id, du: f64, dz: f64) -> T<[f64; 2]> {
+            let (a, b) = (at(s, elev, 0.0, 0.0)?, at(s, elev, du, dz)?);
+            Ok([b.x - a.x, b.y - a.y])
+        }
+
+        #[test]
+        fn an_elevation_line_through_a_seen_marker_links_and_sets_that_segments_extent() -> R {
+            let mut fx = fixture(true)?;
+            let cap = fx.cap.ok_or("no cap")?;
+            {
+                let dp = DrawingProject::new(fx.s.doc()?)?;
+                let m: Vec<_> = compute_link_markers_for_view(&dp, fx.elev)?.into_iter().filter(|m| m.source_entity_id == cap).collect();
+                assert_eq!(m.len(), 1, "{m:?}");
+                assert_eq!(m[0].position, at(&fx.s, fx.elev, 2500.0, 1200.0)?);
+            }
+            let before = outer_wall_spans(&fx.s, fx.plan)?;
+            let n = read_document(fx.s.doc()?)?.links.len();
+            let jamb = draw_jamb(&mut fx)?;
+            let links = links_between(&fx.s, jamb, cap)?;
+            assert_eq!(links.len(), 1, "{links:?}");
+            assert_eq!(read_document(fx.s.doc()?)?.links.len(), n + 1, "one new link");
+            let plan_end = if links[0].a.entity_id == cap { &links[0].a } else { &links[0].b };
+            assert_eq!(plan_end.segment_index, 0);
+            {
+                let dp = DrawingProject::new(fx.s.doc()?)?;
+                let spans = resolve_cut_segment(&dp, &dp.entity(cap).ok_or("no cap")?, 0)?;
+                assert_eq!(spans.len(), 1, "{spans:?}");
+                assert_eq!(spans[0].provenance, ProvenanceKind::Authored);
+                assert_eq!(spans[0].extent, Some(VerticalExtent { bottom: 900.0, top: 2100.0 }));
+            }
+            assert_eq!(outer_wall_spans(&fx.s, fx.plan)?, before, "the wall polyline's height is untouched");
+            Ok(())
+        }
+
+        #[test]
+        fn a_cap_drawn_after_the_elevation_line_links_too() -> R {
+            let mut fx = fixture(false)?;
+            let jamb = draw_jamb(&mut fx)?;
+            fx.s.execute("editview", &json!({ "viewId": fx.plan.0 }))?;
+            layer(&mut fx.s, "WALL-EXT")?;
+            let cap = line(&mut fx.s, Point2 { x: 2000.0, y: 0.0 }, Point2 { x: 2000.0, y: 200.0 })?;
+            assert_eq!(links_between(&fx.s, jamb, cap)?.len(), 1);
+            Ok(())
+        }
+
+        #[test]
+        fn move_travels_a_seen_link_both_ways_and_a_move_off_the_marker_drops_it() -> R {
+            let mut fx = fixture(true)?;
+            let cap = fx.cap.ok_or("no cap")?;
+            let jamb = draw_jamb(&mut fx)?;
+            let hex = |id: Id| format!("{:X}", id.0);
+
+            // The elevation line 100 along +u, the link in the travel set (a crossing box): the cap
+            // follows 100 along c_hat (+x).
+            let link = links_between(&fx.s, jamb, cap)?.first().ok_or("no link")?.id;
+            fx.s.set_travel(vec![link.0]);
+            let d = delta(&fx.s, fx.elev, 100.0, 0.0)?;
+            fx.s.execute("move", &json!({ "handles": [hex(jamb)], "delta": d }))?;
+            assert_eq!(uz_of_line(&fx.s, fx.elev, jamb)?, [(2600.0, 900.0), (2600.0, 2100.0)]);
+            assert_eq!(cap_points(&fx.s, cap)?, [(2100.0, 0.0), (2100.0, 200.0)]);
+            assert_eq!(links_between(&fx.s, jamb, cap)?.len(), 1, "held");
+
+            // The cap 300 along the gaze (+y): still seen end-on at the same u, the line stays.
+            fx.s.execute("editview", &json!({ "viewId": fx.plan.0 }))?;
+            fx.s.set_travel(vec![link.0]);
+            fx.s.execute("move", &json!({ "handles": [hex(cap)], "delta": [0, 300] }))?;
+            assert_eq!(cap_points(&fx.s, cap)?, [(2100.0, 300.0), (2100.0, 500.0)]);
+            assert_eq!(uz_of_line(&fx.s, fx.elev, jamb)?, [(2600.0, 900.0), (2600.0, 2100.0)]);
+            assert_eq!(links_between(&fx.s, jamb, cap)?.len(), 1, "held");
+
+            // The elevation line up 2000, clear of the marker at z 1200: the link drops.
+            fx.s.execute("editview", &json!({ "viewId": fx.elev.0 }))?;
+            let d = delta(&fx.s, fx.elev, 0.0, 2000.0)?;
+            fx.s.execute("move", &json!({ "handles": [hex(jamb)], "delta": d }))?;
+            assert_eq!(uz_of_line(&fx.s, fx.elev, jamb)?, [(2600.0, 2900.0), (2600.0, 4100.0)]);
+            assert!(links_between(&fx.s, jamb, cap)?.is_empty(), "dropped");
+            Ok(())
+        }
     }
 }

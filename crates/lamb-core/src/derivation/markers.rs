@@ -1,5 +1,9 @@
 //! Intersection markers, cut-line overlays and a view's cut plane through the solids (TS
 //! `markers.ts`). All derived per view, never written into a view's entities.
+//!
+//! Seen markers (LAMB T720, `docs/01-core-concept/line-model-and-linking.md` §5b): an elevation
+//! also marks the `u` of every straight plan segment it sees end-on, at its near end, so a line
+//! drawn through one links to that segment. Only elevations carry them; sections are deferred.
 
 use std::collections::HashSet;
 
@@ -16,7 +20,7 @@ use super::solids::SynthesizedSolid;
 use super::synthesis::synthesize;
 use crate::geometry::halfspace::{HalfSpace, section_polyhedron};
 use crate::geometry::intersect::{crossing_angle_deg, intersect_segment_with_infinite_line, intersect_segments, tangent_at_hit};
-use crate::geometry::point::{normalize2, sub2};
+use crate::geometry::point::{dot2, normalize2, sub2};
 use crate::geometry::polyline::{point_at_param, resolved_segments};
 use crate::geometry::tolerance::TOLERANCE;
 use crate::geometry::transform2d::{world_to_local_dir2, world_to_local2};
@@ -214,6 +218,91 @@ pub fn compute_markers_for_plan_view(doc: &impl ProjectRead, plan_view: &ViewRef
                 }
             }
         }
+    }
+    Ok(markers)
+}
+
+/// Seen markers in a placed elevation (LAMB T720, §5b): one at the near end of every straight plan
+/// `cut`/`seen` segment that does not reach the cut line, points away from it within
+/// `marker_circle_min_deg` of the gaze, and lies in front of the view. Empty for any other view —
+/// sections are deferred.
+pub fn compute_seen_markers_for_vertical_view(doc: &impl ProjectRead, view: &ViewRef<'_>) -> Result<Vec<Marker>, String> {
+    if !view.elevation {
+        return Ok(Vec::new());
+    }
+    let Some(transform) = view.transform() else { return Ok(Vec::new()) };
+    let Some(host_view) = view.host_view_id().and_then(|h| doc.view(h)) else { return Ok(Vec::new()) };
+    let basis = vertical_basis(view, &host_view)?;
+    let cut_line_from = basis.origin_xy;
+    let cut_line_to = Point2 { x: basis.origin_xy.x + basis.c_hat.x, y: basis.origin_xy.y + basis.c_hat.y };
+    let gaze = vertical_gaze_dir(basis.c_hat, view.flipped());
+
+    let mut markers = Vec::new();
+    for other_view in doc.views() {
+        if other_view.kind != ViewKind::Plan {
+            continue;
+        }
+        let Some(cut_elevation) = plan_cut_elevation(&other_view) else { continue };
+        for entity in doc.entities(other_view.id) {
+            let Some(role) = crossing_role(doc, &entity) else { continue };
+            let Some(poly) = entity.polyline.as_deref() else { continue };
+            let segments = resolved_segments(poly);
+            for seg in &segments {
+                if seg.bulge != 0.0 {
+                    continue;
+                }
+                let global_seg = ResolvedSegment {
+                    index: seg.index,
+                    from: plan_local_to_global_xy(&other_view, seg.from)?,
+                    to: plan_local_to_global_xy(&other_view, seg.to)?,
+                    bulge: 0.0,
+                };
+                if !intersect_segment_with_infinite_line(&global_seg, cut_line_from, cut_line_to, INTERSECT_EPS).is_empty() {
+                    continue;
+                }
+                let theta_deg = crossing_angle_deg(sub2(global_seg.to, global_seg.from), basis.c_hat);
+                if theta_deg < TOLERANCE.marker_circle_min_deg {
+                    continue;
+                }
+                let d_from = dot2(sub2(global_seg.from, basis.origin_xy), gaze);
+                let d_to = dot2(sub2(global_seg.to, basis.origin_xy), gaze);
+                let (end, t, depth) = if d_from <= d_to { (global_seg.from, 0.0, d_from) } else { (global_seg.to, 1.0, d_to) };
+                if depth <= TOLERANCE.coincidence_mm {
+                    continue;
+                }
+                let (z, assumed_z) = if role == LineRole::Cut {
+                    (cut_elevation, false)
+                } else {
+                    let r = resolve_seen_z(doc, &entity, seg.index)?;
+                    (r.z, r.provenance != ProvenanceKind::Authored)
+                };
+                let u = project_to_u(&basis, end);
+                markers.push(Marker {
+                    id: marker_id(view.id, entity.id, seg.index, t),
+                    view_id: view.id,
+                    source_entity_id: entity.id,
+                    source_view_id: other_view.id,
+                    source_segment_index: seg.index,
+                    source_segment_param: t,
+                    position: world_to_local2(transform, Point2 { x: u, y: z }),
+                    theta_deg,
+                    shape: MarkerShape::Circle,
+                    filled: marker_filled(doc, entity.id, &segments, view.id, point_at_param(seg, t)),
+                    assumed_z,
+                });
+            }
+        }
+    }
+    Ok(markers)
+}
+
+/// The markers a line in `view_id` links through: [`compute_markers_for_view`] plus an
+/// elevation's seen markers (LAMB T720, §5b; sections are deferred). Only linking and link
+/// maintenance use it; every other caller keeps cut markers only.
+pub fn compute_link_markers_for_view(doc: &impl ProjectRead, view_id: Id) -> Result<Vec<Marker>, String> {
+    let mut markers = compute_markers_for_view(doc, view_id)?;
+    if let Some(view) = doc.view(view_id).filter(|v| v.kind == ViewKind::Vertical) {
+        markers.extend(compute_seen_markers_for_vertical_view(doc, &view)?);
     }
     Ok(markers)
 }
@@ -699,6 +788,94 @@ mod floor_cut_tests {
         p.set_suppressed_proposals(vec![format!("{k}#1")]);
         reconcile_solid_cut_lines_once(&mut p, &mut mint)?;
         assert_eq!(keys(&p), [k]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod seen_marker_tests {
+    //! LAMB T720 (§5b): an elevation marks the plan segments it sees end-on; a section does not.
+    use super::*;
+    use crate::geometry::transform2d::IDENTITY_TRANSFORM;
+    use crate::geometry::{PolySegment, Polyline2};
+    use crate::model::{AnyView, DrawingEntity, EntityGeometry, PlanView, Project, VerticalIntent, VerticalView, empty_project};
+
+    const PLAN: Id = Id(10);
+    const ELEV: Id = Id(20);
+
+    fn pl(a: (f64, f64), b: (f64, f64)) -> Polyline2 {
+        Polyline2 {
+            start: Point2 { x: a.0, y: a.1 },
+            segments: vec![PolySegment { to: Point2 { x: b.0, y: b.1 }, bulge: 0.0, corner_at_to: None }],
+            closed: false,
+        }
+    }
+
+    /// A plan cut at 1200 holding one segment `a`–`b`, and a vertical view along y = −1000 from
+    /// x = −500 (identity transform: local = (u, z), u = x + 500), gazing north unless flipped.
+    fn project(a: (f64, f64), b: (f64, f64), intent: VerticalIntent, flipped: bool) -> Project {
+        let mut p = empty_project(None);
+        let e = DrawingEntity {
+            id: Id(1),
+            view_id: PLAN,
+            role: LineRole::Cut,
+            layer_id: "layer-wall-ext".into(),
+            geometry: EntityGeometry::Polyline { geometry: pl(a, b) },
+            color_override: None,
+            lineweight_override: None,
+            ai_origin: None,
+        };
+        p.views.push(AnyView::Plan(PlanView {
+            id: PLAN,
+            name: "plan".into(),
+            entities: vec![e],
+            placement: Some(Placement::Plan { level_id: Id(5), cut_elevation: 1200.0, transform: IDENTITY_TRANSFORM }),
+        }));
+        p.views.push(AnyView::Vertical(VerticalView {
+            id: ELEV,
+            name: "South".into(),
+            intent,
+            entities: vec![],
+            placement: Some(Placement::Vertical {
+                cut_line: pl((-500.0, -1000.0), (5500.0, -1000.0)),
+                host_view_id: PLAN,
+                transform: IDENTITY_TRANSFORM,
+                flipped: flipped.then_some(true),
+            }),
+        }));
+        p
+    }
+
+    fn seen(p: &Project) -> Result<Vec<Marker>, String> {
+        let v = p.view(ELEV).ok_or("no view")?;
+        compute_seen_markers_for_vertical_view(p, &v)
+    }
+
+    #[test]
+    fn an_elevation_marks_a_segment_it_sees_end_on_at_its_near_end() -> Result<(), String> {
+        let p = project((2000.0, 0.0), (2000.0, 200.0), VerticalIntent::Elevation, false);
+        let m = seen(&p)?;
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!((m[0].position.x, m[0].position.y, m[0].source_segment_param), (2500.0, 1200.0, 0.0));
+        assert_eq!(m[0].shape, MarkerShape::Circle);
+        assert!(!m[0].filled);
+        assert_eq!(compute_link_markers_for_view(&p, ELEV)?, m, "no cut marker: the segment never reaches the cut line");
+        // Drawn the other way, the near end is the segment's end.
+        let p = project((2000.0, 200.0), (2000.0, 0.0), VerticalIntent::Elevation, false);
+        assert_eq!(seen(&p)?.iter().map(|m| m.source_segment_param).collect::<Vec<_>>(), [1.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn behind_oblique_crossing_or_in_a_section_gives_no_seen_marker() -> Result<(), String> {
+        assert!(seen(&project((2000.0, 0.0), (2000.0, 200.0), VerticalIntent::Elevation, true))?.is_empty(), "behind the view");
+        assert!(seen(&project((2000.0, 0.0), (2200.0, 200.0), VerticalIntent::Elevation, false))?.is_empty(), "at 45°");
+        let crossing = project((2000.0, -1500.0), (2000.0, 200.0), VerticalIntent::Elevation, false);
+        assert!(seen(&crossing)?.is_empty(), "crossing the cut line");
+        assert_eq!(compute_link_markers_for_view(&crossing, ELEV)?.len(), 1, "only its cut marker");
+        let sec = project((2000.0, 0.0), (2000.0, 200.0), VerticalIntent::Section, false);
+        assert!(seen(&sec)?.is_empty(), "a section");
+        assert!(compute_link_markers_for_view(&sec, ELEV)?.is_empty());
         Ok(())
     }
 }
